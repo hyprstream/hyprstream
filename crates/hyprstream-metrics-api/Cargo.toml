@@ -1,0 +1,37 @@
+[package]
+name = "hyprstream-metrics-api"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/hyprstream/hyprstream"
+description = "Metrics API: schema-v2 types, producer API, calibration and decision-batch stores over the StorageBackend trait"
+
+[lib]
+name = "hyprstream_metrics_api"
+path = "src/lib.rs"
+
+[dependencies]
+# Arrow must stay on the SAME major as the engine crate's duckdb/datafusion
+# pair (arrow 56 for duckdb =1.4.3 + datafusion 50) — RecordBatch crosses the
+# api/engine boundary by type identity.
+arrow = "56.2.0"
+
+# Server/RPC
+tonic = { version = "0.13", features = ["transport"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async trait abstraction
+async-trait = "0.1"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4"] }
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

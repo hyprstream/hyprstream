@@ -5,10 +5,7 @@ pub use hyprstream_compositor::theme;
 
 /// Generated Cap'n Proto types for compositor/ChatApp IPC.
 #[cfg(target_os = "wasi")]
-pub mod compositor_ipc_capnp {
-    #![allow(dead_code, unused_imports, clippy::all)]
-    include!(concat!(env!("OUT_DIR"), "/compositor_ipc_capnp.rs"));
-}
+pub use hyprstream_rpc_std::compositor_ipc_capnp;
 
 pub mod private_store;
 
@@ -26,11 +23,9 @@ pub mod cast_ui;
 pub mod wizard;
 
 #[cfg(not(target_os = "wasi"))]
-pub mod console_app;
-#[cfg(not(target_os = "wasi"))]
 pub mod chat_ui;
 #[cfg(not(target_os = "wasi"))]
-pub mod vt_pane;
+pub mod console_app;
 #[cfg(not(target_os = "wasi"))]
 pub mod container_app;
 #[cfg(not(target_os = "wasi"))]
@@ -39,3 +34,5 @@ pub mod shell;
 pub mod shell_app;
 #[cfg(not(target_os = "wasi"))]
 pub mod shell_ui;
+#[cfg(not(target_os = "wasi"))]
+pub mod vt_pane;

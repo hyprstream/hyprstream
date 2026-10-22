@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use git2::Repository;
 use std::path::Path;
 
-use crate::services::generated::registry_client::{DetailedStatusInfo, FileChangeType, FileStatusInfo};
+use hyprstream_rpc_std::registry_client::{DetailedStatusInfo, FileChangeType, FileStatusInfo};
 
 // === Commit Operations ===
 
@@ -18,7 +18,8 @@ pub fn commit_index(repo: &Repository, message: &str) -> Result<git2::Oid> {
     let tree_id = index.write_tree()?;
     let tree = repo.find_tree(tree_id)?;
 
-    let sig = repo.signature()
+    let sig = repo
+        .signature()
         .map_err(|e| anyhow!("Failed to create signature: {}", e))?;
     let parent = repo.head()?.peel_to_commit()?;
 
@@ -66,9 +67,9 @@ pub fn amend_head(repo: &Repository, message: &str) -> Result<git2::Oid> {
 
     let new_oid = commit_to_amend.amend(
         Some("HEAD"),
-        None,  // Keep author
-        None,  // Keep committer
-        None,  // Keep encoding
+        None, // Keep author
+        None, // Keep committer
+        None, // Keep encoding
         Some(message),
         Some(&tree),
     )?;
@@ -119,12 +120,7 @@ pub fn list_tags(repo: &Repository) -> Result<Vec<String>> {
 /// Create lightweight tag
 ///
 /// If `target` is None, tags HEAD. If `force` is true, overwrites existing tags.
-pub fn create_tag(
-    repo: &Repository,
-    name: &str,
-    target: Option<&str>,
-    force: bool,
-) -> Result<()> {
+pub fn create_tag(repo: &Repository, name: &str, target: Option<&str>, force: bool) -> Result<()> {
     let target_oid = if let Some(target_spec) = target {
         repo.revparse_single(target_spec)?.id()
     } else {
@@ -150,10 +146,7 @@ pub fn delete_tag(repo: &Repository, name: &str) -> Result<()> {
 
 /// Detailed status with per-file change info, ahead/behind, merge state
 pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusInfo> {
-    let repo_path = repo
-        .workdir()
-        .unwrap_or_else(|| repo.path())
-        .to_path_buf();
+    let repo_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
 
     // Get branch name
     let branch = repo
@@ -227,10 +220,9 @@ pub fn detailed_status(repo: &Repository) -> Result<DetailedStatusInfo> {
         if let Some(branch_name) = head_ref.shorthand() {
             let upstream_name = format!("origin/{}", branch_name);
             if let Ok(upstream) = repo.revparse_single(&upstream_name) {
-                if let (Ok(local), Ok(remote)) = (
-                    head_ref.peel_to_commit(),
-                    upstream.peel_to_commit(),
-                ) {
+                if let (Ok(local), Ok(remote)) =
+                    (head_ref.peel_to_commit(), upstream.peel_to_commit())
+                {
                     repo.graph_ahead_behind(local.id(), remote.id())
                         .unwrap_or((0, 0))
                 } else {
@@ -273,8 +265,12 @@ pub fn merge(repo: &Repository, source: &str, message: Option<&str>) -> Result<g
 
     if analysis.is_fast_forward() {
         let refname = format!("refs/heads/{}", repo.head()?.shorthand().unwrap_or("HEAD"));
-        repo.reference(&refname, source_commit.id(), true,
-            &format!("Fast-forward to {}", source))?;
+        repo.reference(
+            &refname,
+            source_commit.id(),
+            true,
+            &format!("Fast-forward to {}", source),
+        )?;
         repo.set_head(&refname)?;
         repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
         return Ok(source_commit.id());
@@ -285,7 +281,9 @@ pub fn merge(repo: &Repository, source: &str, message: Option<&str>) -> Result<g
 
     let mut index = repo.index()?;
     if index.has_conflicts() {
-        return Err(anyhow!("Merge conflicts detected. Resolve and use continueMerge."));
+        return Err(anyhow!(
+            "Merge conflicts detected. Resolve and use continueMerge."
+        ));
     }
 
     let tree_id = index.write_tree()?;
@@ -294,11 +292,19 @@ pub fn merge(repo: &Repository, source: &str, message: Option<&str>) -> Result<g
     let head = repo.head()?.peel_to_commit()?;
 
     let merge_msg = message.map(String::from).unwrap_or_else(|| {
-        format!("Merge '{}' into {}", source, head.summary().unwrap_or("HEAD"))
+        format!(
+            "Merge '{}' into {}",
+            source,
+            head.summary().unwrap_or("HEAD")
+        )
     });
 
     let oid = repo.commit(
-        Some("HEAD"), &sig, &sig, &merge_msg, &tree,
+        Some("HEAD"),
+        &sig,
+        &sig,
+        &merge_msg,
+        &tree,
         &[&head, &source_commit],
     )?;
 
@@ -425,12 +431,8 @@ pub fn ensure_branch(repo: &Repository, name: &str) -> Result<()> {
 
 // === Utility ===
 
-/// COW-aware file copy (uses reflink when filesystem supports it, falls back to regular copy).
-pub fn cow_copy(src: &Path, dst: &Path) -> Result<()> {
-    reflink_copy::reflink_or_copy(src, dst)
-        .map(|_| ())
-        .map_err(|e| anyhow!("cow_copy failed: {}", e))
-}
+// NOTE: `cow_copy` moved to `hyprstream-inference` (`worktree_ext`) with its only
+// caller, the training checkpoint path (Wave B decomposition).
 
 /// Sanitize a string for use as a Git tag name
 pub fn sanitize_tag_name(name: &str) -> String {

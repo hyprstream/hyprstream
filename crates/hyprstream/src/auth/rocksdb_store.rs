@@ -10,7 +10,7 @@
 //! The database directory is `credentials_dir/users.db/`.
 
 #![cfg_attr(
-    all(feature = "credential-pds", not(test)),
+    all(feature = "encrypted-account-admission", not(test)),
     allow(dead_code, unused_imports)
 )]
 
@@ -178,7 +178,7 @@ impl RocksDbUserStore {
 
         let mut message = Builder::new_default();
         {
-            let mut ui = message.init_root::<crate::oauth_capnp::user_info::Builder>();
+            let mut ui = message.init_root::<hyprstream_rpc_std::oauth_capnp::user_info::Builder>();
             ui.set_sub(sub);
             if let Some(ref name) = profile.name {
                 ui.set_name(name);
@@ -235,7 +235,7 @@ impl RocksDbUserStore {
         let flags = bytes[0];
         let cursor = Cursor::new(&bytes[1..]);
         let reader = capnp::serialize::read_message(cursor, ReaderOptions::new())?;
-        let ui = reader.get_root::<crate::oauth_capnp::user_info::Reader>()?;
+        let ui = reader.get_root::<hyprstream_rpc_std::oauth_capnp::user_info::Reader>()?;
 
         let sub = ui.get_sub()?.to_string()?;
         let profile = UserProfile {
@@ -376,7 +376,7 @@ impl RocksDbUserStore {
 impl super::user_store::private::Sealed for RocksDbUserStore {}
 
 #[async_trait]
-#[cfg(any(not(feature = "credential-pds"), test))]
+#[cfg(any(not(feature = "encrypted-account-admission"), test))]
 impl UserStore for RocksDbUserStore {
     async fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
         Ok(self.get_raw(username)?.map(|(_, p, _)| p))
@@ -1896,7 +1896,7 @@ mod tests {
         // downgrade to Ed25519).
         let mut message = Builder::new_default();
         {
-            let mut ui = message.init_root::<crate::oauth_capnp::user_info::Builder>();
+            let mut ui = message.init_root::<hyprstream_rpc_std::oauth_capnp::user_info::Builder>();
             ui.set_sub("sub");
             let mut pk_list = ui.init_pubkeys(1);
             let mut e = pk_list.reborrow().get(0);

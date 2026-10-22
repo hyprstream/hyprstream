@@ -181,6 +181,14 @@ impl CompositeKeySet {
         self.snapshot.read().clone()
     }
 
+    /// Whether an on-disk composite signing authority has been configured for
+    /// this process. `false` means first bootstrap — no ledger exists yet —
+    /// which is distinct from a configured authority whose
+    /// [`CompositeKeySet::mint_snapshot`] fails (stale or pending cutover).
+    pub fn authority_configured(&self) -> bool {
+        self.authority.read().is_some()
+    }
+
     pub fn configure_authority(
         &self,
         ledger: PathBuf,
@@ -198,6 +206,13 @@ impl CompositeKeySet {
 
     /// Return a signing snapshot only when it matches the committed disk generation.
     pub fn mint_snapshot(&self) -> anyhow::Result<Arc<CompositeKeySetSnapshot>> {
+        let (snapshot, _authority_lock) = self.mint_snapshot_locked()?;
+        Ok(snapshot)
+    }
+
+    fn mint_snapshot_locked(
+        &self,
+    ) -> anyhow::Result<(Arc<CompositeKeySetSnapshot>, std::fs::File)> {
         use nix::fcntl::{flock, FlockArg};
         use std::os::fd::AsRawFd;
         let authority = self
@@ -258,7 +273,78 @@ impl CompositeKeySet {
                 && snapshot.component_digest() == committed_digest,
             "composite signing authority is stale or cutover is pending"
         );
-        Ok(snapshot)
+        Ok((snapshot, lock))
+    }
+
+    /// Attach local private handles to the exact already-committed public snapshot.
+    /// This does not publish a generation or change any pair's authority metadata.
+    /// Keep the disk lock through the atomic compare-and-attach so a cutover cannot
+    /// authorize stale handles while this process is being promoted to a signer.
+    pub fn attach_committed_signing_keys(
+        &self,
+        version: u64,
+        component_digest: &str,
+        pairs: Vec<CompositeKeyPair>,
+    ) -> anyhow::Result<()> {
+        let (observed, _authority_lock) = self.mint_snapshot_locked()?;
+        self.attach_signing_keys_to_snapshot(&observed, version, component_digest, pairs)
+    }
+
+    fn attach_signing_keys_to_snapshot(
+        &self,
+        observed: &Arc<CompositeKeySetSnapshot>,
+        version: u64,
+        component_digest: &str,
+        pairs: Vec<CompositeKeyPair>,
+    ) -> anyhow::Result<()> {
+        let mut guard = self.snapshot.write();
+        anyhow::ensure!(
+            Arc::ptr_eq(&guard, observed)
+                && guard.version == version
+                && guard.component_digest() == component_digest,
+            "committed composite snapshot changed before signer attachment"
+        );
+        anyhow::ensure!(
+            pairs.len() == guard.pairs.len(),
+            "composite pair set changed"
+        );
+        let mut seen = std::collections::HashSet::new();
+        let mut attached = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            anyhow::ensure!(seen.insert(pair.kid.clone()), "duplicate composite kid");
+            let current = guard
+                .pair(&pair.kid)
+                .ok_or_else(|| anyhow::anyhow!("signer pair is not committed"))?;
+            anyhow::ensure!(
+                pair.role == current.role
+                    && pair.state == current.state
+                    && pair.not_before == current.not_before
+                    && pair.expires_at == current.expires_at
+                    && pair.ed25519 == current.ed25519
+                    && crate::crypto::pq::ml_dsa_vk_bytes(&pair.ml_dsa)
+                        == crate::crypto::pq::ml_dsa_vk_bytes(&current.ml_dsa),
+                "signer pair differs from committed public authority"
+            );
+            if let Some((pq, ed)) = pair.signing_keys() {
+                anyhow::ensure!(
+                    ed.verifying_key() == current.ed25519
+                        && crate::crypto::pq::ml_dsa_vk_bytes(&ml_dsa::Keypair::verifying_key(
+                            &*pq
+                        )) == crate::crypto::pq::ml_dsa_vk_bytes(&current.ml_dsa),
+                    "private signer does not match committed public pair"
+                );
+                attached.push(pair);
+            } else {
+                // A verifier-only input must never remove an existing private handle.
+                attached.push(current.clone());
+            }
+        }
+        *guard = Arc::new(CompositeKeySetSnapshot {
+            version,
+            component_digest: Arc::clone(&observed.component_digest),
+            pairs: attached.into(),
+        });
+        Ok(())
     }
 
     /// Atomically replace the complete ledger. Versions must increase.
@@ -460,6 +546,115 @@ mod tests {
         assert!(!verify(&old_token, &after));
         let new_token = mint(after.active_signing_pair(CompositePairRole::OAuth).unwrap());
         assert!(verify(&new_token, &after));
+    }
+
+    #[test]
+    fn committed_signer_attachment_preserves_exact_authority_and_rejects_changes() {
+        let dir = std::env::temp_dir().join(format!("hyprstream-attach-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys = CompositeKeySet::default();
+        keys.configure_authority(
+            dir.join("ledger"),
+            dir.join("commit"),
+            dir.join("committed"),
+            dir.join("lock"),
+        );
+        let signing = pair(41);
+        let verifying = CompositeKeyPair::verifying(
+            signing.kid.clone(),
+            signing.ml_dsa.clone(),
+            signing.ed25519,
+            signing.role,
+            signing.state,
+            signing.not_before,
+            signing.expires_at,
+        );
+        keys.publish(1, "generation-1".into(), vec![verifying.clone()])
+            .unwrap();
+        assert!(
+            keys.attach_committed_signing_keys(1, "generation-1", vec![signing.clone()])
+                .is_err(),
+            "uncommitted authority gained a signer"
+        );
+        let committed = br#"{"version":1,"component_digest":"generation-1"}"#;
+        std::fs::write(dir.join("commit"), committed).unwrap();
+        std::fs::write(dir.join("committed-1-generation-1.json"), committed).unwrap();
+
+        for changed in [
+            {
+                let mut p = signing.clone();
+                p.role = CompositePairRole::Policy;
+                p
+            },
+            {
+                let mut p = signing.clone();
+                p.state = CompositePairState::Drain;
+                p
+            },
+            {
+                let mut p = signing.clone();
+                p.expires_at -= 1;
+                p
+            },
+            {
+                let mut p = signing.clone();
+                p.ed25519_signing = Some(Arc::new(SigningKey::from_bytes(&[42; 32])));
+                p
+            },
+            pair(43),
+        ] {
+            assert!(keys
+                .attach_committed_signing_keys(1, "generation-1", vec![changed])
+                .is_err());
+            assert!(keys
+                .snapshot()
+                .active_signing_pair(CompositePairRole::OAuth)
+                .is_none());
+        }
+        assert!(keys
+            .attach_committed_signing_keys(2, "generation-1", vec![signing.clone()])
+            .is_err());
+        assert!(keys
+            .attach_committed_signing_keys(1, "changed-digest", vec![signing.clone()])
+            .is_err());
+        keys.attach_committed_signing_keys(1, "generation-1", vec![signing.clone()])
+            .unwrap();
+        let restored = keys.mint_snapshot().unwrap();
+        assert_eq!(restored.version(), 1);
+        assert_eq!(restored.component_digest(), "generation-1");
+        assert!(verify(
+            &mint(
+                restored
+                    .active_signing_pair(CompositePairRole::OAuth)
+                    .unwrap()
+            ),
+            &restored
+        ));
+        // Idempotent attachment cannot strip handles; ordinary publication stays monotonic.
+        keys.attach_committed_signing_keys(1, "generation-1", vec![verifying])
+            .unwrap();
+        assert!(keys
+            .snapshot()
+            .active_signing_pair(CompositePairRole::OAuth)
+            .is_some());
+        assert!(keys
+            .publish(1, "generation-1".into(), vec![signing.clone()])
+            .is_err());
+
+        // Deterministically model a publication between the disk check and CAS.
+        let observed = keys.mint_snapshot().unwrap();
+        keys.publish(2, "generation-2".into(), vec![pair(44)])
+            .unwrap();
+        assert!(keys
+            .attach_signing_keys_to_snapshot(&observed, 1, "generation-1", vec![signing.clone()])
+            .is_err());
+        assert_eq!(keys.snapshot().version(), 2);
+        assert!(
+            keys.attach_committed_signing_keys(2, "generation-2", vec![signing])
+                .is_err(),
+            "memory ahead of committed disk gained a signer"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

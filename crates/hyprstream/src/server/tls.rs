@@ -59,15 +59,29 @@ pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<Arc<TlsMa
         crate::auth::identity_store::load_or_generate_tls_materials(&secrets_dir, server_name, 365)?
     } else {
         // Both paths guaranteed Some when use_self_signed() returns false
-        let cert_path = config.cert_path.as_ref()
+        let cert_path = config
+            .cert_path
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("tls.cert_path must be set when tls.key_path is set"))?;
-        let key_path = config.key_path.as_ref()
+        let key_path = config
+            .key_path
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("tls.key_path must be set when tls.cert_path is set"))?;
 
-        let cert_pem = std::fs::read(cert_path)
-            .map_err(|e| anyhow::anyhow!("failed to read tls.cert_path '{}': {}", cert_path.display(), e))?;
-        let key_pem = std::fs::read(key_path)
-            .map_err(|e| anyhow::anyhow!("failed to read tls.key_path '{}': {}", key_path.display(), e))?;
+        let cert_pem = std::fs::read(cert_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read tls.cert_path '{}': {}",
+                cert_path.display(),
+                e
+            )
+        })?;
+        let key_pem = std::fs::read(key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read tls.key_path '{}': {}",
+                key_path.display(),
+                e
+            )
+        })?;
 
         let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
             .next()
@@ -92,17 +106,35 @@ pub fn get_or_init_tls_materials(config: &TlsConfig) -> anyhow::Result<Arc<TlsMa
 
 /// Resolve the rustls configuration for a service.
 ///
+pub struct ResolvedTlsConfig {
+    pub rustls: axum_server::tls_rustls::RustlsConfig,
+    /// Present only when the rustls-acme listener must inspect and handle
+    /// TLS-ALPN-01 connections before the ordinary Axum TLS handshake.
+    pub acme_acceptor: Option<rustls_acme::axum::AxumAcceptor>,
+}
+
+impl ResolvedTlsConfig {
+    pub(crate) fn ordinary(rustls: axum_server::tls_rustls::RustlsConfig) -> Self {
+        Self {
+            rustls,
+            acme_acceptor: None,
+        }
+    }
+}
+
+/// Resolve HTTP TLS configuration and any protocol-specific acceptor.
+///
 /// Resolution order:
 /// 1. `tls_config.enabled == false` → `None` (plain HTTP)
 /// 2. Both `service_cert` + `service_key` set → per-service PEM files (overrides mode)
-/// 3. `mode = "acme"` → obtain/renew via ACME; spawns background renewal task
+/// 3. `mode = "acme"` → obtain/renew via ACME and use its challenge-aware acceptor
 /// 4. Otherwise → shared self-signed / `files` mode materials
 pub async fn resolve_rustls_config(
     tls_config: &TlsConfig,
     account_cfg: &AccountZoneConfig,
     service_cert: Option<&PathBuf>,
     service_key: Option<&PathBuf>,
-) -> anyhow::Result<Option<axum_server::tls_rustls::RustlsConfig>> {
+) -> anyhow::Result<Option<ResolvedTlsConfig>> {
     if !tls_config.enabled {
         return Ok(None);
     }
@@ -117,8 +149,15 @@ pub async fn resolve_rustls_config(
     if let (Some(cert), Some(key)) = (service_cert, service_key) {
         let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await
-            .map_err(|e| anyhow::anyhow!("failed to load per-service TLS from {:?}/{:?}: {}", cert, key, e))?;
-        return Ok(Some(rustls_config));
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to load per-service TLS from {:?}/{:?}: {}",
+                    cert,
+                    key,
+                    e
+                )
+            })?;
+        return Ok(Some(ResolvedTlsConfig::ordinary(rustls_config)));
     }
 
     // Warn if only one of cert/key is set at the per-service level
@@ -168,7 +207,7 @@ pub async fn resolve_rustls_config(
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to build RustlsConfig from DER: {}", e))?;
-                    Ok(Some(rustls_config))
+                    Ok(Some(ResolvedTlsConfig::ordinary(rustls_config)))
                 }
                 Err(e) => {
                     // Sane-degrade: clear error in the log, fall back to shared
@@ -186,7 +225,7 @@ pub async fn resolve_rustls_config(
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to build RustlsConfig from DER: {}", e))?;
-                    Ok(Some(rustls_config))
+                    Ok(Some(ResolvedTlsConfig::ordinary(rustls_config)))
                 }
             }
         }
@@ -199,7 +238,7 @@ pub async fn resolve_rustls_config(
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to build RustlsConfig from DER: {}", e))?;
-            Ok(Some(rustls_config))
+            Ok(Some(ResolvedTlsConfig::ordinary(rustls_config)))
         }
     }
 }
@@ -212,14 +251,13 @@ pub async fn resolve_rustls_config(
 ///
 /// For self-hosted ACME, point `acme_directory` at a step-ca or Pebble URL.
 /// See `docs/tls.md` for operator guidance.
-async fn init_acme_rustls_config(
-    tls_config: &TlsConfig,
-) -> anyhow::Result<axum_server::tls_rustls::RustlsConfig> {
+async fn init_acme_rustls_config(tls_config: &TlsConfig) -> anyhow::Result<ResolvedTlsConfig> {
     use rustls_acme::AcmeConfig;
 
-    let domain = tls_config.acme_domain.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("[tls] mode = \"acme\" requires acme_domain to be set")
-    })?;
+    let domain = tls_config
+        .acme_domain
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("[tls] mode = \"acme\" requires acme_domain to be set"))?;
     let contact = tls_config.acme_contact.as_deref().unwrap_or("");
     let cache_dir = tls_config.acme_cache_dir.clone().unwrap_or_else(|| {
         dirs::cache_dir()
@@ -232,6 +270,7 @@ async fn init_acme_rustls_config(
         .map_err(|e| anyhow::anyhow!("cannot create ACME cache dir {:?}: {e}", cache_dir))?;
 
     let mut acme = AcmeConfig::new([domain])
+        .directory_lets_encrypt(true)
         .contact_push(contact)
         .cache_option(Some(rustls_acme::caches::DirCache::new(cache_dir)));
 
@@ -239,11 +278,18 @@ async fn init_acme_rustls_config(
         acme = acme.directory(dir_url);
     }
 
-    info!("ACME TLS: obtaining certificate for domain '{}' from {}", domain,
-        tls_config.acme_directory.as_deref().unwrap_or("Let's Encrypt"));
+    info!(
+        "ACME TLS: obtaining certificate for domain '{}' from {}",
+        domain,
+        tls_config
+            .acme_directory
+            .as_deref()
+            .unwrap_or("Let's Encrypt")
+    );
 
     let mut state = acme.state();
-    let rustls_server_config = state.challenge_rustls_config();
+    let rustls_server_config = acme_https_config(state.resolver());
+    let acme_acceptor = state.axum_acceptor(Arc::clone(&rustls_server_config));
 
     // Spawn the ACME event loop — handles challenge responses and renewals.
     tokio::spawn(async move {
@@ -261,28 +307,66 @@ async fn init_acme_rustls_config(
         }
     });
 
-    // Wrap the rustls ServerConfig in an axum-server RustlsConfig.
-    // rustls-acme updates the Arc<ServerConfig> in-place on renewal.
+    // Keep the resolver shared between ordinary TLS handshakes and the
+    // AxumAcceptor's dedicated TLS-ALPN-01 handshake path.
     let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_server_config);
-    Ok(rustls_config)
+    Ok(ResolvedTlsConfig {
+        rustls: rustls_config,
+        acme_acceptor: Some(acme_acceptor),
+    })
 }
 
-/// Serve an Axum router over HTTPS (if rustls_config is Some) or plain HTTP.
+/// A bound HTTP(S) listener retained between the bind and serve phases.
 ///
-/// Uses `axum_server` for HTTPS with `Handle`-based graceful shutdown,
-/// or standard `axum::serve` for HTTP.
-pub async fn serve_app(
+/// Bind early (before readiness signals); serve later, consuming the handle.
+/// No second bind occurs: the TLS arm keeps the already-bound std listener
+/// and hands it to the pinned `axum-server` prebound constructor.
+pub enum BoundHttpListener {
+    /// Prebound nonblocking listener adopted by tokio.
+    Http(tokio::net::TcpListener),
+    /// Prebound std listener + TLS config, served either via
+    /// `axum_server::from_tcp_rustls` or the ACME-aware acceptor.
+    Https(std::net::TcpListener, ResolvedTlsConfig),
+}
+
+/// Bind phase: a real `std::net::TcpListener::bind` plus `set_nonblocking`.
+///
+/// Call this BEFORE any readiness signal so a bind failure (e.g. an occupied
+/// port) surfaces before the launcher is told the service is ready.
+pub fn bind_listener(
     addr: SocketAddr,
+    rustls_config: Option<ResolvedTlsConfig>,
+    service_name: &str,
+) -> Result<BoundHttpListener, RpcError> {
+    let std_listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| RpcError::SpawnFailed(format!("{service_name} HTTP(S) bind failed: {e}")))?;
+    std_listener.set_nonblocking(true).map_err(|e| {
+        RpcError::SpawnFailed(format!(
+            "{service_name} HTTP(S) set_nonblocking failed: {e}"
+        ))
+    })?;
+    match rustls_config {
+        Some(tls) => Ok(BoundHttpListener::Https(std_listener, tls)),
+        None => Ok(BoundHttpListener::Http(
+            tokio::net::TcpListener::from_std(std_listener).map_err(|e| {
+                RpcError::SpawnFailed(format!("{service_name} HTTP listener adoption failed: {e}"))
+            })?,
+        )),
+    }
+}
+
+/// Serve phase: consume a [`BoundHttpListener`] with graceful shutdown.
+///
+/// TLS uses the pinned `axum-server` prebound constructor on the already-bound
+/// std listener; ACME mode installs rustls-acme's challenge-aware acceptor.
+pub async fn serve_bound(
+    bound: BoundHttpListener,
     app: axum::Router,
-    rustls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     shutdown: Arc<Notify>,
     service_name: &str,
 ) -> Result<(), RpcError> {
-    let scheme = if rustls_config.is_some() { "https" } else { "http" };
-    info!("{service_name} listening on {scheme}://{addr}");
-
-    match rustls_config {
-        Some(tls) => {
+    match bound {
+        BoundHttpListener::Https(std_listener, tls) => {
             let handle = axum_server::Handle::new();
             let shutdown_handle = handle.clone();
             let name = service_name.to_owned();
@@ -294,29 +378,325 @@ pub async fn serve_app(
                 shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
             });
 
-            axum_server::bind_rustls(addr, tls)
-                .handle(handle)
-                .serve(app.into_make_service())
-                .await
-                .map_err(|e| RpcError::SpawnFailed(format!("{service_name} HTTPS server error: {e}")))?;
+            if let Some(acme_acceptor) = tls.acme_acceptor {
+                axum_server::from_tcp(std_listener)
+                    .acceptor(acme_acceptor)
+                    .handle(handle)
+                    .serve(app.into_make_service())
+                    .await
+                    .map_err(|e| {
+                        RpcError::SpawnFailed(format!("{service_name} HTTPS server error: {e}"))
+                    })?;
+            } else {
+                axum_server::from_tcp_rustls(std_listener, tls.rustls)
+                    .handle(handle)
+                    .serve(app.into_make_service())
+                    .await
+                    .map_err(|e| {
+                        RpcError::SpawnFailed(format!("{service_name} HTTPS server error: {e}"))
+                    })?;
+            }
         }
-        None => {
-            let name = service_name.to_owned();
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .map_err(|e| RpcError::SpawnFailed(format!("{name} HTTP bind failed: {e}")))?;
-
+        BoundHttpListener::Http(listener) => {
             let shutdown_clone = shutdown.clone();
+            let name = service_name.to_owned();
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     shutdown_clone.notified().await;
                     info!("{name} received shutdown signal");
                 })
                 .await
-                .map_err(|e| RpcError::SpawnFailed(format!("{service_name} HTTP server error: {e}")))?;
+                .map_err(|e| {
+                    RpcError::SpawnFailed(format!("{service_name} HTTP server error: {e}"))
+                })?;
         }
     }
 
     info!("{service_name} stopped");
     Ok(())
+}
+
+/// Serve an Axum router over HTTPS (if rustls_config is Some) or plain HTTP.
+///
+/// Uses `axum_server` for HTTPS with `Handle`-based graceful shutdown,
+/// or standard `axum::serve` for HTTP. Bind-then-serve wrapper over
+/// [`bind_listener`] + [`serve_bound`]; existing callers are unchanged.
+pub async fn serve_app(
+    addr: SocketAddr,
+    app: axum::Router,
+    rustls_config: Option<ResolvedTlsConfig>,
+    shutdown: Arc<Notify>,
+    service_name: &str,
+) -> Result<(), RpcError> {
+    let scheme = if rustls_config.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    info!("{service_name} listening on {scheme}://{addr}");
+
+    let bound = bind_listener(addr, rustls_config, service_name)?;
+    serve_bound(bound, app, shutdown, service_name).await
+}
+
+/// Configure normal HTTP protocols on the certificate resolver. The
+/// rustls-acme AxumAcceptor handles TLS-ALPN-01 ClientHello routing before
+/// handing ordinary connections to this server config.
+fn acme_https_config(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> Arc<rustls::ServerConfig> {
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Arc::new(config)
+}
+
+#[cfg(test)]
+mod acme_tests {
+    use super::*;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct FixtureResolver {
+        key: Arc<rustls::sign::CertifiedKey>,
+        challenge_seen: AtomicBool,
+    }
+
+    impl rustls::server::ResolvesServerCert for FixtureResolver {
+        fn resolve(
+            &self,
+            hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            self.challenge_seen
+                .store(rustls_acme::is_tls_alpn_challenge(&hello), Ordering::SeqCst);
+            Some(self.key.clone())
+        }
+    }
+
+    /// Exercise the ordinary HTTP side of the production config with real
+    /// ClientHello negotiation. TLS-ALPN challenge handshakes are routed by
+    /// rustls-acme's AxumAcceptor before this config is used.
+    #[test]
+    fn acme_https_negotiates_http_protocols() -> anyhow::Result<()> {
+        hyprstream_rpc::transport::install_pq_crypto_provider()?;
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let cert = generated.cert.der().clone();
+        let private =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()));
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .ok_or_else(|| anyhow::anyhow!("crypto provider missing"))?;
+        let key = Arc::new(rustls::sign::CertifiedKey::from_der(
+            vec![cert.clone()],
+            private,
+            provider,
+        )?);
+        for protocol in [b"h2".as_slice(), b"http/1.1"] {
+            let resolver = Arc::new(FixtureResolver {
+                key: key.clone(),
+                challenge_seen: AtomicBool::new(false),
+            });
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.clone())?;
+            let mut client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            client_config.alpn_protocols = vec![protocol.to_vec()];
+            let mut client = rustls::ClientConnection::new(
+                Arc::new(client_config),
+                ServerName::try_from("localhost")?,
+            )?;
+            let mut server = rustls::ServerConnection::new(acme_https_config(resolver.clone()))?;
+            for _ in 0..16 {
+                let mut bytes = Vec::new();
+                client.write_tls(&mut bytes)?;
+                server.read_tls(&mut Cursor::new(bytes))?;
+                server.process_new_packets()?;
+                let mut bytes = Vec::new();
+                server.write_tls(&mut bytes)?;
+                client.read_tls(&mut Cursor::new(bytes))?;
+                client.process_new_packets()?;
+                if !client.is_handshaking() && !server.is_handshaking() {
+                    break;
+                }
+            }
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            assert_eq!(client.alpn_protocol(), Some(protocol));
+            assert!(!resolver.challenge_seen.load(Ordering::SeqCst));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bound_serve_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use axum::routing::get;
+    use rustls::pki_types::ServerName;
+
+    /// Positive HTTPS regression through the production bind/serve seam:
+    /// `bind_listener` retains the real socket, `serve_bound` hands it to the
+    /// pinned `axum_server::from_tcp_rustls` constructor, a client that
+    /// TRUSTS the served certificate and verifies the hostname normally (no
+    /// verification bypass) completes a real request, and shutdown is
+    /// bounded. Same helper OAuth and OAI call before their readiness
+    /// signals.
+    #[tokio::test]
+    async fn bound_https_serves_verified_client_and_shuts_down_bounded() -> anyhow::Result<()> {
+        hyprstream_rpc::transport::install_pq_crypto_provider()?;
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            generated.cert.pem().into_bytes(),
+            generated.key_pair.serialize_pem().into_bytes(),
+        )
+        .await?;
+
+        // Reserve, then bind through the production seam (no second bind).
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = probe.local_addr()?;
+        drop(probe);
+        let bound = bind_listener(
+            addr,
+            Some(ResolvedTlsConfig::ordinary(rustls_config)),
+            "BoundServeTest",
+        )?;
+
+        let app =
+            axum::Router::new().route("/bound-serve-probe", get(|| async { "bound-serve-ok" }));
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_signal = Arc::clone(&shutdown);
+        let server = tokio::spawn(serve_bound(
+            bound,
+            app,
+            Arc::clone(&shutdown),
+            "BoundServeTest",
+        ));
+
+        // Client trusts the served certificate and verifies "localhost"
+        // normally; no dangerous verification-disabling configuration.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(generated.cert.der().clone())?;
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        // The client runs on a blocking thread over a real socket. `StreamOwned`
+        // implements blocking Read/Write that drives rustls IO internally (the
+        // raw ClientConnection reader only drains buffered plaintext); hostname
+        // and certificate verification stay fully enabled.
+        let client = std::thread::spawn(move || -> anyhow::Result<String> {
+            use std::io::{Read, Write};
+            let tcp = std::net::TcpStream::connect(addr)?;
+            tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let tls = rustls::ClientConnection::new(
+                Arc::new(client_config),
+                ServerName::try_from("localhost")?,
+            )?;
+            let mut stream = rustls::StreamOwned::new(tls, tcp);
+            stream.write_all(
+                b"GET /bound-serve-probe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(String::from_utf8_lossy(&response).into_owned())
+        });
+
+        let response = tokio::task::spawn_blocking(move || client.join())
+            .await
+            .expect("client joiner must not fail")
+            .expect("client thread must not panic")?;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "verified-TLS client must receive HTTP 200: got {response:?}"
+        );
+        assert!(
+            response.contains("bound-serve-ok"),
+            "exact probe body must be served through the TLS path: got {response:?}"
+        );
+
+        // Bounded shutdown: the retained handle's server ends cleanly.
+        shutdown_signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("serve_bound must terminate within the shutdown budget")?
+            .expect("graceful shutdown must complete Ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bound_https_acme_acceptor_serves_ordinary_tls() -> anyhow::Result<()> {
+        hyprstream_rpc::transport::install_pq_crypto_provider()?;
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let cert = generated.cert.der().clone();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()),
+        );
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)?;
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let server_config = Arc::new(server_config);
+
+        // No ACME event loop is needed for this regression: the supplied
+        // certificate serves ordinary HTTPS while the acceptor owns the
+        // separate TLS-ALPN challenge handshake path.
+        let acme_state = rustls_acme::AcmeConfig::new(["localhost"]).state();
+        let acme_acceptor = acme_state.axum_acceptor(Arc::clone(&server_config));
+        let tls = ResolvedTlsConfig {
+            rustls: axum_server::tls_rustls::RustlsConfig::from_config(server_config),
+            acme_acceptor: Some(acme_acceptor),
+        };
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = probe.local_addr()?;
+        drop(probe);
+        let bound = bind_listener(addr, Some(tls), "BoundAcmeServeTest")?;
+        let app = axum::Router::new().route("/bound-acme-probe", get(|| async { "bound-acme-ok" }));
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_signal = Arc::clone(&shutdown);
+        let server = tokio::spawn(serve_bound(
+            bound,
+            app,
+            Arc::clone(&shutdown),
+            "BoundAcmeServeTest",
+        ));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert)?;
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client = std::thread::spawn(move || -> anyhow::Result<String> {
+            use std::io::{Read, Write};
+            let tcp = std::net::TcpStream::connect(addr)?;
+            tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let tls = rustls::ClientConnection::new(
+                Arc::new(client_config),
+                ServerName::try_from("localhost")?,
+            )?;
+            let mut stream = rustls::StreamOwned::new(tls, tcp);
+            stream.write_all(
+                b"GET /bound-acme-probe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(String::from_utf8_lossy(&response).into_owned())
+        });
+        let response = tokio::task::spawn_blocking(move || client.join())
+            .await
+            .expect("client joiner must not fail")
+            .expect("client thread must not panic")?;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response:?}");
+        assert!(response.contains("bound-acme-ok"), "{response:?}");
+
+        shutdown_signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("serve_bound must terminate within the shutdown budget")?
+            .expect("graceful shutdown must complete Ok");
+        Ok(())
+    }
 }

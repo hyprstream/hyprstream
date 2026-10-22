@@ -27,9 +27,15 @@ type LoadFn = Box<dyn Fn(&str, ModelStatusSender) + Send>;
 /// Progress update from a background git operation.
 #[derive(Debug, Clone)]
 pub enum GitOpProgress {
-    CloneProgress { stage: String, pct: u8 },
+    CloneProgress {
+        stage: String,
+        pct: u8,
+    },
     Status(String),
-    Done { message: String, new_model: Option<ModelEntry> },
+    Done {
+        message: String,
+        new_model: Option<ModelEntry>,
+    },
     Failed(String),
     /// Authoritative model list from a background registry re-scan (refresh_fn).
     ModelList(Vec<ModelEntry>),
@@ -39,7 +45,8 @@ pub type GitProgressSender = std::sync::mpsc::Sender<GitOpProgress>;
 pub type CloneFn = Box<dyn Fn(String, Option<String>, Option<String>, GitProgressSender) + Send>;
 pub type PullFn = Box<dyn Fn(String, GitProgressSender) + Send>;
 pub type PushFn = Box<dyn Fn(String, GitProgressSender) + Send>;
-pub type FetchStatusFn = Box<dyn Fn(Vec<String>, std::sync::mpsc::Sender<(String, u32, u32, bool)>) + Send>;
+pub type FetchStatusFn =
+    Box<dyn Fn(Vec<String>, std::sync::mpsc::Sender<(String, u32, u32, bool)>) + Send>;
 /// Re-query the registry for the current model set; results return via
 /// `GitOpProgress::ModelList` on the shared git-progress channel.
 pub type RefreshFn = Box<dyn Fn(GitProgressSender) + Send>;
@@ -60,7 +67,7 @@ pub struct GitOps {
 /// A model repo discovered in the registry directory.
 #[derive(Clone, Debug)]
 pub struct ModelEntry {
-    pub model_ref: String,  // "name:branch"
+    pub model_ref: String, // "name:branch"
     pub path: PathBuf,
     pub loaded: bool,
     pub ahead: u32,
@@ -201,7 +208,12 @@ pub enum CloneScreen {
     /// Prompting for an optional local name (URL stored from previous step).
     EnterName(TextInput, String),
     /// Clone in progress — progress updates driven by tick().
-    Cloning { url: String, name: String, progress_msg: String, progress_pct: u8 },
+    Cloning {
+        url: String,
+        name: String,
+        progress_msg: String,
+        progress_pct: u8,
+    },
     /// Clone completed successfully.
     Done(String),
     /// Clone failed.
@@ -220,16 +232,20 @@ pub enum ShellMode {
     /// Multi-step clone flow.
     CloneFlow(CloneScreen),
     /// Pull/push in progress.
-    GitOpInProgress { op_name: String, model_ref: String, progress_msg: String },
+    GitOpInProgress {
+        op_name: String,
+        model_ref: String,
+        progress_msg: String,
+    },
 }
 
 /// Menu items: (label, chord hint shown in popup).
 pub const MENU_ITEMS: &[(&str, &str)] = &[
-    ("New",        "N"),
-    ("Close",      "Q"),
-    ("Cycle",      "Tab"),
-    ("Models",     "M"),
-    ("Settings",   "S"),
+    ("New", "N"),
+    ("Close", "Q"),
+    ("Cycle", "Tab"),
+    ("Models", "M"),
+    ("Settings", "S"),
     ("Disconnect", "D"),
 ];
 
@@ -314,10 +330,7 @@ impl ShellApp {
         let model_list = SelectList::new("Models", models);
 
         let default_style = BackgroundStyle::Stars;
-        let settings_list = SelectList::new(
-            "Background",
-            ALL_STYLES.to_vec(),
-        ).with_selected(1); // Stars is index 1
+        let settings_list = SelectList::new("Background", ALL_STYLES.to_vec()).with_selected(1); // Stars is index 1
 
         let (status_tx, status_rx) = std::sync::mpsc::channel();
         let (git_progress_tx, git_progress_rx) = std::sync::mpsc::channel();
@@ -361,7 +374,9 @@ impl ShellApp {
             (git_ops.refresh_fn)(self.git_progress_tx.clone());
             return;
         }
-        let Some(ref dir) = self.registry_dir else { return };
+        let Some(ref dir) = self.registry_dir else {
+            return;
+        };
         let discovered = discover_models(dir);
         self.merge_model_list(discovered);
     }
@@ -459,9 +474,8 @@ impl ShellApp {
     fn handle_model_list(&mut self, key: KeyPress) -> bool {
         // Clone — opens the clone flow (no model selection needed).
         if matches!(key, KeyPress::Char(b'c')) && self.git_ops.is_some() {
-            self.mode = ShellMode::CloneFlow(
-                CloneScreen::EnterUrl(TextInput::new("Repository URL:")),
-            );
+            self.mode =
+                ShellMode::CloneFlow(CloneScreen::EnterUrl(TextInput::new("Repository URL:")));
             return true;
         }
 
@@ -552,58 +566,66 @@ impl ShellApp {
         };
 
         match screen {
-            CloneScreen::EnterUrl(mut input) => {
-                match input.handle_key(&key) {
-                    WidgetResult::Confirmed(url) => {
-                        if url.trim().is_empty() {
-                            self.mode = ShellMode::ModelList;
-                        } else {
-                            self.mode = ShellMode::CloneFlow(CloneScreen::EnterName(
-                                TextInput::new("Local name (Enter for default):"),
-                                url,
-                            ));
-                        }
-                    }
-                    WidgetResult::Cancelled => {
+            CloneScreen::EnterUrl(mut input) => match input.handle_key(&key) {
+                WidgetResult::Confirmed(url) => {
+                    if url.trim().is_empty() {
                         self.mode = ShellMode::ModelList;
-                    }
-                    WidgetResult::Pending => {
-                        self.mode = ShellMode::CloneFlow(CloneScreen::EnterUrl(input));
-                    }
-                }
-            }
-            CloneScreen::EnterName(mut input, url) => {
-                match input.handle_key(&key) {
-                    WidgetResult::Confirmed(name) => {
-                        let name_opt = if name.trim().is_empty() { None } else { Some(name) };
-                        let display_name = name_opt.clone().unwrap_or_else(|| url.clone());
-                        if let Some(ref git_ops) = self.git_ops {
-                            (git_ops.clone_fn)(
-                                url.clone(),
-                                name_opt,
-                                None,
-                                self.git_progress_tx.clone(),
-                            );
-                        }
-                        self.mode = ShellMode::CloneFlow(CloneScreen::Cloning {
+                    } else {
+                        self.mode = ShellMode::CloneFlow(CloneScreen::EnterName(
+                            TextInput::new("Local name (Enter for default):"),
                             url,
-                            name: display_name,
-                            progress_msg: "Starting…".to_owned(),
-                            progress_pct: 0,
-                        });
-                    }
-                    WidgetResult::Cancelled => {
-                        self.mode = ShellMode::ModelList;
-                    }
-                    WidgetResult::Pending => {
-                        self.mode = ShellMode::CloneFlow(CloneScreen::EnterName(input, url));
+                        ));
                     }
                 }
-            }
-            CloneScreen::Cloning { url, name, progress_msg, progress_pct } => {
+                WidgetResult::Cancelled => {
+                    self.mode = ShellMode::ModelList;
+                }
+                WidgetResult::Pending => {
+                    self.mode = ShellMode::CloneFlow(CloneScreen::EnterUrl(input));
+                }
+            },
+            CloneScreen::EnterName(mut input, url) => match input.handle_key(&key) {
+                WidgetResult::Confirmed(name) => {
+                    let name_opt = if name.trim().is_empty() {
+                        None
+                    } else {
+                        Some(name)
+                    };
+                    let display_name = name_opt.clone().unwrap_or_else(|| url.clone());
+                    if let Some(ref git_ops) = self.git_ops {
+                        (git_ops.clone_fn)(
+                            url.clone(),
+                            name_opt,
+                            None,
+                            self.git_progress_tx.clone(),
+                        );
+                    }
+                    self.mode = ShellMode::CloneFlow(CloneScreen::Cloning {
+                        url,
+                        name: display_name,
+                        progress_msg: "Starting…".to_owned(),
+                        progress_pct: 0,
+                    });
+                }
+                WidgetResult::Cancelled => {
+                    self.mode = ShellMode::ModelList;
+                }
+                WidgetResult::Pending => {
+                    self.mode = ShellMode::CloneFlow(CloneScreen::EnterName(input, url));
+                }
+            },
+            CloneScreen::Cloning {
+                url,
+                name,
+                progress_msg,
+                progress_pct,
+            } => {
                 // No key handling during clone — progress driven by tick().
                 self.mode = ShellMode::CloneFlow(CloneScreen::Cloning {
-                    url, name, progress_msg, progress_pct,
+                    url,
+                    name,
+                    progress_msg,
+                    progress_pct,
                 });
             }
             CloneScreen::Done(_) | CloneScreen::Failed(_) => {
@@ -619,7 +641,10 @@ impl ShellApp {
 
     fn handle_git_op_progress(&mut self, key: KeyPress) -> bool {
         // Allow Esc/Enter to dismiss after completion (detected by "Done:" or "Error:" prefix).
-        if let ShellMode::GitOpInProgress { ref progress_msg, .. } = self.mode {
+        if let ShellMode::GitOpInProgress {
+            ref progress_msg, ..
+        } = self.mode
+        {
             if (progress_msg.starts_with("Done:") || progress_msg.starts_with("Error:"))
                 && matches!(key, KeyPress::Enter | KeyPress::Escape)
             {
@@ -635,7 +660,7 @@ impl ShellApp {
         let chord_action: Option<usize> = match key {
             KeyPress::Char(b'n' | b'N') => Some(0),
             KeyPress::Char(b'q' | b'Q') => Some(1),
-            KeyPress::Tab               => Some(2),
+            KeyPress::Tab => Some(2),
             KeyPress::Char(b'm' | b'M') => Some(3),
             KeyPress::Char(b's' | b'S') => Some(4),
             KeyPress::Char(b'd' | b'D') => Some(5),
@@ -646,14 +671,18 @@ impl ShellApp {
             return self.execute_menu_action(idx);
         }
         match key {
-            KeyPress::Escape | KeyPress::CtrlSpace => { self.mode = ShellMode::Normal; }
+            KeyPress::Escape | KeyPress::CtrlSpace => {
+                self.mode = ShellMode::Normal;
+            }
             KeyPress::ArrowUp => {
                 self.mode = ShellMode::StartMenu {
                     selected: if selected == 0 { n - 1 } else { selected - 1 },
                 };
             }
             KeyPress::ArrowDown => {
-                self.mode = ShellMode::StartMenu { selected: (selected + 1) % n };
+                self.mode = ShellMode::StartMenu {
+                    selected: (selected + 1) % n,
+                };
             }
             KeyPress::Enter => {
                 self.mode = ShellMode::Normal;
@@ -676,13 +705,18 @@ impl ShellApp {
             }
             4 => {
                 self.saved_style = self.bg.style;
-                let i = ALL_STYLES.iter().position(|s| *s == self.bg.style).unwrap_or(0);
-                self.settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
-                    .with_selected(i);
+                let i = ALL_STYLES
+                    .iter()
+                    .position(|s| *s == self.bg.style)
+                    .unwrap_or(0);
+                self.settings_list =
+                    SelectList::new("Background", ALL_STYLES.to_vec()).with_selected(i);
                 self.preview_bg.style = self.bg.style;
                 self.mode = ShellMode::Settings;
             }
-            5 => { self.quit = true; }
+            5 => {
+                self.quit = true;
+            }
             _ => {}
         }
         true
@@ -690,7 +724,10 @@ impl ShellApp {
 
     fn fetch_git_status(&self) {
         if let Some(ref git_ops) = self.git_ops {
-            let refs: Vec<String> = self.model_list.items().iter()
+            let refs: Vec<String> = self
+                .model_list
+                .items()
+                .iter()
                 .map(|e| e.model_ref.clone())
                 .collect();
             if !refs.is_empty() {
@@ -703,21 +740,21 @@ impl ShellApp {
         match self.settings_list.handle_key(&key) {
             WidgetResult::Cancelled => {
                 // Restore saved style on Esc.
-                self.bg.style      = self.saved_style;
+                self.bg.style = self.saved_style;
                 self.preview_bg.style = self.saved_style;
-                self.mode          = ShellMode::Normal;
+                self.mode = ShellMode::Normal;
                 true
             }
             WidgetResult::Confirmed(style) => {
-                self.bg.style      = style;
+                self.bg.style = style;
                 self.preview_bg.style = style;
-                self.mode          = ShellMode::Normal;
+                self.mode = ShellMode::Normal;
                 true
             }
             WidgetResult::Pending => {
                 // Live-preview: sync bg style to the highlighted list entry.
                 if let Some(&style) = self.settings_list.selected_item() {
-                    self.bg.style      = style;
+                    self.bg.style = style;
                     self.preview_bg.style = style;
                 }
                 true
@@ -736,12 +773,12 @@ impl TerminalApp for ShellApp {
     fn handle_input(&mut self, cmd: ShellCmd) -> bool {
         let ShellCmd::Key(key) = cmd;
         match self.mode {
-            ShellMode::Normal                    => self.handle_normal(key),
-            ShellMode::ModelList                 => self.handle_model_list(key),
-            ShellMode::Settings                  => self.handle_settings(key),
-            ShellMode::StartMenu { selected }    => self.handle_start_menu(key, selected),
-            ShellMode::CloneFlow(_)              => self.handle_clone_flow(key),
-            ShellMode::GitOpInProgress { .. }    => self.handle_git_op_progress(key),
+            ShellMode::Normal => self.handle_normal(key),
+            ShellMode::ModelList => self.handle_model_list(key),
+            ShellMode::Settings => self.handle_settings(key),
+            ShellMode::StartMenu { selected } => self.handle_start_menu(key, selected),
+            ShellMode::CloneFlow(_) => self.handle_clone_flow(key),
+            ShellMode::GitOpInProgress { .. } => self.handle_git_op_progress(key),
         }
     }
 
@@ -773,7 +810,9 @@ impl TerminalApp for ShellApp {
                     entry.loaded = loaded;
                 }
             }
-            if self.load_status.as_ref()
+            if self
+                .load_status
+                .as_ref()
                 .is_some_and(|s| s.contains(&model_ref))
             {
                 self.load_status = None;
@@ -786,21 +825,30 @@ impl TerminalApp for ShellApp {
             match progress {
                 GitOpProgress::CloneProgress { stage, pct } => {
                     if let ShellMode::CloneFlow(CloneScreen::Cloning {
-                        ref mut progress_msg, ref mut progress_pct, ..
-                    }) = self.mode {
+                        ref mut progress_msg,
+                        ref mut progress_pct,
+                        ..
+                    }) = self.mode
+                    {
                         *progress_msg = stage;
                         *progress_pct = pct;
                     }
                 }
                 GitOpProgress::Status(msg) => {
-                    if let ShellMode::GitOpInProgress { ref mut progress_msg, .. } = self.mode {
+                    if let ShellMode::GitOpInProgress {
+                        ref mut progress_msg,
+                        ..
+                    } = self.mode
+                    {
                         *progress_msg = msg;
                     }
                 }
                 GitOpProgress::Done { message, new_model } => {
                     if let Some(entry) = new_model {
                         self.model_list.items_mut().push(entry);
-                        self.model_list.items_mut().sort_by(|a, b| a.model_ref.cmp(&b.model_ref));
+                        self.model_list
+                            .items_mut()
+                            .sort_by(|a, b| a.model_ref.cmp(&b.model_ref));
                     }
                     match self.mode {
                         ShellMode::CloneFlow(_) => {
@@ -816,21 +864,19 @@ impl TerminalApp for ShellApp {
                         _ => {}
                     }
                 }
-                GitOpProgress::Failed(msg) => {
-                    match self.mode {
-                        ShellMode::CloneFlow(_) => {
-                            self.mode = ShellMode::CloneFlow(CloneScreen::Failed(msg));
-                        }
-                        ShellMode::GitOpInProgress { .. } => {
-                            self.mode = ShellMode::GitOpInProgress {
-                                op_name: String::new(),
-                                model_ref: String::new(),
-                                progress_msg: format!("Error: {msg}"),
-                            };
-                        }
-                        _ => {}
+                GitOpProgress::Failed(msg) => match self.mode {
+                    ShellMode::CloneFlow(_) => {
+                        self.mode = ShellMode::CloneFlow(CloneScreen::Failed(msg));
                     }
-                }
+                    ShellMode::GitOpInProgress { .. } => {
+                        self.mode = ShellMode::GitOpInProgress {
+                            op_name: String::new(),
+                            model_ref: String::new(),
+                            progress_msg: format!("Error: {msg}"),
+                        };
+                    }
+                    _ => {}
+                },
                 GitOpProgress::ModelList(models) => {
                     self.merge_model_list(models);
                     // Refresh git status for any newly-appeared models.
@@ -910,14 +956,20 @@ mod tests {
         // ...but git status is carried over from the existing entry.
         assert_eq!((a.ahead, a.behind, a.is_dirty), (2, 1, true));
         // new model has no carried-over status.
-        assert_eq!((merged[1].ahead, merged[1].behind, merged[1].is_dirty), (0, 0, false));
+        assert_eq!(
+            (merged[1].ahead, merged[1].behind, merged[1].is_dirty),
+            (0, 0, false)
+        );
         // selection stays on a:main.
         assert_eq!(idx, 0);
     }
 
     #[test]
     fn merge_drops_removed_models_and_keeps_selection() {
-        let existing = vec![entry("a:main", false, 0, 0, false), entry("b:main", false, 0, 0, false)];
+        let existing = vec![
+            entry("a:main", false, 0, 0, false),
+            entry("b:main", false, 0, 0, false),
+        ];
         // b was removed upstream; only a remains. Selection was on b.
         let incoming = vec![entry("a:main", false, 0, 0, false)];
         let (merged, idx) = merge_models(&existing, incoming, Some("b:main"));
@@ -931,7 +983,10 @@ mod tests {
     fn merge_keeps_selection_on_moved_index() {
         let existing = vec![entry("b:main", false, 0, 0, false)];
         // Refresh returns sorted list; previously-selected b is now at index 1.
-        let incoming = vec![entry("a:main", false, 0, 0, false), entry("b:main", false, 0, 0, false)];
+        let incoming = vec![
+            entry("a:main", false, 0, 0, false),
+            entry("b:main", false, 0, 0, false),
+        ];
         let (merged, idx) = merge_models(&existing, incoming, Some("b:main"));
         assert_eq!(idx, 1, "selection follows the model to its new index");
         assert_eq!(merged[idx].model_ref, "b:main");

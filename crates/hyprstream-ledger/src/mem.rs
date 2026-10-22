@@ -40,11 +40,20 @@ pub struct MemLedger {
     head: ChainHead,
     clock: u64,
     last_checkpoint: Option<SignedCheckpoint>,
+    /// The issuance authority, fixed at construction. `None` means this ledger
+    /// cannot mint at all — the fail-closed default for a ledger nobody
+    /// deliberately granted an issuance authority.
+    mint_authority: Option<crate::mint::MintAuthority>,
 }
 
 impl MemLedger {
-    /// Create an empty ledger for the given cell identity, logical clock at 0.
-    pub fn new(ledger_id: Did) -> Self {
+    /// Create an empty ledger for the given cell identity (logical clock at 0)
+    /// with the given issuance authority.
+    ///
+    /// The authority is a **construction parameter, not a setter**: once a
+    /// `MemLedger` exists, what it will accept as a mint authorization cannot
+    /// be changed. `None` yields a ledger that cannot mint at all.
+    pub fn new(ledger_id: Did, mint_authority: Option<crate::mint::MintAuthority>) -> Self {
         MemLedger {
             ledger_id,
             accounts: BTreeMap::new(),
@@ -56,6 +65,7 @@ impl MemLedger {
             head: ChainHead::default(),
             clock: 0,
             last_checkpoint: None,
+            mint_authority,
         }
     }
 
@@ -218,8 +228,16 @@ impl LedgerBackend for MemLedger {
         }
     }
 
-    fn credit(&mut self, t: IssueTransfer) -> Outcome {
-        self.commit(Op::Credit(t))
+    fn credit(&mut self, cap: crate::mint::MintCapability<'_>) -> Outcome {
+        self.commit(Op::Credit(cap.transfer().clone()))
+    }
+
+    fn authorize_mint<'a>(
+        &self,
+        t: &'a IssueTransfer,
+        sig: &[u8],
+    ) -> Result<crate::mint::MintCapability<'a>, LedgerError> {
+        crate::mint::authorize(self.mint_authority.as_ref(), t, sig)
     }
 
     fn debit(&mut self, t: Transfer) -> Outcome {

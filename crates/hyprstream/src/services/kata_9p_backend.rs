@@ -27,8 +27,8 @@ use dashmap::DashMap;
 use hyprstream_9p::backend::{Backend, OpenResult, StatResult, WalkResult};
 use hyprstream_9p::msg::Qid;
 
-use crate::services::generated::model_client::{ModelClient, ModelFsClient};
-use crate::services::generated::model_client::{
+use hyprstream_rpc_std::model_client::{ModelClient, ModelFsClient};
+use hyprstream_rpc_std::model_client::{
     NpClunk, NpOpen, NpRead, NpStatReq, NpWalk, NpWrite, ROpen, RStat, RWalk,
 };
 
@@ -79,8 +79,12 @@ impl ModelBackend {
     }
 }
 
-fn qid_from_rpc(q: &crate::services::generated::model_client::Qid) -> Qid {
-    Qid { qtype: q.qtype, version: q.version, path: q.path }
+fn qid_from_rpc(q: &hyprstream_rpc_std::model_client::Qid) -> Qid {
+    Qid {
+        qtype: q.qtype,
+        version: q.version,
+        path: q.path,
+    }
 }
 
 #[async_trait]
@@ -117,11 +121,18 @@ impl Backend for ModelBackend {
 
         // Forward the walk to the model service's fs scope.
         let fs = self.fs_client(&model_ref);
-        let req = NpWalk { fid, newfid, wnames };
+        let req = NpWalk {
+            fid,
+            newfid,
+            wnames,
+        };
         let RWalk { qid } = self.rt.block_on(fs.walk(&req))?;
         self.fids.insert(newfid, ModelFidState { model_ref });
 
-        Ok(WalkResult { qids: vec![qid_from_rpc(&qid)], reached: components.to_vec() })
+        Ok(WalkResult {
+            qids: vec![qid_from_rpc(&qid)],
+            reached: components.to_vec(),
+        })
     }
 
     async fn open(&self, fid: u32, flags: u32) -> anyhow::Result<OpenResult> {
@@ -137,7 +148,10 @@ impl Backend for ModelBackend {
         let mode = lopen_flags_to_mode(flags);
         let req = NpOpen { fid, mode };
         let ROpen { qid, iounit } = self.rt.block_on(fs.open(&req))?;
-        Ok(OpenResult { qid: qid_from_rpc(&qid), iounit })
+        Ok(OpenResult {
+            qid: qid_from_rpc(&qid),
+            iounit,
+        })
     }
 
     async fn read(&self, fid: u32, offset: u64, count: u32) -> anyhow::Result<Vec<u8>> {
@@ -159,7 +173,11 @@ impl Backend for ModelBackend {
             .ok_or_else(|| anyhow::anyhow!("write: fid {fid} not walked"))?
             .clone();
         let fs = self.fs_client(&state.model_ref);
-        let req = NpWrite { fid, offset, data: data.to_vec() };
+        let req = NpWrite {
+            fid,
+            offset,
+            data: data.to_vec(),
+        };
         let result = self.rt.block_on(fs.write(&req))?;
         Ok(result.count)
     }

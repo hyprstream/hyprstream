@@ -5,12 +5,12 @@
 //!
 //! Usage: git clone gittorrent://example.com/user/repo
 
-use crate::service::{GitTorrentService, GitTorrentConfig};
-use crate::{Result, Error, GitTorrentUrl};
+use crate::service::{GitTorrentConfig, GitTorrentService};
+use crate::{Error, GitTorrentUrl, Result};
 
-use std::path::{Path, PathBuf};
-use std::io::{self, BufRead, Write};
 use std::collections::HashMap;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 
 /// Git remote helper for gittorrent:// protocol
 pub struct GitRemoteHelper {
@@ -183,7 +183,9 @@ impl GitRemoteHelper {
         let for_push = args.first().map(|&s| s == "for-push").unwrap_or(false);
         tracing::debug!("List command, for_push: {}", for_push);
 
-        let url = self.remote_url.as_ref()
+        let url = self
+            .remote_url
+            .as_ref()
             .ok_or_else(|| Error::other("No remote URL set"))?;
 
         // Try to get refs from P2P network, fall back to defaults if not available
@@ -203,14 +205,16 @@ impl GitRemoteHelper {
 
         response.push('\n'); // End with empty line
 
-        tracing::info!("Listed {} references for {}",
-                      refs.len(),
-                      match url {
-                          GitTorrentUrl::Commit { hash } => format!("commit {hash}"),
-                          GitTorrentUrl::CommitWithRefs { hash } => format!("commit {hash} (with refs)"),
-                          GitTorrentUrl::GitServer { server, repo } => format!("{server}/{repo}"),
-                          GitTorrentUrl::Username { username } => username.clone(),
-                      });
+        tracing::info!(
+            "Listed {} references for {}",
+            refs.len(),
+            match url {
+                GitTorrentUrl::Commit { hash } => format!("commit {hash}"),
+                GitTorrentUrl::CommitWithRefs { hash } => format!("commit {hash} (with refs)"),
+                GitTorrentUrl::GitServer { server, repo } => format!("{server}/{repo}"),
+                GitTorrentUrl::Username { username } => username.clone(),
+            }
+        );
 
         Ok(Some(response))
     }
@@ -229,7 +233,11 @@ impl GitRemoteHelper {
             return Err(Error::other("Remote URL not set"));
         }
 
-        tracing::info!("Connected for service {} to {:?}", service_name, self.remote_url);
+        tracing::info!(
+            "Connected for service {} to {:?}",
+            service_name,
+            self.remote_url
+        );
 
         // For GitTorrent, we don't support the bidirectional Git protocol directly.
         // Instead, we use the import/export capabilities through the remote helper protocol.
@@ -244,12 +252,20 @@ impl GitRemoteHelper {
         }
 
         let commit_hash = args[0];
-        let ref_name = if args.len() > 1 { args[1] } else { "refs/heads/main" };
+        let ref_name = if args.len() > 1 {
+            args[1]
+        } else {
+            "refs/heads/main"
+        };
 
-        let url = self.remote_url.as_ref()
+        let url = self
+            .remote_url
+            .as_ref()
             .ok_or_else(|| Error::other("No remote URL set"))?;
 
-        let local_repo = self.local_repo.as_ref()
+        let local_repo = self
+            .local_repo
+            .as_ref()
             .ok_or_else(|| Error::other("No local repository path set"))?;
 
         tracing::info!("Fetching {} {} from GitTorrent", commit_hash, ref_name);
@@ -260,7 +276,8 @@ impl GitRemoteHelper {
         // 3. Process LFS/XET files
         // 4. Import objects into local Git repository
 
-        self.fetch_repository_data(url, local_repo, commit_hash, ref_name).await?;
+        self.fetch_repository_data(url, local_repo, commit_hash, ref_name)
+            .await?;
         Ok(())
     }
 
@@ -282,10 +299,14 @@ impl GitRemoteHelper {
             (refspec, refspec)
         };
 
-        let url = self.remote_url.as_ref()
+        let url = self
+            .remote_url
+            .as_ref()
             .ok_or_else(|| Error::other("No remote URL set"))?;
 
-        let local_repo = self.local_repo.as_ref()
+        let local_repo = self
+            .local_repo
+            .as_ref()
             .ok_or_else(|| Error::other("No local repository path set"))?;
 
         tracing::info!("Pushing {} to {} on GitTorrent", src_ref, dst_ref);
@@ -296,7 +317,10 @@ impl GitRemoteHelper {
         // 3. Distribute chunks to P2P network
         // 4. Announce updated repository metadata
 
-        match self.push_repository_data(url, local_repo, src_ref, dst_ref).await {
+        match self
+            .push_repository_data(url, local_repo, src_ref, dst_ref)
+            .await
+        {
             Ok(()) => Ok(format!("ok {dst_ref}\n")),
             Err(e) => Ok(format!("error {dst_ref} {e}\n")),
         }
@@ -341,15 +365,26 @@ impl GitRemoteHelper {
         commit_hash: &str,
         ref_name: &str,
     ) -> Result<()> {
-        tracing::info!("Fetching repository data for {} at {}", ref_name, commit_hash);
+        tracing::info!(
+            "Fetching repository data for {} at {}",
+            ref_name,
+            commit_hash
+        );
 
         // Handle commit-based URLs differently
         match url {
             GitTorrentUrl::Commit { hash } | GitTorrentUrl::CommitWithRefs { hash } => {
                 // For commit-based URLs, try to clone from DHT directly
-                if let Err(e) = self.clone_from_dht(hash, local_repo, url.includes_refs()).await {
-                    tracing::warn!("Failed to clone from DHT: {}, falling back to basic repository", e);
-                    self.create_basic_repository(local_repo, hash.as_str(), ref_name, url).await?;
+                if let Err(e) = self
+                    .clone_from_dht(hash, local_repo, url.includes_refs())
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to clone from DHT: {}, falling back to basic repository",
+                        e
+                    );
+                    self.create_basic_repository(local_repo, hash.as_str(), ref_name, url)
+                        .await?;
                 }
             }
             _ => {
@@ -372,20 +407,26 @@ impl GitRemoteHelper {
                             } else {
                                 git2::Repository::open(&path)?
                             };
-                            Self::create_git_repo_from_metadata_sync(&repo, &metadata, &ref_name, &url_clone)
+                            Self::create_git_repo_from_metadata_sync(
+                                &repo, &metadata, &ref_name, &url_clone,
+                            )
                         })
                         .await
                         .map_err(|e| crate::Error::other(format!("Task join error: {e}")))??;
                     }
                     None => {
                         tracing::info!("Repository metadata not found in P2P network, creating basic repository");
-                        self.create_basic_repository(local_repo, &repo_identifier, ref_name, url).await?;
+                        self.create_basic_repository(local_repo, &repo_identifier, ref_name, url)
+                            .await?;
                     }
                 }
             }
         }
 
-        tracing::debug!("Successfully fetched repository data to {}", local_repo.display());
+        tracing::debug!(
+            "Successfully fetched repository data to {}",
+            local_repo.display()
+        );
         Ok(())
     }
 
@@ -500,7 +541,11 @@ impl GitRemoteHelper {
         ref_name: &str,
         url: &GitTorrentUrl,
     ) -> Result<()> {
-        let sig = git2::Signature::new("GitTorrent", "gittorrent@example.com", &git2::Time::new(1234567890, 0))?;
+        let sig = git2::Signature::new(
+            "GitTorrent",
+            "gittorrent@example.com",
+            &git2::Time::new(1234567890, 0),
+        )?;
 
         let tree_id = {
             let mut tree_builder = repo.treebuilder(None)?;
@@ -549,13 +594,21 @@ impl GitRemoteHelper {
             format!("refs/heads/{ref_name}")
         };
 
-        repo.reference(&ref_name_normalized, commit_id, true, "Initial commit from P2P")?;
+        repo.reference(
+            &ref_name_normalized,
+            commit_id,
+            true,
+            "Initial commit from P2P",
+        )?;
 
         if ref_name.contains("main") || ref_name.contains("master") {
             repo.set_head(&ref_name_normalized)?;
         }
 
-        tracing::debug!("Created Git repository from P2P metadata with commit {}", commit_id);
+        tracing::debug!(
+            "Created Git repository from P2P metadata with commit {}",
+            commit_id
+        );
         Ok(())
     }
 
@@ -606,7 +659,9 @@ impl GitRemoteHelper {
                     if let Some(target) = reference.target() {
                         refs.insert(name.to_owned(), target.to_string());
                     } else if let Some(symbolic_target) = reference.symbolic_target() {
-                        if let Ok(resolved) = repo.resolve_reference_from_short_name(symbolic_target) {
+                        if let Ok(resolved) =
+                            repo.resolve_reference_from_short_name(symbolic_target)
+                        {
                             if let Some(target) = resolved.target() {
                                 refs.insert(name.to_owned(), target.to_string());
                             }
@@ -616,12 +671,17 @@ impl GitRemoteHelper {
             }
 
             Ok(refs)
-        }).await;
+        })
+        .await;
 
         // If open fails (not a git repo), return empty map
         match refs {
             Ok(r) => {
-                tracing::debug!("Found {} references in repository at {}", r.len(), repo_path.display());
+                tracing::debug!(
+                    "Found {} references in repository at {}",
+                    r.len(),
+                    repo_path.display()
+                );
                 Ok(r)
             }
             Err(_) => Ok(HashMap::new()),
@@ -630,7 +690,10 @@ impl GitRemoteHelper {
 }
 
 /// Entry point for git-remote-gittorrent binary
-pub async fn run_git_remote_helper(config: Option<GitTorrentConfig>, url: Option<&str>) -> Result<()> {
+pub async fn run_git_remote_helper(
+    config: Option<GitTorrentConfig>,
+    url: Option<&str>,
+) -> Result<()> {
     let mut helper = match config {
         Some(config) => GitRemoteHelper::new_with_config(config).await?,
         None => {

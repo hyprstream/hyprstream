@@ -51,19 +51,18 @@ use tokio::sync::RwLock;
 use git2db::{Git2DB, RepoId};
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::config::TokenConfig;
-use hyprstream_core::services::{
-    PolicyClient, PolicyService, RegistryClient, RegistryService,
-    generated::registry_client::CreateWorktreeRequest,
-};
+use hyprstream_core::git::promote::{promote, PromoteAuthor, PromoteLeaseTable};
 use hyprstream_core::services::remote_registry_mount::RemoteRegistryMount;
-use hyprstream_core::git::promote::{PromoteAuthor, PromoteLeaseTable, promote};
+use hyprstream_core::services::{PolicyService, RegistryService};
+use hyprstream_rpc_std::policy_client::PolicyClient;
+use hyprstream_rpc_std::registry_client::{CreateWorktreeRequest, RegistryClient};
 
-use hyprstream_rpc::crypto::{CryptoPolicy, generate_signing_keypair};
-use hyprstream_rpc::envelope::{EnvelopeVerifyConfig, install_verify_config};
+use hyprstream_rpc::crypto::{generate_signing_keypair, CryptoPolicy};
+use hyprstream_rpc::envelope::{install_verify_config, EnvelopeVerifyConfig};
 use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::Subject;
-use hyprstream_vfs::{DMDIR, OREAD, OWRITE, Mount};
 use hyprstream_service::{InprocManager, ServiceManager};
+use hyprstream_vfs::{Mount, DMDIR, OREAD, OWRITE};
 
 /// Minimal dependency-free `block_on` for driving the mount's async methods
 /// from a thread that has **no tokio runtime entered**.
@@ -180,11 +179,17 @@ fn make_temp_git_repo(parent: &std::path::Path) -> Result<(std::path::PathBuf, V
         return Err(anyhow!("git add config.json failed"));
     }
     let commit_status = Command::new("git")
-        .args(["commit", "-m", "initial: config.json fixture for e3-9p-walk"])
+        .args([
+            "commit",
+            "-m",
+            "initial: config.json fixture for e3-9p-walk",
+        ])
         .current_dir(&repo_dir)
         .status()?;
     if !commit_status.success() {
-        return Err(anyhow!("git commit failed (is the repo empty / git user unset?)"));
+        return Err(anyhow!(
+            "git commit failed (is the repo empty / git user unset?)"
+        ));
     }
 
     Ok((repo_dir, config_json.to_vec()))
@@ -228,9 +233,7 @@ async fn spawn_services(repo_dir: &std::path::Path, repo_name: &str) -> Result<S
     );
     let policy_endpoint = unique_inproc("policy");
     let policy_transport = TransportConfig::from_endpoint(&policy_endpoint);
-    let policy_git2db = Arc::new(RwLock::new(
-        Git2DB::open(policy_temp.path()).await?,
-    ));
+    let policy_git2db = Arc::new(RwLock::new(Git2DB::open(policy_temp.path()).await?));
     let policy_service = PolicyService::new(
         policy_manager,
         Arc::new(signing_key.clone()),
@@ -403,178 +406,181 @@ async fn e2e_9p_walk_read_stat_create_promote() -> Result<()> {
         let config_bytes = config_bytes.clone();
         tokio::task::spawn_blocking(move || {
             std_block_on(async move {
-    // ───────────────────────────────────────────────────────────────────────
-    // CHECK 3: walk {repo}/{worktree}/ → directory fid; readdir lists real files
-    // ───────────────────────────────────────────────────────────────────────
-    let dir_fid = mount
-        .walk(&[repo_name.as_str(), worktree_name.as_str()], &caller)
-        .await
-        .map_err(|e| anyhow!("walk {repo_name}/{worktree_name}: {e}"))?;
-    // open the dir fid for readdir (9P readdir requires an open dir fid).
-    let mut dir_fid_opened = dir_fid;
-    mount
-        .open(&mut dir_fid_opened, OREAD, &caller)
-        .await
-        .map_err(|e| anyhow!("open dir fid: {e}"))?;
-    let entries = mount
-        .readdir(&dir_fid_opened, &caller)
-        .await
-        .map_err(|e| anyhow!("readdir: {e}"))?;
-    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-    println!("readdir {repo_name}/{worktree_name}: {names:?}");
-    assert!(
-        names.contains(&"config.json"),
-        "readdir must list config.json; got {names:?}"
-    );
+                // ───────────────────────────────────────────────────────────────────────
+                // CHECK 3: walk {repo}/{worktree}/ → directory fid; readdir lists real files
+                // ───────────────────────────────────────────────────────────────────────
+                let dir_fid = mount
+                    .walk(&[repo_name.as_str(), worktree_name.as_str()], &caller)
+                    .await
+                    .map_err(|e| anyhow!("walk {repo_name}/{worktree_name}: {e}"))?;
+                // open the dir fid for readdir (9P readdir requires an open dir fid).
+                let mut dir_fid_opened = dir_fid;
+                mount
+                    .open(&mut dir_fid_opened, OREAD, &caller)
+                    .await
+                    .map_err(|e| anyhow!("open dir fid: {e}"))?;
+                let entries = mount
+                    .readdir(&dir_fid_opened, &caller)
+                    .await
+                    .map_err(|e| anyhow!("readdir: {e}"))?;
+                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                println!("readdir {repo_name}/{worktree_name}: {names:?}");
+                assert!(
+                    names.contains(&"config.json"),
+                    "readdir must list config.json; got {names:?}"
+                );
 
-    // ───────────────────────────────────────────────────────────────────────
-    // CHECK 2 & 4: walk config.json → open → read → real file bytes
-    // ───────────────────────────────────────────────────────────────────────
-    let mut file_fid = mount
-        .walk(
-            &[repo_name.as_str(), worktree_name.as_str(), "config.json"],
-            &caller,
-        )
-        .await
-        .map_err(|e| anyhow!("walk config.json: {e}"))?;
-    mount
-        .open(&mut file_fid, OREAD, &caller)
-        .await
-        .map_err(|e| anyhow!("open config.json: {e}"))?;
+                // ───────────────────────────────────────────────────────────────────────
+                // CHECK 2 & 4: walk config.json → open → read → real file bytes
+                // ───────────────────────────────────────────────────────────────────────
+                let mut file_fid = mount
+                    .walk(
+                        &[repo_name.as_str(), worktree_name.as_str(), "config.json"],
+                        &caller,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("walk config.json: {e}"))?;
+                mount
+                    .open(&mut file_fid, OREAD, &caller)
+                    .await
+                    .map_err(|e| anyhow!("open config.json: {e}"))?;
 
-    // Read in a loop until EOF (bounded by a generous count per read; the
-    // service clamps to its iounit).
-    let mut buf = Vec::new();
-    let mut offset = 0u64;
-    loop {
-        let chunk = mount
-            .read(&file_fid, offset, 65536, &caller)
-            .await
-            .map_err(|e| anyhow!("read config.json @ {offset}: {e}"))?;
-        if chunk.is_empty() {
-            break;
-        }
-        offset += chunk.len() as u64;
-        buf.extend_from_slice(&chunk);
-    }
-    assert_eq!(
-        buf, config_bytes,
-        "cat config.json must return the real committed bytes"
-    );
-    println!("cat config.json: {} bytes matched", buf.len());
+                // Read in a loop until EOF (bounded by a generous count per read; the
+                // service clamps to its iounit).
+                let mut buf = Vec::new();
+                let mut offset = 0u64;
+                loop {
+                    let chunk = mount
+                        .read(&file_fid, offset, 65536, &caller)
+                        .await
+                        .map_err(|e| anyhow!("read config.json @ {offset}: {e}"))?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    offset += chunk.len() as u64;
+                    buf.extend_from_slice(&chunk);
+                }
+                assert_eq!(
+                    buf, config_bytes,
+                    "cat config.json must return the real committed bytes"
+                );
+                println!("cat config.json: {} bytes matched", buf.len());
 
-    // ───────────────────────────────────────────────────────────────────────
-    // CHECK 5: stat → qid version/path threaded (#388 Stat widening)
-    // ───────────────────────────────────────────────────────────────────────
-    //
-    // The registry service populates version=ctime and path=ino from real
-    // filesystem metadata (qid_from_metadata). On Unix, path (inode) is
-    // non-zero for a real file. We assert the bytes round-trip through the
-    // mount's Stat (previously these were discarded by a flattened qid).
-    let stat = mount
-        .stat(&file_fid, &caller)
-        .await
-        .map_err(|e| anyhow!("stat config.json: {e}"))?;
-    println!(
-        "stat config.json: qtype={:#x} version={} path={} size={} name={:?}",
-        stat.qtype, stat.version, stat.path, stat.size, stat.name
-    );
-    // NB: the registry's Tstat handler returns an empty name
-    // (`metadata_to_np_stat("", ..)`); identity (size/qtype/qid) is what's
-    // threaded through, not the name. Assert on those, not on `stat.name`.
-    assert_eq!(stat.size, config_bytes.len() as u64);
-    // qtype: QTFILE bit must be set (0x00 = plain file; QTDIR = 0x80).
-    // The registry uses QTFILE=0x00 / QTDIR=0x80, so for a file qtype & 0x80 == 0.
-    assert_eq!(
-        stat.qtype & 0x80,
-        0,
-        "config.json stat must be a file (QTDIR unset), qtype={:#x}",
-        stat.qtype
-    );
-    #[cfg(unix)]
-    {
-        // Real on-disk file → inode is non-zero. (path==0 means "unknown qid"
-        // per the vfs::Stat convention; a real file must not report that.)
-        assert_ne!(
-            stat.path, 0,
-            "qid path (inode) must be threaded through for a real file (#388)"
-        );
-    }
+                // ───────────────────────────────────────────────────────────────────────
+                // CHECK 5: stat → qid version/path threaded (#388 Stat widening)
+                // ───────────────────────────────────────────────────────────────────────
+                //
+                // The registry service populates version=ctime and path=ino from real
+                // filesystem metadata (qid_from_metadata). On Unix, path (inode) is
+                // non-zero for a real file. We assert the bytes round-trip through the
+                // mount's Stat (previously these were discarded by a flattened qid).
+                let stat = mount
+                    .stat(&file_fid, &caller)
+                    .await
+                    .map_err(|e| anyhow!("stat config.json: {e}"))?;
+                println!(
+                    "stat config.json: qtype={:#x} version={} path={} size={} name={:?}",
+                    stat.qtype, stat.version, stat.path, stat.size, stat.name
+                );
+                // NB: the registry's Tstat handler returns an empty name
+                // (`metadata_to_np_stat("", ..)`); identity (size/qtype/qid) is what's
+                // threaded through, not the name. Assert on those, not on `stat.name`.
+                assert_eq!(stat.size, config_bytes.len() as u64);
+                // qtype: QTFILE bit must be set (0x00 = plain file; QTDIR = 0x80).
+                // The registry uses QTFILE=0x00 / QTDIR=0x80, so for a file qtype & 0x80 == 0.
+                assert_eq!(
+                    stat.qtype & 0x80,
+                    0,
+                    "config.json stat must be a file (QTDIR unset), qtype={:#x}",
+                    stat.qtype
+                );
+                #[cfg(unix)]
+                {
+                    // Real on-disk file → inode is non-zero. (path==0 means "unknown qid"
+                    // per the vfs::Stat convention; a real file must not report that.)
+                    assert_ne!(
+                        stat.path, 0,
+                        "qid path (inode) must be threaded through for a real file (#388)"
+                    );
+                }
 
-    // Clunk the file fid before we create a sibling under the same dir.
-    mount.clunk(file_fid, &caller).await;
+                // Clunk the file fid before we create a sibling under the same dir.
+                mount.clunk(file_fid, &caller).await;
 
-    // ───────────────────────────────────────────────────────────────────────
-    // CHECK 6: create + write → writable upper (#394)
-    // ───────────────────────────────────────────────────────────────────────
-    //
-    // Walk the directory fresh (the previous dir fid was opened for readdir;
-    // create needs a walked-not-opened directory fid), then create a new file
-    // and write to it. The registry's handle_create consumes the dir fid and
-    // returns an opened fid on the new file.
-    let mut create_dir_fid = mount
-        .walk(&[repo_name.as_str(), worktree_name.as_str()], &caller)
-        .await
-        .map_err(|e| anyhow!("walk dir for create: {e}"))?;
+                // ───────────────────────────────────────────────────────────────────────
+                // CHECK 6: create + write → writable upper (#394)
+                // ───────────────────────────────────────────────────────────────────────
+                //
+                // Walk the directory fresh (the previous dir fid was opened for readdir;
+                // create needs a walked-not-opened directory fid), then create a new file
+                // and write to it. The registry's handle_create consumes the dir fid and
+                // returns an opened fid on the new file.
+                let mut create_dir_fid = mount
+                    .walk(&[repo_name.as_str(), worktree_name.as_str()], &caller)
+                    .await
+                    .map_err(|e| anyhow!("walk dir for create: {e}"))?;
 
-    let new_file = "promoted.txt";
-    let new_content = b"promoted via 9P create+write (#421-E3)\n";
-    let create_stat = mount
-        .create(&mut create_dir_fid, new_file, 0o644, OWRITE, &caller)
-        .await
-        .map_err(|e| anyhow!("create {new_file}: {e}"))?;
-    println!(
-        "create {new_file}: qtype={:#x} version={} path={}",
-        create_stat.qtype, create_stat.version, create_stat.path
-    );
-    assert_eq!(create_stat.name, new_file);
+                let new_file = "promoted.txt";
+                let new_content = b"promoted via 9P create+write (#421-E3)\n";
+                let create_stat = mount
+                    .create(&mut create_dir_fid, new_file, 0o644, OWRITE, &caller)
+                    .await
+                    .map_err(|e| anyhow!("create {new_file}: {e}"))?;
+                println!(
+                    "create {new_file}: qtype={:#x} version={} path={}",
+                    create_stat.qtype, create_stat.version, create_stat.path
+                );
+                assert_eq!(create_stat.name, new_file);
 
-    let written = mount
-        .write(&create_dir_fid, 0, new_content, &caller)
-        .await
-        .map_err(|e| anyhow!("write {new_file}: {e}"))?;
-    assert_eq!(
-        written as usize,
-        new_content.len(),
-        "write must accept all bytes (iounit permits it for this small payload)"
-    );
-    mount.clunk(create_dir_fid, &caller).await;
+                let written = mount
+                    .write(&create_dir_fid, 0, new_content, &caller)
+                    .await
+                    .map_err(|e| anyhow!("write {new_file}: {e}"))?;
+                assert_eq!(
+                    written as usize,
+                    new_content.len(),
+                    "write must accept all bytes (iounit permits it for this small payload)"
+                );
+                mount.clunk(create_dir_fid, &caller).await;
 
-    // Verify the write landed on disk by reading it back through the 9P path.
-    let mut rb_fid = mount
-        .walk(
-            &[repo_name.as_str(), worktree_name.as_str(), new_file],
-            &caller,
-        )
-        .await
-        .map_err(|e| anyhow!("walk {new_file} for readback: {e}"))?;
-    mount
-        .open(&mut rb_fid, OREAD, &caller)
-        .await
-        .map_err(|e| anyhow!("open {new_file} for readback: {e}"))?;
-    let mut readback = Vec::new();
-    let mut off = 0u64;
-    loop {
-        let chunk = mount
-            .read(&rb_fid, off, 65536, &caller)
-            .await
-            .map_err(|e| anyhow!("read {new_file} @ {off}: {e}"))?;
-        if chunk.is_empty() {
-            break;
-        }
-        off += chunk.len() as u64;
-        readback.extend_from_slice(&chunk);
-    }
-    assert_eq!(
-        readback, new_content,
-        "readback of created file must match what we wrote"
-    );
-    mount.clunk(rb_fid, &caller).await;
-    println!("create+write+readback {new_file}: {} bytes matched", readback.len());
+                // Verify the write landed on disk by reading it back through the 9P path.
+                let mut rb_fid = mount
+                    .walk(
+                        &[repo_name.as_str(), worktree_name.as_str(), new_file],
+                        &caller,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("walk {new_file} for readback: {e}"))?;
+                mount
+                    .open(&mut rb_fid, OREAD, &caller)
+                    .await
+                    .map_err(|e| anyhow!("open {new_file} for readback: {e}"))?;
+                let mut readback = Vec::new();
+                let mut off = 0u64;
+                loop {
+                    let chunk = mount
+                        .read(&rb_fid, off, 65536, &caller)
+                        .await
+                        .map_err(|e| anyhow!("read {new_file} @ {off}: {e}"))?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    off += chunk.len() as u64;
+                    readback.extend_from_slice(&chunk);
+                }
+                assert_eq!(
+                    readback, new_content,
+                    "readback of created file must match what we wrote"
+                );
+                mount.clunk(rb_fid, &caller).await;
+                println!(
+                    "create+write+readback {new_file}: {} bytes matched",
+                    readback.len()
+                );
 
-    // Clunk the directory fid we opened for readdir earlier.
-    mount.clunk(dir_fid_opened, &caller).await;
-            Ok::<(), anyhow::Error>(())
+                // Clunk the directory fid we opened for readdir earlier.
+                mount.clunk(dir_fid_opened, &caller).await;
+                Ok::<(), anyhow::Error>(())
             })
         })
         .await??;
@@ -588,10 +594,7 @@ async fn e2e_9p_walk_read_stat_create_promote() -> Result<()> {
     // resolved repo + worktree. It runs stageAll + commitWithAuthor and returns
     // the new commit OID. The atproto pointer advance is stubbed (#355/#410),
     // so we only assert the local-commit phase here.
-    let wt_client = svc
-        .registry_client
-        .repo(&repo_id)
-        .worktree(&worktree_name);
+    let wt_client = svc.registry_client.repo(&repo_id).worktree(&worktree_name);
 
     // Capture the pre-promote HEAD so we can prove the OID advanced.
     let pre_oid = svc
@@ -607,9 +610,15 @@ async fn e2e_9p_walk_read_stat_create_promote() -> Result<()> {
         name: "e3-9p-promote".to_owned(),
         email: "e3-9p-promote@example.invalid".to_owned(),
     };
-    let outcome = promote(&repo_name, &worktree_name, &wt_client, &author, &lease_table)
-        .await
-        .map_err(|e| anyhow!("promote: {e}"))?;
+    let outcome = promote(
+        &repo_name,
+        &worktree_name,
+        &wt_client,
+        &author,
+        &lease_table,
+    )
+    .await
+    .map_err(|e| anyhow!("promote: {e}"))?;
     println!("promote commit_oid: {}", outcome.commit_oid);
     assert!(
         outcome.pointer_advanced,
@@ -632,10 +641,7 @@ async fn e2e_9p_walk_read_stat_create_promote() -> Result<()> {
         outcome.commit_oid
     );
     assert!(
-        outcome
-            .commit_oid
-            .chars()
-            .all(|c| c.is_ascii_hexdigit()),
+        outcome.commit_oid.chars().all(|c| c.is_ascii_hexdigit()),
         "commit OID must be hex: {}",
         outcome.commit_oid
     );
@@ -703,7 +709,11 @@ async fn e2e_9p_create_directory_and_stat_qtype() -> Result<()> {
             // name (`metadata_to_np_stat("", ..)`); the name is carried by
             // walk/create qids, not stat-by-fid. So we assert on qtype only.
             let stat = mount.stat(&dir_fid, &caller).await?;
-            assert_ne!(stat.qtype & 0x80, 0, "stat on created dir must report QTDIR");
+            assert_ne!(
+                stat.qtype & 0x80,
+                0,
+                "stat on created dir must report QTDIR"
+            );
 
             mount.clunk(dir_fid, &caller).await;
             Ok::<(), anyhow::Error>(())

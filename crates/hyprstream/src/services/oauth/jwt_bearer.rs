@@ -17,7 +17,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
 
 use super::state::OAuthState;
-use crate::services::generated::policy_client::IssueToken;
+use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
 
 /// Exchange a JWT bearer assertion for an access token (RFC 7523).
 pub async fn exchange_jwt_bearer(
@@ -29,7 +29,11 @@ pub async fn exchange_jwt_bearer(
     let unverified = match hyprstream_rpc::auth::decode_unverified(assertion) {
         Ok(c) => c,
         Err(e) => {
-            return jwt_bearer_error(StatusCode::BAD_REQUEST, "invalid_grant", &format!("Cannot parse assertion: {e}"));
+            return jwt_bearer_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                &format!("Cannot parse assertion: {e}"),
+            );
         }
     };
 
@@ -37,7 +41,11 @@ pub async fn exchange_jwt_bearer(
     let iss = {
         let iss = unverified.iss.clone();
         if iss.is_empty() {
-            return jwt_bearer_error(StatusCode::BAD_REQUEST, "invalid_grant", "Assertion missing 'iss' claim");
+            return jwt_bearer_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "Assertion missing 'iss' claim",
+            );
         }
         iss
     };
@@ -47,7 +55,11 @@ pub async fn exchange_jwt_bearer(
         let now = chrono::Utc::now().timestamp();
         if let Some(nbf) = decode_jwt_nbf(assertion) {
             if nbf > now + 5 {
-                return jwt_bearer_error(StatusCode::BAD_REQUEST, "invalid_grant", "Assertion not yet valid (nbf)");
+                return jwt_bearer_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "Assertion not yet valid (nbf)",
+                );
             }
         }
     }
@@ -80,17 +92,25 @@ pub async fn exchange_jwt_bearer(
             }
         };
         // Fetch JWKS from the issuer's discovery document.
-        let vk = match resolve_federated_key(state, &iss, assertion, issuer_config.allow_http).await {
+        let vk = match resolve_federated_key(state, &iss, assertion, issuer_config.allow_http).await
+        {
             Ok(vk) => vk,
             Err(e) => {
                 return jwt_bearer_error(StatusCode::UNAUTHORIZED, "invalid_grant", &e);
             }
         };
         let token_endpoint = format!("{}/oauth/token", state.issuer_url.trim_end_matches('/'));
-        let claims = match hyprstream_rpc::auth::decode_with_key(assertion, &vk, Some(&token_endpoint)) {
-            Ok(claims) => claims,
-            Err(e) => return jwt_bearer_error(StatusCode::UNAUTHORIZED, "invalid_grant", &format!("Assertion verification failed: {e}")),
-        };
+        let claims =
+            match hyprstream_rpc::auth::decode_with_key(assertion, &vk, Some(&token_endpoint)) {
+                Ok(claims) => claims,
+                Err(e) => {
+                    return jwt_bearer_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_grant",
+                        &format!("Assertion verification failed: {e}"),
+                    )
+                }
+            };
         (claims, None)
     };
 
@@ -112,6 +132,15 @@ pub async fn exchange_jwt_bearer(
             issuer: None,
             tenant,
             require_clearance: false,
+            session_id: None,
+            issuance_profile: if sub.starts_with("service:") {
+                IssueTokenProfile::Service
+            } else {
+                IssueTokenProfile::Rfc7523
+            },
+            // RFC 9068 §2.2.1: the RFC 7523 client on the user `at+jwt`; the
+            // service (`wit+jwt`) form carries none.
+            client_id: (!sub.starts_with("service:")).then(|| client_id.to_owned()),
         })
         .await;
 
@@ -136,7 +165,11 @@ pub async fn exchange_jwt_bearer(
         }
         Err(e) => {
             tracing::error!(sub = %sub, error = %e, "JWT bearer token issuance failed");
-            jwt_bearer_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Failed to issue token")
+            jwt_bearer_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Failed to issue token",
+            )
         }
     }
 }
@@ -164,8 +197,11 @@ pub(super) fn decode_with_any_local_service_key(
     expected_audience: &str,
 ) -> Option<(hyprstream_rpc::auth::Claims, VerifyingKey)> {
     decode_with_any_service_key_at(
-        hyprstream_service::global_trust_store(), assertion, service_name,
-        expected_audience, chrono::Utc::now().timestamp(),
+        hyprstream_service::global_trust_store(),
+        assertion,
+        service_name,
+        expected_audience,
+        chrono::Utc::now().timestamp(),
     )
 }
 
@@ -176,17 +212,30 @@ fn decode_with_any_service_key_at(
     expected_audience: &str,
     now: i64,
 ) -> Option<(hyprstream_rpc::auth::Claims, VerifyingKey)> {
-    trust.published_keys_for_scope_at(service_name, now).into_iter().find_map(|candidate| {
-        hyprstream_rpc::auth::decode_with_key(assertion, &candidate.verifying_key, Some(expected_audience))
-            .ok().map(|claims| (claims, candidate.verifying_key))
-    })
+    trust
+        .published_keys_for_scope_at(service_name, now)
+        .into_iter()
+        .find_map(|candidate| {
+            hyprstream_rpc::auth::decode_with_key(
+                assertion,
+                &candidate.verifying_key,
+                Some(expected_audience),
+            )
+            .ok()
+            .map(|claims| (claims, candidate.verifying_key))
+        })
 }
 
 /// Fetch a verifying key for a federated issuer by resolving JWKS.
 /// Matches the `kid` JWT header against keys in the JWKS endpoint.
 /// Falls back to the first Ed25519 (OKP/Ed25519) key when no `kid` matches.
 /// Shared by jwt_bearer (RFC 7523) and token_exchange (RFC 8693).
-pub(super) async fn resolve_federated_key(state: &Arc<OAuthState>, issuer: &str, assertion: &str, allow_http: bool) -> Result<VerifyingKey, String> {
+pub(super) async fn resolve_federated_key(
+    state: &Arc<OAuthState>,
+    issuer: &str,
+    assertion: &str,
+    allow_http: bool,
+) -> Result<VerifyingKey, String> {
     let metadata = state
         .oidc_discovery
         .get_metadata(issuer, allow_http)
@@ -236,7 +285,9 @@ pub(super) async fn resolve_federated_key(state: &Arc<OAuthState>, issuer: &str,
         }
     }
 
-    Err(format!("No matching Ed25519 key in JWKS for issuer {issuer}"))
+    Err(format!(
+        "No matching Ed25519 key in JWKS for issuer {issuer}"
+    ))
 }
 
 /// Decode `nbf` from a JWT payload without verifying the signature.
@@ -268,7 +319,13 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     fn attestation(expires_at: i64) -> hyprstream_service::Attestation {
-        hyprstream_service::Attestation { scopes: std::iter::once("model".to_owned()).collect(), subject: None, jwt: None, expires_at, attested_by: None }
+        hyprstream_service::Attestation {
+            scopes: std::iter::once("model".to_owned()).collect(),
+            subject: None,
+            jwt: None,
+            expires_at,
+            attested_by: None,
+        }
     }
 
     #[test]
@@ -284,8 +341,16 @@ mod tests {
             let assertion = hyprstream_rpc::auth::jwt::encode(
                 &hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 300)
                     .with_issuer("https://issuer.example".to_owned())
-                    .with_audience(Some("https://issuer.example/oauth/token".to_owned())), signer);
-            let Some((_, verified)) = decode_with_any_service_key_at(&trust, &assertion, "model", "https://issuer.example/oauth/token", now) else {
+                    .with_audience(Some("https://issuer.example/oauth/token".to_owned())),
+                signer,
+            );
+            let Some((_, verified)) = decode_with_any_service_key_at(
+                &trust,
+                &assertion,
+                "model",
+                "https://issuer.example/oauth/token",
+                now,
+            ) else {
                 panic!("each overlap key must verify its own assertion");
             };
             assert_eq!(verified, signer.verifying_key());
@@ -293,20 +358,25 @@ mod tests {
         let retired_assertion = hyprstream_rpc::auth::jwt::encode(
             &hyprstream_rpc::auth::Claims::new("service:model".to_owned(), now, now + 300)
                 .with_issuer("https://issuer.example".to_owned())
-                .with_audience(Some("https://issuer.example/oauth/token".to_owned())), &retired);
-        assert!(decode_with_any_service_key_at(&trust, &retired_assertion, "model", "https://issuer.example/oauth/token", retirement).is_none());
+                .with_audience(Some("https://issuer.example/oauth/token".to_owned())),
+            &retired,
+        );
+        assert!(decode_with_any_service_key_at(
+            &trust,
+            &retired_assertion,
+            "model",
+            "https://issuer.example/oauth/token",
+            retirement
+        )
+        .is_none());
     }
 
     #[test]
     fn federated_bearer_cannot_launder_tenant_into_local_token() {
         let now = chrono::Utc::now().timestamp();
-        let claims = hyprstream_rpc::auth::Claims::new(
-            "external-user".to_owned(),
-            now,
-            now + 300,
-        )
-        .with_issuer("https://federated.example".to_owned())
-        .with_tenant("victim-domain".to_owned());
+        let claims = hyprstream_rpc::auth::Claims::new("external-user".to_owned(), now, now + 300)
+            .with_issuer("https://federated.example".to_owned())
+            .with_tenant("victim-domain".to_owned());
 
         assert_eq!(
             authority_verified_assertion_tenant(&claims, false),

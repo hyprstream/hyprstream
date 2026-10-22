@@ -40,7 +40,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
 use serde_json::{json, Value};
 
-use super::state::OAuthState;
+use super::state::{atproto_service_did_for_origin, OAuthState};
 
 /// The node's live, self-certifying at9p identity.
 ///
@@ -52,21 +52,6 @@ pub(crate) struct RenderedAt9pIdentity {
     pub did: String,
     pub cid512: String,
     pub capsule: Arc<[u8]>,
-}
-
-/// Extract the authority component (host[:port]) from the OAuth issuer URL.
-///
-/// Used as the method-specific identifier in did:web — `did:web:{authority}:...`.
-/// Mirrors the helper in `user_mapping.rs` but kept inline here to avoid
-/// pulling in the user-mapping module from a different concern.
-pub(crate) fn issuer_authority(issuer_url: &str) -> Option<String> {
-    let after_scheme = issuer_url.split_once("://").map(|(_, rest)| rest)?;
-    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
-    if authority.is_empty() {
-        None
-    } else {
-        Some(authority.to_owned())
-    }
 }
 
 /// Build the multibase z-encoded Ed25519 public-key string per the
@@ -109,8 +94,8 @@ pub(crate) fn render_at9p_identity(
     };
     use hyprstream_pds::at9p_sign::sign_capsule;
 
-    let authority = issuer_authority(issuer_url)
-        .ok_or_else(|| anyhow::anyhow!("OAuth issuer URL has no authority"))?;
+    let did = atproto_service_did_for_origin(issuer_url)
+        .ok_or_else(|| anyhow::anyhow!("OAuth issuer URL has no supported service DID"))?;
     let origin = issuer_origin(issuer_url)
         .ok_or_else(|| anyhow::anyhow!("OAuth issuer URL has no origin"))?;
     anyhow::ensure!(
@@ -125,7 +110,7 @@ pub(crate) fn render_at9p_identity(
     let endpoint = ServiceEndpoint::new(Transport::Https, origin)?;
     let service = ServiceEntry::new("#pds", ServiceType::AtprotoPds, endpoint)?;
     let mut body = CapsuleBody::new(vec![subject_key], vec![service])?;
-    body.also_known_as = Some(vec![format!("did:web:{authority}")]);
+    body.also_known_as = Some(vec![did]);
 
     let capsule = sign_capsule(body, ed_sk, pq_sk)?;
     let capsule_bytes = capsule.to_dag_cbor()?;
@@ -147,7 +132,9 @@ fn normalize_atproto_handle(handle: &str) -> Option<String> {
             && label.len() <= 63
             && !label.starts_with('-')
             && !label.ends_with('-')
-            && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     });
     valid.then_some(handle)
 }
@@ -698,21 +685,21 @@ fn append_root_identity_methods(doc: &mut Value, did: &str, methods: &[RootIdent
 
 /// `GET /.well-known/did.json` — root deployment DID document.
 ///
-/// `id = did:web:{authority}`. Verification methods: the OAuth issuer's
+/// `id` is the canonical issuer-root did:web (non-default port encoded as
+/// `%3A`). Verification methods: the OAuth issuer's
 /// current signing key (entity-signing key from OAuthState). Acts as the
 /// trust anchor that controls user/client DIDs under this authority.
 pub async fn root_did_document(State(state): State<Arc<OAuthState>>) -> Response {
-    let authority = match issuer_authority(&state.issuer_url) {
+    let did = match state.atproto_service_did() {
         Some(a) => a,
         None => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "issuer URL has no authority",
+                "issuer URL has no supported service DID",
             )
                 .into_response()
         }
     };
-    let did = format!("did:web:{authority}");
 
     // Use the OAuth signing key as the root verification method.
     let Some(ref sk) = state.signing_key else {
@@ -797,7 +784,7 @@ pub async fn root_did_document(State(state): State<Arc<OAuthState>>) -> Response
             endpoint: hyprstream_rpc::service_entry::encode_iroh(
                 &node_id,
                 &state.iroh_relays,
-                &["hyprstream-rpc/1", "moql"],
+                &["hyprstream-rpc/1"],
             ),
         });
     }
@@ -862,7 +849,7 @@ pub async fn at9p_capsule(
 /// Per the atproto Handle spec (https://atproto.com/specs/handle), the HTTPS
 /// well-known method returns the **bare DID string** as `text/plain` (no JSON
 /// or wrapper) so this deployment's handle (its authority hostname) resolves to
-/// its `did:web:{authority}`. Companion to `/.well-known/did.json`, which serves
+/// its canonical issuer-root did:web. Companion to `/.well-known/did.json`, which serves
 /// the full W3C DID document for the same subject.
 ///
 /// Consumed by the frontend handle resolver
@@ -870,14 +857,13 @@ pub async fn at9p_capsule(
 /// CORS-simple GET (no custom request headers → no preflight), so it needs only
 /// cross-origin readability from the public CORS layer, not permissive headers.
 pub async fn atproto_did(State(state): State<Arc<OAuthState>>) -> Response {
-    let Some(authority) = issuer_authority(&state.issuer_url) else {
+    let Some(did) = state.atproto_service_did() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "issuer URL has no authority",
+            "issuer URL has no supported service DID",
         )
             .into_response();
     };
-    let did = format!("did:web:{authority}");
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -910,19 +896,19 @@ fn path_form_account_did_disabled_response() -> Response {
 
 /// `GET /clients/:client_id/did.json` — per-client DID document.
 ///
-/// `id = did:web:{authority}:clients:{client_id}`. Verification methods:
+/// `id = {canonical issuer-root DID}:clients:{client_id}`. Verification methods:
 /// JWKS keys registered for the client via dynamic-client-registration's
 /// `jwks` field (Tier 3 confidential clients with `private_key_jwt`).
 pub async fn client_did_document(
     State(state): State<Arc<OAuthState>>,
     Path(client_id): Path<String>,
 ) -> Response {
-    let authority = match issuer_authority(&state.issuer_url) {
+    let did = match state.atproto_service_did() {
         Some(a) => a,
         None => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "issuer URL has no authority",
+                "issuer URL has no supported service DID",
             )
                 .into_response()
         }
@@ -930,7 +916,7 @@ pub async fn client_did_document(
     if client_id.contains(['/', '#', '?', ':']) || client_id.is_empty() {
         return (StatusCode::BAD_REQUEST, "invalid client_id").into_response();
     }
-    let did = format!("did:web:{authority}:clients:{client_id}");
+    let did = format!("{did}:clients:{client_id}");
 
     // Client JWKS storage will be wired up in Phase 1b (client-key
     // registration CLI + server-side JWKS persistence). For now,
@@ -1002,22 +988,6 @@ mod tests {
     use rand::rngs::OsRng;
 
     #[test]
-    fn issuer_authority_with_port() {
-        assert_eq!(
-            issuer_authority("http://127.0.0.1:6791").as_deref(),
-            Some("127.0.0.1:6791"),
-        );
-    }
-
-    #[test]
-    fn issuer_authority_https_no_port() {
-        assert_eq!(
-            issuer_authority("https://hyprstream.example.com").as_deref(),
-            Some("hyprstream.example.com"),
-        );
-    }
-
-    #[test]
     fn rendered_at9p_capsule_is_key_owned_and_mutually_aliased() {
         let sk = SigningKey::from_bytes(&[0x31; 32]);
         let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&sk);
@@ -1039,6 +1009,35 @@ mod tests {
             verified.capsule().body.also_known_as.as_deref(),
             Some(&["did:web:discovery.hyprstream.com".to_owned()][..]),
         );
+    }
+
+    #[test]
+    fn rendered_at9p_capsule_uses_canonical_service_did_alias() {
+        let sk = SigningKey::from_bytes(&[0x31; 32]);
+        let pq_sk = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&sk);
+        for (issuer, expected) in [
+            (
+                "https://pds.example:8443/oauth",
+                "did:web:pds.example%3A8443",
+            ),
+            ("https://PDS.example:443/oauth", "did:web:pds.example"),
+        ] {
+            let identity = render_at9p_identity(issuer, &sk, &pq_sk).unwrap();
+            let verified =
+                hyprstream_pds::at9p_gate::verify_did_at9p(&identity.did, &identity.capsule)
+                    .unwrap();
+            assert_eq!(
+                verified.capsule().body.also_known_as.as_deref(),
+                Some(&[expected.to_owned()][..])
+            );
+        }
+        for issuer in [
+            "https://user@pds.example",
+            "https://[::1]:8443",
+            "not-a-url",
+        ] {
+            assert!(render_at9p_identity(issuer, &sk, &pq_sk).is_err());
+        }
     }
 
     #[test]
@@ -1097,8 +1096,8 @@ mod tests {
         config.external_url = Some(issuer_url.to_owned());
         OAuthState::new(
             &config,
-            crate::services::PolicyClient::new(make_client()),
-            crate::services::DiscoveryClient::new(make_client()),
+            hyprstream_rpc_std::policy_client::PolicyClient::new(make_client()),
+            hyprstream_rpc_std::discovery_client::DiscoveryClient::new(make_client()),
             local.verifying_key().to_bytes(),
         )
         .with_signing_key(local, CryptoPolicy::Hybrid)
@@ -1181,19 +1180,6 @@ mod tests {
             .any(|alias| alias == &identity.did));
     }
 
-    #[test]
-    fn issuer_authority_strips_path() {
-        assert_eq!(
-            issuer_authority("https://example.com/oauth/issuer").as_deref(),
-            Some("example.com"),
-        );
-    }
-
-    #[test]
-    fn issuer_authority_rejects_no_scheme() {
-        assert_eq!(issuer_authority("example.com"), None);
-    }
-
     /// `GET /users/:username/did.json` must be a deliberate 410 hard error,
     /// driven through the **production** OAuth router (`create_app`) — NOT by
     /// calling the `path_form_account_did_disabled_response()` helper directly.
@@ -1211,16 +1197,17 @@ mod tests {
         use crate::auth::user_store::{
             PubkeyEntry, UserFilter, UserProfile, UserProfilePatch, UserStore,
         };
-        use crate::config::OAuthConfig;
         use crate::config::server::CorsConfig;
+        use crate::config::OAuthConfig;
         use crate::services::oauth::create_app;
-        use crate::services::{DiscoveryClient, PolicyClient};
         use async_trait::async_trait;
         use axum::body::Body;
         use axum::http::Request as HttpRequest;
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+        use hyprstream_rpc_std::policy_client::PolicyClient;
         use tower::ServiceExt; // oneshot
 
         /// User-store spy whose every method panics. The frozen account-DID
@@ -1385,7 +1372,7 @@ mod tests {
         assert_eq!(doc["id"].as_str().unwrap(), did);
         assert!(doc["@context"].is_array());
         assert_eq!(doc["verificationMethod"].as_array().unwrap().len(), 2); // multibase + jwk
-        // The ed25519 VM is emitted as a Multikey (#280) with a multibase key.
+                                                                            // The ed25519 VM is emitted as a Multikey (#280) with a multibase key.
         let vm = &doc["verificationMethod"][0];
         assert_eq!(vm["type"].as_str().unwrap(), "Multikey");
         assert!(vm["publicKeyMultibase"].as_str().unwrap().starts_with('z'));
@@ -1459,23 +1446,19 @@ mod tests {
         let vms = doc["verificationMethod"].as_array().unwrap();
         assert_eq!(vms[0]["id"].as_str().unwrap(), format!("{did}#atproto"));
         assert_eq!(vms[0]["type"].as_str().unwrap(), "Multikey");
-        assert!(
-            vms[0]["publicKeyMultibase"]
-                .as_str()
-                .unwrap()
-                .starts_with('z')
-        );
+        assert!(vms[0]["publicKeyMultibase"]
+            .as_str()
+            .unwrap()
+            .starts_with('z'));
         // Ed25519 mesh VMs still present after it.
         assert_eq!(vms.len(), 1 + 2);
         // The ed25519 mesh VM is also a Multikey (#280), not the deprecated
         // Ed25519VerificationKey2020 type, with a multibase key; JWK fallback kept.
         assert_eq!(vms[1]["type"].as_str().unwrap(), "Multikey");
-        assert!(
-            vms[1]["publicKeyMultibase"]
-                .as_str()
-                .unwrap()
-                .starts_with('z')
-        );
+        assert!(vms[1]["publicKeyMultibase"]
+            .as_str()
+            .unwrap()
+            .starts_with('z'));
         assert_eq!(vms[2]["type"].as_str().unwrap(), "JsonWebKey2020");
 
         // #atproto_pds first, origin-only (no path), correct type.
@@ -1543,13 +1526,11 @@ mod tests {
             "at://alice.pds.example.com"
         );
         // The hosted-account #atproto VM (P-256 Multikey) is present.
-        assert!(
-            doc["verificationMethod"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|vm| vm["id"].as_str() == Some(&format!("{did}#atproto")))
-        );
+        assert!(doc["verificationMethod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|vm| vm["id"].as_str() == Some(&format!("{did}#atproto"))));
     }
 
     /// #918 producer side: active remains the exact `#atproto` VM, while drain
@@ -1623,8 +1604,8 @@ mod tests {
     #[test]
     fn root_identity_publisher_and_consumer_enforce_bounded_overlap() {
         use hyprstream_rpc::admission::AdmittedIdentity;
-        use hyprstream_rpc::auth::AtprotoPerimeterGateway;
         use hyprstream_rpc::auth::mac::Assurance;
+        use hyprstream_rpc::auth::AtprotoPerimeterGateway;
         use hyprstream_rpc::identity_resolver::{DidDocumentProvider, MethodDispatchResolver};
 
         #[derive(Clone)]
@@ -1682,9 +1663,7 @@ mod tests {
         let first_ed = vms
             .iter()
             .filter_map(|vm| vm["publicKeyMultibase"].as_str())
-            .find_map(|multibase| {
-                hyprstream_rpc::did_web::decode_ed25519_multikey(multibase).ok()
-            })
+            .find_map(|multibase| hyprstream_rpc::did_web::decode_ed25519_multikey(multibase).ok())
             .unwrap();
         let first_pq = vms
             .iter()
@@ -1813,20 +1792,16 @@ mod tests {
         assert_eq!(&decoded[2..], vk_bytes.as_slice());
         // Referenced as both an authentication and assertion method.
         let mesh_pq_id = format!("{did}#mesh-pq");
-        assert!(
-            doc["authentication"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| *v == mesh_pq_id)
-        );
-        assert!(
-            doc["assertionMethod"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| *v == mesh_pq_id)
-        );
+        assert!(doc["authentication"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| *v == mesh_pq_id));
+        assert!(doc["assertionMethod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| *v == mesh_pq_id));
     }
 
     #[test]
@@ -1878,7 +1853,7 @@ mod tests {
             endpoint: hyprstream_rpc::service_entry::encode_iroh(
                 &node_id,
                 &[],
-                &["hyprstream-rpc/1", "moql"],
+                &["hyprstream-rpc/1"],
             ),
         }];
         let doc = build_did_document(
@@ -1904,8 +1879,7 @@ mod tests {
         assert_eq!(iroh_svc["id"].as_str().unwrap(), format!("{did}#iroh"));
         let accept = iroh_svc["serviceEndpoint"]["accept"].as_array().unwrap();
         let accept: Vec<&str> = accept.iter().filter_map(|v| v.as_str()).collect();
-        assert!(accept.contains(&"hyprstream-rpc/1"));
-        assert!(accept.contains(&"moql"));
+        assert_eq!(accept, vec!["hyprstream-rpc/1"]);
     }
 
     #[test]
@@ -1993,21 +1967,17 @@ mod tests {
         assert_eq!(kas[1]["type"].as_str().unwrap(), "Multikey");
 
         let vms = doc["verificationMethod"].as_array().unwrap();
-        assert!(
-            !vms.iter()
-                .any(|v| v["id"] == format!("{did}#mesh-kem-x25519"))
-        );
-        assert!(
-            !vms.iter()
-                .any(|v| v["id"] == format!("{did}#mesh-kem-mlkem768"))
-        );
-        assert!(
-            !doc["authentication"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v.as_str().map(|s| s.contains("mesh-kem")).unwrap_or(false))
-        );
+        assert!(!vms
+            .iter()
+            .any(|v| v["id"] == format!("{did}#mesh-kem-x25519")));
+        assert!(!vms
+            .iter()
+            .any(|v| v["id"] == format!("{did}#mesh-kem-mlkem768")));
+        assert!(!doc["authentication"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().map(|s| s.contains("mesh-kem")).unwrap_or(false)));
 
         // The published X25519 leg round-trips to the exact bytes derived —
         // consistency between the DID doc and the key the node actually holds.

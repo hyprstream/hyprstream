@@ -1,7 +1,7 @@
 //! Ed25519 cryptographic operations for GitTorrent
 
 use crate::{types::MutableKey, Error, Result};
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -25,7 +25,10 @@ impl Ed25519KeyPair {
     pub fn generate() -> Result<Self> {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
-        Ok(Ed25519KeyPair { signing_key, verifying_key })
+        Ok(Ed25519KeyPair {
+            signing_key,
+            verifying_key,
+        })
     }
 
     /// Create keypair from existing key data
@@ -41,7 +44,10 @@ impl Ed25519KeyPair {
         let signing_key = SigningKey::from_bytes(&secret_array);
         let verifying_key = signing_key.verifying_key();
 
-        Ok(Ed25519KeyPair { signing_key, verifying_key })
+        Ok(Ed25519KeyPair {
+            signing_key,
+            verifying_key,
+        })
     }
 
     /// Load keypair from file, creating if it doesn't exist

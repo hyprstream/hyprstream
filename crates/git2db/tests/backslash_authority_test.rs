@@ -38,13 +38,13 @@
 #![cfg(test)]
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
-use git2db::auth::{AuthManager, AuthStrategy, extract_git_authority};
+use git2db::auth::{extract_git_authority, AuthManager, AuthStrategy};
 use git2db::callback_config::CallbackConfigBuilder;
 use parking_lot::Mutex;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use tempfile::TempDir;
 
@@ -246,8 +246,7 @@ fn decode_basic_auth(header_value: &str) -> String {
 }
 
 fn base64_decode(input: &str) -> Vec<u8> {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut lut = [0u8; 256];
     for (i, &c) in TABLE.iter().enumerate() {
         lut[c as usize] = i as u8;

@@ -1027,10 +1027,11 @@ mod tests {
         // The binding is exactly the capsule's verified keys — comes from the
         // capsule, not config.
         assert_eq!(store.len(), 1, "exactly one hybrid binding installed");
-        let bound = store
-            .ml_dsa_key_for(&ed)
-            .expect("ed25519→ml_dsa_65 bound");
-        assert_eq!(ml_dsa_vk_bytes(&bound), ml_dsa_vk_bytes(keys.keys()[0].ml_dsa_65()));
+        let bound = store.ml_dsa_key_for(&ed).expect("ed25519→ml_dsa_65 bound");
+        assert_eq!(
+            ml_dsa_vk_bytes(&bound),
+            ml_dsa_vk_bytes(keys.keys()[0].ml_dsa_65())
+        );
     }
 
     #[tokio::test]

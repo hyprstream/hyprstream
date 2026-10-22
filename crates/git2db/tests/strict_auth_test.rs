@@ -256,11 +256,9 @@ fn use_credential_helper_defaults_to_false() {
 fn is_ambient_classifies_environment_sources() {
     assert!(AuthStrategy::Default.is_ambient());
     assert!(AuthStrategy::SshAgent { username: None }.is_ambient());
-    assert!(
-        !AuthStrategy::Token {
-            token: "t".into(),
-            host: None
-        }
-        .is_ambient()
-    );
+    assert!(!AuthStrategy::Token {
+        token: "t".into(),
+        host: None
+    }
+    .is_ambient());
 }

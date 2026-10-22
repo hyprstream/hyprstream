@@ -1,4 +1,9 @@
-//! Deterministic DAG-CBOR encoding/decoding.
+//! Hyprstream's existing deterministic CBOR encoding/decoding.
+//!
+//! Compatibility note: this codec uses lexical text-key ordering. Public
+//! AT Protocol DAG-CBOR instead orders encoded keys (length first). Use
+//! [`crate::atproto_cbor`] for that explicit boundary. Existing native signed
+//! artifacts retain this codec; do not silently change their bytes or verifier.
 //!
 //! DAG-CBOR is a restricted subset of [CBOR (RFC 7049)](https://tools.ietf.org/html/rfc7049)
 //! with additional constraints so that a given value always produces the
@@ -8,11 +13,8 @@
 //!
 //! # Constraints enforced here
 //!
-//! 1. **Map keys are sorted** in pure lexicographic byte order
-//!    (RFC 7049 §4.2.1 "core determinism") — the convention atproto's
-//!    `@atproto/lex-cbor` (via `cborg`) uses. (NOT length-first-then-lex; that's
-//!    the older §3.9 "canonical CBOR" rule, which atproto rejects because it
-//!    would produce different bytes for the same record.)
+//! 1. **Map keys are sorted** in pure lexicographic text-byte order, preserving
+//!    the existing native format. This differs from public DAG-CBOR ordering.
 //! 2. **Integers use minimal encoding**: `u8` < 24 → one byte (major 0/1);
 //!    otherwise the smallest power-of-two width (1/2/4/8 bytes).
 //! 3. **No duplicate keys**: decoding rejects them.
@@ -80,8 +82,9 @@ pub enum DagCbor {
     Text(String),
     /// Array (major 4), in given order.
     List(Vec<DagCbor>),
-    /// Map (major 5). Keys are stored in canonical (pure lexicographic byte)
-    /// sorted order at construction; encoding emits them as-is.
+    /// Map (major 5). Keys are stored in the existing native lexical text-byte
+    /// order at construction; public AT ordering is applied by
+    /// [`crate::atproto_cbor`] at its explicit boundary.
     Map(Vec<(DagCbor, DagCbor)>),
     /// CID link — encoded as CBOR tag 42.
     Link(Cid),
@@ -185,13 +188,25 @@ impl DagCbor {
     /// sorted text keys, no duplicates, bounded recursion, and minimal integer
     /// and length widths on the wire.
     pub fn decode(input: &[u8]) -> Result<Self> {
+        Self::decode_with_order(input, canonical_key_cmp)
+    }
+
+    pub(crate) fn decode_with_order(
+        input: &[u8],
+        key_order: fn(&[u8], &[u8]) -> std::cmp::Ordering,
+    ) -> Result<Self> {
         let mut cursor = 0usize;
-        let val = Self::read(input, &mut cursor, 0)?;
+        let val = Self::read(input, &mut cursor, 0, key_order)?;
         ensure!(cursor == input.len(), "trailing bytes after DAG-CBOR value");
         Ok(val)
     }
 
-    fn read(input: &[u8], cursor: &mut usize, depth: usize) -> Result<Self> {
+    fn read(
+        input: &[u8],
+        cursor: &mut usize,
+        depth: usize,
+        key_order: fn(&[u8], &[u8]) -> std::cmp::Ordering,
+    ) -> Result<Self> {
         ensure!(
             depth <= MAX_RECURSION_DEPTH,
             "DepthLimitExceeded: DAG-CBOR nesting exceeds {MAX_RECURSION_DEPTH}"
@@ -240,7 +255,7 @@ impl DagCbor {
                 // untrusted and a huge value must not trigger a capacity panic.
                 let mut items = Vec::with_capacity(len.min(input.len().saturating_sub(*cursor)));
                 for _ in 0..len {
-                    items.push(Self::read(input, cursor, depth + 1)?);
+                    items.push(Self::read(input, cursor, depth + 1, key_order)?);
                 }
                 Ok(DagCbor::List(items))
             }
@@ -252,17 +267,17 @@ impl DagCbor {
                     Vec::with_capacity(len.min(input.len().saturating_sub(*cursor)));
                 let mut prev_key: Option<Vec<u8>> = None;
                 for _ in 0..len {
-                    let k = Self::read(input, cursor, depth + 1)?;
+                    let k = Self::read(input, cursor, depth + 1, key_order)?;
                     ensure!(
                         matches!(k, DagCbor::Text(_)),
                         "DAG-CBOR map key must be a text string"
                     );
-                    let v = Self::read(input, cursor, depth + 1)?;
+                    let v = Self::read(input, cursor, depth + 1, key_order)?;
                     // Enforce sorted + unique keys: compare against previous.
                     let key_bytes = canonical_key_of(&k);
                     if let Some(ref prev) = prev_key {
                         ensure!(
-                            canonical_key_cmp(prev, &key_bytes) == std::cmp::Ordering::Less,
+                            key_order(prev, &key_bytes) == std::cmp::Ordering::Less,
                             "DAG-CBOR map keys not in canonical order / duplicate"
                         );
                     }
@@ -434,11 +449,11 @@ fn take<'a>(input: &'a [u8], cursor: &mut usize, n: usize) -> Result<&'a [u8]> {
     Ok(slice)
 }
 
-// ── canonical key ordering ──────────────────────────────────────────────────
+// ── native key ordering ──────────────────────────────────────────────────────
 
 /// Canonical comparison for a map key: returns the "canonical key" byte
 /// representation used both for sorting at construction and for verifying order
-/// at decode. DAG-CBOR map keys are text strings, so this is always UTF-8 bytes.
+/// at decode. Native map keys are text strings, so this is always UTF-8 bytes.
 fn canonical_key_of(key: &DagCbor) -> Vec<u8> {
     match key {
         DagCbor::Text(s) => s.as_bytes().to_vec(),
@@ -446,10 +461,9 @@ fn canonical_key_of(key: &DagCbor) -> Vec<u8> {
     }
 }
 
-/// Compare two canonical keys: **pure lexicographic byte order** (RFC 7049
-/// §4.2.1 "core determinism"), which is what atproto's DAG-CBOR (`@atproto/lex-cbor`
-/// via `cborg`) uses. (Not length-first-then-lex — that's the older RFC 7049 §3.9
-/// "canonical CBOR" convention, which atproto does NOT use.)
+/// Preserve the existing native codec's lexical text-key ordering. Public
+/// AT Protocol ordering is separate in `atproto_cbor`; do not change this
+/// comparator without an explicit migration of native signed artifacts.
 fn canonical_key_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     a.cmp(b)
 }

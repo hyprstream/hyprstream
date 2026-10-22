@@ -103,9 +103,7 @@ impl ModelRef {
                 .split_once('/')
                 .ok_or_else(|| anyhow!("federated modelRef missing rkey: {s:?}"))?;
             if collection != COLLECTION_NSID {
-                bail!(
-                    "federated modelRef collection {collection:?} is not {COLLECTION_NSID:?}"
-                );
+                bail!("federated modelRef collection {collection:?} is not {COLLECTION_NSID:?}");
             }
             if rkey.is_empty() {
                 bail!("federated modelRef rkey is empty: {s:?}");
@@ -194,7 +192,10 @@ async fn register_and_commit_via_git2db(
     // Make a tracked change through git2db's staging → commit API so the OID is
     // produced by git2db (exercising its commit path, not just libgit2's).
     let worktree = handle.worktree()?;
-    fs::write(worktree.join("WEIGHTS.bin"), b"\x00\x01\x02qwen3-weights-stub\x03\x04")?;
+    fs::write(
+        worktree.join("WEIGHTS.bin"),
+        b"\x00\x01\x02qwen3-weights-stub\x03\x04",
+    )?;
     handle.staging().add("WEIGHTS.bin").await?;
     let oid = handle.commit("Add model weights (E2E fixture)").await?;
 
@@ -242,21 +243,21 @@ async fn e2e_content_addressing_record_mst_proof() -> Result<()> {
     let _seed_oid = create_model_repo(&source_repo).await?;
     // Register via git2db and add a second commit through its handle API. The
     // OID we content-address is the one git2db produced.
-    let head_oid = register_and_commit_via_git2db(
-        &mut registry,
-        &registry_root,
-        "qwen3",
-        &source_repo,
-    )
-    .await
-    .context("step 1: git2db register + commit")?;
+    let head_oid =
+        register_and_commit_via_git2db(&mut registry, &registry_root, "qwen3", &source_repo)
+            .await
+            .context("step 1: git2db register + commit")?;
     let oid_hex = head_oid.to_string();
     // A real git OID is 40 hex chars (sha1) or 64 (sha256); libgit2 default is sha1.
-    assert_eq!(oid_hex.len(), 40, "git2 commit OID should be 40-char sha1 hex");
+    assert_eq!(
+        oid_hex.len(),
+        40,
+        "git2 commit OID should be 40-char sha1 hex"
+    );
 
     // ── Step 2: encode the OID as a CID (hyprstream-rpc/src/cid.rs) ──────────
-    let current_oid_cid = hyprstream_rpc::cid::encode_git_oid(&oid_hex)
-        .context("step 2: encode_git_oid")?;
+    let current_oid_cid =
+        hyprstream_rpc::cid::encode_git_oid(&oid_hex).context("step 2: encode_git_oid")?;
     // Canonical CIDv1 base32 form: leading 'b' multibase prefix.
     assert!(
         current_oid_cid.starts_with('b'),
@@ -272,7 +273,10 @@ async fn e2e_content_addressing_record_mst_proof() -> Result<()> {
     assert_eq!(decoded.multihash.digest, oid_bytes);
     // Determinism: encoding the same OID twice yields the same string.
     let again = hyprstream_rpc::cid::encode_git_oid(&oid_hex)?;
-    assert_eq!(current_oid_cid, again, "encode_git_oid must be deterministic");
+    assert_eq!(
+        current_oid_cid, again,
+        "encode_git_oid must be deterministic"
+    );
 
     // ── Step 3: build an `ai.hyprstream.model` record (3 fields) ─────────────
     let did = "did:web:alice.hyprstream.ai";
@@ -291,7 +295,11 @@ async fn e2e_content_addressing_record_mst_proof() -> Result<()> {
     let record_bytes = record.to_dag_cbor();
     let record_again = ModelRecord::from_dag_cbor(&record_bytes)?;
     assert_eq!(record, record_again);
-    assert_eq!(record_again.cid(), record_cid, "re-decoded record CID must match");
+    assert_eq!(
+        record_again.cid(),
+        record_cid,
+        "re-decoded record CID must match"
+    );
 
     // Insert the record's CID into an MST keyed by its TID rkey. We add a couple
     // of sibling records so the tree has >1 node (exercises the proof descent +
@@ -333,24 +341,41 @@ async fn e2e_content_addressing_record_mst_proof() -> Result<()> {
     let unsigned = UnsignedCommit::new(did, root_cid, Tid::now(), None);
     let commit = Commit::sign(&unsigned, &signing_key);
     // The signed commit verifies under the right key and fails under another.
-    commit.verify(&verifying_key).context("commit must verify")?;
+    commit
+        .verify(&verifying_key)
+        .context("commit must verify")?;
     let other_vk = VerifyingKey::from(&SigningKey::random(&mut rand::rngs::OsRng));
-    assert!(commit.verify(&other_vk).is_err(), "commit must reject a wrong key");
+    assert!(
+        commit.verify(&other_vk).is_err(),
+        "commit must reject a wrong key"
+    );
 
     // MST inclusion proof: from the commit's `data` root down to the record.
     let proof = tree
         .proof(COLLECTION_NSID, &target_tid)
         .ok_or_else(|| anyhow!("no MST proof for target record"))?;
-    proof.verify(&root_cid, &target_cid).context("MST proof must verify")?;
+    proof
+        .verify(&root_cid, &target_cid)
+        .context("MST proof must verify")?;
 
     // Build a CAR proof (commit + path nodes + record) and parse it back.
     let (_root_data, node_blocks) = tree.to_node_data_with_blocks();
     let car = build_record_proof_car(&commit, &proof, &node_blocks, &target_record);
     let (car_roots, car_blocks) = parse_car_v1(&car)?;
-    assert_eq!(car_roots, vec![commit.cid()], "CAR root must be the commit CID");
+    assert_eq!(
+        car_roots,
+        vec![commit.cid()],
+        "CAR root must be the commit CID"
+    );
     let car_block_cids: BTreeSet<PdsCid> = car_blocks.iter().map(|(c, _)| *c).collect();
-    assert!(car_block_cids.contains(&commit.cid()), "CAR must contain commit block");
-    assert!(car_block_cids.contains(&target_cid), "CAR must contain record block");
+    assert!(
+        car_block_cids.contains(&commit.cid()),
+        "CAR must contain commit block"
+    );
+    assert!(
+        car_block_cids.contains(&target_cid),
+        "CAR must contain record block"
+    );
 
     // ── Step 5: verifyRecordProof + tamper detection ─────────────────────────
     // Happy path: commit sig + MST path + record CID all check out.
@@ -406,8 +431,9 @@ fn model_ref_prefix_dispatch() {
     );
 
     // A TID-shaped rkey (13 chars, base32) — the realistic federated case.
-    let fed_tid = ModelRef::parse("at://did:web:bob.hyprstream.ai/ai.hyprstream.model/3zztslq4be52u")
-        .expect("federated TID ref parses");
+    let fed_tid =
+        ModelRef::parse("at://did:web:bob.hyprstream.ai/ai.hyprstream.model/3zztslq4be52u")
+            .expect("federated TID ref parses");
     assert_eq!(
         fed_tid,
         ModelRef::Federated {
@@ -463,7 +489,10 @@ fn model_ref_prefix_dispatch() {
         "federated ref with empty DID must be rejected"
     );
     // Local ref with empty name — reject.
-    assert!(ModelRef::parse("").is_err(), "empty modelRef must be rejected");
+    assert!(
+        ModelRef::parse("").is_err(),
+        "empty modelRef must be rejected"
+    );
     assert!(
         ModelRef::parse(":main").is_err(),
         "local ref with empty name must be rejected"

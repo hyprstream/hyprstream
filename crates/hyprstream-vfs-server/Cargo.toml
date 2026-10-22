@@ -8,6 +8,7 @@ description = "Serves a hyprstream VFS Namespace over vhost-user-fs to a Cloud H
 # Native-only (Linux): vhost-user-fs + fuse-backend-rs virtio transport are not
 # available on wasm, and the crate's purpose is serving a VMM.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 hyprstream-vfs = { path = "../hyprstream-vfs" }
 hyprstream-rpc = { path = "../hyprstream-rpc" }
 
@@ -38,3 +39,5 @@ tracing = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 async-trait = "0.1"
 tempfile = "3"
+
+[dependencies]

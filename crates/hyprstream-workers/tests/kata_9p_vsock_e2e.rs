@@ -68,7 +68,8 @@ use std::sync::Arc;
 
 use hyprstream_9p::{AccessDecider, Action, ReferenceMonitorDenyReason};
 use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext, SecurityLabel};
-use hyprstream_workers::runtime::{KataBackend, PodSandbox, PodSandboxConfig, SandboxBackend};
+use hyprstream_rpc_std::worker_client::PodSandboxConfig;
+use hyprstream_workers::runtime::{KataBackend, PodSandbox, SandboxBackend};
 use hyprstream_workers::{HypervisorType, ImageConfig, PoolConfig, RafsStore};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -107,8 +108,12 @@ struct Preflight {
 /// boot + in-guest mount is satisfied; otherwise prints the reason and returns
 /// `None` so the caller skips cleanly (keeping the test inert in CI).
 fn preflight() -> Option<Preflight> {
-    let kernel = readable_env_path("HYPRSTREAM_KATA_KERNEL").map_err(skip).ok()?;
-    let image = readable_env_path("HYPRSTREAM_KATA_IMAGE").map_err(skip).ok()?;
+    let kernel = readable_env_path("HYPRSTREAM_KATA_KERNEL")
+        .map_err(skip)
+        .ok()?;
+    let image = readable_env_path("HYPRSTREAM_KATA_IMAGE")
+        .map_err(skip)
+        .ok()?;
 
     // The 9P-over-vsock channel is only stood up when the sandbox has a tenant
     // VFS (image_id set); without a RAFS image id there is nothing to serve.
@@ -135,7 +140,12 @@ fn preflight() -> Option<Preflight> {
         return None;
     }
 
-    Some(Preflight { kernel, image, rafs_image_id, guest_helper })
+    Some(Preflight {
+        kernel,
+        image,
+        rafs_image_id,
+        guest_helper,
+    })
 }
 
 fn skip(reason: String) -> String {
@@ -270,11 +280,7 @@ async fn kata_9p_vsock_e2e() -> TestResult {
 }
 
 /// Drive the in-guest 9P operations and assert on their output.
-async fn run_guest_9p(
-    backend: &KataBackend,
-    sandbox: &PodSandbox,
-    pre: &Preflight,
-) -> TestResult {
+async fn run_guest_9p(backend: &KataBackend, sandbox: &PodSandbox, pre: &Preflight) -> TestResult {
     // `hypr9p-guest ls /` — the guest dials AF_VSOCK (CID 2, port 564), attaches
     // the host 9P tree, and lists the root. The injected tenant-VFS mounts
     // (`models`/`deltas`/`stream`) are exposed at the 9P root, so seeing them is
@@ -304,15 +310,21 @@ async fn run_guest_9p(
         std::env::var("HYPRSTREAM_GUEST_9P_READ_PATH"),
         std::env::var("HYPRSTREAM_GUEST_9P_EXPECT"),
     ) {
-        let cat_argv: Vec<String> =
-            vec![pre.guest_helper.clone(), "cat".to_owned(), read_path.clone()];
+        let cat_argv: Vec<String> = vec![
+            pre.guest_helper.clone(),
+            "cat".to_owned(),
+            read_path.clone(),
+        ];
         let (code, stdout, stderr) = backend.exec_sync(sandbox, &cat_argv, 30).await?;
         let got = String::from_utf8_lossy(&stdout);
         println!(
             "[kata_9p_vsock_e2e] guest `hypr9p-guest cat {read_path}` exit={code} stdout={got:?} stderr={:?}",
             String::from_utf8_lossy(&stderr)
         );
-        assert_eq!(code, 0, "in-guest `hypr9p-guest cat {read_path}` should exit 0");
+        assert_eq!(
+            code, 0,
+            "in-guest `hypr9p-guest cat {read_path}` should exit 0"
+        );
         assert_eq!(
             got.trim_end(),
             expect.trim_end(),
@@ -363,7 +375,10 @@ async fn kata_9p_fuse_mount_e2e() -> TestResult {
 
     // FUSE mounting needs /dev/fuse + mount privilege in the guest — a CI runner
     // can't grant it, so require an explicit operator opt-in beyond preflight.
-    if std::env::var("HYPRSTREAM_GUEST_FUSE_E2E").map(|v| v != "1").unwrap_or(true) {
+    if std::env::var("HYPRSTREAM_GUEST_FUSE_E2E")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
         println!(
             "[kata_9p_fuse_mount_e2e] SKIP: set HYPRSTREAM_GUEST_FUSE_E2E=1 to run the FUSE \
              POSIX-mount path (needs /dev/fuse + CAP_SYS_ADMIN in the guest)"
@@ -371,8 +386,8 @@ async fn kata_9p_fuse_mount_e2e() -> TestResult {
         return Ok(());
     }
 
-    let mount_dir =
-        std::env::var("HYPRSTREAM_GUEST_FUSE_MOUNT").unwrap_or_else(|_| DEFAULT_FUSE_MOUNT.to_owned());
+    let mount_dir = std::env::var("HYPRSTREAM_GUEST_FUSE_MOUNT")
+        .unwrap_or_else(|_| DEFAULT_FUSE_MOUNT.to_owned());
     // Path to `cat` THROUGH the mount, and its expected contents. The operator
     // injects this file into the tenant VFS; the default tenant VFS injects only
     // empty dirs, so a concrete file must be provided to assert bytes.
@@ -456,8 +471,7 @@ async fn run_guest_fuse(
         "mkdir -p {mount_dir} && {helper} --fuse-mount {mount_dir} & sleep 2",
         helper = pre.guest_helper,
     );
-    let mount_argv: Vec<String> =
-        vec!["/bin/sh".to_owned(), "-c".to_owned(), mount_cmd.clone()];
+    let mount_argv: Vec<String> = vec!["/bin/sh".to_owned(), "-c".to_owned(), mount_cmd.clone()];
     let (code, _out, stderr) = backend.exec_sync(sandbox, &mount_argv, 30).await?;
     println!(
         "[kata_9p_fuse_mount_e2e] mount cmd={mount_cmd:?} exit={code} stderr={:?}",
@@ -466,7 +480,11 @@ async fn run_guest_fuse(
 
     // 2. The load-bearing assertion: a plain `cat` through the FUSE mount — an
     //    arbitrary process, not the hypr9p 9P client — returns the file bytes.
-    let file_path = format!("{}/{}", mount_dir.trim_end_matches('/'), read_rel.trim_start_matches('/'));
+    let file_path = format!(
+        "{}/{}",
+        mount_dir.trim_end_matches('/'),
+        read_rel.trim_start_matches('/')
+    );
     let cat_argv: Vec<String> = vec!["/bin/cat".to_owned(), file_path.clone()];
     let (code, stdout, stderr) = backend.exec_sync(sandbox, &cat_argv, 30).await?;
     let got = String::from_utf8_lossy(&stdout);
@@ -475,7 +493,10 @@ async fn run_guest_fuse(
          stdout={got:?} stderr={:?}",
         String::from_utf8_lossy(&stderr)
     );
-    assert_eq!(code, 0, "bare `cat {file_path}` through the FUSE mount should exit 0");
+    assert_eq!(
+        code, 0,
+        "bare `cat {file_path}` through the FUSE mount should exit 0"
+    );
     assert_eq!(
         got.trim_end(),
         expect.trim_end(),
@@ -484,8 +505,7 @@ async fn run_guest_fuse(
     );
 
     // 3. Best-effort unmount so no stuck mount is left behind.
-    let umount_argv: Vec<String> =
-        vec!["/bin/umount".to_owned(), mount_dir.to_owned()];
+    let umount_argv: Vec<String> = vec!["/bin/umount".to_owned(), mount_dir.to_owned()];
     let _ = backend.exec_sync(sandbox, &umount_argv, 15).await;
 
     Ok(())

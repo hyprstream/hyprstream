@@ -55,7 +55,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
-use crate::services::generated::registry_client::{CommitWithAuthorRequest, WorktreeClient};
+use hyprstream_rpc_std::registry_client::{CommitWithAuthorRequest, WorktreeClient};
 
 /// An error from the promote saga.
 #[derive(Debug)]
@@ -76,7 +76,10 @@ impl std::fmt::Display for PromoteError {
             Self::LeaseHeld(s) => write!(f, "promote lease held by another node: {s}"),
             Self::LocalCommit(s) => write!(f, "local commit failed: {s}"),
             Self::PointerStale(s) => {
-                write!(f, "local commit ok but atproto pointer update failed (stale): {s}")
+                write!(
+                    f,
+                    "local commit ok but atproto pointer update failed (stale): {s}"
+                )
             }
         }
     }
@@ -109,7 +112,9 @@ pub struct PromoteLease {
 
 impl std::fmt::Debug for PromoteLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PromoteLease").field("key", &self.key).finish()
+        f.debug_struct("PromoteLease")
+            .field("key", &self.key)
+            .finish()
     }
 }
 
@@ -137,7 +142,10 @@ impl PromoteLeaseTable {
             return Err(PromoteError::LeaseHeld(key.to_owned()));
         }
         guard.insert(key.to_owned(), ());
-        Ok(PromoteLease { key: key.to_owned(), table: Arc::clone(self) })
+        Ok(PromoteLease {
+            key: key.to_owned(),
+            table: Arc::clone(self),
+        })
     }
 }
 
@@ -229,8 +237,8 @@ pub async fn promote(
         .map_err(|e| PromoteError::LocalCommit(format!("commit: {e}")))?;
 
     info!(
-        repo, worktree, commit_oid,
-        "promote: local snapshot committed"
+        repo,
+        worktree, commit_oid, "promote: local snapshot committed"
     );
 
     // Phase 2: advance the atproto pointer (eventual consistency). A failure
@@ -246,7 +254,10 @@ pub async fn promote(
         }
     };
 
-    Ok(PromoteOutcome { commit_oid, pointer_advanced })
+    Ok(PromoteOutcome {
+        commit_oid,
+        pointer_advanced,
+    })
 }
 
 /// Build a deterministic, human-readable commit message for a promote.
@@ -296,7 +307,12 @@ mod tests {
         // Until the atproto substrate lands, the stub always succeeds — this
         // test pins that contract so wiring the real client is a body-only
         // change.
-        let author = PromoteAuthor { name: "n".into(), email: "e".into() };
-        advance_pointer("r", "w", "deadbeef", &author).await.unwrap();
+        let author = PromoteAuthor {
+            name: "n".into(),
+            email: "e".into(),
+        };
+        advance_pointer("r", "w", "deadbeef", &author)
+            .await
+            .unwrap();
     }
 }

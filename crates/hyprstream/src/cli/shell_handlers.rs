@@ -22,9 +22,8 @@ use waxterm::input::InputParser;
 use zeroize::Zeroizing;
 
 use hyprstream_compositor::{
-    Compositor, CompositorInput, CompositorOutput, ConversationKind,
-    ConversationPickerEntry, GenerationDefaults, ModelEntry, PaneSummary, RpcRequest,
-    ToastLevel, WindowSummary,
+    Compositor, CompositorInput, CompositorOutput, ConversationKind, ConversationPickerEntry,
+    GenerationDefaults, ModelEntry, PaneSummary, RpcRequest, ToastLevel, WindowSummary,
 };
 
 /// Status update from the model polling background task.
@@ -33,7 +32,9 @@ struct ModelStatusUpdate {
     loaded: bool,
     gen_defaults: GenerationDefaults,
 }
-use hyprstream_compositor::layout::{CellUpdate, CursorState, FrameContent, FrameUpdate, ScrollUpdate};
+use hyprstream_compositor::layout::{
+    CellUpdate, CursorState, FrameContent, FrameUpdate, ScrollUpdate,
+};
 use hyprstream_tui::chat_app::{ChatApp, LoadHook, SaveHook};
 use hyprstream_tui::console_app::ConsoleApp;
 use hyprstream_tui::container_app::ContainerTermApp;
@@ -106,13 +107,14 @@ impl ActiveApp {
             Self::Container(_) => None,
         }
     }
-
 }
 
-use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayMode, SpawnChromeShellRequest, ResizeRequest, SendInputRequest};
 use crate::tui::shell_client::{
-    close_window_rpc, focus_window_rpc, spawn_chat_app_rpc,
-    spawn_shell_rpc,
+    close_window_rpc, focus_window_rpc, spawn_chat_app_rpc, spawn_shell_rpc,
+};
+use hyprstream_rpc_std::tui_client::{
+    ConnectRequest, DisplayMode, ResizeRequest, SendInputRequest, SpawnChromeShellRequest,
+    TuiClient,
 };
 
 // ============================================================================
@@ -140,12 +142,17 @@ pub async fn handle_shell_tui(
     // Connect to session 0 using Capnp display mode so the frame stream
     // carries structured TuiFrame messages with pane_id for correct routing.
     let result = client
-        .connect(&ConnectRequest { session_id: 0, display_mode: DisplayMode::Capnp, cols: pane_cols, rows: pane_rows })
+        .connect(&ConnectRequest {
+            session_id: 0,
+            display_mode: DisplayMode::Capnp,
+            cols: pane_cols,
+            rows: pane_rows,
+        })
         .await
         .context("Failed to connect to TUI session. Is the TUI service running?")?;
 
     let session_id = result.session_id;
-    let viewer_id  = result.viewer_id;
+    let viewer_id = result.viewer_id;
 
     // Build initial window list.
     let windows: Vec<WindowSummary> = result
@@ -155,7 +162,16 @@ pub async fn handle_shell_tui(
             id: w.id,
             name: w.name.clone(),
             active_pane_id: w.active_pane_id,
-            panes: w.panes.iter().map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: p.is_private }).collect(),
+            panes: w
+                .panes
+                .iter()
+                .map(|p| PaneSummary {
+                    id: p.id,
+                    cols: p.cols,
+                    rows: p.rows,
+                    is_private: p.is_private,
+                })
+                .collect(),
         })
         .collect();
 
@@ -163,14 +179,24 @@ pub async fn handle_shell_tui(
     let models = fetch_models(signing_key, models_dir).await;
 
     // Model load-status channel (background polling → event loop).
-    let model_client = crate::services::generated::model_client::ModelClient::from_resolver(
-        signing_key.clone(), None,
+    let model_client = hyprstream_rpc_std::model_client::ModelClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider,
+        signing_key.clone(),
+        None,
     )?;
     // Worker client for sandbox/container/image management.
     let worker_client = {
-        hyprstream_workers::runtime::WorkerClient::from_resolver(signing_key.clone(), None)?
+        hyprstream_rpc_std::worker_client::WorkerClient::from_provider(
+            &hyprstream_discovery::ProductionRpcClientProvider,
+            signing_key.clone(),
+            None,
+        )?
     };
-    let registry = crate::services::RegistryClient::from_resolver(signing_key.clone(), None)?;
+    let registry = hyprstream_rpc_std::registry_client::RegistryClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider,
+        signing_key.clone(),
+        None,
+    )?;
 
     let (model_status_tx, mut model_status_rx) =
         tokio::sync::mpsc::channel::<ModelStatusUpdate>(32);
@@ -185,9 +211,14 @@ pub async fn handle_shell_tui(
     let mut compositor = Compositor::new(cols, rows, session_id, viewer_id, windows, models);
 
     // Subscribe to ANSI frame stream.
-    let stdout_stream = result.streams.get(1)
+    let stdout_stream = result
+        .streams
+        .get(1)
         .context("TuiService did not return a frame stream")?;
-    let mac_key: [u8; 32] = stdout_stream.mac_key.as_slice().try_into()
+    let mac_key: [u8; 32] = stdout_stream
+        .mac_key
+        .as_slice()
+        .try_into()
         .context("mac_key must be 32 bytes")?;
     let topic = stdout_stream.topic.clone();
 
@@ -217,12 +248,22 @@ pub async fn handle_shell_tui(
     // `mac_key`+`topic` out of band), so the transport enc_key is never exercised
     // here — derive a stable one from mac_key purely to satisfy the consumer API.
     let enc_key = *hyprstream_rpc::crypto::StreamKeys::new(topic.clone(), mac_key).enc_key;
-    let mut handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
+    let mut handle = MoqStreamHandle::networked_with_server_identity(
+        reach,
+        &qos,
+        broadcast_path,
+        mac_key,
+        enc_key,
+        topic,
+        stdout_stream.moql_server_identity.clone(),
+    );
     let _recv_handle = tokio::spawn(async move {
         loop {
             match handle.recv_next().await {
                 Ok(Some(StreamPayload::Data(data))) => {
-                    if frame_tx.send(data).await.is_err() { return; }
+                    if frame_tx.send(data).await.is_err() {
+                        return;
+                    }
                 }
                 // A terminal Complete payload or a clean end-of-stream both end
                 // the loop cleanly.
@@ -233,7 +274,10 @@ pub async fn handle_shell_tui(
                 }
                 // Other payloads (e.g. Tagged) carry no ANSI frame bytes.
                 Ok(Some(_)) => continue,
-                Err(e) => { tracing::warn!("moq frame recv: {e}"); return; }
+                Err(e) => {
+                    tracing::warn!("moq frame recv: {e}");
+                    return;
+                }
             }
         }
     });
@@ -247,7 +291,9 @@ pub async fn handle_shell_tui(
             match std::io::stdin().lock().read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() { break; }
+                    if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -256,8 +302,8 @@ pub async fn handle_shell_tui(
     // Set up ratatui terminal.
     let writer = AnsiWriter(std::io::stdout());
     let backend = AnsiBackend::new(writer, cols, rows, false);
-    let mut terminal = ratatui::Terminal::new(backend)
-        .context("Failed to create ratatui terminal")?;
+    let mut terminal =
+        ratatui::Terminal::new(backend).context("Failed to create ratatui terminal")?;
     let _ = terminal.hide_cursor();
     let _ = terminal.clear();
 
@@ -307,25 +353,22 @@ pub async fn handle_shell_tui(
     // not currently have one and omits it.
     let vfs_ns: std::sync::Arc<hyprstream_vfs::Namespace> = {
         let config = crate::config::HyprConfig::load().unwrap_or_default();
-        let pep = crate::mac::production_vfs_pep(
-            signing_key.clone(),
-            &config.oauth,
-            "vfs-shell",
-        )
-        .await
-        .context("construct shell VFS MAC PEP")?;
-        let ns = crate::services::build_standard_namespace(crate::services::StandardNamespaceConfig {
-            subject: vfs_subject.clone(),
-            model_client: model_client.clone(),
-            registry: Some(Clone::clone(&registry)),
-            pep: Some(pep),
-            model_path: "/srv/model".to_owned(),
-            registry_path: "/srv/registry".to_owned(),
-            worktree_path: "/worktree".to_owned(),
-            bin_path: "/bin".to_owned(),
-            env_path: "/env".to_owned(),
-            tcl_path: "/lang/tcl".to_owned(),
-        });
+        let pep = crate::mac::production_vfs_pep(signing_key.clone(), &config.oauth, "vfs-shell")
+            .await
+            .context("construct shell VFS MAC PEP")?;
+        let ns =
+            crate::services::build_standard_namespace(crate::services::StandardNamespaceConfig {
+                subject: vfs_subject.clone(),
+                model_client: model_client.clone(),
+                registry: Some(Clone::clone(&registry)),
+                pep: Some(pep),
+                model_path: "/srv/model".to_owned(),
+                registry_path: "/srv/registry".to_owned(),
+                worktree_path: "/worktree".to_owned(),
+                bin_path: "/bin".to_owned(),
+                env_path: "/env".to_owned(),
+                tcl_path: "/lang/tcl".to_owned(),
+            });
         std::sync::Arc::new(ns)
     };
 
@@ -333,10 +376,8 @@ pub async fn handle_shell_tui(
     // The CLI shell's ChatApps run directly in the LocalSet event loop (not
     // via spawn_app_process), so the proxy must NOT share the same runtime —
     // otherwise reply_rx.recv() blocks the runtime and deadlocks the proxy.
-    let vfs_proxy_tx = crate::tui::vfs::spawn_dedicated_vfs_proxy(
-        vfs_ns.clone(),
-        vfs_subject.clone(),
-    );
+    let vfs_proxy_tx =
+        crate::tui::vfs::spawn_dedicated_vfs_proxy(vfs_ns.clone(), vfs_subject.clone());
 
     // Console overlay for log viewing (F9 / Ctrl-L).
     let mut console_app = ConsoleApp::new();
@@ -497,13 +538,13 @@ pub async fn handle_shell_tui(
 
             _ = worker_refresh.tick() => {
                 if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::WorkerManager { .. }) {
-                    
+
                     // Poll sandboxes + containers
-                    if let Ok(sandbox_infos) = worker_client.sandbox().list(&crate::services::worker::PodSandboxFilter::default()).await {
+                    if let Ok(sandbox_infos) = worker_client.sandbox().list(&hyprstream_rpc_std::worker_client::PodSandboxFilter::default()).await {
                         let mut entries = Vec::new();
                         for sb in &sandbox_infos {
                             let short_id = if sb.id.len() > 8 { sb.id[..8].to_owned() } else { sb.id.clone() };
-                            let containers = match worker_client.container().list(&crate::services::worker::ContainerFilter {
+                            let containers = match worker_client.container().list(&hyprstream_rpc_std::worker_client::ContainerFilter {
                                 pod_sandbox_id: sb.id.clone(),
                                 ..Default::default()
                             }).await {
@@ -540,7 +581,7 @@ pub async fn handle_shell_tui(
                         ).await { break; }
                     }
                     // Poll images
-                    if let Ok(images) = worker_client.image().list(&crate::services::worker::ImageFilter { image: crate::services::worker::ImageSpec::default() }).await {
+                    if let Ok(images) = worker_client.image().list(&hyprstream_rpc_std::worker_client::ImageFilter { image: hyprstream_rpc_std::worker_client::ImageSpec::default() }).await {
                         let entries: Vec<hyprstream_compositor::ImageEntry> = images.into_iter().map(|img| {
                             let repo_tag = img.repo_tags.first().cloned().unwrap_or_else(|| "<none>".to_owned());
                             let id = if img.id.len() > 12 { img.id[..12].to_owned() } else { img.id.clone() };
@@ -607,7 +648,7 @@ pub async fn handle_shell_tui(
                         format!("Reloading {model_ref} with context {ctx_label}…"),
                         ToastLevel::Info,
                     );
-                    let _ = model_client.load(&crate::services::generated::model_client::LoadModelRequest {
+                    let _ = model_client.load(&hyprstream_rpc_std::model_client::LoadModelRequest {
                         model_ref: model_ref.clone(),
                         max_context: reload_max_context,
                         kv_quant: None,
@@ -737,15 +778,23 @@ fn composite_draw(
 ) {
     let _ = terminal.draw(|f| {
         compositor.render(f);
-        if matches!(compositor.chrome.mode, hyprstream_compositor::ShellMode::Console) {
+        if matches!(
+            compositor.chrome.mode,
+            hyprstream_compositor::ShellMode::Console
+        ) {
             use ratatui::layout::{Constraint, Flex, Layout};
             use ratatui::widgets::Clear;
             let area = f.area();
             let pane_area = compositor.pane_block_area(area);
-            let [v] = Layout::vertical([Constraint::Percentage(68)]).flex(Flex::Center).areas(pane_area);
-            let [popup] = Layout::horizontal([Constraint::Percentage(82)]).flex(Flex::Center).areas(v);
+            let [v] = Layout::vertical([Constraint::Percentage(68)])
+                .flex(Flex::Center)
+                .areas(pane_area);
+            let [popup] = Layout::horizontal([Constraint::Percentage(82)])
+                .flex(Flex::Center)
+                .areas(v);
             f.render_widget(Clear, popup);
-            let block = hyprstream_compositor::theme::modal_block(ratatui::text::Line::from(" Console "));
+            let block =
+                hyprstream_compositor::theme::modal_block(ratatui::text::Line::from(" Console "));
             let inner = block.inner(popup);
             f.render_widget(block, popup);
             console_app.draw(f, inner);
@@ -758,8 +807,8 @@ fn composite_draw(
 async fn dispatch_outputs(
     compositor: &mut Compositor,
     client: &TuiClient,
-    model_client: &crate::services::generated::model_client::ModelClient,
-    worker_client: &hyprstream_workers::runtime::WorkerClient,
+    model_client: &hyprstream_rpc_std::model_client::ModelClient,
+    worker_client: &hyprstream_rpc_std::worker_client::WorkerClient,
     model_status_tx: &tokio::sync::mpsc::Sender<ModelStatusUpdate>,
     terminal: &mut ratatui::Terminal<AnsiBackend<AnsiWriter>>,
     console_app: &mut ConsoleApp,
@@ -767,7 +816,7 @@ async fn dispatch_outputs(
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
-    registry: &crate::services::RegistryClient,
+    registry: &hyprstream_rpc_std::registry_client::RegistryClient,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
     vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
@@ -781,15 +830,29 @@ async fn dispatch_outputs(
             CompositorOutput::Quit => return true,
             CompositorOutput::Rpc(req) => {
                 let feed_back = handle_rpc(
-                    compositor, client, model_client, worker_client, model_status_tx,
-                    active_apps, next_local_id, storage_key, signing_key,
-                    registry, vfs_ns, vfs_subject, vfs_proxy_tx, req,
-                ).await;
+                    compositor,
+                    client,
+                    model_client,
+                    worker_client,
+                    model_status_tx,
+                    active_apps,
+                    next_local_id,
+                    storage_key,
+                    signing_key,
+                    registry,
+                    vfs_ns,
+                    vfs_subject,
+                    vfs_proxy_tx,
+                    req,
+                )
+                .await;
                 for input in feed_back {
                     let follow = compositor.handle(input);
                     for fo in follow {
                         match fo {
-                            CompositorOutput::Redraw => { composite_draw(terminal, compositor, console_app); }
+                            CompositorOutput::Redraw => {
+                                composite_draw(terminal, compositor, console_app);
+                            }
                             CompositorOutput::Quit => return true,
                             _ => {}
                         }
@@ -802,7 +865,8 @@ async fn dispatch_outputs(
                     for key in keys {
                         if app.handle_input(key) {
                             let ansi = render_app_to_ansi(app);
-                            let outs = compositor.handle(CompositorInput::AppFrame { app_id, ansi });
+                            let outs =
+                                compositor.handle(CompositorInput::AppFrame { app_id, ansi });
                             for o in outs {
                                 if let CompositorOutput::Redraw = o {
                                     composite_draw(terminal, compositor, console_app);
@@ -822,14 +886,14 @@ async fn dispatch_outputs(
 async fn handle_rpc(
     compositor: &mut Compositor,
     client: &TuiClient,
-    model_client: &crate::services::generated::model_client::ModelClient,
-    worker_client: &hyprstream_workers::runtime::WorkerClient,
+    model_client: &hyprstream_rpc_std::model_client::ModelClient,
+    worker_client: &hyprstream_rpc_std::worker_client::WorkerClient,
     model_status_tx: &tokio::sync::mpsc::Sender<ModelStatusUpdate>,
     active_apps: &mut HashMap<u32, ActiveApp>,
     next_local_id: &mut u32,
     storage_key: &StorageKey,
     signing_key: &SigningKey,
-    registry: &crate::services::RegistryClient,
+    registry: &hyprstream_rpc_std::registry_client::RegistryClient,
     vfs_ns: &std::sync::Arc<hyprstream_vfs::Namespace>,
     vfs_subject: &hyprstream_rpc::Subject,
     vfs_proxy_tx: &tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>,
@@ -859,7 +923,9 @@ async fn handle_rpc(
 
         RpcRequest::CloseWindow { window_id, .. } => {
             // Collect pane IDs before removing the window.
-            let pane_ids: Vec<u32> = compositor.chrome.windows
+            let pane_ids: Vec<u32> = compositor
+                .chrome
+                .windows
                 .iter()
                 .find(|w| w.id == window_id)
                 .map(|w| w.panes.iter().map(|p| p.id).collect())
@@ -871,13 +937,20 @@ async fn handle_rpc(
             }
             // Remove the window from chrome immediately so the tab disappears
             // and the background animation resumes without waiting for server confirmation.
-            if let Some(win_idx) = compositor.chrome.windows.iter().position(|w| w.id == window_id) {
+            if let Some(win_idx) = compositor
+                .chrome
+                .windows
+                .iter()
+                .position(|w| w.id == window_id)
+            {
                 compositor.chrome.windows.remove(win_idx);
                 if compositor.chrome.windows.is_empty() {
                     compositor.chrome.active_win = 0;
                 } else {
-                    compositor.chrome.active_win =
-                        compositor.chrome.active_win.min(compositor.chrome.windows.len() - 1);
+                    compositor.chrome.active_win = compositor
+                        .chrome
+                        .active_win
+                        .min(compositor.chrome.windows.len() - 1);
                 }
             }
             let _ = close_window_rpc(client, window_id).await;
@@ -890,7 +963,12 @@ async fn handle_rpc(
 
         RpcRequest::FocusWindow { window_id, .. } => {
             if focus_window_rpc(client, window_id).await.is_ok() {
-                if let Some(idx) = compositor.chrome.windows.iter().position(|w| w.id == window_id) {
+                if let Some(idx) = compositor
+                    .chrome
+                    .windows
+                    .iter()
+                    .position(|w| w.id == window_id)
+                {
                     compositor.chrome.active_win = idx;
                 }
             }
@@ -904,7 +982,8 @@ async fn handle_rpc(
                 if let Ok(win_info) = client.create_window().await {
                     let new_win_id = win_info.id;
                     let _ = focus_window_rpc(client, new_win_id).await;
-                    let _ = spawn_shell_rpc(client, session_id, win_info.active_pane_id, &cwd).await;
+                    let _ =
+                        spawn_shell_rpc(client, session_id, win_info.active_pane_id, &cwd).await;
                     let wins = list_windows_rpc(client).await.unwrap_or_default();
                     if let Some(idx) = wins.iter().position(|w| w.id == new_win_id) {
                         compositor.chrome.active_win = idx;
@@ -919,13 +998,25 @@ async fn handle_rpc(
             }
         }
 
-        RpcRequest::SpawnServerChat { model_ref, cols, rows, .. } => {
+        RpcRequest::SpawnServerChat {
+            model_ref,
+            cols,
+            rows,
+            ..
+        } => {
             // Create a window, spawn chat app in its pane, then advance active_win.
             if let Ok(win_info) = client.create_window().await {
                 let new_win_id = win_info.id;
                 let _ = focus_window_rpc(client, new_win_id).await;
-                let _ = spawn_chat_app_rpc(client, session_id, &model_ref, cols, rows,
-                                           win_info.active_pane_id).await;
+                let _ = spawn_chat_app_rpc(
+                    client,
+                    session_id,
+                    &model_ref,
+                    cols,
+                    rows,
+                    win_info.active_pane_id,
+                )
+                .await;
                 let wins = list_windows_rpc(client).await.unwrap_or_default();
                 if let Some(idx) = wins.iter().position(|w| w.id == new_win_id) {
                     compositor.chrome.active_win = idx;
@@ -936,24 +1027,49 @@ async fn handle_rpc(
         }
 
         RpcRequest::LoadModel { model_ref } => {
-            let _ = model_client.load(&crate::services::generated::model_client::LoadModelRequest {
-                model_ref: model_ref.clone(),
-                max_context: None,
-                kv_quant: None,
-            }).await;
+            let _ = model_client
+                .load(&hyprstream_rpc_std::model_client::LoadModelRequest {
+                    model_ref: model_ref.clone(),
+                    max_context: None,
+                    kv_quant: None,
+                })
+                .await;
             spawn_model_load_poll(model_client.clone(), model_ref, model_status_tx.clone());
             vec![]
         }
 
         RpcRequest::UnloadModel { model_ref } => {
-            let ok = model_client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: model_ref.clone() }).await.is_ok();
+            let ok = model_client
+                .unload(&hyprstream_rpc_std::model_client::UnloadModelRequest {
+                    model_ref: model_ref.clone(),
+                })
+                .await
+                .is_ok();
             if ok {
                 compositor.chrome.update_model_status(&model_ref, false);
             }
             vec![]
         }
 
-        RpcRequest::LocalPrivateChat { model_ref, cols, rows, resume_uuid, gen_defaults } => {
+        RpcRequest::LocalPrivateChat {
+            model_ref,
+            cols,
+            rows,
+            resume_uuid,
+            gen_defaults,
+        } => {
+            let (tool_caller, tool_descriptions, openai_tools) =
+                match crate::tui::rpc_transport::make_tool_caller(signing_key) {
+                    Ok(tool_caller) => tool_caller,
+                    Err(_) => {
+                        compositor.chrome.push_toast(
+                            "Private chat unavailable: TUI service credential is required"
+                                .to_owned(),
+                            ToastLevel::Error,
+                        );
+                        return vec![];
+                    }
+                };
             // Allocate a local pane ID in the high-bit range to avoid
             // collision with server-allocated IDs (which start at 1).
             let pane_id = *next_local_id;
@@ -963,11 +1079,6 @@ async fn handle_rpc(
                 Some(s) => uuid::Uuid::parse_str(s).unwrap_or_else(|_| uuid::Uuid::new_v4()),
                 None => uuid::Uuid::new_v4(),
             };
-            // Fetch tool list once; used by both the spawner (for chat template)
-            // and the ChatApp (for dispatch + descriptions).
-            let (tool_caller, tool_descriptions, openai_tools) =
-                crate::tui::rpc_transport::make_tool_caller(signing_key);
-
             // Shared gen_config Arc — passed to both the spawner and the ChatApp.
             // Use model-specific defaults from RPC if available, otherwise fall back.
             let chat_gen_cfg = match gen_defaults {
@@ -989,12 +1100,11 @@ async fn handle_rpc(
             let app = match FsBackend::new(storage_dir) {
                 Ok(fs) => {
                     let key_bytes: [u8; 32] = **storage_key;
-                    let fs_store = std::sync::Arc::new(
-                        hyprstream_tui::private_store::PrivateStore::new(
+                    let fs_store =
+                        std::sync::Arc::new(hyprstream_tui::private_store::PrivateStore::new(
                             fs,
                             Zeroizing::new(key_bytes),
-                        )
-                    );
+                        ));
                     // Register conversation in manifest (skip if resuming).
                     if resume_uuid.is_none() {
                         let now = std::time::SystemTime::now()
@@ -1016,7 +1126,8 @@ async fn handle_rpc(
                     let uuid_for_load = session_uuid;
                     let uuid_for_save = session_uuid;
                     let load_hook: LoadHook = Box::new(move || {
-                        load_store.load::<hyprstream_tui::chat_app::ChatHistoryEntry>(&uuid_for_load)
+                        load_store
+                            .load::<hyprstream_tui::chat_app::ChatHistoryEntry>(&uuid_for_load)
                             .ok()
                             .flatten()
                     });
@@ -1024,15 +1135,26 @@ async fn handle_rpc(
                         let _ = save_store.save(&uuid_for_save, entries);
                     });
                     let spawner = crate::tui::rpc_transport::make_chat_spawner(
-                        signing_key, &model_ref, Some(openai_tools.clone()),
+                        signing_key,
+                        &model_ref,
+                        Some(openai_tools.clone()),
                         gen_config.clone(),
                     );
                     ChatApp::new_private(
-                        model_ref.clone(), cols, rows, spawner,
-                        session_uuid, load_hook, save_hook,
+                        model_ref.clone(),
+                        cols,
+                        rows,
+                        spawner,
+                        session_uuid,
+                        load_hook,
+                        save_hook,
                     )
                     .with_gen_config(gen_config)
-                    .with_vfs_proxy(vfs_ns.clone(), vfs_subject.clone(), vfs_proxy_tx.clone())
+                    .with_vfs_proxy(
+                        vfs_ns.clone(),
+                        vfs_subject.clone(),
+                        vfs_proxy_tx.clone(),
+                    )
                 }
                 Err(e) => {
                     compositor.chrome.push_toast(
@@ -1040,7 +1162,9 @@ async fn handle_rpc(
                         ToastLevel::Warn,
                     );
                     let spawner = crate::tui::rpc_transport::make_chat_spawner(
-                        signing_key, &model_ref, Some(openai_tools.clone()),
+                        signing_key,
+                        &model_ref,
+                        Some(openai_tools.clone()),
                         gen_config.clone(),
                     );
                     ChatApp::new(model_ref.clone(), cols, rows, spawner)
@@ -1052,25 +1176,34 @@ async fn handle_rpc(
             let tool_format = {
                 use crate::api::tools::ToolCallFormat;
                 match ToolCallFormat::from_model_ref(&model_ref) {
-                    ToolCallFormat::Qwen3Xml | ToolCallFormat::None => hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
-                    ToolCallFormat::Qwen35XmlParam => hyprstream_tui::chat_app::ToolCallFormat::Qwen35XmlParam,
-                    ToolCallFormat::LlamaJson     => hyprstream_tui::chat_app::ToolCallFormat::LlamaJson,
-                    ToolCallFormat::MistralJson   => hyprstream_tui::chat_app::ToolCallFormat::MistralJson,
+                    ToolCallFormat::Qwen3Xml | ToolCallFormat::None => {
+                        hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml
+                    }
+                    ToolCallFormat::Qwen35XmlParam => {
+                        hyprstream_tui::chat_app::ToolCallFormat::Qwen35XmlParam
+                    }
+                    ToolCallFormat::LlamaJson => {
+                        hyprstream_tui::chat_app::ToolCallFormat::LlamaJson
+                    }
+                    ToolCallFormat::MistralJson => {
+                        hyprstream_tui::chat_app::ToolCallFormat::MistralJson
+                    }
                 }
             };
-            let app = app.with_tool_caller(
-                tool_caller,
-                tool_descriptions,
-                tool_format,
-            );
+            let app = app.with_tool_caller(tool_caller, tool_descriptions, tool_format);
             active_apps.insert(pane_id, ActiveApp::Chat(Box::new(app)));
             compositor.chrome.private_panes.insert(pane_id);
             compositor.layout.get_or_create_private(pane_id);
 
             // Auto-number window names for duplicate models.
             let chat_prefix = format!("Chat: {}", model_ref);
-            let existing_count = compositor.chrome.windows.iter()
-                .filter(|w| w.name == chat_prefix || w.name.starts_with(&format!("{} (", chat_prefix)))
+            let existing_count = compositor
+                .chrome
+                .windows
+                .iter()
+                .filter(|w| {
+                    w.name == chat_prefix || w.name.starts_with(&format!("{} (", chat_prefix))
+                })
                 .count();
             let win_name = if existing_count > 0 {
                 format!("{} ({})", chat_prefix, existing_count + 1)
@@ -1096,7 +1229,10 @@ async fn handle_rpc(
             // Render first frame.
             if let Some(a) = active_apps.get(&pane_id) {
                 let ansi = render_app_to_ansi(a);
-                compositor.handle(CompositorInput::AppFrame { app_id: pane_id, ansi });
+                compositor.handle(CompositorInput::AppFrame {
+                    app_id: pane_id,
+                    ansi,
+                });
             }
             vec![]
         }
@@ -1107,20 +1243,28 @@ async fn handle_rpc(
                 Ok(fs) => {
                     let key_bytes: [u8; 32] = **storage_key;
                     let store = hyprstream_tui::private_store::PrivateStore::new(
-                        fs, Zeroizing::new(key_bytes),
+                        fs,
+                        Zeroizing::new(key_bytes),
                     );
-                    store.list_conversations(&model_ref)
+                    store
+                        .list_conversations(&model_ref)
                         .into_iter()
                         .map(|meta| ConversationPickerEntry {
-                            kind: ConversationKind::Resume { uuid: meta.uuid.to_string() },
-                            label: meta.label.unwrap_or_else(|| format!("Chat: {}", meta.model_ref)),
+                            kind: ConversationKind::Resume {
+                                uuid: meta.uuid.to_string(),
+                            },
+                            label: meta
+                                .label
+                                .unwrap_or_else(|| format!("Chat: {}", meta.model_ref)),
                             last_active: meta.last_active,
                         })
                         .collect()
                 }
                 Err(_) => vec![],
             };
-            compositor.chrome.open_conversation_picker(model_ref, conversations);
+            compositor
+                .chrome
+                .open_conversation_picker(model_ref, conversations);
             vec![]
         }
 
@@ -1128,9 +1272,8 @@ async fn handle_rpc(
             let storage_dir = private_store_dir();
             if let Ok(fs) = FsBackend::new(storage_dir) {
                 let key_bytes: [u8; 32] = **storage_key;
-                let store = hyprstream_tui::private_store::PrivateStore::new(
-                    fs, Zeroizing::new(key_bytes),
-                );
+                let store =
+                    hyprstream_tui::private_store::PrivateStore::new(fs, Zeroizing::new(key_bytes));
                 if let Ok(uid) = uuid::Uuid::parse_str(&uuid) {
                     let _ = store.delete_conversation(&uid);
                 }
@@ -1156,97 +1299,178 @@ async fn handle_rpc(
         }
         RpcRequest::WorkerDestroySandbox { sandbox_id } => {
             let short = &sandbox_id[..sandbox_id.len().min(8)];
-            compositor.chrome.push_toast(format!("Destroying {short}..."), ToastLevel::Info);
+            compositor
+                .chrome
+                .push_toast(format!("Destroying {short}..."), ToastLevel::Info);
             match worker_client.sandbox().stop(&sandbox_id).await {
                 Ok(()) => {
                     let _ = worker_client.sandbox().remove(&sandbox_id).await;
-                    compositor.chrome.push_toast(format!("Destroyed {short}"), ToastLevel::Info);
+                    compositor
+                        .chrome
+                        .push_toast(format!("Destroyed {short}"), ToastLevel::Info);
                 }
                 Err(e) => {
-                    compositor.chrome.push_toast(format!("Destroy failed: {e}"), ToastLevel::Error);
+                    compositor
+                        .chrome
+                        .push_toast(format!("Destroy failed: {e}"), ToastLevel::Error);
                 }
             }
             vec![]
         }
-        RpcRequest::WorkerExecSync { sandbox_id: _, container_id, cmd } => {
+        RpcRequest::WorkerExecSync {
+            sandbox_id: _,
+            container_id,
+            cmd,
+        } => {
             let short = &container_id[..container_id.len().min(8)];
-            compositor.chrome.push_toast(format!("Exec in {short}: {:?}", cmd), ToastLevel::Info);
-            match worker_client.container().exec(&crate::services::worker::ExecSyncRequest {
-                container_id: container_id.clone(),
-                cmd: cmd.clone(),
-                timeout: 30,
-            }).await {
+            compositor
+                .chrome
+                .push_toast(format!("Exec in {short}: {:?}", cmd), ToastLevel::Info);
+            match worker_client
+                .container()
+                .exec(&hyprstream_rpc_std::worker_client::ExecSyncRequest {
+                    container_id: container_id.clone(),
+                    cmd: cmd.clone(),
+                    timeout: 30,
+                })
+                .await
+            {
                 Ok(result) => {
                     let stdout = String::from_utf8_lossy(&result.stdout);
-                    let msg = if stdout.len() > 60 { format!("{}…", &stdout[..60]) } else { stdout.to_string() };
-                    compositor.chrome.push_toast(format!("exec: {msg}"), ToastLevel::Info);
+                    let msg = if stdout.len() > 60 {
+                        format!("{}…", &stdout[..60])
+                    } else {
+                        stdout.to_string()
+                    };
+                    compositor
+                        .chrome
+                        .push_toast(format!("exec: {msg}"), ToastLevel::Info);
                 }
                 Err(e) => {
-                    compositor.chrome.push_toast(format!("exec failed: {e}"), ToastLevel::Error);
+                    compositor
+                        .chrome
+                        .push_toast(format!("exec failed: {e}"), ToastLevel::Error);
                 }
             }
             vec![]
         }
         RpcRequest::WorkerImageList => {
-            match worker_client.image().list(&crate::services::worker::ImageFilter { image: crate::services::worker::ImageSpec::default() }).await {
+            match worker_client
+                .image()
+                .list(&hyprstream_rpc_std::worker_client::ImageFilter {
+                    image: hyprstream_rpc_std::worker_client::ImageSpec::default(),
+                })
+                .await
+            {
                 Ok(images) => {
-                    let entries: Vec<hyprstream_compositor::ImageEntry> = images.into_iter().map(|img| {
-                        let repo_tag = img.repo_tags.first().cloned().unwrap_or_else(|| "<none>".to_owned());
-                        let id = if img.id.len() > 12 { img.id[..12].to_owned() } else { img.id.clone() };
-                        hyprstream_compositor::ImageEntry {
-                            repo_tag,
-                            id,
-                            size_bytes: img.size,
-                            created: format!("{}s ago", std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
-                                .saturating_sub(img.uid as u64)),
-                        }
-                    }).collect();
+                    let entries: Vec<hyprstream_compositor::ImageEntry> = images
+                        .into_iter()
+                        .map(|img| {
+                            let repo_tag = img
+                                .repo_tags
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| "<none>".to_owned());
+                            let id = if img.id.len() > 12 {
+                                img.id[..12].to_owned()
+                            } else {
+                                img.id.clone()
+                            };
+                            hyprstream_compositor::ImageEntry {
+                                repo_tag,
+                                id,
+                                size_bytes: img.size,
+                                created: format!(
+                                    "{}s ago",
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        .saturating_sub(img.uid as u64)
+                                ),
+                            }
+                        })
+                        .collect();
                     vec![CompositorInput::WorkerImageList { images: entries }]
                 }
                 Err(e) => {
-                    compositor.chrome.push_toast(format!("Image list failed: {e}"), ToastLevel::Warn);
+                    compositor
+                        .chrome
+                        .push_toast(format!("Image list failed: {e}"), ToastLevel::Warn);
                     vec![]
                 }
             }
         }
         RpcRequest::WorkerImagePull { image } => {
-            use crate::services::worker::ImageSpec;
-            compositor.chrome.push_toast(format!("Pulling {image}..."), ToastLevel::Info);
-            let spec = ImageSpec { image: image.clone(), annotations: Default::default(), runtime_handler: Default::default() };
-            match worker_client.image().pull(&crate::services::worker::PullImageRequest {
-                image: spec,
-                auth: crate::services::worker::AuthConfig::default(),
-                sandbox_config: crate::services::worker::PodSandboxConfig::default(),
-            }).await {
+            use hyprstream_rpc_std::worker_client::ImageSpec;
+            compositor
+                .chrome
+                .push_toast(format!("Pulling {image}..."), ToastLevel::Info);
+            let spec = ImageSpec {
+                image: image.clone(),
+                annotations: Default::default(),
+                runtime_handler: Default::default(),
+            };
+            match worker_client
+                .image()
+                .pull(&hyprstream_rpc_std::worker_client::PullImageRequest {
+                    image: spec,
+                    auth: hyprstream_rpc_std::worker_client::AuthConfig::default(),
+                    sandbox_config: hyprstream_rpc_std::worker_client::PodSandboxConfig::default(),
+                })
+                .await
+            {
                 Ok(ref_id) => {
-                    compositor.chrome.push_toast(format!("Pulled: {}", &ref_id[..ref_id.len().min(20)]), ToastLevel::Info);
+                    compositor.chrome.push_toast(
+                        format!("Pulled: {}", &ref_id[..ref_id.len().min(20)]),
+                        ToastLevel::Info,
+                    );
                 }
                 Err(e) => {
-                    compositor.chrome.push_toast(format!("Pull failed: {e}"), ToastLevel::Error);
+                    compositor
+                        .chrome
+                        .push_toast(format!("Pull failed: {e}"), ToastLevel::Error);
                 }
             }
             vec![]
         }
         RpcRequest::WorkerImageRemove { image } => {
-            use crate::services::worker::ImageSpec;
-            let spec = ImageSpec { image: image.clone(), annotations: Default::default(), runtime_handler: Default::default() };
+            use hyprstream_rpc_std::worker_client::ImageSpec;
+            let spec = ImageSpec {
+                image: image.clone(),
+                annotations: Default::default(),
+                runtime_handler: Default::default(),
+            };
             match worker_client.image().remove(&spec).await {
                 Ok(()) => {
-                    compositor.chrome.push_toast(format!("Removed {image}"), ToastLevel::Info);
+                    compositor
+                        .chrome
+                        .push_toast(format!("Removed {image}"), ToastLevel::Info);
                 }
                 Err(e) => {
-                    compositor.chrome.push_toast(format!("Remove failed: {e}"), ToastLevel::Error);
+                    compositor
+                        .chrome
+                        .push_toast(format!("Remove failed: {e}"), ToastLevel::Error);
                 }
             }
             vec![]
         }
-        RpcRequest::WorkerCreateSandbox { hostname, backend, gpu } => {
-            use crate::services::worker::{PodSandboxConfig, KeyValue};
+        RpcRequest::WorkerCreateSandbox {
+            hostname,
+            backend,
+            gpu,
+        } => {
+            use hyprstream_rpc_std::worker_client::{KeyValue, PodSandboxConfig};
             let mut annotations = vec![];
-            annotations.push(KeyValue { key: "io.hyprstream/runtime-handler".to_owned(), value: backend });
+            annotations.push(KeyValue {
+                key: "io.hyprstream/runtime-handler".to_owned(),
+                value: backend,
+            });
             if gpu {
-                annotations.push(KeyValue { key: "hyprstream.io/gpu".to_owned(), value: "true".to_owned() });
+                annotations.push(KeyValue {
+                    key: "hyprstream.io/gpu".to_owned(),
+                    value: "true".to_owned(),
+                });
             }
             let config = PodSandboxConfig {
                 hostname,
@@ -1256,40 +1480,64 @@ async fn handle_rpc(
             match worker_client.sandbox().run(&config).await {
                 Ok(sandbox_id) => {
                     let short = &sandbox_id[..sandbox_id.len().min(8)];
-                    compositor.chrome.push_toast(format!("Created sandbox {short}"), ToastLevel::Info);
+                    compositor
+                        .chrome
+                        .push_toast(format!("Created sandbox {short}"), ToastLevel::Info);
                 }
                 Err(e) => {
-                    compositor.chrome.push_toast(format!("Create sandbox failed: {e}"), ToastLevel::Error);
+                    compositor
+                        .chrome
+                        .push_toast(format!("Create sandbox failed: {e}"), ToastLevel::Error);
                 }
             }
             vec![]
         }
-        RpcRequest::WorkerCreateContainer { sandbox_id, image, cmd, tty } => {
-            use crate::services::worker::{ContainerConfig, ImageSpec, PodSandboxConfig};
+        RpcRequest::WorkerCreateContainer {
+            sandbox_id,
+            image,
+            cmd,
+            tty,
+        } => {
+            use hyprstream_rpc_std::worker_client::{ContainerConfig, ImageSpec, PodSandboxConfig};
             let short_sb = &sandbox_id[..sandbox_id.len().min(8)];
             // PodSandboxStatusResponse has no config field — use default
             let sandbox_config = PodSandboxConfig::default();
             let container_config = ContainerConfig {
-                image: ImageSpec { image: image.clone(), annotations: Default::default(), runtime_handler: Default::default() },
+                image: ImageSpec {
+                    image: image.clone(),
+                    annotations: Default::default(),
+                    runtime_handler: Default::default(),
+                },
                 command: cmd,
                 tty,
                 ..Default::default()
             };
-            match worker_client.container().create(&crate::services::worker::CreateContainerRequest {
-                pod_sandbox_id: sandbox_id.clone(),
-                config: container_config,
-                sandbox_config,
-            }).await {
+            match worker_client
+                .container()
+                .create(&hyprstream_rpc_std::worker_client::CreateContainerRequest {
+                    pod_sandbox_id: sandbox_id.clone(),
+                    config: container_config,
+                    sandbox_config,
+                })
+                .await
+            {
                 Ok(container_id) => {
                     let short = &container_id[..container_id.len().min(8)];
-                    compositor.chrome.push_toast(format!("Created container {short} in {short_sb}"), ToastLevel::Info);
+                    compositor.chrome.push_toast(
+                        format!("Created container {short} in {short_sb}"),
+                        ToastLevel::Info,
+                    );
                     // Auto-start
                     if let Err(e) = worker_client.container().start(&container_id).await {
-                        compositor.chrome.push_toast(format!("Start failed: {e}"), ToastLevel::Error);
+                        compositor
+                            .chrome
+                            .push_toast(format!("Start failed: {e}"), ToastLevel::Error);
                     }
                 }
                 Err(e) => {
-                    compositor.chrome.push_toast(format!("Create container failed: {e}"), ToastLevel::Error);
+                    compositor
+                        .chrome
+                        .push_toast(format!("Create container failed: {e}"), ToastLevel::Error);
                 }
             }
             vec![]
@@ -1297,48 +1545,73 @@ async fn handle_rpc(
         RpcRequest::WorkerStartContainer { container_id } => {
             let short = &container_id[..container_id.len().min(8)];
             match worker_client.container().start(&container_id).await {
-                Ok(()) => compositor.chrome.push_toast(format!("Started {short}"), ToastLevel::Info),
-                Err(e) => compositor.chrome.push_toast(format!("Start failed: {e}"), ToastLevel::Error),
+                Ok(()) => compositor
+                    .chrome
+                    .push_toast(format!("Started {short}"), ToastLevel::Info),
+                Err(e) => compositor
+                    .chrome
+                    .push_toast(format!("Start failed: {e}"), ToastLevel::Error),
             }
             vec![]
         }
         RpcRequest::WorkerStopContainer { container_id } => {
             let short = &container_id[..container_id.len().min(8)];
-            match worker_client.container().stop(&crate::services::worker::StopContainerRequest {
-                container_id: container_id.clone(),
-                timeout: 10,
-            }).await {
-                Ok(()) => compositor.chrome.push_toast(format!("Stopped {short}"), ToastLevel::Info),
-                Err(e) => compositor.chrome.push_toast(format!("Stop failed: {e}"), ToastLevel::Error),
+            match worker_client
+                .container()
+                .stop(&hyprstream_rpc_std::worker_client::StopContainerRequest {
+                    container_id: container_id.clone(),
+                    timeout: 10,
+                })
+                .await
+            {
+                Ok(()) => compositor
+                    .chrome
+                    .push_toast(format!("Stopped {short}"), ToastLevel::Info),
+                Err(e) => compositor
+                    .chrome
+                    .push_toast(format!("Stop failed: {e}"), ToastLevel::Error),
             }
             vec![]
         }
         RpcRequest::WorkerRemoveContainer { container_id } => {
             let short = &container_id[..container_id.len().min(8)];
             match worker_client.container().remove(&container_id).await {
-                Ok(()) => compositor.chrome.push_toast(format!("Removed {short}"), ToastLevel::Info),
-                Err(e) => compositor.chrome.push_toast(format!("Remove failed: {e}"), ToastLevel::Error),
+                Ok(()) => compositor
+                    .chrome
+                    .push_toast(format!("Removed {short}"), ToastLevel::Info),
+                Err(e) => compositor
+                    .chrome
+                    .push_toast(format!("Remove failed: {e}"), ToastLevel::Error),
             }
             vec![]
         }
-        RpcRequest::AttachContainer { sandbox_id, container_id, cols, rows } => {
+        RpcRequest::AttachContainer {
+            sandbox_id,
+            container_id,
+            cols,
+            rows,
+        } => {
             use hyprstream_rpc::streaming::StreamPayload;
 
             let short_c = container_id[..container_id.len().min(8)].to_owned();
             let short_s = sandbox_id[..sandbox_id.len().min(8)].to_owned();
 
             // Attach RPC → returns ready-to-use StreamHandle (DH + SUB + HMAC managed internally).
-            use hyprstream_workers::generated::worker_client::ContainerRpc;
-            let mut stream_handle = match ContainerRpc::attach(&worker_client.container(), &crate::services::worker::AttachRequest {
-                container_id: container_id.clone(),
-                fds: vec![],
-            }).await {
+            use hyprstream_rpc_std::worker_client::ContainerRpc;
+            let mut stream_handle = match ContainerRpc::attach(
+                &worker_client.container(),
+                &hyprstream_rpc_std::worker_client::AttachRequest {
+                    container_id: container_id.clone(),
+                    fds: vec![],
+                },
+            )
+            .await
+            {
                 Ok(h) => h,
                 Err(e) => {
-                    compositor.chrome.push_toast(
-                        format!("Attach failed: {e}"),
-                        ToastLevel::Error,
-                    );
+                    compositor
+                        .chrome
+                        .push_toast(format!("Attach failed: {e}"), ToastLevel::Error);
                     return vec![];
                 }
             };
@@ -1356,7 +1629,8 @@ async fn handle_rpc(
                     Err(_) => return,
                 };
                 rt.block_on(async move {
-                    while let Ok(Some(StreamPayload::Data(bytes))) = stream_handle.recv_next().await {
+                    while let Ok(Some(StreamPayload::Data(bytes))) = stream_handle.recv_next().await
+                    {
                         if stdout_tx.send(bytes).is_err() {
                             break; // ContainerTermApp dropped
                         }
@@ -1404,91 +1678,136 @@ async fn handle_rpc(
             // Render initial frame.
             if let Some(a) = active_apps.get(&pane_id) {
                 let ansi = render_app_to_ansi(a);
-                compositor.handle(CompositorInput::AppFrame { app_id: pane_id, ansi });
+                compositor.handle(CompositorInput::AppFrame {
+                    app_id: pane_id,
+                    ansi,
+                });
             }
 
-            compositor.chrome.push_toast(
-                format!("Attached to {short_c}"),
-                ToastLevel::Info,
-            );
+            compositor
+                .chrome
+                .push_toast(format!("Attached to {short_c}"), ToastLevel::Info);
             vec![]
         }
         RpcRequest::CloneModel { url, name } => {
-            use crate::services::generated::registry_client::CloneRequest;
-            compositor.chrome.push_toast(format!("Cloning {name}…"), ToastLevel::Info);
-            match registry.clone(&CloneRequest {
-                url,
-                name: name.clone(),
-                shallow: false,
-                depth: 0,
-                branch: String::new(),
-            }).await {
+            use hyprstream_rpc_std::registry_client::CloneRequest;
+            compositor
+                .chrome
+                .push_toast(format!("Cloning {name}…"), ToastLevel::Info);
+            match registry
+                .clone(&CloneRequest {
+                    url,
+                    name: name.clone(),
+                    shallow: false,
+                    depth: 0,
+                    branch: String::new(),
+                })
+                .await
+            {
                 Ok(_) => {
-                    compositor.chrome.finish_clone(true, format!("Cloned {name}"));
-                    compositor.chrome.push_toast(format!("Cloned {name}"), ToastLevel::Info);
+                    compositor
+                        .chrome
+                        .finish_clone(true, format!("Cloned {name}"));
+                    compositor
+                        .chrome
+                        .push_toast(format!("Cloned {name}"), ToastLevel::Info);
                 }
                 Err(e) => {
-                    compositor.chrome.finish_clone(false, format!("Clone failed: {e}"));
-                    compositor.chrome.push_toast(format!("Clone failed: {e}"), ToastLevel::Error);
+                    compositor
+                        .chrome
+                        .finish_clone(false, format!("Clone failed: {e}"));
+                    compositor
+                        .chrome
+                        .push_toast(format!("Clone failed: {e}"), ToastLevel::Error);
                 }
             }
             vec![]
         }
 
         RpcRequest::PullModel { model_ref } => {
-            use crate::services::generated::registry_client::UpdateRequest;
+            use hyprstream_rpc_std::registry_client::UpdateRequest;
             let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
             let branch = model_ref.split(':').nth(1).unwrap_or("main");
             match registry.get_by_name(model_name).await {
                 Ok(tracked) => {
                     let repo_client = registry.repo(&tracked.id);
-                    match repo_client.update(&UpdateRequest {
-                        refspec: format!("refs/heads/{branch}"),
-                    }).await {
+                    match repo_client
+                        .update(&UpdateRequest {
+                            refspec: format!("refs/heads/{branch}"),
+                        })
+                        .await
+                    {
                         Ok(()) => {
-                            compositor.chrome.update_git_op_progress(&format!("Done: Pulled {model_ref}"));
-                            compositor.chrome.push_toast(format!("Pulled {model_ref}"), ToastLevel::Info);
+                            compositor
+                                .chrome
+                                .update_git_op_progress(&format!("Done: Pulled {model_ref}"));
+                            compositor
+                                .chrome
+                                .push_toast(format!("Pulled {model_ref}"), ToastLevel::Info);
                         }
                         Err(e) => {
-                            compositor.chrome.update_git_op_progress(&format!("Error: {e}"));
-                            compositor.chrome.push_toast(format!("Pull failed: {e}"), ToastLevel::Error);
+                            compositor
+                                .chrome
+                                .update_git_op_progress(&format!("Error: {e}"));
+                            compositor
+                                .chrome
+                                .push_toast(format!("Pull failed: {e}"), ToastLevel::Error);
                         }
                     }
                 }
                 Err(e) => {
-                    compositor.chrome.update_git_op_progress(&format!("Error: {e}"));
-                    compositor.chrome.push_toast(format!("Pull failed: {e}"), ToastLevel::Error);
+                    compositor
+                        .chrome
+                        .update_git_op_progress(&format!("Error: {e}"));
+                    compositor
+                        .chrome
+                        .push_toast(format!("Pull failed: {e}"), ToastLevel::Error);
                 }
             }
             vec![]
         }
 
         RpcRequest::PushModel { model_ref } => {
-            use crate::services::generated::registry_client::PushRequest;
+            use hyprstream_rpc_std::registry_client::PushRequest;
             let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
             let branch = model_ref.split(':').nth(1).unwrap_or("main");
             match registry.get_by_name(model_name).await {
                 Ok(tracked) => {
                     let repo_client = registry.repo(&tracked.id);
                     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-                    match repo_client.push(&PushRequest {
-                        remote: "origin".to_owned(),
-                        refspec,
-                        force: false,
-                    }).await {
+                    match repo_client
+                        .push(&PushRequest {
+                            remote: "origin".to_owned(),
+                            refspec,
+                            force: false,
+                        })
+                        .await
+                    {
                         Ok(()) => {
-                            compositor.chrome.update_git_op_progress(&format!("Done: Pushed {model_ref}"));
-                            compositor.chrome.push_toast(format!("Pushed {model_ref}"), ToastLevel::Info);
+                            compositor
+                                .chrome
+                                .update_git_op_progress(&format!("Done: Pushed {model_ref}"));
+                            compositor
+                                .chrome
+                                .push_toast(format!("Pushed {model_ref}"), ToastLevel::Info);
                         }
                         Err(e) => {
-                            compositor.chrome.update_git_op_progress(&format!("Error: {e}"));
-                            compositor.chrome.push_toast(format!("Push failed: {e}"), ToastLevel::Error);
+                            compositor
+                                .chrome
+                                .update_git_op_progress(&format!("Error: {e}"));
+                            compositor
+                                .chrome
+                                .push_toast(format!("Push failed: {e}"), ToastLevel::Error);
                         }
                     }
                 }
                 Err(e) => {
-                    compositor.chrome.update_git_op_progress(&format!("Error: {e}"));
-                    compositor.chrome.push_toast(format!("Push failed: {e}"), ToastLevel::Error);
+                    compositor
+                        .chrome
+                        .update_git_op_progress(&format!("Error: {e}"));
+                    compositor
+                        .chrome
+                        .push_toast(format!("Push failed: {e}"), ToastLevel::Error);
                 }
             }
             vec![]
@@ -1530,16 +1849,23 @@ pub async fn handle_tui_shell(
     let client = create_tui_client(signing_key)?;
 
     let registry_dir = models_dir.join(".registry").join("models");
-    let registry_dir = if registry_dir.exists() { registry_dir } else { models_dir.to_path_buf() };
+    let registry_dir = if registry_dir.exists() {
+        registry_dir
+    } else {
+        models_dir.to_path_buf()
+    };
     let registry_str = registry_dir.to_string_lossy().into_owned();
 
-    client.spawn_chrome_shell(&SpawnChromeShellRequest {
-        session_id,
-        registry_dir: registry_str,
-        cols,
-        rows,
-        pane_id: 0,
-    }).await.context("spawnChromeShell RPC failed")?;
+    client
+        .spawn_chrome_shell(&SpawnChromeShellRequest {
+            session_id,
+            registry_dir: registry_str,
+            cols,
+            rows,
+            pane_id: 0,
+        })
+        .await
+        .context("spawnChromeShell RPC failed")?;
 
     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?
         .recv()
@@ -1552,22 +1878,21 @@ pub async fn handle_tui_shell(
 // Helpers — model fetch
 // ============================================================================
 
-async fn fetch_models(
-    signing_key: &SigningKey,
-    models_dir: &std::path::Path,
-) -> Vec<ModelEntry> {
-
-    let registry: crate::services::RegistryClient = match crate::services::RegistryClient::from_resolver(
-        signing_key.clone(),
-        None,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Failed to create RegistryClient: {e}");
-            return Vec::new();
-        }
-    };
-    let model_client_for_status = match crate::services::generated::model_client::ModelClient::from_resolver(
+async fn fetch_models(signing_key: &SigningKey, models_dir: &std::path::Path) -> Vec<ModelEntry> {
+    let registry: hyprstream_rpc_std::registry_client::RegistryClient =
+        match hyprstream_rpc_std::registry_client::RegistryClient::from_provider(
+            &hyprstream_discovery::ProductionRpcClientProvider,
+            signing_key.clone(),
+            None,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to create RegistryClient: {e}");
+                return Vec::new();
+            }
+        };
+    let model_client_for_status = match hyprstream_rpc_std::model_client::ModelClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(),
         None,
     ) {
@@ -1580,22 +1905,29 @@ async fn fetch_models(
     let registry_models_dir = models_dir.to_path_buf();
     let status_timeout = std::time::Duration::from_millis(500);
 
-    let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
+    let all_status_req = hyprstream_rpc_std::model_client::StatusRequest {
+        model_ref: String::new(),
+    };
     let (repos_result, status_result) = tokio::join!(
         registry.list(),
-        tokio::time::timeout(status_timeout, model_client_for_status.status(&all_status_req)),
+        tokio::time::timeout(
+            status_timeout,
+            model_client_for_status.status(&all_status_req)
+        ),
     );
 
-    let status_map: std::collections::HashMap<String, (bool, GenerationDefaults)> = match status_result {
-        Ok(Ok(entries)) => entries.into_iter()
-            .map(|e| {
-                let loaded = e.status == "loaded";
-                let gd = wire_gen_defaults_to_compositor(&e.generation_defaults);
-                (e.model_ref, (loaded, gd))
-            })
-            .collect(),
-        _ => std::collections::HashMap::new(),
-    };
+    let status_map: std::collections::HashMap<String, (bool, GenerationDefaults)> =
+        match status_result {
+            Ok(Ok(entries)) => entries
+                .into_iter()
+                .map(|e| {
+                    let loaded = e.status == "loaded";
+                    let gd = wire_gen_defaults_to_compositor(&e.generation_defaults);
+                    (e.model_ref, (loaded, gd))
+                })
+                .collect(),
+            _ => std::collections::HashMap::new(),
+        };
 
     match repos_result {
         Ok(repos) => repos
@@ -1603,14 +1935,26 @@ async fn fetch_models(
             .filter(|r| !r.name.is_empty())
             .flat_map(|r| {
                 let name = r.name.clone();
-                let rmd  = registry_models_dir.clone();
-                r.worktrees.into_iter().map(move |wt| {
-                    let branch = if wt.branch_name.is_empty() { "main".to_owned() } else { wt.branch_name };
-                    let model_ref = format!("{}:{}", name, branch);
-                    let path = rmd.join(&name).join("worktrees").join(&branch);
-                    ModelEntry { model_ref, path, loaded: false, loading: false, gen_defaults: Default::default() }
-                })
-                .collect::<Vec<_>>()
+                let rmd = registry_models_dir.clone();
+                r.worktrees
+                    .into_iter()
+                    .map(move |wt| {
+                        let branch = if wt.branch_name.is_empty() {
+                            "main".to_owned()
+                        } else {
+                            wt.branch_name
+                        };
+                        let model_ref = format!("{}:{}", name, branch);
+                        let path = rmd.join(&name).join("worktrees").join(&branch);
+                        ModelEntry {
+                            model_ref,
+                            path,
+                            loaded: false,
+                            loading: false,
+                            gen_defaults: Default::default(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
             .map(|mut entry| {
                 if let Some((loaded, gd)) = status_map.get(&entry.model_ref) {
@@ -1637,7 +1981,16 @@ async fn list_windows_rpc(client: &TuiClient) -> anyhow::Result<Vec<WindowSummar
             id: w.id,
             name: w.name.clone(),
             active_pane_id: w.active_pane_id,
-            panes: w.panes.iter().map(|p| PaneSummary { id: p.id, cols: p.cols, rows: p.rows, is_private: p.is_private }).collect(),
+            panes: w
+                .panes
+                .iter()
+                .map(|p| PaneSummary {
+                    id: p.id,
+                    cols: p.cols,
+                    rows: p.rows,
+                    is_private: p.is_private,
+                })
+                .collect(),
         })
         .collect())
 }
@@ -1647,10 +2000,13 @@ async fn resize_rpc(client: &TuiClient, cols: u16, rows: u16) -> anyhow::Result<
 }
 
 async fn send_input_rpc(client: &TuiClient, viewer_id: u32, data: &[u8]) {
-    if let Err(e) = client.send_input(&SendInputRequest {
-        viewer_id,
-        data: data.to_vec(),
-    }).await {
+    if let Err(e) = client
+        .send_input(&SendInputRequest {
+            viewer_id,
+            data: data.to_vec(),
+        })
+        .await
+    {
         tracing::debug!("sendInput failed: {e}");
     }
 }
@@ -1662,8 +2018,12 @@ async fn send_input_rpc(client: &TuiClient, viewer_id: u32, data: &[u8]) {
 struct AnsiWriter(std::io::Stdout);
 
 impl std::io::Write for AnsiWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.write(buf) }
-    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
 // ============================================================================
@@ -1706,8 +2066,6 @@ fn tab_index_at_col(windows: &[WindowSummary], col: u16) -> Option<usize> {
     None
 }
 
-
-
 /// Convert the wire GenerationDefaults (7 fields) to the compositor's
 /// GenerationDefaults (5 fields).
 ///
@@ -1719,7 +2077,7 @@ fn tab_index_at_col(windows: &[WindowSummary], col: u16) -> Option<usize> {
 /// `context_window` is set to `None` because it is a load-time parameter
 /// configured via `LoadModelRequest.maxContext`, not a generation default.
 fn wire_gen_defaults_to_compositor(
-    wire: &crate::services::generated::model_client::GenerationDefaults,
+    wire: &hyprstream_rpc_std::model_client::GenerationDefaults,
 ) -> GenerationDefaults {
     GenerationDefaults {
         temperature: wire.temperature,
@@ -1733,30 +2091,39 @@ fn wire_gen_defaults_to_compositor(
 /// Spawn a background task that polls model status every 2s until loaded (or timeout).
 /// Sends a `ModelStatusUpdate` through `tx` when the model loads or after 120s timeout.
 fn spawn_model_load_poll(
-    poll_client: crate::services::generated::model_client::ModelClient,
+    poll_client: hyprstream_rpc_std::model_client::ModelClient,
     model_ref: String,
     tx: tokio::sync::mpsc::Sender<ModelStatusUpdate>,
 ) {
     tokio::spawn(async move {
         for _ in 0..60u32 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if let Ok(entries) = poll_client.status(
-                &crate::services::generated::model_client::StatusRequest {
+            if let Ok(entries) = poll_client
+                .status(&hyprstream_rpc_std::model_client::StatusRequest {
                     model_ref: model_ref.clone(),
-                },
-            ).await {
+                })
+                .await
+            {
                 if let Some(entry) = entries.iter().find(|e| e.status == "loaded") {
                     let gd = wire_gen_defaults_to_compositor(&entry.generation_defaults);
-                    let _ = tx.send(ModelStatusUpdate {
-                        model_ref, loaded: true, gen_defaults: gd,
-                    }).await;
+                    let _ = tx
+                        .send(ModelStatusUpdate {
+                            model_ref,
+                            loaded: true,
+                            gen_defaults: gd,
+                        })
+                        .await;
                     return;
                 }
             }
         }
-        let _ = tx.send(ModelStatusUpdate {
-            model_ref, loaded: false, gen_defaults: GenerationDefaults::default(),
-        }).await;
+        let _ = tx
+            .send(ModelStatusUpdate {
+                model_ref,
+                loaded: false,
+                gen_defaults: GenerationDefaults::default(),
+            })
+            .await;
     });
 }
 
@@ -1767,10 +2134,8 @@ fn spawn_model_load_poll(
 /// invalidates all history — documented V1 limitation).
 fn derive_storage_key(signing_key: &SigningKey) -> StorageKey {
     let seed = signing_key.to_bytes(); // 32-byte seed (pre-SHA-512)
-    let key = hyprstream_rpc::crypto::backend::derive_key(
-        "hyprstream-storage-session-enc-v1",
-        &seed,
-    );
+    let key =
+        hyprstream_rpc::crypto::backend::derive_key("hyprstream-storage-session-enc-v1", &seed);
     Zeroizing::new(key)
 }
 
@@ -1779,9 +2144,7 @@ fn derive_storage_key(signing_key: &SigningKey) -> StorageKey {
 fn private_store_dir() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            dirs::home_dir().map(|h| h.join(".local").join("share"))
-        })
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     base.join("hyprstream").join("private").join("v1")
 }
@@ -1806,7 +2169,7 @@ fn render_app_to_ansi(app: &ActiveApp) -> Vec<u8> {
 /// The resulting `FrameUpdate` is passed to `CompositorInput::ServerFrameCapnp`.
 fn decode_tui_frame(data: &[u8]) -> anyhow::Result<FrameUpdate> {
     use capnp::serialize;
-    use crate::tui_capnp;
+    use hyprstream_rpc_std::tui_capnp;
 
     let reader = serialize::read_message_from_flat_slice(
         &mut &data[..],
@@ -1814,12 +2177,16 @@ fn decode_tui_frame(data: &[u8]) -> anyhow::Result<FrameUpdate> {
     )?;
     let frame = reader.get_root::<tui_capnp::tui_frame::Reader<'_>>()?;
 
-    let pane_id    = frame.get_pane_id();
+    let pane_id = frame.get_pane_id();
     let generation = frame.get_generation();
 
     let cursor = {
         let c = frame.get_cursor()?;
-        CursorState { x: c.get_x(), y: c.get_y(), visible: c.get_visible() }
+        CursorState {
+            x: c.get_x(),
+            y: c.get_y(),
+            visible: c.get_visible(),
+        }
     };
 
     let content = match frame.which()? {
@@ -1827,36 +2194,63 @@ fn decode_tui_frame(data: &[u8]) -> anyhow::Result<FrameUpdate> {
             let full = full_r?;
             let cols = full.get_cols();
             let rows = full.get_rows();
-            let cells = full.get_cells()?.iter().map(|c| CellUpdate {
-                x: c.get_x(),
-                y: c.get_y(),
-                symbol: c.get_symbol().ok().and_then(|r| r.to_str().ok()).unwrap_or("").to_owned(),
-                fg:        unpack_color(c.get_fg()),
-                bg:        unpack_color(c.get_bg()),
-                modifiers: ratatui::style::Modifier::from_bits_truncate(c.get_modifiers()),
-            }).collect();
+            let cells = full
+                .get_cells()?
+                .iter()
+                .map(|c| CellUpdate {
+                    x: c.get_x(),
+                    y: c.get_y(),
+                    symbol: c
+                        .get_symbol()
+                        .ok()
+                        .and_then(|r| r.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned(),
+                    fg: unpack_color(c.get_fg()),
+                    bg: unpack_color(c.get_bg()),
+                    modifiers: ratatui::style::Modifier::from_bits_truncate(c.get_modifiers()),
+                })
+                .collect();
             FrameContent::Full { cols, rows, cells }
         }
         tui_capnp::tui_frame::Which::Incremental(incr_r) => {
             let incr = incr_r?;
-            let scrolls = incr.get_scrolls()?.iter().map(|s| ScrollUpdate {
-                top:    s.get_top(),
-                bottom: s.get_bottom(),
-                amount: s.get_amount(),
-            }).collect();
-            let deltas = incr.get_deltas()?.iter().map(|c| CellUpdate {
-                x: c.get_x(),
-                y: c.get_y(),
-                symbol: c.get_symbol().ok().and_then(|r| r.to_str().ok()).unwrap_or("").to_owned(),
-                fg:        unpack_color(c.get_fg()),
-                bg:        unpack_color(c.get_bg()),
-                modifiers: ratatui::style::Modifier::from_bits_truncate(c.get_modifiers()),
-            }).collect();
+            let scrolls = incr
+                .get_scrolls()?
+                .iter()
+                .map(|s| ScrollUpdate {
+                    top: s.get_top(),
+                    bottom: s.get_bottom(),
+                    amount: s.get_amount(),
+                })
+                .collect();
+            let deltas = incr
+                .get_deltas()?
+                .iter()
+                .map(|c| CellUpdate {
+                    x: c.get_x(),
+                    y: c.get_y(),
+                    symbol: c
+                        .get_symbol()
+                        .ok()
+                        .and_then(|r| r.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned(),
+                    fg: unpack_color(c.get_fg()),
+                    bg: unpack_color(c.get_bg()),
+                    modifiers: ratatui::style::Modifier::from_bits_truncate(c.get_modifiers()),
+                })
+                .collect();
             FrameContent::Incremental { scrolls, deltas }
         }
     };
 
-    Ok(FrameUpdate { pane_id, generation, cursor, content })
+    Ok(FrameUpdate {
+        pane_id,
+        generation,
+        cursor,
+        content,
+    })
 }
 
 /// Unpack a u32 color (as encoded by `diff::pack_color`) into a ratatui Color.
@@ -1867,20 +2261,20 @@ fn unpack_color(packed: u32) -> ratatui::style::Color {
     } else if packed & 0x0100_0000 != 0 {
         Color::Rgb(
             ((packed >> 16) & 0xFF) as u8,
-            ((packed >>  8) & 0xFF) as u8,
-            ( packed        & 0xFF) as u8,
+            ((packed >> 8) & 0xFF) as u8,
+            (packed & 0xFF) as u8,
         )
     } else {
         match packed {
-            1  => Color::Black,
-            2  => Color::Red,
-            3  => Color::Green,
-            4  => Color::Yellow,
-            5  => Color::Blue,
-            6  => Color::Magenta,
-            7  => Color::Cyan,
-            8  => Color::Gray,
-            9  => Color::DarkGray,
+            1 => Color::Black,
+            2 => Color::Red,
+            3 => Color::Green,
+            4 => Color::Yellow,
+            5 => Color::Blue,
+            6 => Color::Magenta,
+            7 => Color::Cyan,
+            8 => Color::Gray,
+            9 => Color::DarkGray,
             10 => Color::LightRed,
             11 => Color::LightGreen,
             12 => Color::LightYellow,
@@ -1888,7 +2282,7 @@ fn unpack_color(packed: u32) -> ratatui::style::Color {
             14 => Color::LightMagenta,
             15 => Color::LightCyan,
             16 => Color::White,
-            _  => Color::Reset,
+            _ => Color::Reset,
         }
     }
 }

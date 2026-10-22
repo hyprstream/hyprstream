@@ -34,8 +34,8 @@ use std::sync::Arc;
 use nydus_api::ConfigV2;
 use nydus_builder::attributes::Attributes;
 use nydus_builder::{
-    ArtifactStorage, BlobManager, BootstrapManager, BuildContext, Builder, ConversionType, Features,
-    Prefetch, TarballBuilder, WhiteoutSpec,
+    ArtifactStorage, BlobManager, BootstrapManager, BuildContext, Builder, ConversionType,
+    Features, Prefetch, TarballBuilder, WhiteoutSpec,
 };
 use nydus_rafs::metadata::RafsVersion;
 use nydus_utils::{compress, digest};
@@ -157,8 +157,8 @@ fn build_one_layer(
         String::new(), // blob_id: derive from blob hash
         // RAFS v6 (EROFS) requires 4K-aligned chunks; `nydus-image` forces this
         // on for any v6 build that is not TarToTarfs.
-        true, // aligned_chunk
-        0,    // blob_offset
+        true,                        // aligned_chunk
+        0,                           // blob_offset
         compress::Algorithm::Zstd,   // compressor
         digest::Algorithm::Sha256,   // digester
         false,                       // explicit_uidgid (OCI: normalize to 0)
@@ -204,13 +204,15 @@ fn build_one_layer(
 /// are invisible to the OCI-layer-based GC pass).
 pub fn bootstrap_blob_ids(bootstrap_path: &Path) -> Result<Vec<String>> {
     let config = Arc::new(ConfigV2::default());
-    let (rs, _reader) = nydus_rafs::metadata::RafsSuper::load_from_file(bootstrap_path, config, false)
-        .map_err(|e| {
-            WorkerError::RafsError(format!(
-                "failed to load RAFS bootstrap {}: {e:#}",
-                bootstrap_path.display()
-            ))
-        })?;
+    let (rs, _reader) =
+        nydus_rafs::metadata::RafsSuper::load_from_file(bootstrap_path, config, false).map_err(
+            |e| {
+                WorkerError::RafsError(format!(
+                    "failed to load RAFS bootstrap {}: {e:#}",
+                    bootstrap_path.display()
+                ))
+            },
+        )?;
     Ok(rs
         .superblock
         .get_blob_infos()
@@ -305,8 +307,7 @@ mod tests {
         );
 
         let bootstrap = bootstrap_dir.join("img.meta");
-        let out =
-            build_rafs_bootstrap(&[lower, upper], &blobs_dir, &bootstrap).unwrap();
+        let out = build_rafs_bootstrap(&[lower, upper], &blobs_dir, &bootstrap).unwrap();
         assert_eq!(out, bootstrap);
         assert!(std::fs::metadata(&bootstrap).unwrap().len() > 0);
 

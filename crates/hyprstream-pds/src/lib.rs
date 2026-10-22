@@ -7,10 +7,13 @@
 //!
 //! # What this crate provides
 //!
-//! - **DAG-CBOR** deterministic encode/decode ([`dag_cbor`]) — canonical CBOR:
-//!   map keys sorted in **pure lexicographic byte order** (RFC 7049 §4.2.1 "core
-//!   determinism", the convention atproto's `@atproto/lex-cbor` uses), minimal-
-//!   length ints, no duplicate keys. CID links use CBOR tag 42 per the
+//! - **Existing native CBOR** deterministic encode/decode ([`dag_cbor`]):
+//!   map keys sorted in lexical text-byte order, minimal-length ints and no
+//!   duplicate keys. Public AT DAG-CBOR instead requires length-first key order;
+//!   [`atproto_cbor`] provides that explicit boundary without changing existing
+//!   native signed artifacts. Public repository call-site integration is still
+//!   required; the existing commit/MST APIs retain their existing bytes.
+//!   CID links use CBOR tag 42 per the
 //!   [DAG-CBOR spec](https://github.com/ipld/specs/blob/master/block-layer/codecs/dag-cbor.md).
 //!   The same record produces identical bytes → same CID every time.
 //! - **`ai.hyprstream.model` record** ([`record`]) — the confirmed 3-field
@@ -50,14 +53,15 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod account_label;
 pub mod at9p;
 pub mod at9p_alias;
 pub mod at9p_chain;
 pub mod at9p_duplicity;
 pub mod at9p_gate;
-pub mod at9p_login;
 pub mod at9p_resolver;
 pub mod at9p_sign;
+pub mod atproto_cbor;
 pub mod car;
 pub mod cid;
 pub mod commit;
@@ -71,11 +75,18 @@ pub mod ledger;
 pub mod list_record;
 pub mod mst;
 pub mod name_record;
+#[cfg(all(feature = "postgres", not(target_arch = "wasm32")))]
+pub mod pgsql_kv;
 pub mod placement;
+pub mod rds;
 pub mod record;
 pub mod repo_authority;
 pub mod tid;
 
+pub use account_label::{
+    AccountLabel, AccountLabelRegistry, ReservedAccountLabel, MAX_ACCOUNT_LABEL_LEN,
+    RESERVED_ACCOUNT_LABELS,
+};
 pub use cid::Cid;
 pub use did_op::{
     sign_genesis, DidOpSignature, GenesisDidOp, GenesisRepoHead, GenesisRotationKeys,
@@ -84,9 +95,9 @@ pub use did_op::{
     DID_OP_SIGNATURE_CONTEXT, DID_OP_VERSION,
 };
 pub use hosted_account::{
-    AccountRecord, AllocatedAccountName, DirectoryHostedAccountStore, HostedAccountMint,
-    PendingHostedAccountMint, SealedHostedAccount, ACCOUNT_RECORD_VERSION,
-    ATPROTO_SIGNING_KEY_FILE,
+    is_hosted_account_staging_directory, AccountRecord, AllocatedAccountName,
+    DirectoryHostedAccountStore, HostedAccountMint, PendingHostedAccountMint, SealedHostedAccount,
+    ACCOUNT_RECORD_VERSION, ATPROTO_SIGNING_KEY_FILE, DID_DOCUMENT_FILE, GENESIS_DID_OP_FILE,
 };
 pub use hosted_did_document::{
     SealedHostedDidDocument, DID_DOCUMENT_MEDIA_TYPE, DID_DOCUMENT_PATH, DID_OPERATION_LOG_PATH,

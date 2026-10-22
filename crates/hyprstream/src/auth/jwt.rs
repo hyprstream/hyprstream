@@ -3,13 +3,12 @@
 //! Re-exports EdDSA signing from hyprstream-rpc and adds ES256 (P-256) signing.
 
 pub use hyprstream_rpc::auth::{
-    decode, decode_with_any_key, decode_with_any_key_lenient,
-    decode_with_federation_candidates, decode_with_key, encode, encode_service_jwt, Claims,
-    JwtError,
+    decode, decode_with_any_key, decode_with_any_key_lenient, decode_with_federation_candidates,
+    decode_with_key, encode, encode_service_jwt, Claims, JwtError,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use p256::ecdsa::{SigningKey as Es256SigningKey, signature::Signer};
+use p256::ecdsa::{signature::Signer, SigningKey as Es256SigningKey};
 
 /// Encode and sign an OAuth 2.0 access token with ES256 (P-256 ECDSA).
 ///
@@ -50,7 +49,10 @@ fn es256_coordinates(signing_key: &Es256SigningKey) -> ([u8; 32], [u8; 32]) {
 /// Compute the RFC 7638 JWK Thumbprint for a P-256 signing key.
 pub fn es256_kid(signing_key: &Es256SigningKey) -> String {
     let (x, y) = es256_coordinates(signing_key);
-    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Es256 { x: &x, y: &y })
+    hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Es256 {
+        x: &x,
+        y: &y,
+    })
 }
 
 /// Build a JWK (serde_json::Value) for JWKS publishing from a P-256 signing key.
@@ -87,12 +89,11 @@ pub fn encode_ml_dsa_65(
     };
     let vk = ml_dsa::Keypair::verifying_key(signing_key);
     let vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&vk);
-    let kid = hyprstream_rpc::auth::jwk_thumbprint(
-        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
+    let kid =
+        hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Akp {
             alg: "ML-DSA-65",
             pub_bytes: &vk_bytes,
-        },
-    );
+        });
     let header = format!(r#"{{"alg":"ML-DSA-65","typ":"at+jwt","kid":"{}"}}"#, kid);
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
     let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
@@ -124,7 +125,10 @@ pub fn encode_composite_ml_dsa_65_ed25519(
     };
     let vk = ml_dsa::Keypair::verifying_key(ml_dsa_key);
     let kid = composite_kid(&vk, &ed25519_key.verifying_key());
-    let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{}"}}"#, kid);
+    let header = format!(
+        r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{}"}}"#,
+        kid
+    );
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
     let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
         tracing::error!("JWT claims serialization failed: {}", _e);
@@ -159,7 +163,10 @@ pub fn encode_composite_service_jwt(
     };
     let vk = ml_dsa::Keypair::verifying_key(ml_dsa_key);
     let kid = composite_kid(&vk, &ed25519_key.verifying_key());
-    let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","kid":"{}"}}"#, kid);
+    let header = format!(
+        r#"{{"alg":"ML-DSA-65-Ed25519","typ":"wit+jwt","kid":"{}"}}"#,
+        kid
+    );
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
     let payload_json = serde_json::to_string(claims.as_ref()).unwrap_or_else(|_e| {
         tracing::error!("JWT claims serialization failed: {}", _e);
@@ -179,17 +186,69 @@ pub fn encode_composite_service_jwt(
     format!("{signing_input}.{sig_b64}")
 }
 
+/// Encode a service WIT with the mandatory hybrid suite for the dispatch plane.
+///
+/// When a composite signing authority is configured, mints with its active
+/// OAuth pair through the authority barrier (rotation-aware, mirroring
+/// PolicyService's token signing seam) — a mint-snapshot failure or a missing
+/// active pair is an error, never a silent downgrade to another key: the
+/// callers' `fallback_ed` is the rotating `active_jwt_signing_key()` slot, so
+/// a derived pair minted behind a configured authority would carry a
+/// composite kid nothing resolves while bypassing the staleness barrier.
+///
+/// Only when NO authority has been initialized (fresh install, before
+/// rotation bootstrap) does it fall back to the self-contained CA JWT pair
+/// `(derive_mesh_mldsa_key(fallback_ed), fallback_ed)`, whose composite kid
+/// the dispatch key sources resolve offline from the `ca-mldsa-pubkey`
+/// credential. A classical WIT is never minted: the dispatch plane's Hybrid
+/// policy would reject it unconditionally.
+pub fn encode_service_jwt_hybrid_via_authority(
+    claims: &Claims,
+    fallback_ed: &ed25519_dalek::SigningKey,
+) -> anyhow::Result<String> {
+    encode_service_jwt_hybrid_with_key_set(
+        &hyprstream_rpc::auth::global_composite_key_set(),
+        claims,
+        fallback_ed,
+    )
+}
+
+/// Key-set-parameterized body of [`encode_service_jwt_hybrid_via_authority`].
+fn encode_service_jwt_hybrid_with_key_set(
+    key_set: &hyprstream_rpc::auth::CompositeKeySet,
+    claims: &Claims,
+    fallback_ed: &ed25519_dalek::SigningKey,
+) -> anyhow::Result<String> {
+    if key_set.authority_configured() {
+        let snapshot = key_set
+            .mint_snapshot()
+            .map_err(|error| anyhow::anyhow!("composite authority unavailable: {error}"))?;
+        let (ml_key, ed_key) = snapshot
+            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
+            .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys)
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active OAuth composite signing pair; refusing to mint")
+            })?;
+        return Ok(encode_composite_service_jwt(claims, &ml_key, &ed_key));
+    }
+    let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(fallback_ed);
+    let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq);
+    Ok(hyprstream_rpc::auth::jwt::encode_service_jwt_hybrid(
+        claims,
+        fallback_ed,
+        &pq,
+        &pq_vk,
+    ))
+}
+
 /// Build a JWK for an ML-DSA-65 key (`kty: "AKP"`).
-pub fn ml_dsa_65_jwk(
-    vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey,
-) -> serde_json::Value {
+pub fn ml_dsa_65_jwk(vk: &hyprstream_rpc::crypto::pq::MlDsaVerifyingKey) -> serde_json::Value {
     let vk_bytes = hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(vk);
-    let kid = hyprstream_rpc::auth::jwk_thumbprint(
-        &hyprstream_rpc::auth::JwkThumbprintInput::Akp {
+    let kid =
+        hyprstream_rpc::auth::jwk_thumbprint(&hyprstream_rpc::auth::JwkThumbprintInput::Akp {
             alg: "ML-DSA-65",
             pub_bytes: &vk_bytes,
-        },
-    );
+        });
     serde_json::json!({
         "kty": "AKP",
         "alg": "ML-DSA-65",
@@ -232,6 +291,106 @@ pub fn composite_jwk(
 mod tests {
     use super::*;
 
+    /// With NO composite authority initialized (fresh install), the hybrid
+    /// WIT mint falls back to the self-contained pair derived from the passed
+    /// Ed25519 key, and the token verifies against exactly that pair.
+    #[test]
+    fn hybrid_wit_falls_back_only_without_authority() {
+        let key_set = hyprstream_rpc::auth::CompositeKeySet::default();
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600);
+
+        let wit = encode_service_jwt_hybrid_with_key_set(&key_set, &claims, &ed).unwrap();
+
+        let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ed);
+        let pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&pq);
+        let dispatch =
+            hyprstream_rpc::auth::jwt::parse_composite_dispatch(&wit, &["wit+jwt"]).unwrap();
+        assert_eq!(dispatch.kid(), composite_kid(&pq_vk, &ed.verifying_key()));
+        let verified = hyprstream_rpc::auth::jwt::decode_composite(
+            &wit,
+            &pq_vk,
+            &ed.verifying_key(),
+            None,
+            &dispatch,
+        )
+        .unwrap();
+        assert_eq!(verified.sub, "alice");
+    }
+
+    /// With a CONFIGURED authority whose mint snapshot fails (stale / pending
+    /// cutover / unreadable), the hybrid WIT mint propagates the error — it
+    /// must never silently downgrade to a derived pair, whose kid nothing
+    /// resolves and which would bypass the authority mint barrier.
+    #[test]
+    fn hybrid_wit_mint_failure_propagates_instead_of_falling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_set = hyprstream_rpc::auth::CompositeKeySet::default();
+        // Configured, but no committed generation exists on disk, so
+        // mint_snapshot fails closed.
+        key_set.configure_authority(
+            dir.path().join("ledger.json"),
+            dir.path().join("committed"),
+            dir.path().join("committed-ledger"),
+            dir.path().join("ledger.lock"),
+        );
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600);
+
+        let result = encode_service_jwt_hybrid_with_key_set(&key_set, &claims, &ed);
+        assert!(
+            result.is_err(),
+            "mint-snapshot failure must propagate, not fall back to a derived pair"
+        );
+    }
+
+    /// With a healthy authority that has no ACTIVE OAuth signing pair, the
+    /// hybrid WIT mint refuses rather than downgrading to a derived pair.
+    #[test]
+    fn hybrid_wit_refuses_without_active_oauth_pair() {
+        use hyprstream_rpc::auth::{CompositeKeyPair, CompositePairRole, CompositePairState};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_set = hyprstream_rpc::auth::CompositeKeySet::default();
+        let generation = br#"{"version":1,"component_digest":"g1"}"#;
+        std::fs::write(dir.path().join("ledger.json"), generation).unwrap();
+        std::fs::write(dir.path().join("committed"), generation).unwrap();
+        std::fs::write(dir.path().join("committed-ledger-1-g1.json"), generation).unwrap();
+        key_set.configure_authority(
+            dir.path().join("ledger.json"),
+            dir.path().join("committed"),
+            dir.path().join("committed-ledger"),
+            dir.path().join("ledger.lock"),
+        );
+        // Publish only a Policy-role signing pair — no active OAuth pair.
+        let (pq, pq_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let pair_ed = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]));
+        let kid = composite_kid(&pq_vk, &pair_ed.verifying_key());
+        key_set
+            .publish(
+                1,
+                "g1".to_owned(),
+                vec![CompositeKeyPair::signing(
+                    kid,
+                    Arc::new(pq),
+                    pair_ed,
+                    CompositePairRole::Policy,
+                    CompositePairState::Active,
+                    0,
+                    i64::MAX,
+                )],
+            )
+            .unwrap();
+
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".to_owned(), now, now + 3600);
+        assert!(encode_service_jwt_hybrid_with_key_set(&key_set, &claims, &ed).is_err());
+    }
+
     #[test]
     fn es256_roundtrip() {
         let key = generate_es256_key();
@@ -253,11 +412,13 @@ mod tests {
         assert!(decoded.jti.is_some());
 
         // Verify signature
-        use p256::ecdsa::{Signature, signature::Verifier};
+        use p256::ecdsa::{signature::Verifier, Signature};
         let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
         let signature = Signature::from_slice(&sig_bytes).unwrap();
         let signing_input = format!("{}.{}", parts[0], parts[1]);
-        key.verifying_key().verify(signing_input.as_bytes(), &signature).unwrap();
+        key.verifying_key()
+            .verify(signing_input.as_bytes(), &signature)
+            .unwrap();
     }
 
     #[test]
@@ -343,8 +504,13 @@ mod tests {
 
         let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         let decoded = hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &ed25519_vk, None, &dispatch,
-        ).unwrap();
+            &token,
+            &ml_dsa_vk,
+            &ed25519_vk,
+            None,
+            &dispatch,
+        )
+        .unwrap();
         assert_eq!(decoded.sub, "bob");
         assert!(decoded.jti.is_some());
     }
@@ -377,14 +543,20 @@ mod tests {
     fn composite_wrong_ed25519_key_rejects() {
         let (ml_dsa_sk, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
         let ed25519_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let wrong_ed25519_vk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
+        let wrong_ed25519_vk =
+            ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
 
         let claims = Claims::new("bob".to_owned(), 0, 9_999_999_999);
         let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
         let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         assert!(hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &wrong_ed25519_vk, None, &dispatch,
-        ).is_err());
+            &token,
+            &ml_dsa_vk,
+            &wrong_ed25519_vk,
+            None,
+            &dispatch,
+        )
+        .is_err());
     }
 
     #[test]
@@ -405,8 +577,13 @@ mod tests {
         let token = encode_composite_ml_dsa_65_ed25519(&claims, &ml_dsa_sk, &ed25519_sk);
         let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
         let err = hyprstream_rpc::auth::jwt::decode_composite(
-            &token, &ml_dsa_vk, &ed25519_vk, None, &dispatch,
-        ).unwrap_err();
+            &token,
+            &ml_dsa_vk,
+            &ed25519_vk,
+            None,
+            &dispatch,
+        )
+        .unwrap_err();
         assert!(matches!(err, hyprstream_rpc::auth::JwtError::Expired));
     }
 
@@ -426,8 +603,11 @@ mod tests {
         // Token without aud should be accepted even when expected_aud is set
         let token = encode_ml_dsa_65(&claims, &sk);
         assert!(hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
-            &token, &vk, Some("https://example.com"),
-        ).is_ok());
+            &token,
+            &vk,
+            Some("https://example.com"),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -436,9 +616,12 @@ mod tests {
         let mut claims = Claims::new("alice".to_owned(), 0, 9_999_999_999);
         claims.aud = Some("https://wrong.example.com".to_owned());
         let token = encode_ml_dsa_65(&claims, &sk);
-        let err = hyprstream_rpc::auth::jwt::decode_ml_dsa_65(
-            &token, &vk, Some("https://example.com"),
-        ).unwrap_err();
-        assert!(matches!(err, hyprstream_rpc::auth::JwtError::InvalidAudience));
+        let err =
+            hyprstream_rpc::auth::jwt::decode_ml_dsa_65(&token, &vk, Some("https://example.com"))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            hyprstream_rpc::auth::JwtError::InvalidAudience
+        ));
     }
 }

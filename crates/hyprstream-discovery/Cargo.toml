@@ -2,7 +2,7 @@
 name = "hyprstream-discovery"
 version = "0.1.0"
 edition.workspace = true
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 repository.workspace = true
 description = "Service discovery and endpoint resolution for hyprstream"
 
@@ -15,10 +15,27 @@ crate-type = ["rlib"]  # rlib-only: OnceLock singletons must be shared workspace
 # Pulls in `hyprstream-k8s`, whose re-exported `k8s-openapi` gives the PodSpec /
 # Quantity / Affinity types at the single workspace-pinned `v1_32` version.
 k8s = ["dep:hyprstream-k8s"]
+# Model-free downstream fixtures for the production selector boundary. Never
+# enabled by production features; `hyprstream` enables it only as a dev-dependency.
+test-fixtures = []
+# Native shared/tiered Discovery state. The dependency itself is target-gated
+# below so enabling the feature never pulls sockets into a WASM graph.
+valkey = ["dep:fred"]
+# Checkpointed PDS accepted-state store (local RocksDB backend). The
+# dependency is target-gated to non-wasm32 below: on wasm32 the feature may be
+# enabled but pulls nothing, and all rocksdb code is gated
+# `#[cfg(all(feature = "rocksdb", not(target_arch = "wasm32")))]`.
+rocksdb = ["dep:rocksdb"]
+# Checkpointed accepted-state authority on the networked RDS Postgres backend
+# (the `pds_kv` KV shell in hyprstream-pds). Selected by the resolved `[rds]`
+# binding handed in at bootstrap; fails closed, never falls back to local
+# RocksDB. Native-only, like `rocksdb`.
+postgres = ["hyprstream-pds/postgres"]
 
 [dependencies]
 # Workspace crates
 hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }
 hyprstream-service = { path = "../hyprstream-service" }
 # K4c (#787) — optional, only for the `k8s` feature's placement→PodSpec map.
 hyprstream-k8s = { path = "../hyprstream-k8s", optional = true }
@@ -33,6 +50,7 @@ hyprstream-crypto = { path = "../hyprstream-crypto" }
 
 # Async runtime
 async-trait = { workspace = true }
+futures = { workspace = true }
 
 # Serialization
 capnp = { workspace = true }
@@ -62,14 +80,24 @@ hex = { workspace = true }
 p256 = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # Production accepted-state authority is read directly from the concrete
 # checkpointed PDS store. No downstream callback/trait can supply authority.
-rocksdb = "0.23"
+rocksdb = { version = "0.23", optional = true }
+fred = { version = "9", optional = true, features = ["i-scripts", "enable-rustls-ring"] }
+tokio = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
+iroh = { workspace = true }
+bytes = { workspace = true }
+moq-net = { workspace = true }
+web-transport-iroh = { workspace = true }
+# #1652 derived-admission tests register admission-only test factories: the
+# factory inventory lives in the app crate, which this crate cannot link.
+inventory = { workspace = true }
 # #431 / #524 — build/verify real CAR proofs in getRecord + placement tests.
 p256 = { workspace = true }
 rand = { workspace = true }
@@ -79,16 +107,14 @@ tokio = { workspace = true }
 hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 # #893 (at9p D1) — mint real hybrid-signed capsules for the resolver tests.
 hyprstream-crypto = { path = "../hyprstream-crypto" }
+# Scratch-DB live tests for the Postgres accepted-state authority (NoTls, test-only).
+hyprstream-pds = { path = "../hyprstream-pds", features = ["postgres-test-connect"] }
+# Direct scratch-DB cleanup connection for the torn-fixture isolation guard.
+tokio-postgres = { workspace = true }
 # K4c (#787) — property tests for the placement→PodSpec map's no-widening invariant.
 proptest = { workspace = true }
 serde_yaml = { workspace = true }
 tempfile = { workspace = true }
-
-[build-dependencies]
-capnpc = { workspace = true }
-capnp = { workspace = true }
-serde_json = { workspace = true }
-hyprstream-rpc-build = { workspace = true }
 
 [lints]
 workspace = true

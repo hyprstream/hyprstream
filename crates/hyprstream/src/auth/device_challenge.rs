@@ -48,8 +48,8 @@ pub fn derive_cookie_key_seed(signing_key_bytes: &[u8; 32]) -> [u8; 32] {
 pub fn device_challenge(challenge_key: &[u8; 32], pubkey: &[u8; 32]) -> [u8; 32] {
     // new_from_slice only fails for keys larger than the block size; a 32-byte key is valid.
     #[allow(clippy::expect_used)]
-    let mut mac = HmacSha256::new_from_slice(challenge_key)
-        .expect("HMAC-SHA256 accepts 32-byte key");
+    let mut mac =
+        HmacSha256::new_from_slice(challenge_key).expect("HMAC-SHA256 accepts 32-byte key");
     mac.update(pubkey);
     mac.finalize().into_bytes().into()
 }
@@ -61,7 +61,9 @@ pub fn verify_device_enrollment(
     signature: &[u8; 64],
 ) -> bool {
     let challenge = device_challenge(challenge_key, pubkey);
-    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else { return false };
+    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
+        return false;
+    };
     let sig = Signature::from_bytes(signature);
     vk.verify(&challenge, &sig).is_ok()
 }
@@ -79,8 +81,8 @@ pub fn encode_vault_device_cookie(
     pubkey: &[u8; 32],
     exp: i64,
 ) -> String {
-    use ed25519_dalek::Signer;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ed25519_dalek::Signer;
 
     assert_eq!(kid.len(), 8, "kid must be exactly 8 ASCII characters");
     let kid_bytes = kid.as_bytes();
@@ -115,7 +117,10 @@ pub fn compute_kid(verifying_key_bytes: &[u8]) -> String {
 ///
 /// Returns `None` on malformation, signature failure, kid mismatch (key rotation),
 /// or expiry (`now >= exp`).
-pub fn verify_vault_device_cookie(signing_key_bytes: &[u8; 32], cookie_value: &str) -> Option<[u8; 32]> {
+pub fn verify_vault_device_cookie(
+    signing_key_bytes: &[u8; 32],
+    cookie_value: &str,
+) -> Option<[u8; 32]> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use ed25519_dalek::{Signature, Verifier};
 
@@ -178,7 +183,7 @@ mod tests {
 
     #[test]
     fn verify_roundtrip() {
-        use ed25519_dalek::{SigningKey, Signer};
+        use ed25519_dalek::{Signer, SigningKey};
         let mut rng = rand::rngs::OsRng;
         let sk = SigningKey::generate(&mut rng);
         let pubkey = sk.verifying_key().to_bytes();

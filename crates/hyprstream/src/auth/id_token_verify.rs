@@ -6,7 +6,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use jsonwebtoken::{DecodingKey, Validation, Algorithm};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::Value;
 
 /// Verification result for an external id_token.
@@ -57,11 +57,13 @@ pub async fn verify_id_token(
         .await
         .context("Failed to read JWKS response body")?;
     if jwks_body.len() > 256 * 1024 {
-        return Err(anyhow!("JWKS response too large: {} bytes (max 256KB)", jwks_body.len()));
+        return Err(anyhow!(
+            "JWKS response too large: {} bytes (max 256KB)",
+            jwks_body.len()
+        ));
     }
 
-    let jwks_json: Value = serde_json::from_slice(&jwks_body)
-        .context("Invalid JWKS JSON")?;
+    let jwks_json: Value = serde_json::from_slice(&jwks_body).context("Invalid JWKS JSON")?;
 
     let keys = jwks_json["keys"]
         .as_array()
@@ -163,8 +165,7 @@ fn decode_jwt_header(token: &str) -> Result<Value> {
     let header_bytes = URL_SAFE_NO_PAD
         .decode(parts[0])
         .map_err(|e| anyhow!("Invalid base64 in JWT header: {e}"))?;
-    serde_json::from_slice(&header_bytes)
-        .map_err(|e| anyhow!("Invalid JSON in JWT header: {e}"))
+    serde_json::from_slice(&header_bytes).map_err(|e| anyhow!("Invalid JSON in JWT header: {e}"))
 }
 
 /// Collect every algorithm-compatible JWKS candidate for a JWT header.
@@ -400,9 +401,7 @@ mod tests {
 
     #[test]
     fn test_candidate_keys_no_kid_no_match() {
-        let keys = vec![
-            serde_json::json!({"kty": "EC", "kid": "ec-1", "x": "a", "y": "b"}),
-        ];
+        let keys = vec![serde_json::json!({"kty": "EC", "kid": "ec-1", "x": "a", "y": "b"})];
         let header = serde_json::json!({"alg": "RS256"});
         let found = candidate_keys(&keys, None, &header);
         assert!(found.is_empty());
@@ -453,7 +452,10 @@ mod tests {
         let sk_b = ed25519_dalek::SigningKey::from_bytes(&[0xB0; 32]);
 
         // Publish BOTH keys (overlap window): lead first, drain second.
-        let keys = jwks_ed25519(&[("lead", &sk_a.verifying_key()), ("drain", &sk_b.verifying_key())]);
+        let keys = jwks_ed25519(&[
+            ("lead", &sk_a.verifying_key()),
+            ("drain", &sk_b.verifying_key()),
+        ]);
 
         // Sign with the SECOND (drain) key — no `kid` in the header.
         let claims = serde_json::json!({
@@ -464,12 +466,8 @@ mod tests {
         });
         let token = sign_eddsa_jwt(&sk_b, &claims, None);
 
-        let verified = verify_id_token_with_keys(
-            &token,
-            &keys,
-            "https://idp.example.com",
-            "client-42",
-        )?;
+        let verified =
+            verify_id_token_with_keys(&token, &keys, "https://idp.example.com", "client-42")?;
         assert_eq!(verified.claims["sub"], "user-1");
         Ok(())
     }
@@ -497,18 +495,21 @@ mod tests {
 
         // First (lead) signer — accepted.
         let token_lead = sign_eddsa_jwt(&sk_lead, &claims, None);
-        let v = verify_id_token_with_keys(&token_lead, &keys, "https://idp.example.com", "client-42")?;
+        let v =
+            verify_id_token_with_keys(&token_lead, &keys, "https://idp.example.com", "client-42")?;
         assert_eq!(v.claims["sub"], "user-1");
 
         // Non-first (drain) signer — accepted.
         let token_drain = sign_eddsa_jwt(&sk_drain, &claims, None);
-        let v = verify_id_token_with_keys(&token_drain, &keys, "https://idp.example.com", "client-42")?;
+        let v =
+            verify_id_token_with_keys(&token_drain, &keys, "https://idp.example.com", "client-42")?;
         assert_eq!(v.claims["sub"], "user-1");
 
         // Unknown signer (not in the published set) — rejected.
         let token_bad = sign_eddsa_jwt(&sk_unknown, &claims, None);
-        let err = verify_id_token_with_keys(&token_bad, &keys, "https://idp.example.com", "client-42")
-            .unwrap_err();
+        let err =
+            verify_id_token_with_keys(&token_bad, &keys, "https://idp.example.com", "client-42")
+                .unwrap_err();
         assert!(
             err.to_string().contains("signature verification failed")
                 || err.to_string().contains("no candidate verified"),

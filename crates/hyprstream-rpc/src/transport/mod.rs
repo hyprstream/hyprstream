@@ -7,43 +7,47 @@
 //! - QUIC/WebTransport via `quinn_transport` (`QuinnRpcServer` + moq multiplex, #274)
 //! - Raw socket options via `sockopt` submodule
 
-mod traits;
 pub mod carrier;
-pub mod zmtp_quic;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pq_provider;
+mod traits;
+pub mod zmtp_quic;
 #[cfg(not(target_arch = "wasm32"))]
 pub use pq_provider::{install_pq_crypto_provider, pq_crypto_provider};
 #[cfg(not(target_arch = "wasm32"))]
-pub mod iroh_substrate;
+pub mod backoff;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod rpc_session;
+pub mod in_memory;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod iroh_moq;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_rpc;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod quinn_transport;
+pub mod iroh_substrate;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh_transport;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod iroh_moq;
+pub mod lazy_iroh;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod lazy_quinn;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod lazy_uds;
 #[cfg(not(target_arch = "wasm32"))]
 /// CONNECT-time authentication + tenant binding for the `/moq` WebTransport
 /// plane (#1153).
 pub mod moq_connect_auth;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod in_memory;
+/// Inside-carrier Ed25519 + ML-DSA-65 challenge/response admission for the
+/// iroh `moql` ALPN (#1027).
+pub mod moql_admission;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod lazy_quinn;
+pub mod quinn_transport;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod lazy_iroh;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod uds_session;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod lazy_uds;
+pub mod rpc_session;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod uds_server;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod backoff;
+pub mod uds_session;
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -122,21 +126,36 @@ pub struct QuicServerAuth {
 impl QuicServerAuth {
     /// WebPKI / CA-chain validation only (public, CA-fronted peer).
     pub fn web_pki() -> Self {
-        Self { require_web_pki: true, accept_cert_hashes: Vec::new() }
+        Self {
+            require_web_pki: true,
+            accept_cert_hashes: Vec::new(),
+        }
     }
 
     /// Pin the leaf cert to one of `hashes` (SHA-256), no CA requirement — the
     /// self-signed internal-mesh model. Errors if `hashes` is empty.
     pub fn pinned(hashes: Vec<[u8; 32]>) -> anyhow::Result<Self> {
-        anyhow::ensure!(!hashes.is_empty(), "QuicServerAuth::pinned requires >= 1 cert hash");
-        Ok(Self { require_web_pki: false, accept_cert_hashes: hashes })
+        anyhow::ensure!(
+            !hashes.is_empty(),
+            "QuicServerAuth::pinned requires >= 1 cert hash"
+        );
+        Ok(Self {
+            require_web_pki: false,
+            accept_cert_hashes: hashes,
+        })
     }
 
     /// WebPKI validation **and** the leaf must be one of `hashes` — defence in
     /// depth against CA mis-issuance (HPKP-style). Errors if `hashes` is empty.
     pub fn web_pki_pinned(hashes: Vec<[u8; 32]>) -> anyhow::Result<Self> {
-        anyhow::ensure!(!hashes.is_empty(), "QuicServerAuth::web_pki_pinned requires >= 1 cert hash");
-        Ok(Self { require_web_pki: true, accept_cert_hashes: hashes })
+        anyhow::ensure!(
+            !hashes.is_empty(),
+            "QuicServerAuth::web_pki_pinned requires >= 1 cert hash"
+        );
+        Ok(Self {
+            require_web_pki: true,
+            accept_cert_hashes: hashes,
+        })
     }
 
     /// Whether CA-chain validation is required.
@@ -227,9 +246,7 @@ impl TransportConfig {
     /// Create an IPC (Unix domain socket) endpoint configuration.
     pub fn ipc(path: impl Into<PathBuf>) -> Self {
         Self {
-            endpoint: EndpointType::Ipc {
-                path: path.into(),
-            },
+            endpoint: EndpointType::Ipc { path: path.into() },
             bind_mode: BindMode::Bind,
         }
     }
@@ -270,13 +287,20 @@ impl TransportConfig {
     /// Create a client QUIC endpoint that pins the server's self-signed cert by
     /// its SHA-256 fingerprint. This is the dial target the resolver/`dial()`
     /// produce for an internal-mesh RPC peer (dialed by IP).
-    pub fn quic_pinned(addr: SocketAddr, server_name: impl Into<String>, cert_hash: [u8; 32]) -> Self {
+    pub fn quic_pinned(
+        addr: SocketAddr,
+        server_name: impl Into<String>,
+        cert_hash: [u8; 32],
+    ) -> Self {
         Self {
             endpoint: EndpointType::Quic {
                 addr,
                 server_name: server_name.into(),
                 // In-module: construct directly (a one-element set is always valid).
-                auth: QuicServerAuth { require_web_pki: false, accept_cert_hashes: vec![cert_hash] },
+                auth: QuicServerAuth {
+                    require_web_pki: false,
+                    accept_cert_hashes: vec![cert_hash],
+                },
             },
             bind_mode: BindMode::Connect,
         }
@@ -285,9 +309,17 @@ impl TransportConfig {
     /// Create a client QUIC endpoint with an explicit channel-auth policy
     /// (used by the DID-doc service-entry codec, which may produce any of
     /// WebPKI / Pinned / WebPKI+pin).
-    pub fn quic_with_auth(addr: SocketAddr, server_name: impl Into<String>, auth: QuicServerAuth) -> Self {
+    pub fn quic_with_auth(
+        addr: SocketAddr,
+        server_name: impl Into<String>,
+        auth: QuicServerAuth,
+    ) -> Self {
         Self {
-            endpoint: EndpointType::Quic { addr, server_name: server_name.into(), auth },
+            endpoint: EndpointType::Quic {
+                addr,
+                server_name: server_name.into(),
+                auth,
+            },
             bind_mode: BindMode::Connect,
         }
     }
@@ -348,10 +380,10 @@ impl TransportConfig {
             // Unknown scheme — fail-closed: misrouting to inproc would yield a
             // cryptic "no in-process service registered" error at dial time.
             // Networked transports (quic://, iroh://, tcp://) are obtained via
-            // TransportConfig::from_resolver(), not from_endpoint().
+            // the application-owned RpcClientProvider, not from_endpoint().
             panic!(
                 "TransportConfig::from_endpoint: unknown scheme in '{endpoint}'; \
-                 use from_resolver() for networked transports"
+                 use an RpcClientProvider for networked transports"
             );
         } else {
             // Bare name (no scheme) — defaults to inproc
@@ -377,7 +409,9 @@ impl TransportConfig {
             EndpointType::SystemdFd { client_path, .. } => {
                 format!("ipc://{}", client_path.display())
             }
-            EndpointType::Quic { addr, server_name, .. } => {
+            EndpointType::Quic {
+                addr, server_name, ..
+            } => {
                 format!("quic://{server_name}:{addr}")
             }
             EndpointType::Iroh { node_id, .. } => {
@@ -392,9 +426,9 @@ impl TransportConfig {
     /// Returns `https://{server_name}:{port}` for QUIC endpoints, `None` otherwise.
     pub fn quic_webtransport_url(&self) -> Option<String> {
         match &self.endpoint {
-            EndpointType::Quic { addr, server_name, .. } => {
-                Some(format!("https://{}:{}", server_name, addr.port()))
-            }
+            EndpointType::Quic {
+                addr, server_name, ..
+            } => Some(format!("https://{}:{}", server_name, addr.port())),
             _ => None,
         }
     }
@@ -559,7 +593,9 @@ mod tests {
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4433);
         let config = TransportConfig::quic(addr, "hyprstream.local");
-        assert!(config.endpoint_string().starts_with("quic://hyprstream.local:"));
+        assert!(config
+            .endpoint_string()
+            .starts_with("quic://hyprstream.local:"));
         assert!(config.is_quic());
         assert!(!config.is_systemd_activated());
     }

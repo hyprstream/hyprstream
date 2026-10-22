@@ -84,10 +84,22 @@ impl<C: From<KeyPress>> InputParser<C> {
                             if i + 2 < data.len() {
                                 match data[i + 2] {
                                     // Single-byte: arrow keys
-                                    b'A' => { cmds.push(C::from(KeyPress::ArrowUp)); i += 3; }
-                                    b'B' => { cmds.push(C::from(KeyPress::ArrowDown)); i += 3; }
-                                    b'C' => { cmds.push(C::from(KeyPress::ArrowRight)); i += 3; }
-                                    b'D' => { cmds.push(C::from(KeyPress::ArrowLeft)); i += 3; }
+                                    b'A' => {
+                                        cmds.push(C::from(KeyPress::ArrowUp));
+                                        i += 3;
+                                    }
+                                    b'B' => {
+                                        cmds.push(C::from(KeyPress::ArrowDown));
+                                        i += 3;
+                                    }
+                                    b'C' => {
+                                        cmds.push(C::from(KeyPress::ArrowRight));
+                                        i += 3;
+                                    }
+                                    b'D' => {
+                                        cmds.push(C::from(KeyPress::ArrowLeft));
+                                        i += 3;
+                                    }
                                     // Digit → tilde-terminated: ESC [ <num> ~
                                     b'0'..=b'9' => {
                                         // Scan for '~' terminator (max 4 bytes of digits)
@@ -98,9 +110,10 @@ impl<C: From<KeyPress>> InputParser<C> {
                                             .map(|p| start + p);
                                         if let Some(tilde_pos) = end {
                                             let num_bytes = &data[start..tilde_pos];
-                                            let num: u32 = num_bytes.iter().fold(0u32, |acc, &b| {
-                                                acc * 10 + u32::from(b - b'0')
-                                            });
+                                            let num: u32 =
+                                                num_bytes.iter().fold(0u32, |acc, &b| {
+                                                    acc * 10 + u32::from(b - b'0')
+                                                });
                                             // VT sequence number → F-key mapping
                                             let fkey = match num {
                                                 11 => Some(KeyPress::F(1)),
@@ -138,13 +151,21 @@ impl<C: From<KeyPress>> InputParser<C> {
                                             let params = &data[start..start + end_off];
                                             // Parse btn from first param (before first ';')
                                             if term == b'M' {
-                                                if let Some(semi) = params.iter().position(|&b| b == b';') {
-                                                    if let Ok(btn_str) = std::str::from_utf8(&params[..semi]) {
+                                                if let Some(semi) =
+                                                    params.iter().position(|&b| b == b';')
+                                                {
+                                                    if let Ok(btn_str) =
+                                                        std::str::from_utf8(&params[..semi])
+                                                    {
                                                         if let Ok(btn) = btn_str.parse::<u32>() {
                                                             if btn == 64 {
-                                                                cmds.push(C::from(KeyPress::ScrollUp));
+                                                                cmds.push(C::from(
+                                                                    KeyPress::ScrollUp,
+                                                                ));
                                                             } else if btn == 65 {
-                                                                cmds.push(C::from(KeyPress::ScrollDown));
+                                                                cmds.push(C::from(
+                                                                    KeyPress::ScrollDown,
+                                                                ));
                                                             }
                                                         }
                                                     }
@@ -159,7 +180,9 @@ impl<C: From<KeyPress>> InputParser<C> {
                                     b'M' => {
                                         i += if i + 5 < data.len() { 6 } else { data.len() };
                                     }
-                                    _ => { i += 3; } // ignore unknown CSI sequences
+                                    _ => {
+                                        i += 3;
+                                    } // ignore unknown CSI sequences
                                 }
                             } else {
                                 // Incomplete CSI, skip ESC
@@ -268,7 +291,9 @@ mod tests {
 
     #[test]
     fn test_parse_all_arrows() {
-        let data = [0x1B, 0x5B, b'A', 0x1B, 0x5B, b'B', 0x1B, 0x5B, b'C', 0x1B, 0x5B, b'D'];
+        let data = [
+            0x1B, 0x5B, b'A', 0x1B, 0x5B, b'B', 0x1B, 0x5B, b'C', 0x1B, 0x5B, b'D',
+        ];
         let cmds = parser().parse(&data);
         assert_eq!(cmds.len(), 4);
         assert_eq!(cmds[0], KeyPress::ArrowUp);

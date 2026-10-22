@@ -24,8 +24,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer as _, SigningKey};
 use hyprstream_rpc::wasm_token_exchange::{
-    ed25519_dpop_jkt, fetch_exchange_token, verify_sender_bound_token, TokenType,
-    ISSUED_TOKEN_TYPE,
+    ed25519_dpop_jkt, fetch_exchange_token, verify_sender_bound_token, TokenType, ISSUED_TOKEN_TYPE,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_test::*;
@@ -85,13 +84,18 @@ extern "C" {
 /// on the next call).
 fn make_sign_fn(
     signing_key: SigningKey,
-) -> (js_sys::Function, Closure<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>) {
-    let closure = Closure::wrap(Box::new(move |input: js_sys::Uint8Array| -> js_sys::Promise {
-        let bytes = input.to_vec();
-        let signature = signing_key.sign(&bytes).to_bytes();
-        let array = js_sys::Uint8Array::from(signature.as_slice());
-        js_sys::Promise::resolve(&JsValue::from(array))
-    }) as Box<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>);
+) -> (
+    js_sys::Function,
+    Closure<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>,
+) {
+    let closure = Closure::wrap(
+        Box::new(move |input: js_sys::Uint8Array| -> js_sys::Promise {
+            let bytes = input.to_vec();
+            let signature = signing_key.sign(&bytes).to_bytes();
+            let array = js_sys::Uint8Array::from(signature.as_slice());
+            js_sys::Promise::resolve(&JsValue::from(array))
+        }) as Box<dyn FnMut(js_sys::Uint8Array) -> js_sys::Promise>,
+    );
     let function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
     (function, closure)
 }
@@ -170,24 +174,30 @@ async fn browser_fetch_success_after_nonce_retry_exact_request_shape() {
         let body = call["body"].as_str().unwrap();
         assert!(body.contains("grant_type="), "{body}");
         assert!(body.contains("subject_token=subject-token-value"), "{body}");
-        assert!(
-            body.contains("client_id=hyprstream-browser-vfs"),
-            "{body}"
-        );
+        assert!(body.contains("client_id=hyprstream-browser-vfs"), "{body}");
         // #1425 r2 P2: the real fetch always sends the canonical resource.
         assert!(
             body.contains("resource=https%3A%2F%2Fas.example.test"),
             "resource missing/wrong in request body: {body}"
         );
         // The DPoP proof is a real, freshly signed 3-segment JWT.
-        let proof = call["headers"]["dpop"].as_str().expect("DPoP header present");
-        assert_eq!(proof.split('.').count(), 3, "DPoP proof must be header.payload.signature");
+        let proof = call["headers"]["dpop"]
+            .as_str()
+            .expect("DPoP header present");
+        assert_eq!(
+            proof.split('.').count(),
+            3,
+            "DPoP proof must be header.payload.signature"
+        );
     }
 
     // The retry proof must carry the nonce the first response returned.
     let first_proof = calls[0]["headers"]["dpop"].as_str().unwrap();
     let retry_proof = calls[1]["headers"]["dpop"].as_str().unwrap();
-    assert_ne!(first_proof, retry_proof, "the retry must be a freshly signed proof");
+    assert_ne!(
+        first_proof, retry_proof,
+        "the retry must be a freshly signed proof"
+    );
     let retry_payload = retry_proof.split('.').nth(1).unwrap();
     let retry_json: serde_json::Value =
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(retry_payload).unwrap()).unwrap();
@@ -229,7 +239,10 @@ async fn browser_fetch_rejects_bearer_response() {
     .await;
 
     let err = result.expect_err("a Bearer response must be rejected, not installed");
-    assert!(err.to_string().contains("DPoP"), "unexpected error: {err:#}");
+    assert!(
+        err.to_string().contains("DPoP"),
+        "unexpected error: {err:#}"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -270,5 +283,8 @@ async fn browser_fetch_rejects_foreign_key_binding() {
     .await;
 
     let err = result.expect_err("a token bound to a foreign key must be rejected, not installed");
-    assert!(err.to_string().contains("cnf.jkt"), "unexpected error: {err:#}");
+    assert!(
+        err.to_string().contains("cnf.jkt"),
+        "unexpected error: {err:#}"
+    );
 }

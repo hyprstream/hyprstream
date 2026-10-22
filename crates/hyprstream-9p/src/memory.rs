@@ -5,8 +5,8 @@
 //! exactly as it would drive a `ModelBackend` (capnp RPC), so tests exercise
 //! the full 9P codec + fid-table + dispatch path with no network.
 
-use std::collections::HashMap;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 
@@ -55,12 +55,19 @@ impl MemoryBackend {
         };
         files.insert(
             path_no_root.to_owned(),
-            FileEntry { bytes: contents.to_vec(), qid },
+            FileEntry {
+                bytes: contents.to_vec(),
+                qid,
+            },
         );
     }
 
     fn root_qid() -> Qid {
-        Qid { qtype: 0x80, version: 1, path: 0 } // QTDIR
+        Qid {
+            qtype: 0x80,
+            version: 1,
+            path: 0,
+        } // QTDIR
     }
 }
 
@@ -78,11 +85,21 @@ impl Backend for MemoryBackend {
             let mut fids = self.fids.lock();
             if let Some(link) = fids.get(&_fid).cloned() {
                 fids.insert(newfid, link);
-                return Ok(WalkResult { qids: Vec::new(), reached: Vec::new() });
+                return Ok(WalkResult {
+                    qids: Vec::new(),
+                    reached: Vec::new(),
+                });
             }
-            let link = FidLink { path: None, qid: Self::root_qid(), is_dir: true };
+            let link = FidLink {
+                path: None,
+                qid: Self::root_qid(),
+                is_dir: true,
+            };
             fids.insert(newfid, link);
-            return Ok(WalkResult { qids: vec![Self::root_qid()], reached: Vec::new() });
+            return Ok(WalkResult {
+                qids: vec![Self::root_qid()],
+                reached: Vec::new(),
+            });
         }
 
         let name = &components[0];
@@ -93,9 +110,16 @@ impl Backend for MemoryBackend {
         let qid = entry.qid.clone();
         drop(files);
 
-        let link = FidLink { path: Some(name.clone()), qid: qid.clone(), is_dir: false };
+        let link = FidLink {
+            path: Some(name.clone()),
+            qid: qid.clone(),
+            is_dir: false,
+        };
         self.fids.lock().insert(newfid, link);
-        Ok(WalkResult { qids: vec![qid], reached: vec![name.clone()] })
+        Ok(WalkResult {
+            qids: vec![qid],
+            reached: vec![name.clone()],
+        })
     }
 
     async fn open(&self, fid: u32, _flags: u32) -> anyhow::Result<OpenResult> {
@@ -103,7 +127,10 @@ impl Backend for MemoryBackend {
         let link = fids
             .get(&fid)
             .ok_or_else(|| anyhow::anyhow!("unknown fid {fid}"))?;
-        Ok(OpenResult { qid: link.qid.clone(), iounit: 8 * 1024 })
+        Ok(OpenResult {
+            qid: link.qid.clone(),
+            iounit: 8 * 1024,
+        })
     }
 
     async fn read(&self, fid: u32, offset: u64, count: u32) -> anyhow::Result<Vec<u8>> {
@@ -176,7 +203,12 @@ impl Backend for MemoryBackend {
             let len = files.get(&path).map(|e| e.bytes.len() as u64).unwrap_or(0);
             (len, 0o100644)
         };
-        Ok(StatResult { qid: link.qid.clone(), mode, size, mtime_sec: 0 })
+        Ok(StatResult {
+            qid: link.qid.clone(),
+            mode,
+            size,
+            mtime_sec: 0,
+        })
     }
 
     async fn readdir(&self, fid: u32, offset: u64, count: u32) -> anyhow::Result<Vec<u8>> {

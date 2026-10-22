@@ -185,7 +185,10 @@ pub fn bind_time_label(binder_floor: SecurityLabel, declared: SecurityLabel) -> 
 /// asserted label after perimeter translation into this node's lattice
 /// vocabulary.
 #[must_use]
-pub fn import_label(import_floor_for_that_peer: SecurityLabel, translated: SecurityLabel) -> SecurityLabel {
+pub fn import_label(
+    import_floor_for_that_peer: SecurityLabel,
+    translated: SecurityLabel,
+) -> SecurityLabel {
     import_floor_for_that_peer.join(&translated)
 }
 
@@ -231,7 +234,10 @@ mod tests {
             cid: vec![1, 2, 3],
             label: SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY),
         };
-        assert!(!m.verify_binding(), "unimplemented binding check must fail closed");
+        assert!(
+            !m.verify_binding(),
+            "unimplemented binding check must fail closed"
+        );
         assert_eq!(m.content_id(), &[1, 2, 3]);
     }
 
@@ -261,7 +267,8 @@ mod tests {
             Some(label(Level::Confidential))
         );
         assert!(
-            r.resolve(ObjectRef::Path(&["srv", "model", "unknown"])).is_none(),
+            r.resolve(ObjectRef::Path(&["srv", "model", "unknown"]))
+                .is_none(),
             "an unresolvable reference must deny, not fall back to a default label"
         );
         assert!(r.resolve(ObjectRef::Cid(&[9, 9, 9])).is_none());
@@ -285,7 +292,8 @@ mod tests {
         );
 
         // Declaring MORE restrictive than the floor is honored as declared.
-        let declared_high = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        let declared_high =
+            SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY);
         let effective_high = bind_time_label(floor, declared_high);
         assert_eq!(effective_high, declared_high.join(&floor));
     }

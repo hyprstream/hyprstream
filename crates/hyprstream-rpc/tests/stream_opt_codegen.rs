@@ -8,8 +8,8 @@
 
 use hyprstream_rpc::capnp::{FromCapnp, ToCapnp};
 use hyprstream_rpc::stream_info::{
-    Completion, Delivery, IrohReach, Job, Log, Ordering, OverflowPolicy, Pipe, QuicReach,
-    Destination, Retention, Role, StreamInfo, StreamOpt, StreamOptPreset, TransportConfig,
+    Completion, Delivery, Destination, IrohReach, Job, Log, Ordering, OverflowPolicy, Pipe,
+    QuicReach, Retention, Role, StreamInfo, StreamOpt, StreamOptPreset, TransportConfig,
 };
 
 /// Serialize a `StreamInfo` through a Cap'n Proto message and read it back.
@@ -42,6 +42,7 @@ fn sample_info(qos: StreamOpt) -> StreamInfo {
         dh_public: [7u8; 32],
         qos,
         broadcast_path: "local/streams/deadbeef".to_owned(),
+        moql_server_identity: Default::default(),
         // #554: classical DH-keyed sample — no hybrid KEM ciphertexts.
         kem_ciphertexts: Vec::new(),
         // #274: exercise the native-capnp reach codec (List(struct) + union + group).
@@ -52,6 +53,7 @@ fn sample_info(qos: StreamOpt) -> StreamInfo {
                 server_name: "hyprstream.local".to_owned(),
                 cert_hashes: vec![vec![0xABu8; 32], vec![0xCDu8; 32]],
             }),
+            moql_server_identity: Default::default(),
         }],
     }
 }
@@ -83,11 +85,18 @@ fn non_default_arms_roundtrip() {
     // Each axis exercised with a non-@0 arm, including all three group arms,
     // both scalar Retention arms, and the Void Completion::None arm.
     let qos = StreamOpt {
-        ordering: Ordering::Unordered { anti_replay_window: 7 },
-        delivery: Delivery::AtLeastOnce { dedup_window: 4096, resumable: true },
+        ordering: Ordering::Unordered {
+            anti_replay_window: 7,
+        },
+        delivery: Delivery::AtLeastOnce {
+            dedup_window: 4096,
+            resumable: true,
+        },
         completion: Completion::None,
         retention: Retention::Blocks(256),
-        overflow_policy: OverflowPolicy::DropOldest { high_water_mark: 1024 },
+        overflow_policy: OverflowPolicy::DropOldest {
+            high_water_mark: 1024,
+        },
     };
     assert_roundtrips(qos);
 
@@ -168,6 +177,7 @@ fn stream_info_iroh_reach_roundtrips() {
         dh_public: [3u8; 32],
         qos: StreamOpt::default(),
         broadcast_path: "local/streams/iroh".to_owned(),
+        moql_server_identity: Default::default(),
         // #554: non-empty hybrid-KEM ciphertexts so the round-trip proves the
         // Data field is carried through the capnp codec (not silently dropped).
         kem_ciphertexts: vec![0xABu8; 40],
@@ -178,6 +188,7 @@ fn stream_info_iroh_reach_roundtrips() {
                 alpn: "moql".to_owned(),
                 relay_url: "https://r.example".to_owned(),
             }),
+            moql_server_identity: Default::default(),
         }],
     };
     let back = roundtrip(&info);
@@ -189,8 +200,13 @@ fn group_arm_field_values_preserved() {
     // Explicitly assert the group-arm leaf values survive the round-trip
     // (not just structural equality), since group arms are the new codegen path.
     let info = sample_info(StreamOpt {
-        ordering: Ordering::Unordered { anti_replay_window: 42 },
-        delivery: Delivery::AtLeastOnce { dedup_window: 99, resumable: false },
+        ordering: Ordering::Unordered {
+            anti_replay_window: 42,
+        },
+        delivery: Delivery::AtLeastOnce {
+            dedup_window: 99,
+            resumable: false,
+        },
         overflow_policy: OverflowPolicy::DropOldest { high_water_mark: 8 },
         ..StreamOpt::default()
     });
@@ -201,7 +217,10 @@ fn group_arm_field_values_preserved() {
         other => panic!("expected Unordered, got {other:?}"),
     }
     match back.qos.delivery {
-        Delivery::AtLeastOnce { dedup_window, resumable } => {
+        Delivery::AtLeastOnce {
+            dedup_window,
+            resumable,
+        } => {
             assert_eq!(dedup_window, 99);
             assert!(!resumable);
         }

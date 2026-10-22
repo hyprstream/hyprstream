@@ -76,7 +76,7 @@ use hyprstream_vfs::Subject;
 
 use crate::error::{Result, WorkerError};
 
-use super::client::{KeyValue, PodSandboxConfig};
+use hyprstream_rpc_std::worker_client::{KeyValue, PodSandboxConfig};
 
 /// Annotation key: per-request GPU count demand (a plain non-negative
 /// integer string, e.g. `"1"`). Independent of `oci_backend`'s existing
@@ -348,9 +348,7 @@ fn check_feasible(
     max_sandboxes: usize,
 ) -> std::result::Result<(), String> {
     if max_sandboxes == 0 {
-        return Err(
-            "pool declares zero schedulable capacity (max_sandboxes = 0)".to_owned(),
-        );
+        return Err("pool declares zero schedulable capacity (max_sandboxes = 0)".to_owned());
     }
     if let Some(total) = cfg.cpu_millis_total {
         if demand.cpu_millis > total {
@@ -515,8 +513,7 @@ pub trait GroupSelectorValidator: Send + Sync + std::fmt::Debug {
     /// - `Ok(Some(group))` — selector validated: `subject` is a consented
     ///   member of `group`, which becomes the authoritative partition key.
     /// - `Err(_)` — selector present but `subject` is not a member → reject.
-    async fn validate(&self, subject: &Subject, selector: Option<&str>)
-        -> Result<Option<String>>;
+    async fn validate(&self, subject: &Subject, selector: Option<&str>) -> Result<Option<String>>;
 }
 
 /// Fail-closed default [`GroupSelectorValidator`]: denies every non-empty
@@ -529,11 +526,7 @@ pub struct DenyUnknownGroupValidator;
 
 #[async_trait]
 impl GroupSelectorValidator for DenyUnknownGroupValidator {
-    async fn validate(
-        &self,
-        _subject: &Subject,
-        selector: Option<&str>,
-    ) -> Result<Option<String>> {
+    async fn validate(&self, _subject: &Subject, selector: Option<&str>) -> Result<Option<String>> {
         match selector {
             None => Ok(None),
             Some(sel) => Err(WorkerError::AdmissionDenied {
@@ -571,11 +564,7 @@ impl StaticGroupMembership {
 
 #[async_trait]
 impl GroupSelectorValidator for StaticGroupMembership {
-    async fn validate(
-        &self,
-        subject: &Subject,
-        selector: Option<&str>,
-    ) -> Result<Option<String>> {
+    async fn validate(&self, subject: &Subject, selector: Option<&str>) -> Result<Option<String>> {
         match selector {
             None => Ok(None),
             Some(sel) => {
@@ -608,11 +597,7 @@ impl AdmissionTracker {
     /// production default until a membership-backed validator is wired
     /// (any group selector is rejected; the no-selector case is unaffected).
     pub fn new(config: AdmissionConfig, max_sandboxes: usize) -> Self {
-        Self::with_group_validator(
-            config,
-            max_sandboxes,
-            Arc::new(DenyUnknownGroupValidator),
-        )
+        Self::with_group_validator(config, max_sandboxes, Arc::new(DenyUnknownGroupValidator))
     }
 
     /// Construct with an explicit [`GroupSelectorValidator`] (e.g. one backed
@@ -765,8 +750,8 @@ impl AdmissionTracker {
                 None => continue,
             };
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let timed_out = remaining.is_zero()
-                || tokio::time::timeout(remaining, t.notified()).await.is_err();
+            let timed_out =
+                remaining.is_zero() || tokio::time::timeout(remaining, t.notified()).await.is_err();
             if timed_out {
                 let mut state = self.state.lock().await;
                 let was_head = state.queue.front().is_some_and(|h| Arc::ptr_eq(h, &t));
@@ -900,7 +885,10 @@ mod tests {
         let r_alice = tracker
             .reserve(&Subject::new("alice"), Some("team-a"), demand(0, 0, 0))
             .await;
-        assert!(r_alice.is_ok(), "member's selector must validate: {r_alice:?}");
+        assert!(
+            r_alice.is_ok(),
+            "member's selector must validate: {r_alice:?}"
+        );
         // A non-member asserting team-a is rejected — no cross-tenant quota
         // consumption.
         let r_bob = tracker
@@ -920,7 +908,10 @@ mod tests {
         let r_none = tracker
             .reserve(&Subject::new("alice"), None, demand(0, 0, 0))
             .await;
-        assert!(r_none.is_ok(), "absent selector must not partition: {r_none:?}");
+        assert!(
+            r_none.is_ok(),
+            "absent selector must not partition: {r_none:?}"
+        );
         // Any selector is rejected fail-closed (no membership source wired).
         let r_sel = tracker
             .reserve(&Subject::new("alice"), Some("team-a"), demand(0, 0, 0))
@@ -1118,7 +1109,10 @@ mod tests {
             .await
             .expect("dave should be admitted")
             .expect("task ok");
-        assert!(dave_res.is_ok(), "dave should have remained queued: {dave_res:?}");
+        assert!(
+            dave_res.is_ok(),
+            "dave should have remained queued: {dave_res:?}"
+        );
     }
 
     // ── F4: FIFO — arrivals never barge past queued waiters ────────────────
@@ -1162,7 +1156,10 @@ mod tests {
             .await
             .expect("bob should be woken")
             .expect("task ok");
-        assert!(bob_res.is_ok(), "earlier waiter bob must be admitted: {bob_res:?}");
+        assert!(
+            bob_res.is_ok(),
+            "earlier waiter bob must be admitted: {bob_res:?}"
+        );
 
         // carol must still be waiting (only one slot freed, bob took it — no
         // barging).
@@ -1178,7 +1175,10 @@ mod tests {
             .await
             .expect("carol should now be woken")
             .expect("task ok");
-        assert!(carol_res.is_ok(), "carol admitted once capacity frees: {carol_res:?}");
+        assert!(
+            carol_res.is_ok(),
+            "carol admitted once capacity frees: {carol_res:?}"
+        );
     }
 
     #[tokio::test]

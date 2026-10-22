@@ -61,7 +61,10 @@ async fn weight_fetch_roundtrip_lib() {
         merkle,
         xorb_hashes,
         bytes_stored,
-    } = store.put_file_bytes(&original).await.expect("put_file_bytes");
+    } = store
+        .put_file_bytes(&original)
+        .await
+        .expect("put_file_bytes");
     assert!(!xorb_hashes.is_empty(), "upload must yield >=1 xorb");
     assert!(bytes_stored > 0, "first upload writes new payload");
     // The server-computed merkle must be a valid 64-char hex MerkleHash.

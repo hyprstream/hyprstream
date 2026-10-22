@@ -61,7 +61,9 @@ pub fn build_mesh_pq_trust_store(oauth: &OAuthConfig) -> KeyedPqTrustStore {
         let pq_vk = match hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(&pq_bytes) {
             Ok(vk) => vk,
             Err(e) => {
-                tracing::error!("mesh_peer '{label}': invalid ML-DSA-65 verifying key, skipping: {e}");
+                tracing::error!(
+                    "mesh_peer '{label}': invalid ML-DSA-65 verifying key, skipping: {e}"
+                );
                 continue;
             }
         };
@@ -69,6 +71,47 @@ pub fn build_mesh_pq_trust_store(oauth: &OAuthConfig) -> KeyedPqTrustStore {
         tracing::info!("mesh_peer '{label}': anchored ML-DSA-65 key for Ed25519 signer identity");
     }
     store
+}
+
+/// Anchor the ML-DSA-65 keys carried by the node's own `bootstrap-pubkeys`
+/// entries into `store`, keyed by the Ed25519 signer identity each entry
+/// already anchors in the classical trust store.
+///
+/// The bootstrap file is OS-owned, written out-of-band by the provisioning
+/// wizard, so it satisfies the [`KeyedPqTrustStore`] contract exactly as
+/// `mesh_peers` does. Classical-only entries contribute nothing and clear
+/// nothing: anchoring is monotonic, so a legacy file left in place after a
+/// hybrid enrollment cannot downgrade an already-anchored service.
+///
+/// A missing or unreadable file yields zero bindings — the pre-hybrid
+/// behavior, unchanged.
+///
+/// Returns the number of identities anchored from the file.
+pub fn seed_bootstrap_pq_bindings(
+    store: &mut KeyedPqTrustStore,
+    credentials_dir: &std::path::Path,
+) -> usize {
+    let entries = match crate::auth::identity_store::load_bootstrap_pubkeys_hybrid(credentials_dir)
+    {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::error!(
+                "bootstrap-pubkeys could not be read for PQ anchoring, no bindings seeded \
+                 (re-run the provisioning wizard if hybrid services are expected): {e}"
+            );
+            return 0;
+        }
+    };
+
+    let mut anchored = 0usize;
+    for (name, entry) in &entries {
+        let ed_pubkey = entry.ed25519.to_bytes();
+        if store.register(ed_pubkey, entry.ml_dsa_65.as_ref()) && entry.is_hybrid() {
+            anchored += 1;
+            tracing::info!("bootstrap service '{name}': anchored ML-DSA-65 key for its Ed25519 signer identity");
+        }
+    }
+    anchored
 }
 
 /// Build the per-host mesh identity roster from the admin-configured
@@ -145,7 +188,10 @@ mod tests {
     fn empty_mesh_peers_yields_empty_store() {
         let oauth = OAuthConfig::default();
         let store = build_mesh_pq_trust_store(&oauth);
-        assert!(store.is_empty(), "absent mesh_peers must produce an empty store");
+        assert!(
+            store.is_empty(),
+            "absent mesh_peers must produce an empty store"
+        );
     }
 
     #[test]
@@ -163,7 +209,10 @@ mod tests {
 
         let oauth = oauth_with_peers(vec![(
             "peer-a",
-            MeshPeerConfig { ed25519_multibase: ed_mb, mldsa65_multibase: pq_mb },
+            MeshPeerConfig {
+                ed25519_multibase: ed_mb,
+                mldsa65_multibase: pq_mb,
+            },
         )]);
         let store = build_mesh_pq_trust_store(&oauth);
         assert_eq!(store.len(), 1, "one valid peer must produce one binding");
@@ -196,7 +245,10 @@ mod tests {
             },
         )]);
         let store = build_mesh_pq_trust_store(&oauth);
-        assert!(store.is_empty(), "malformed entry must be skipped, not trusted");
+        assert!(
+            store.is_empty(),
+            "malformed entry must be skipped, not trusted"
+        );
     }
 
     #[test]
@@ -213,7 +265,10 @@ mod tests {
         );
         let oauth = oauth_with_peers(vec![(
             "gpu-node-3",
-            MeshPeerConfig { ed25519_multibase: ed_mb, mldsa65_multibase: pq_mb },
+            MeshPeerConfig {
+                ed25519_multibase: ed_mb,
+                mldsa65_multibase: pq_mb,
+            },
         )]);
 
         let roster = build_mesh_identity_roster(&oauth);
@@ -236,7 +291,10 @@ mod tests {
             },
         )]);
         let roster = build_mesh_identity_roster(&oauth);
-        assert!(roster.is_empty(), "malformed entry must be skipped, not enrolled");
+        assert!(
+            roster.is_empty(),
+            "malformed entry must be skipped, not enrolled"
+        );
     }
 
     #[test]
@@ -253,5 +311,96 @@ mod tests {
         // Round-trips with the correct codec.
         let raw = decode_multikey(&ed_mb, &MULTICODEC_ED25519_PUB).unwrap();
         assert_eq!(raw, [7u8; 32]);
+    }
+
+    // ─── bootstrap-pubkeys PQ seeding ────────────────────────────────────────
+
+    fn write_entries(
+        dir: &std::path::Path,
+        entries: Vec<(&str, crate::auth::identity_store::BootstrapPubkey)>,
+    ) {
+        let map: std::collections::HashMap<String, _> = entries
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        crate::auth::identity_store::write_bootstrap_pubkeys_hybrid(dir, &map)
+            .expect("write bootstrap-pubkeys");
+    }
+
+    #[test]
+    fn hybrid_bootstrap_file_anchors_its_services() {
+        use crate::auth::identity_store::BootstrapPubkey;
+        use hyprstream_rpc::envelope::PqTrustStore;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ed = SigningKey::generate(&mut OsRng);
+        let (_pq_sk, pq_vk) = pq::ml_dsa_generate_keypair();
+        write_entries(
+            dir.path(),
+            vec![("policy", BootstrapPubkey::hybrid(ed.verifying_key(), pq_vk))],
+        );
+
+        let mut store = KeyedPqTrustStore::new();
+        let anchored = seed_bootstrap_pq_bindings(&mut store, dir.path());
+        assert_eq!(anchored, 1, "the hybrid entry must be anchored");
+        assert!(store
+            .ml_dsa_key_for(&ed.verifying_key().to_bytes())
+            .is_some());
+    }
+
+    #[test]
+    fn classical_bootstrap_file_anchors_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ed = SigningKey::generate(&mut OsRng);
+        write_entries(
+            dir.path(),
+            vec![(
+                "policy",
+                crate::auth::identity_store::BootstrapPubkey::classical(ed.verifying_key()),
+            )],
+        );
+
+        let mut store = KeyedPqTrustStore::new();
+        let anchored = seed_bootstrap_pq_bindings(&mut store, dir.path());
+        assert_eq!(anchored, 0, "a classical-only file must anchor nothing");
+        assert!(
+            store.is_empty(),
+            "a classical-only file must change nothing"
+        );
+    }
+
+    #[test]
+    fn absent_bootstrap_file_anchors_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = KeyedPqTrustStore::new();
+        assert_eq!(seed_bootstrap_pq_bindings(&mut store, dir.path()), 0);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_later_classical_file_cannot_unanchor_a_service() {
+        use crate::auth::identity_store::BootstrapPubkey;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ed = SigningKey::generate(&mut OsRng);
+        let (_pq_sk, pq_vk) = pq::ml_dsa_generate_keypair();
+
+        let mut store = KeyedPqTrustStore::new();
+        write_entries(
+            dir.path(),
+            vec![("policy", BootstrapPubkey::hybrid(ed.verifying_key(), pq_vk))],
+        );
+        assert_eq!(seed_bootstrap_pq_bindings(&mut store, dir.path()), 1);
+
+        // Re-seeding from a file that lost its PQ half must leave the anchor.
+        write_entries(
+            dir.path(),
+            vec![("policy", BootstrapPubkey::classical(ed.verifying_key()))],
+        );
+        seed_bootstrap_pq_bindings(&mut store, dir.path());
+        assert!(
+            store.is_anchored(&ed.verifying_key().to_bytes()),
+            "a classical re-registration must not clear an established anchor"
+        );
     }
 }

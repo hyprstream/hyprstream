@@ -121,9 +121,9 @@ impl XetProvenanceStore {
                 return Ok(());
             }
         }
-        self.persist().await.with_context(|| {
-            format!("failed to persist XET provenance for merkle {merkle_hex}")
-        })?;
+        self.persist()
+            .await
+            .with_context(|| format!("failed to persist XET provenance for merkle {merkle_hex}"))?;
         debug!(merkle = %merkle_hex, repo = %repo_id, "recorded XET provenance");
         Ok(())
     }
@@ -173,9 +173,12 @@ impl XetProvenanceStore {
             let _ = tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await;
         }
 
-        tokio::fs::rename(&tmp, &self.path)
-            .await
-            .with_context(|| format!("failed to rename provenance into place {}", self.path.display()))?;
+        tokio::fs::rename(&tmp, &self.path).await.with_context(|| {
+            format!(
+                "failed to rename provenance into place {}",
+                self.path.display()
+            )
+        })?;
         Ok(())
     }
 }
@@ -192,7 +195,9 @@ mod tests {
     const REPO_B: &str = "22222222-2222-2222-2222-222222222222";
 
     async fn store_in(dir: &Path) -> XetProvenanceStore {
-        tokio::fs::create_dir_all(dir.join(".registry")).await.unwrap();
+        tokio::fs::create_dir_all(dir.join(".registry"))
+            .await
+            .unwrap();
         XetProvenanceStore::load(dir).await.unwrap()
     }
 
@@ -237,7 +242,10 @@ mod tests {
         let dir = tempdir().unwrap();
         {
             let store = store_in(dir.path()).await;
-            store.record(&MERKLE_A.to_ascii_uppercase(), REPO_A).await.unwrap();
+            store
+                .record(&MERKLE_A.to_ascii_uppercase(), REPO_A)
+                .await
+                .unwrap();
         }
         let reloaded = XetProvenanceStore::load(dir.path()).await.unwrap();
         assert!(reloaded.is_bound(MERKLE_A, REPO_A).await);

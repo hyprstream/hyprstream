@@ -225,11 +225,9 @@ pub fn authority_log_and_checkpoint(
     let did = genesis
         .genesis_did()
         .expect("fixture genesis DidOp must derive a DID");
-    let verified = hyprstream_discovery::did_op::verify_did_op_log(
-        &did,
-        std::slice::from_ref(&genesis),
-    )
-    .expect("fixture genesis DidOp must verify");
+    let verified =
+        hyprstream_discovery::did_op::verify_did_op_log(&did, std::slice::from_ref(&genesis))
+            .expect("fixture genesis DidOp must verify");
     let log = json!({
         "schema": "hyprstream.deployment-authority-log.v1",
         "deployment_domain": domain,

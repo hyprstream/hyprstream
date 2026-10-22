@@ -7,8 +7,8 @@ use crate::errors::{Git2DBError, Git2DBResult};
 use crate::references::GitRef;
 use crate::registry::{Git2DB, RepoId, TrackedRepository};
 use crate::remote::RemoteManager;
-use crate::storage::{DriverOpts, WorktreeHandle};
 use crate::stage::StageManager;
+use crate::storage::{DriverOpts, WorktreeHandle};
 use git2::{Oid, Repository, Signature};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -287,7 +287,10 @@ impl<'a> RepositoryHandle<'a> {
         // Clone signature data to move into the blocking task
         // Note: Signature has a lifetime, so we need to extract the data
         let sig_name = signature.name().unwrap_or("Unknown").to_owned();
-        let sig_email = signature.email().unwrap_or("unknown@example.com").to_owned();
+        let sig_email = signature
+            .email()
+            .unwrap_or("unknown@example.com")
+            .to_owned();
         // Preserve the original timestamp from the signature
         let sig_time = signature.when();
         let sig_time_seconds = sig_time.seconds();
@@ -341,14 +344,7 @@ impl<'a> RepositoryHandle<'a> {
 
             // Create the commit
             let commit_oid = repo
-                .commit(
-                    Some("HEAD"),
-                    &sig,
-                    &sig,
-                    &message,
-                    &tree,
-                    &parent_refs,
-                )
+                .commit(Some("HEAD"), &sig, &sig, &message, &tree, &parent_refs)
                 .map_err(|e| Git2DBError::internal(format!("Failed to create commit: {e}")))?;
 
             Ok(commit_oid)
@@ -388,9 +384,13 @@ impl<'a> RepositoryHandle<'a> {
         tokio::task::spawn_blocking(move || {
             let repo = crate::manager::GitManager::global()
                 .get_repository(&repo_path)
-                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to get repository: {e}")))?
+                .map_err(|e| {
+                    Git2DBError::repository(&repo_path, format!("Failed to get repository: {e}"))
+                })?
                 .open()
-                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}")))?;
+                .map_err(|e| {
+                    Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
+                })?;
 
             // Get HEAD
             let head = repo.head().ok();
@@ -460,9 +460,13 @@ impl<'a> RepositoryHandle<'a> {
         tokio::task::spawn_blocking(move || {
             let repo = crate::manager::GitManager::global()
                 .get_repository(&repo_path)
-                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to get repository: {e}")))?
+                .map_err(|e| {
+                    Git2DBError::repository(&repo_path, format!("Failed to get repository: {e}"))
+                })?
                 .open()
-                .map_err(|e| Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}")))?;
+                .map_err(|e| {
+                    Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
+                })?;
 
             // Get default signature from the global GitManager
             let git_manager = crate::manager::GitManager::global();
@@ -473,17 +477,20 @@ impl<'a> RepositoryHandle<'a> {
                 .revparse_ext(&source)
                 .map_err(|e| Git2DBError::reference(&source, format!("Failed to find ref: {e}")))?;
 
-            let source_commit = obj
-                .peel_to_commit()
-                .map_err(|e| Git2DBError::reference(&source, format!("Failed to peel to commit: {e}")))?;
+            let source_commit = obj.peel_to_commit().map_err(|e| {
+                Git2DBError::reference(&source, format!("Failed to peel to commit: {e}"))
+            })?;
 
             // Get annotated commit for merge
             let source_annotated = repo
                 .find_annotated_commit(source_commit.id())
-                .map_err(|e| Git2DBError::internal(format!("Failed to find annotated commit: {e}")))?;
+                .map_err(|e| {
+                    Git2DBError::internal(format!("Failed to find annotated commit: {e}"))
+                })?;
 
             // Perform the merge analysis
-            let (analysis, _preference) = repo.merge_analysis(&[&source_annotated])
+            let (analysis, _preference) = repo
+                .merge_analysis(&[&source_annotated])
                 .map_err(|e| Git2DBError::internal(format!("Failed to analyze merge: {e}")))?;
 
             // Check if up-to-date
@@ -514,8 +521,9 @@ impl<'a> RepositoryHandle<'a> {
                 .map_err(|e| Git2DBError::internal(format!("Failed to get index: {e}")))?;
 
             if index.has_conflicts() {
-                repo.cleanup_state()
-                    .map_err(|e| Git2DBError::internal(format!("Failed to cleanup merge state: {e}")))?;
+                repo.cleanup_state().map_err(|e| {
+                    Git2DBError::internal(format!("Failed to cleanup merge state: {e}"))
+                })?;
                 return Err(Git2DBError::invalid_operation("Merge conflicts detected"));
             }
 
@@ -533,7 +541,9 @@ impl<'a> RepositoryHandle<'a> {
                 .head()
                 .map_err(|e| Git2DBError::internal(format!("Failed to get HEAD: {e}")))?
                 .peel_to_commit()
-                .map_err(|e| Git2DBError::internal(format!("Failed to resolve HEAD commit: {e}")))?;
+                .map_err(|e| {
+                    Git2DBError::internal(format!("Failed to resolve HEAD commit: {e}"))
+                })?;
 
             let merge_msg = message.unwrap_or_else(|| format!("Merge branch '{source}'"));
 
@@ -547,11 +557,14 @@ impl<'a> RepositoryHandle<'a> {
                     &tree,
                     &[&head, &source_commit],
                 )
-                .map_err(|e| Git2DBError::internal(format!("Failed to create merge commit: {e}")))?;
+                .map_err(|e| {
+                    Git2DBError::internal(format!("Failed to create merge commit: {e}"))
+                })?;
 
             // Cleanup merge state
-            repo.cleanup_state()
-                .map_err(|e| Git2DBError::internal(format!("Failed to cleanup merge state: {e}")))?;
+            repo.cleanup_state().map_err(|e| {
+                Git2DBError::internal(format!("Failed to cleanup merge state: {e}"))
+            })?;
 
             Ok(merge_oid)
         })
@@ -697,9 +710,7 @@ impl<'a> RepositoryHandle<'a> {
             GitRef::Tag(tag_name) => {
                 let reference = repo
                     .find_reference(&format!("refs/tags/{tag_name}"))
-                    .map_err(|e| {
-                        Git2DBError::reference(tag_name, format!("Tag not found: {e}"))
-                    })?;
+                    .map_err(|e| Git2DBError::reference(tag_name, format!("Tag not found: {e}")))?;
                 reference.peel_to_commit().map(|c| c.id()).map_err(|e| {
                     Git2DBError::reference(tag_name, format!("Failed to peel to commit: {e}"))
                 })
@@ -779,9 +790,9 @@ impl<'a> RepositoryHandle<'a> {
     /// ```
     pub async fn resolve_revspec(&self, spec: &str) -> Git2DBResult<Oid> {
         let repo = self.open_repo()?;
-        let obj = repo.revparse_single(spec).map_err(|e| {
-            Git2DBError::reference(spec, format!("Failed to resolve revspec: {e}"))
-        })?;
+        let obj = repo
+            .revparse_single(spec)
+            .map_err(|e| Git2DBError::reference(spec, format!("Failed to resolve revspec: {e}")))?;
         Ok(obj.id())
     }
 
@@ -834,7 +845,9 @@ impl<'a> RepositoryHandle<'a> {
         let driver = self.registry.storage_driver().clone();
 
         // Query storage driver directly for specific worktree
-        driver.get_worktree(&tracked_repo.worktree_path, branch).await
+        driver
+            .get_worktree(&tracked_repo.worktree_path, branch)
+            .await
     }
 
     /// Create a new worktree using the configured storage driver
@@ -896,7 +909,9 @@ impl<'a> RepositoryHandle<'a> {
                     if stats.processed > 0 || stats.skipped > 0 {
                         tracing::info!(
                             "XET fetch complete: {} processed, {} skipped, {} failed",
-                            stats.processed, stats.skipped, stats.failed
+                            stats.processed,
+                            stats.skipped,
+                            stats.failed
                         );
                         if stats.failed == 0 {
                             return Ok(());
@@ -952,7 +967,9 @@ impl<'a> RepositoryHandle<'a> {
                     if stats.processed > 0 || stats.skipped > 0 {
                         tracing::info!(
                             "XET fetch complete: {} processed, {} skipped, {} failed",
-                            stats.processed, stats.skipped, stats.failed
+                            stats.processed,
+                            stats.skipped,
+                            stats.failed
                         );
                         if stats.failed == 0 {
                             return Ok(());
@@ -982,11 +999,13 @@ impl<'a> RepositoryHandle<'a> {
             Git2DBError::internal("BUG: XET filter initialized but FILTER_CONFIG was not set")
         })?;
 
-        let storage = LfsStorage::new(&config).await.map_err(|e| {
-            Git2DBError::internal(format!("Failed to create LFS storage: {e}"))
-        })?;
+        let storage = LfsStorage::new(&config)
+            .await
+            .map_err(|e| Git2DBError::internal(format!("Failed to create LFS storage: {e}")))?;
 
-        storage.process_worktree_with_progress(repo_path, progress).await
+        storage
+            .process_worktree_with_progress(repo_path, progress)
+            .await
     }
 
     /// Try to fetch LFS files via XET
@@ -999,9 +1018,9 @@ impl<'a> RepositoryHandle<'a> {
             Git2DBError::internal("BUG: XET filter initialized but FILTER_CONFIG was not set")
         })?;
 
-        let storage = LfsStorage::new(&config).await.map_err(|e| {
-            Git2DBError::internal(format!("Failed to create LFS storage: {e}"))
-        })?;
+        let storage = LfsStorage::new(&config)
+            .await
+            .map_err(|e| Git2DBError::internal(format!("Failed to create LFS storage: {e}")))?;
 
         storage.process_worktree(repo_path).await
     }
@@ -1020,7 +1039,7 @@ impl<'a> RepositoryHandle<'a> {
         if !lfs_available {
             tracing::warn!("git-lfs not installed or not in PATH");
             return Err(Git2DBError::internal(
-                "git-lfs not available. Install with: sudo apt install git-lfs"
+                "git-lfs not available. Install with: sudo apt install git-lfs",
             ));
         }
 
@@ -1048,9 +1067,11 @@ impl<'a> RepositoryHandle<'a> {
 
             let error_msg = match exit_code {
                 128 => "git lfs pull failed (exit code 128): Authentication failed.\n\
-                     Check your git credentials or LFS endpoint.".to_owned(),
+                     Check your git credentials or LFS endpoint."
+                    .to_owned(),
                 1 => "git lfs pull failed (exit code 1): Network error.\n\
-                     Check network connectivity and LFS endpoint.".to_owned(),
+                     Check network connectivity and LFS endpoint."
+                    .to_owned(),
                 _ => format!(
                     "git lfs pull failed (exit code {exit_code}): Unknown error.\n\
                      Check logs above for details."
@@ -1129,7 +1150,10 @@ impl<'a> RepositoryHandle<'a> {
                     );
                     tracing::info!("Rolling back worktree creation due to LFS fetch failure");
                     if let Err(cleanup_err) = handle.cleanup().await {
-                        tracing::error!("Failed to cleanup worktree during rollback: {}", cleanup_err);
+                        tracing::error!(
+                            "Failed to cleanup worktree during rollback: {}",
+                            cleanup_err
+                        );
                     }
                     return Err(Git2DBError::internal(format!(
                         "Worktree creation failed: LFS fetch error: {e}. Worktree has been rolled back."
@@ -1138,9 +1162,16 @@ impl<'a> RepositoryHandle<'a> {
                 Ok(handle)
             }
             Err(e) => {
-                tracing::error!("Failed to create filtered worktree at {}: {}", worktree_path.display(), e);
+                tracing::error!(
+                    "Failed to create filtered worktree at {}: {}",
+                    worktree_path.display(),
+                    e
+                );
                 if worktree_path.exists() {
-                    tracing::info!("Cleaning up partial worktree at {}", worktree_path.display());
+                    tracing::info!(
+                        "Cleaning up partial worktree at {}",
+                        worktree_path.display()
+                    );
                     tokio::fs::remove_dir_all(worktree_path)
                         .await
                         .unwrap_or_else(|cleanup_err| {
@@ -1152,7 +1183,11 @@ impl<'a> RepositoryHandle<'a> {
         }
     }
 
-    pub async fn create_worktree(&self, worktree_path: &Path, branch: &str) -> Git2DBResult<WorktreeHandle> {
+    pub async fn create_worktree(
+        &self,
+        worktree_path: &Path,
+        branch: &str,
+    ) -> Git2DBResult<WorktreeHandle> {
         let tracked_repo = self.metadata()?;
 
         // When path is empty, derive from worktrees/{branch} (CLI passes "" to mean "use default")
@@ -1247,7 +1282,10 @@ impl<'a> RepositoryHandle<'a> {
                 );
 
                 if worktree_path.exists() {
-                    tracing::info!("Cleaning up partial worktree at {}", worktree_path.display());
+                    tracing::info!(
+                        "Cleaning up partial worktree at {}",
+                        worktree_path.display()
+                    );
                     tokio::fs::remove_dir_all(worktree_path)
                         .await
                         .unwrap_or_else(|cleanup_err| {

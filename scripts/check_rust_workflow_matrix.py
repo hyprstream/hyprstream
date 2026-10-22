@@ -228,6 +228,35 @@ def _assert(cond: bool, msg: str) -> None:
         raise AssertionError(msg)
 
 
+def _podman_quoted_script(job_block: str, job: str) -> str:
+    """Return the body of the job's single-quoted `bash -euo pipefail -c '…'` script.
+
+    Fails closed if the script opener or its closing quote line is missing.
+    The body is everything between the opener line and the first line that is
+    only a single quote — exactly what the container's bash receives, so an
+    assertion against the body reasons about what actually runs inside it.
+    """
+    lines = job_block.splitlines()
+    start: int | None = None
+    for i, line in enumerate(lines):
+        if line.rstrip().endswith("bash -euo pipefail -c '"):
+            start = i + 1
+            break
+    _assert(
+        start is not None,
+        f"rust.yml: job {job!r} must run its container commands in a "
+        "single-quoted bash script",
+    )
+    body: list[str] = []
+    for line in lines[start:]:
+        if line.strip() == "'":
+            return "\n".join(body)
+        body.append(line)
+    raise AssertionError(
+        f"rust.yml: job {job!r} single-quoted bash script is never closed"
+    )
+
+
 def check_rust_text(text: str) -> None:
     trigger_blocks = _on_blocks(text)
     triggers = set(trigger_blocks)
@@ -244,7 +273,7 @@ def check_rust_text(text: str) -> None:
         )
 
     jobs = _jobs_if_map(text)
-    for name in ("clippy", "deny", "loopback-burndown", "wasm", "build"):
+    for name in ("clippy", "deny", "loopback-burndown", "wasm", "build", "build-release"):
         _assert(name in jobs, f"rust.yml: required job {name!r} missing; got {sorted(jobs)}")
 
     skip_merge_group = "github.event_name!='merge_group'"
@@ -260,12 +289,14 @@ def check_rust_text(text: str) -> None:
         jobs.get("deny") is None,
         f"rust.yml: 'deny' must run on every supported event (if={jobs.get('deny')!r})",
     )
-    build_if = jobs.get("build")
-    _assert(
-        _normalized_condition(build_if) == "github.event_name!='pull_request'",
-        f"rust.yml: 'build' condition must be exactly the pull_request skip "
-        f"(if={build_if!r})",
-    )
+    pull_request_skip = "github.event_name!='pull_request'"
+    for name in ("build", "build-release"):
+        cond = jobs.get(name)
+        _assert(
+            _normalized_condition(cond) == pull_request_skip,
+            f"rust.yml: job {name!r} condition must be exactly the pull_request "
+            f"skip (if={cond!r})",
+        )
 
     # The merge-gate runners provision a dedicated cache EBS volume at this
     # path. Every Rust container must bind it and direct Cargo's target there;
@@ -276,7 +307,7 @@ def check_rust_text(text: str) -> None:
         "-e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream",
     )
     job_blocks = _job_blocks(text)
-    for name in ("clippy", "wasm", "build"):
+    for name in ("clippy", "wasm", "build", "build-release"):
         block = job_blocks[name]
         for argument in required_cache_args:
             _assert(
@@ -295,6 +326,30 @@ def check_rust_text(text: str) -> None:
             re.search(r"\\\n[ \t]*#", block) is None,
             f"rust.yml: job {name!r} must not put comments inside continued shell commands",
         )
+
+    # #1257 (followup): the pds-postgres feature lint must run INSIDE the
+    # builder container's single-quoted script. An ASCII apostrophe anywhere
+    # in that script terminates the quote early (bash word-splitting on the
+    # outer shell), which is exactly how the feature lint once landed on the
+    # host and died with `cargo: command not found`. Pin both the placement
+    # and the apostrophe-free shape so the gate cannot silently regress to
+    # linting only default features — or failing spuriously — again.
+    clippy_script = _podman_quoted_script(job_blocks["clippy"], "clippy")
+    _assert(
+        "cargo clippy --all-targets -- -D warnings" in clippy_script,
+        "rust.yml: job 'clippy' must run the default-members lint inside the builder container",
+    )
+    _assert(
+        "cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings"
+        in clippy_script,
+        "rust.yml: job 'clippy' must run the pds-postgres feature lint inside "
+        "the builder container (not on the host, not after the closing quote)",
+    )
+    _assert(
+        "'" not in clippy_script,
+        "rust.yml: job 'clippy' container script must not contain an ASCII "
+        "apostrophe — it terminates the single-quoted bash script early",
+    )
 
 
 def check_appimage_text(text: str) -> None:
@@ -410,6 +465,19 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
             rust_text.replace("  build:\n", "  build_renamed:\n", 1),
         ),
         (
+            "rename build-release job (removing the release lane gate)",
+            rust_text.replace("  build-release:\n", "  build_release_renamed:\n", 1),
+        ),
+        (
+            "make build-release skip merge_group",
+            rust_text.replace(
+                "  build-release:\n    # MERGE GATE, release/feature-lane half",
+                "  build-release:\n    if: github.event_name == 'merge_group'\n"
+                "    # MERGE GATE, release/feature-lane half",
+                1,
+            ),
+        ),
+        (
             "drop merge-gate cache mount",
             rust_text.replace(
                 "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
@@ -442,6 +510,26 @@ def _rust_mutations(rust_text: str) -> list[tuple[str, str]]:
             rust_text.replace(
                 "          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
                 "          # unsafe inline comment \\\n          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \\\n",
+                1,
+            ),
+        ),
+        (
+            "apostrophe terminates the quoted clippy script early",
+            rust_text.replace(
+                "`pds-postgres`) is cfg-gated",
+                "`pds-postgres`) is cfg'd",
+                1,
+            ),
+        ),
+        (
+            "pds-postgres lint moved outside the quoted script",
+            rust_text.replace(
+                "            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings\n",
+                "",
+                1,
+            ).replace(
+                "          '\n",
+                "          '\n            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings\n",
                 1,
             ),
         ),

@@ -6,13 +6,16 @@ use std::env;
 use std::path::Path;
 use std::process::Command;
 
+#[path = "src/build_info.rs"]
+mod build_info;
+
 fn main() {
+    println!("cargo:rerun-if-env-changed=HYPRSTREAM_SOURCE_COMMIT");
     if std::env::var("DOCS_RS").is_ok() {
         return;
     }
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=schema/");
     println!("cargo:rerun-if-changed=../hyprstream-rpc/schema/streaming.capnp");
     println!("cargo:rerun-if-changed=../hyprstream-rpc/schema/optional.capnp");
     println!("cargo:rerun-if-changed=.git/HEAD");
@@ -23,61 +26,46 @@ fn main() {
 
     // Compile Cap'n Proto schemas
     compile_capnp_schemas();
-
-    // If using Python PyTorch or download-libtorch, tch-rs handles libtorch setup
-    if env::var("LIBTORCH_USE_PYTORCH").is_ok() || env::var("LIBTORCH").is_err() {
-        // tch-rs will handle libtorch setup
-        return;
-    }
-
-    let libtorch_path = match env::var("LIBTORCH") {
-        Ok(path) => path,
-        Err(_) => return, // Early return, should not happen due to check above
-    };
-
-    // Validate libtorch exists
-    let libtorch_dir = Path::new(&libtorch_path);
-    if !libtorch_dir.exists() {
-        panic!("libtorch directory not found at {libtorch_path}");
-    }
-
-    // Configure linking
-    println!("cargo:rustc-link-search=native={libtorch_path}/lib");
-    println!("cargo:rustc-env=LIBTORCH_STATIC=0");
-    println!("cargo:rustc-env=LIBTORCH_BYPASS_VERSION_CHECK=1");
 }
 
 fn compile_capnp_schemas() {
-    let schema_dir = Path::new("schema");
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let rpc_schema_dir = Path::new(&manifest_dir).join("../hyprstream-rpc/schema");
 
-    // Skip if schema directory doesn't exist
-    if !schema_dir.exists() {
-        return;
-    }
-
     let out_path = Path::new(&out_dir);
-    let import_paths: &[&Path] = &[&rpc_schema_dir, schema_dir];
-
-    // TUI-specific schemas only. Service schemas moved to hyprstream-rpc-std.
-    let schemas = ["tui", "compositor_ipc"];
 
     // Schemas from hyprstream-rpc/schema/ (need TS codegen but live in the RPC crate)
     let rpc_schemas = ["streaming", "nine"];
 
-    // Compile hyprstream schemas
-    hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);
-
     // Compile hyprstream-rpc schemas with rpc_schema_dir as src_prefix
-    hyprstream_rpc_build::compile_schemas(&rpc_schema_dir, out_path, import_paths, &rpc_schemas);
+    hyprstream_rpc_build::compile_schemas(
+        &rpc_schema_dir,
+        out_path,
+        &[&rpc_schema_dir],
+        &rpc_schemas,
+    );
 
     // Copy CGR files from hyprstream-rpc-std so the proc macro can find them.
     // DEP_HYPRSTREAM_RPC_STD_OUT_DIR is set by hyprstream-rpc-std's build.rs.
     if let Ok(std_out_dir) = env::var("DEP_HYPRSTREAM_RPC_STD_OUT_DIR") {
-        let std_schemas = ["inference", "model", "registry", "policy", "mcp",
-                          "metrics", "notification", "service_events", "chat_core", "oauth"];
+        let std_schemas = [
+            "inference",
+            "model",
+            "registry",
+            "policy",
+            "mcp",
+            "metrics",
+            "notification",
+            "service_events",
+            "chat_core",
+            "oauth",
+            "worker",
+            "workflow",
+            "discovery",
+            "tui",
+            "compositor_ipc",
+        ];
         for name in &std_schemas {
             let cgr_src = Path::new(&std_out_dir).join(format!("{name}.cgr"));
             let cgr_dst = out_path.join(format!("{name}.cgr"));
@@ -96,7 +84,25 @@ fn compile_capnp_schemas() {
     // Copy CGR files to stable codegen-out/ for TypeScript codegen
     let codegen_dir = Path::new(&manifest_dir).join("../../codegen-out");
     let _ = std::fs::create_dir_all(&codegen_dir);
-    for name in schemas.iter().chain(rpc_schemas.iter()) {
+    for name in [
+        "inference",
+        "model",
+        "registry",
+        "policy",
+        "mcp",
+        "metrics",
+        "service_events",
+        "chat_core",
+        "oauth",
+        "worker",
+        "workflow",
+        "discovery",
+        "tui",
+        "compositor_ipc",
+    ]
+    .iter()
+    .chain(rpc_schemas.iter())
+    {
         let cgr_path = out_path.join(format!("{name}.cgr"));
         if cgr_path.exists() {
             let _ = std::fs::copy(&cgr_path, codegen_dir.join(format!("{name}.cgr")));
@@ -111,8 +117,7 @@ fn compile_capnp_schemas() {
 /// - GIT_BRANCH: sanitized branch name (e.g., "main", "feature-auth")
 /// - GIT_DIRTY: "true" or "false"
 fn capture_git_info() {
-    // Get commit SHA (short)
-    let sha = Command::new("git")
+    let git_sha = Command::new("git")
         .args(["rev-parse", "--short=7", "HEAD"])
         .output()
         .ok()
@@ -121,17 +126,17 @@ fn capture_git_info() {
         .unwrap_or_default();
 
     // Get branch name
-    let branch = Command::new("git")
+    let git_branch = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .map(|b| if b == "HEAD" { String::new() } else { b }) // Detached HEAD
+        .map(|b| if b == "HEAD" { String::new() } else { b })
         .unwrap_or_default();
 
     // Check if worktree is dirty
-    let dirty = Command::new("git")
+    let git_dirty = Command::new("git")
         .args(["status", "--porcelain"])
         .output()
         .ok()
@@ -139,31 +144,30 @@ fn capture_git_info() {
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
 
+    let fallback = build_info::GitInfo {
+        sha: git_sha,
+        branch: git_branch,
+        dirty: git_dirty,
+    };
+    let source_commit = env::var_os("HYPRSTREAM_SOURCE_COMMIT").map(|value| {
+        value
+            .into_string()
+            .unwrap_or_else(|_| panic!("HYPRSTREAM_SOURCE_COMMIT must be valid UTF-8"))
+    });
+    let info = build_info::resolve(source_commit.as_deref(), fallback)
+        .unwrap_or_else(|error| panic!("invalid HYPRSTREAM_SOURCE_COMMIT: {error}"));
+
     // Sanitize branch name for filesystem safety
-    let sanitized_branch = sanitize_git_ref(&branch);
+    let sanitized_branch = sanitize_git_ref(&info.branch);
 
     // Export individual components as environment variables
-    println!("cargo:rustc-env=GIT_SHA={}", sha);
+    println!("cargo:rustc-env=GIT_SHA={}", info.sha);
     println!("cargo:rustc-env=GIT_BRANCH={}", sanitized_branch);
-    println!("cargo:rustc-env=GIT_DIRTY={}", dirty);
+    println!("cargo:rustc-env=GIT_DIRTY={}", info.dirty);
 
     // Build complete version string
     let cargo_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_owned());
-    let build_version = if sha.is_empty() {
-        cargo_version
-    } else {
-        let mut v = format!("{}+", cargo_version);
-        if !sanitized_branch.is_empty() {
-            v.push_str(&sanitized_branch);
-            v.push('.');
-        }
-        v.push('g');
-        v.push_str(&sha);
-        if dirty {
-            v.push_str(".dirty");
-        }
-        v
-    };
+    let build_version = build_info::build_version(&cargo_version, &info, &sanitized_branch);
     println!("cargo:rustc-env=BUILD_VERSION={}", build_version);
 }
 

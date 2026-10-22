@@ -108,15 +108,24 @@ const SPINNER_FRAMES: &[char] = &['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯
 fn tool_call_lines(tc: &ToolCallRecord, spinner_tick: u32) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let gear_style = Style::default().fg(Color::Yellow);
-    let ok_style   = Style::default().fg(Color::Green);
-    let err_style  = Style::default().fg(Color::Red);
+    let ok_style = Style::default().fg(Color::Green);
+    let err_style = Style::default().fg(Color::Red);
     let spin_style = Style::default().fg(Color::Cyan);
 
     // First line: ⚙ description  {args (truncated)}
     let args_display = {
         let a = tc.arguments.trim();
-        let end = a.char_indices().take(40).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(a.len());
-        if a.len() > end { format!("{}…", &a[..end]) } else { a.to_owned() }
+        let end = a
+            .char_indices()
+            .take(40)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(a.len());
+        if a.len() > end {
+            format!("{}…", &a[..end])
+        } else {
+            a.to_owned()
+        }
     };
     let header = Line::from(vec![
         Span::raw("  "),
@@ -142,8 +151,17 @@ fn tool_call_lines(tc: &ToolCallRecord, spinner_tick: u32) -> Vec<Line<'static>>
             } else {
                 ("\u{2713}", ok_style, r.as_str())
             };
-            let end = text.char_indices().take(80).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(text.len());
-            let display = if text.len() > end { format!("{}…", &text[..end]) } else { text.to_owned() };
+            let end = text
+                .char_indices()
+                .take(80)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(text.len());
+            let display = if text.len() > end {
+                format!("{}…", &text[..end])
+            } else {
+                text.to_owned()
+            };
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("{icon} "), style),
@@ -156,7 +174,12 @@ fn tool_call_lines(tc: &ToolCallRecord, spinner_tick: u32) -> Vec<Line<'static>>
 }
 
 /// Build all display lines for one history entry.
-fn entry_lines(entry: &ChatHistoryEntry, width: usize, show_thinking: bool, spinner_tick: u32) -> Vec<Line<'static>> {
+fn entry_lines(
+    entry: &ChatHistoryEntry,
+    width: usize,
+    show_thinking: bool,
+    spinner_tick: u32,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // ── Tool message (injected result) ────────────────────────────────────
@@ -209,9 +232,9 @@ fn entry_lines(entry: &ChatHistoryEntry, width: usize, show_thinking: bool, spin
 
     // ── content ───────────────────────────────────────────────────────────
     let (prefix, prefix_style): (&str, Style) = match entry.role {
-        ChatRole::User      => ("You: ", theme::tab_active()),
+        ChatRole::User => ("You: ", theme::tab_active()),
         ChatRole::Assistant => ("AI:  ", Style::default().fg(Color::Cyan)),
-        ChatRole::Tool      => unreachable!("Tool messages handled above"),
+        ChatRole::Tool => unreachable!("Tool messages handled above"),
     };
 
     let content = &entry.content;
@@ -281,7 +304,12 @@ fn draw_history(frame: &mut Frame, area: Rect, app: &ChatApp) {
 
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     for entry in &app.history {
-        all_lines.extend(entry_lines(entry, width, app.show_thinking, app.spinner_tick));
+        all_lines.extend(entry_lines(
+            entry,
+            width,
+            app.show_thinking,
+            app.spinner_tick,
+        ));
     }
 
     let total = all_lines.len();
@@ -293,11 +321,8 @@ fn draw_history(frame: &mut Frame, area: Rect, app: &ChatApp) {
         tail_start.saturating_sub(app.scroll_offset)
     };
 
-    let display_lines: Vec<Line<'static>> = all_lines
-        .into_iter()
-        .skip(skip)
-        .take(visible)
-        .collect();
+    let display_lines: Vec<Line<'static>> =
+        all_lines.into_iter().skip(skip).take(visible).collect();
 
     let para = Paragraph::new(display_lines).style(Style::default().bg(theme::BG));
     frame.render_widget(para, area);
@@ -344,7 +369,9 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect, app: &ChatApp) {
     }
 
     let show_status = matches!(app.mode, ChatMode::Input)
-        && app.status.as_deref()
+        && app
+            .status
+            .as_deref()
             .map(|s| s != "Generating\u{2026}" && s != "Cancelled")
             .unwrap_or(false);
 
@@ -439,25 +466,32 @@ fn draw_settings_modal(frame: &mut Frame, area: Rect, app: &ChatApp) {
     let modal_area = Rect::new(x, y, modal_w.min(area.width), modal_h.min(area.height));
 
     frame.render_widget(Clear, modal_area);
-    let block = hyprstream_compositor::theme::modal_block(
-        Line::from(" Chat Settings  (Enter save \u{00b7} Esc cancel) "),
-    );
+    let block = hyprstream_compositor::theme::modal_block(Line::from(
+        " Chat Settings  (Enter save \u{00b7} Esc cancel) ",
+    ));
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
     let draft = &app.settings_draft;
     let field_defs: &[(&str, String)] = &[
-        ("Max Tokens",      format!("{}", draft.max_tokens)),
-        ("Temperature",     format!("{:.2}", draft.temperature)),
-        ("Top-P",           format!("{:.2}", draft.top_p)),
-        ("Top-K",           draft.top_k.map_or("off".to_owned(), |v| v.to_string())),
-        ("Context Window",  draft.context_window.map_or(
-            "model default".to_owned(),
-            |v| format!("{v}"),
-        )),
+        ("Max Tokens", format!("{}", draft.max_tokens)),
+        ("Temperature", format!("{:.2}", draft.temperature)),
+        ("Top-P", format!("{:.2}", draft.top_p)),
+        (
+            "Top-K",
+            draft.top_k.map_or("off".to_owned(), |v| v.to_string()),
+        ),
+        (
+            "Context Window",
+            draft
+                .context_window
+                .map_or("model default".to_owned(), |v| format!("{v}")),
+        ),
     ];
 
-    let sel_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let sel_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let dim_style = Style::default().fg(Color::DarkGray);
     let val_style = Style::default().fg(Color::White);
     let arrow_style = Style::default().fg(Color::Cyan);
@@ -470,12 +504,18 @@ fn draw_settings_modal(frame: &mut Frame, area: Rect, app: &ChatApp) {
             let cursor = if is_sel { "\u{25b6} " } else { "  " };
             let lbl_style = if is_sel { sel_style } else { dim_style };
             let (al, ar) = if is_sel {
-                (Span::styled("\u{2039} ", arrow_style), Span::styled(" \u{203a}", arrow_style))
+                (
+                    Span::styled("\u{2039} ", arrow_style),
+                    Span::styled(" \u{203a}", arrow_style),
+                )
             } else {
                 (Span::raw("  "), Span::raw("  "))
             };
             Line::from(vec![
-                Span::styled(cursor.to_owned(), if is_sel { sel_style } else { dim_style }),
+                Span::styled(
+                    cursor.to_owned(),
+                    if is_sel { sel_style } else { dim_style },
+                ),
                 Span::styled(format!("{:<16}", label), lbl_style),
                 al,
                 Span::styled(format!("{:>10}", value), val_style),
@@ -485,12 +525,10 @@ fn draw_settings_modal(frame: &mut Frame, area: Rect, app: &ChatApp) {
         .collect();
 
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  \u{2191}\u{2193} select  \u{2190}\u{2192} adjust",
-            dim_style,
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "  \u{2191}\u{2193} select  \u{2190}\u{2192} adjust",
+        dim_style,
+    )]));
 
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(BG_PANEL)),
@@ -501,18 +539,18 @@ fn draw_settings_modal(frame: &mut Frame, area: Rect, app: &ChatApp) {
 fn draw_editor_overlay(frame: &mut Frame, area: Rect, app: &ChatApp) {
     use ratatui::widgets::Clear;
     frame.render_widget(Clear, area);
-    let block = hyprstream_compositor::theme::modal_block(
-        Line::from(" Editor  (Ctrl-S save · Esc cancel) "),
-    );
+    let block = hyprstream_compositor::theme::modal_block(Line::from(
+        " Editor  (Ctrl-S save · Esc cancel) ",
+    ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     EDITOR_STATE.with(|cell| {
         let mut opt = cell.borrow_mut();
         if opt.is_none() {
-            *opt = Some(edtui::EditorState::new(
-                edtui::Lines::from(app.editor_text.as_str()),
-            ));
+            *opt = Some(edtui::EditorState::new(edtui::Lines::from(
+                app.editor_text.as_str(),
+            )));
         }
         if let Some(ref mut state) = *opt {
             edtui::EditorView::new(state)

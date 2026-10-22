@@ -30,7 +30,7 @@
 use anyhow::Result;
 use hyprstream_rpc::prelude::{FromCapnp, ToCapnp};
 
-use crate::worker_capnp;
+use hyprstream_rpc_std::worker_capnp;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Individual Event Types (with derive macros)
@@ -122,7 +122,8 @@ impl WorkerEvent {
         use capnp::serialize;
         use worker_capnp::worker_event;
 
-        let reader = serialize::read_message(&mut std::io::Cursor::new(bytes), ReaderOptions::new())?;
+        let reader =
+            serialize::read_message(&mut std::io::Cursor::new(bytes), ReaderOptions::new())?;
         let event = reader.get_root::<worker_event::Reader>()?;
 
         match event.which()? {

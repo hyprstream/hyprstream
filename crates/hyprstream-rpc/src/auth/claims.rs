@@ -53,20 +53,33 @@ pub struct CnfJwk {
     pub x: String,
 }
 
-/// RFC 8705 Proof-of-Possession `cnf` claim.
+/// RFC 8705 / RFC 8747 Proof-of-Possession `cnf` claim.
 ///
-/// Two key-binding modes:
-/// - `jwk`: Full OKP JWK object — used for WIMSE service WITs (`cnf.jwk`).
-/// - `jkt`: JWK Thumbprint (RFC 7638 SHA-256, base64url) — used for DPoP user
-///   tokens (`cnf.jkt`, per RFC 9449 § 6).
+/// Key-binding modes:
+/// - `jwk`: Full OKP JWK object — legacy single-Ed25519 binding (`cnf.jwk`).
+/// - `jkt`: JWK Thumbprint (RFC 7638 SHA-256, base64url) — DPoP user tokens
+///   (`cnf.jkt`, per RFC 9449 § 6).
+/// - `hs_signer_suite`: the generic v16 signer-suite content thumbprint (frozen WS-A
+///   credential-profile §1.1/§5) — base64url(SHA-256(det-CBOR `[suite_id,
+///   [ordered raw component public keys]]`)). In the frozen generic v16 profile,
+///   this is the ONLY confirmation method for a **hybrid** (multi-key) primary
+///   signer group; it also covers a classical (single-key) group. A generic v16
+///   dispatch credential MUST
+///   carry it. Computed via [`crate::auth::signer_suite_thumbprint`] — the one
+///   shared helper mint (WS-B) and verify (WS-C) both use. Legacy `jwk`/`jkt`
+///   are preserved ALONGSIDE it where those protocols still require them; adding
+///   `hs_signer_suite` never overwrites them. The opt-in Federate subprofile
+///   instead has one `cnf.jwk` key and a top-level `hs_signer_suite_v1` digest.
 ///
-/// Both fields are optional so the struct serialises correctly for each mode.
+/// All fields are optional so the struct serialises correctly for each mode.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Cnf {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwk: Option<CnfJwk>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jkt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_suite: Option<String>,
 }
 
 /// RFC 8693 §4.1 actor claim — the two-principal carrier for delegated calls
@@ -102,12 +115,19 @@ pub struct ActClaim {
     /// unlabeled ⇒ the delegated derivation **fails closed** (no default
     /// clearance for a missing principal; the S1 rule).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clearance: Option<crate::auth::mac::SecurityLabel>,
+    pub clearance: Option<crate::auth::mac::CredentialClearance>,
     /// Nested actor for multi-hop delegation (RFC 8693 §4.1). Boxed to keep
     /// [`Claims`] sized. Each hop composes into the clearance meet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<Box<ActClaim>>,
 }
+
+// v16 credentials are Reusable-only. The `OneShotTransaction` credential-use
+// profile and its atomic consume-(iss,cti) path were CUT from v16 scope
+// (operator decision `DECISION-defer-oneshot-credentials-2026-08-20`); if
+// exactly-once mutation semantics are needed later they return as a scoped
+// future amendment with its own claim allocation and review. Absence of any
+// use-profile == Reusable, so no field is carried.
 
 /// JWT claims for authentication.
 ///
@@ -134,9 +154,77 @@ pub struct Claims {
     /// RFC 7519 JWT ID — unique token identifier for revocation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
+    /// Registered OIDC session ID (`sid`) — groups an interactive session
+    /// whose access-token rotations share one revocable session. Absent on
+    /// standalone service credentials (no session lifecycle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    /// Signed generation for profiles that use server-side session authority.
+    /// Stateless Federate proof credentials use `hs_signer_inventory_v1`
+    /// instead. This is JWT-only; envelope claims cannot assert this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_session_authority_generation: Option<String>,
+    /// Exact opt-in Federate PoP/COSE subprofile. This is not authority on its
+    /// own; the reserved host path must verify the signed issuer and holder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_profile: Option<String>,
+    /// Federate-only top-level commitment to the ordered hybrid signer suite.
+    /// Unlike generic v16 `cnf.hs_signer_suite`, this is not a second RFC 7800
+    /// confirmation method: `cnf.jwk` remains the sole confirmation key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_suite_v1: Option<String>,
+    /// The public ML-DSA-65 half of the COSE proof key pair. It is safe to
+    /// carry in the issuer-signed credential and lets a verifier validate the
+    /// holder proof without resolving a session row just to recover a key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_pq_key_v1: Option<String>,
+    /// Digest of the issuer's trusted signer inventory at login. This expires
+    /// stale proof credentials after an inventory change without a session DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_signer_inventory_v1: Option<String>,
+    /// Signed login provenance. `sub` remains the canonical ATProto DID;
+    /// these claims retain the upstream OIDC identity used to establish it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_source_issuer_v1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_source_subject_v1: Option<String>,
+    /// TUI-consumer Federate profile (W1.3), deliberately namespaced
+    /// `hs_tui_*` and DISTINCT from every www `federate-session-v1`
+    /// suite/inventory marker above. A credential of the TUI client class
+    /// must NOT enter the deferred federate-session dispatch branch, so
+    /// none of these claims may ever appear in
+    /// [`Claims::has_federate_profile_marker`]: the TUI credential
+    /// authenticates through normal JWT verification with `cnf.jwk` holder
+    /// binding instead. The exact profile string pins the class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_tui_profile: Option<String>,
+    /// The public ML-DSA-65 half of the TUI holder's COSE proof key pair
+    /// (TUI-namespaced analogue of `hs_signer_pq_key_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_tui_signer_pq_key_v1: Option<String>,
+    /// Signed login provenance for the TUI class (TUI-namespaced analogue
+    /// of `hs_source_issuer_v1`/`hs_source_subject_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_tui_source_issuer_v1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hs_tui_source_subject_v1: Option<String>,
+    /// Workload credential family session ID (`workload_session_id`) — a
+    /// distinct namespace from OIDC `sid` (v16 §3.3). Present only on
+    /// credentials of an enrolled workload family (e.g. a service-JWT
+    /// renewal chain); a standalone service credential omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_session_id: Option<String>,
     /// RFC 8707 audience claim for resource indicator binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
+    /// RFC 9068 §2.2.1 `client_id` — the OAuth client the access token was
+    /// issued to. REQUIRED (non-empty) on locally issued `at+jwt` credentials
+    /// (v16 credential profile; JWT-only, no CWT mapping). Distinct from `aud`
+    /// (the RFC 8707 resource indicator) and from `sub` (the resource owner).
+    /// Absent on non-`at+jwt` credentials (e.g. `wit+jwt` service tokens) and
+    /// on the in-process empty-issuer provenance path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     /// OAuth 2.0 granted scope set, serialized as a space-delimited string.
     ///
     /// This is optional because non-OAuth service tokens do not originate from
@@ -182,7 +270,7 @@ pub struct Claims {
     /// clearance; the S1 fail-closed rule). Carried on the hybrid-signed
     /// envelope/JWT so it is itself PQ-forgery-resistant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clearance: Option<crate::auth::mac::SecurityLabel>,
+    pub clearance: Option<crate::auth::mac::CredentialClearance>,
 
     /// **Delegation actor (RFC 8693 §4.1 `act`, #680/#681).** Present iff this is
     /// a delegated (on-behalf-of) token: [`Self::sub`] is the delegator (source of
@@ -208,6 +296,74 @@ pub struct Claims {
     pub cap: Option<String>,
 }
 
+/// Fixed staging Federate issuer/client reservation. Keep these in the JWT
+/// verifier, not only Registry/Model, so a generation-stripped token cannot
+/// authenticate on another RPC, 9P, or HTTP entry point as a static token.
+pub const FEDERATE_STAGING_HOST: &str = "https://discovery.staging.lab.hyprstream.com";
+pub const FEDERATE_STAGING_CLIENT: &str = "cyberdione-www-staging";
+
+/// The deployment-configured Federate TUI client class id (W1.3), installed
+/// once per process from the trusted-issuer configuration at service
+/// startup (before any service factory runs). This is the authority-owned,
+/// marker-independent class reservation: the RPC layer classifies a
+/// credential naming this client id at a local issuer as TUI-class even with
+/// every TUI marker stripped, so the stripped shape can never fall through
+/// to generic handling. `None` (unconfigured deployment) leaves only the
+/// marker-set classification; nothing can mint the class then.
+static FEDERATE_TUI_CLASS_CLIENT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Install the TUI class reservation. Idempotent when the value matches a
+/// previous install (startup paths may run more than once); a conflicting
+/// re-install is an error (the class is an authority pin, never reseated).
+pub fn install_federate_tui_class_client(client_id: Option<&str>) -> anyhow::Result<()> {
+    let value = client_id.map(str::to_owned);
+    // get_or_init is race-safe; a conflicting re-install is still an error
+    // (the class is an authority pin, never reseated).
+    let existing = FEDERATE_TUI_CLASS_CLIENT.get_or_init(|| value.clone());
+    anyhow::ensure!(
+        *existing == value,
+        "federate TUI class client already installed with a different id"
+    );
+    Ok(())
+}
+
+/// The configured TUI class client id, or `None` when the class is
+/// unconfigured (or startup never installed the reservation).
+pub fn federate_tui_class_client() -> Option<&'static str> {
+    FEDERATE_TUI_CLASS_CLIENT.get().and_then(Option::as_deref)
+}
+
+/// Server-configured Federate API identity. Accept only an exact canonical
+/// HTTPS origin; never construct this authority from a request or JWT claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FederateHost(String);
+
+impl FederateHost {
+    pub fn new(configured: &str) -> anyhow::Result<Self> {
+        let parsed = url::Url::parse(configured)?;
+        anyhow::ensure!(
+            parsed.scheme() == "https"
+                && parsed.host_str().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && parsed.path() == "/"
+                && parsed.origin().ascii_serialization() == configured,
+            "Federate requires an exact canonical HTTPS origin"
+        );
+        Ok(Self(configured.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn token_endpoint(&self) -> String {
+        format!("{}/oauth/token", self.0)
+    }
+}
+
 // Custom Debug impl — NEVER log the bearer token
 impl std::fmt::Debug for Claims {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -218,7 +374,24 @@ impl std::fmt::Debug for Claims {
             .field("exp", &self.exp)
             .field("iat", &self.iat)
             .field("jti", &self.jti)
+            .field("sid", &self.sid)
+            .field(
+                "hs_session_authority_generation",
+                &self.hs_session_authority_generation,
+            )
+            .field("hs_profile", &self.hs_profile)
+            .field("hs_signer_suite_v1", &self.hs_signer_suite_v1)
+            .field("hs_signer_pq_key_v1", &self.hs_signer_pq_key_v1)
+            .field("hs_signer_inventory_v1", &self.hs_signer_inventory_v1)
+            .field("hs_source_issuer_v1", &self.hs_source_issuer_v1)
+            .field("hs_source_subject_v1", &self.hs_source_subject_v1)
+            .field("hs_tui_profile", &self.hs_tui_profile)
+            .field("hs_tui_signer_pq_key_v1", &self.hs_tui_signer_pq_key_v1)
+            .field("hs_tui_source_issuer_v1", &self.hs_tui_source_issuer_v1)
+            .field("hs_tui_source_subject_v1", &self.hs_tui_source_subject_v1)
+            .field("workload_session_id", &self.workload_session_id)
             .field("aud", &self.aud)
+            .field("client_id", &self.client_id)
             .field("scope", &self.scope)
             .field("cnf", &self.cnf)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
@@ -303,6 +476,7 @@ impl FromCapnp for Claims {
                     x: x.to_owned(),
                 }),
                 jkt: None,
+                hs_signer_suite: None,
             });
 
         Ok(Self {
@@ -314,7 +488,23 @@ impl FromCapnp for Claims {
             exp: reader.get_exp(),
             iat: reader.get_iat(),
             jti: None,
+            // `sid` / `workload_session_id` are JWT-carried, like `jti`;
+            // the envelope Claims surface does not carry them.
+            sid: None,
+            hs_session_authority_generation: None,
+            hs_profile: None,
+            hs_signer_suite_v1: None,
+            hs_signer_pq_key_v1: None,
+            hs_signer_inventory_v1: None,
+            hs_source_issuer_v1: None,
+            hs_source_subject_v1: None,
+            hs_tui_profile: None,
+            hs_tui_signer_pq_key_v1: None,
+            hs_tui_source_issuer_v1: None,
+            hs_tui_source_subject_v1: None,
+            workload_session_id: None,
             aud,
+            client_id: None,
             // The dedicated OAuth field preserves the signed grant ceiling;
             // the legacy structured scope list remains unused by Claims.
             scope,
@@ -334,6 +524,33 @@ impl FromCapnp for Claims {
     }
 }
 
+/// Session-claim parsing failure (v16 §3.3 exact-one rule). Any error is a
+/// malformed-credential rejection at a verification boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionClaimError {
+    /// Both `sid` and `workload_session_id` present — the namespaces are
+    /// disjoint; carrying both is ambiguous and never valid.
+    AmbiguousSessionClaims,
+    /// A present session identifier is empty or whitespace.
+    EmptySessionIdentifier,
+}
+
+impl std::fmt::Display for SessionClaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AmbiguousSessionClaims => write!(
+                f,
+                "credential carries both sid and workload_session_id (disjoint namespaces)"
+            ),
+            Self::EmptySessionIdentifier => {
+                write!(f, "session identifier is empty")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionClaimError {}
+
 impl Claims {
     /// Create new claims.
     pub fn new(sub: String, iat: i64, exp: i64) -> Self {
@@ -344,7 +561,21 @@ impl Claims {
             exp,
             iat,
             jti: None,
+            sid: None,
+            hs_session_authority_generation: None,
+            hs_profile: None,
+            hs_signer_suite_v1: None,
+            hs_signer_pq_key_v1: None,
+            hs_signer_inventory_v1: None,
+            hs_source_issuer_v1: None,
+            hs_source_subject_v1: None,
+            hs_tui_profile: None,
+            hs_tui_signer_pq_key_v1: None,
+            hs_tui_source_issuer_v1: None,
+            hs_tui_source_subject_v1: None,
+            workload_session_id: None,
             aud: None,
+            client_id: None,
             scope: None,
             cnf: None,
             token: None,
@@ -352,6 +583,21 @@ impl Claims {
             act: None,
             cap: None,
         }
+    }
+
+    /// Attach a delegation actor (RFC 8693 `act`).
+    pub fn with_actor(mut self, actor: Option<ActClaim>) -> Self {
+        self.act = actor;
+        self
+    }
+
+    /// The terminal (deepest) actor subject in the delegation chain, if any.
+    pub fn terminal_actor(&self) -> Option<&str> {
+        let mut current = self.act.as_ref()?;
+        while let Some(next) = current.act.as_deref() {
+            current = next;
+        }
+        Some(current.sub.as_str())
     }
 
     /// Set a random JWT ID (RFC 7519 `jti` claim) for revocation support.
@@ -362,6 +608,197 @@ impl Claims {
         rand::rngs::OsRng.fill_bytes(&mut bytes);
         self.jti = Some(URL_SAFE_NO_PAD.encode(bytes));
         self
+    }
+
+    /// Set the OIDC session ID (`sid` claim).
+    pub fn with_sid(mut self, sid: impl Into<String>) -> Self {
+        self.sid = Some(sid.into());
+        self
+    }
+
+    /// Set a session-authority generation in its one canonical encoding.
+    /// This does not make a token eligible for dispatch; profile, proof,
+    /// replay and Policy checks remain mandatory.
+    pub fn with_session_authority_generation(mut self, generation: [u8; 32]) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        self.hs_session_authority_generation = Some(URL_SAFE_NO_PAD.encode(generation));
+        self
+    }
+
+    /// Parse the signed generation without accepting padding, alternate
+    /// alphabets, truncation, or a wire-provided state locator.
+    pub fn session_authority_generation(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let Some(encoded) = self.hs_session_authority_generation.as_deref() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(encoded.len() == 43, "invalid session generation length");
+        let raw = URL_SAFE_NO_PAD.decode(encoded)?;
+        let generation: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid session generation length"))?;
+        anyhow::ensure!(
+            URL_SAFE_NO_PAD.encode(generation) == encoded,
+            "noncanonical session generation"
+        );
+        Ok(Some(generation))
+    }
+
+    /// Set the trusted signer-inventory digest for the stateless Federate
+    /// proof profile. This binds a short-lived credential to the host's current
+    /// verifier inventory without naming a database or session row.
+    pub fn with_federate_signer_inventory(mut self, inventory: [u8; 32]) -> Self {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        self.hs_signer_inventory_v1 = Some(URL_SAFE_NO_PAD.encode(inventory));
+        self
+    }
+
+    /// Parse the signed Federate signer-inventory digest in its sole canonical
+    /// base64url encoding. Callers decide whether the all-zero value is valid
+    /// for their configured inventory.
+    pub fn federate_signer_inventory(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let Some(encoded) = self.hs_signer_inventory_v1.as_deref() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            encoded.len() == 43,
+            "invalid signer inventory digest length"
+        );
+        let raw = URL_SAFE_NO_PAD.decode(encoded)?;
+        let inventory: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid signer inventory digest length"))?;
+        anyhow::ensure!(
+            URL_SAFE_NO_PAD.encode(inventory) == encoded,
+            "noncanonical signer inventory digest"
+        );
+        Ok(Some(inventory))
+    }
+
+    /// Recognize the fixed host/client even when one profile marker was
+    /// removed by a faulty issuer or token transformation.
+    pub fn is_reserved_federate_staging_credential(&self) -> bool {
+        self.is_reserved_federate_credential(FEDERATE_STAGING_HOST)
+    }
+
+    pub fn is_reserved_federate_credential(&self, configured_host: &str) -> bool {
+        self.iss == configured_host && self.client_id.as_deref() == Some(FEDERATE_STAGING_CLIENT)
+    }
+
+    /// Any signed Federate-only marker takes the deferred, fail-closed path;
+    /// stripping one marker cannot reinterpret the remaining token as generic.
+    ///
+    /// The TUI-consumer markers (`hs_tui_*`, W1.3) are deliberately NOT in
+    /// this set: a TUI-class credential authenticates through normal JWT
+    /// verification (with `cnf.jwk` holder binding), never through the
+    /// deferred federate-session dispatch branch. A TUI credential carrying
+    /// any www marker below still trips this check and is rejected in that
+    /// branch (it is not the reserved staging class); a www credential
+    /// carrying any TUI marker is rejected by the www proof consumer.
+    pub fn has_federate_profile_marker(&self) -> bool {
+        self.hs_session_authority_generation.is_some()
+            || self.hs_profile.is_some()
+            || self.hs_signer_suite_v1.is_some()
+            || self.hs_signer_pq_key_v1.is_some()
+            || self.hs_signer_inventory_v1.is_some()
+            || self.hs_source_issuer_v1.is_some()
+            || self.hs_source_subject_v1.is_some()
+    }
+
+    /// Any signed TUI-consumer marker. Used by the TUI profile consumer to
+    /// reject www-class credentials that smuggle TUI markers (mixed-marker
+    /// defense) and to require the complete TUI marker set.
+    pub fn has_federate_tui_profile_marker(&self) -> bool {
+        self.hs_tui_profile.is_some()
+            || self.hs_tui_signer_pq_key_v1.is_some()
+            || self.hs_tui_source_issuer_v1.is_some()
+            || self.hs_tui_source_subject_v1.is_some()
+    }
+
+    /// The COMPLETE TUI-consumer marker set. The mint stamps all four
+    /// unconditionally, so a classified credential with any marker missing
+    /// is never legitimate.
+    pub fn has_complete_federate_tui_profile(&self) -> bool {
+        self.hs_tui_profile.is_some()
+            && self.hs_tui_signer_pq_key_v1.is_some()
+            && self.hs_tui_source_issuer_v1.is_some()
+            && self.hs_tui_source_subject_v1.is_some()
+    }
+
+    /// Whether this credential is of the Federate TUI client class (W1.3):
+    /// it carries any TUI marker, OR it names the deployment-configured TUI
+    /// client id at a local issuer — the authority-owned, marker-independent
+    /// class pin, mirroring the www reserved (iss, client_id) predicate so a
+    /// class-shaped credential with every marker stripped still cannot fall
+    /// through to generic handling.
+    pub fn is_federate_tui_class(&self, local_issuers: &[&str]) -> bool {
+        self.has_federate_tui_profile_marker()
+            || (crate::auth::is_local_iss(&self.iss, local_issuers)
+                && federate_tui_class_client()
+                    .is_some_and(|client| self.client_id.as_deref() == Some(client)))
+    }
+
+    /// Stamp the TUI-consumer Federate profile marker set. Every claim is
+    /// TUI-namespaced and disjoint from the www `federate-session-v1`
+    /// suite/inventory markers, so the credential never enters the deferred
+    /// federate dispatch branch; the marker alone is never authority.
+    pub fn with_federate_tui_markers(
+        mut self,
+        pq_key_b64url: String,
+        source_issuer: String,
+        source_subject: String,
+    ) -> Self {
+        self.hs_tui_profile = Some("federate-tui-v1".to_owned());
+        self.hs_tui_signer_pq_key_v1 = Some(pq_key_b64url);
+        self.hs_tui_source_issuer_v1 = Some(source_issuer);
+        self.hs_tui_source_subject_v1 = Some(source_subject);
+        self
+    }
+
+    /// Stamp the exact Federate profile and its ordered hybrid-suite digest.
+    /// This marker alone is never authority; the reserved path also verifies
+    /// the signed source binding, holder proof, replay admission and live Policy.
+    pub fn with_federate_signer_suite(mut self, thumbprint_b64url: String) -> Self {
+        self.hs_profile = Some("federate-session-v1".to_owned());
+        self.hs_signer_suite_v1 = Some(thumbprint_b64url);
+        self
+    }
+
+    /// Set the workload credential family session ID
+    /// (`workload_session_id` claim) — enrolled workload families only.
+    pub fn with_workload_session_id(mut self, id: impl Into<String>) -> Self {
+        self.workload_session_id = Some(id.into());
+        self
+    }
+
+    /// The credential's session binding under exact-one parsing (v16 §3.3):
+    /// a credential carries AT MOST ONE session identifier, in a disjoint
+    /// namespace — OIDC `sid` (interactive) or `workload_session_id`
+    /// (enrolled workload family). Both-present is ambiguous and rejects;
+    /// a present-but-empty identifier is malformed and rejects. Neither is
+    /// `Ok(None)` (standalone credential, no session).
+    ///
+    /// Every authorization and cache-insertion path MUST use this parser —
+    /// never an `sid.or_else(workload_session_id)` chain, which would let an
+    /// active OIDC session mask a revoked or unknown workload session.
+    pub fn session_key(
+        &self,
+    ) -> std::result::Result<Option<super::credential::SessionKey>, SessionClaimError> {
+        let sid = self.sid.as_deref();
+        let wsid = self.workload_session_id.as_deref();
+        if sid.is_some() && wsid.is_some() {
+            return Err(SessionClaimError::AmbiguousSessionClaims);
+        }
+        if sid.is_some_and(|v| v.trim().is_empty()) || wsid.is_some_and(|v| v.trim().is_empty()) {
+            return Err(SessionClaimError::EmptySessionIdentifier);
+        }
+        Ok(match (sid, wsid) {
+            (Some(sid), None) => Some(super::credential::SessionKey::oidc(&self.iss, sid)),
+            (None, Some(id)) => Some(super::credential::SessionKey::workload(&self.iss, id)),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("both-present rejected above"),
+        })
     }
 
     /// Set the issuer URL (RFC 7519 `iss` claim).
@@ -383,6 +820,15 @@ impl Claims {
         self
     }
 
+    /// Set the RFC 9068 §2.2.1 `client_id` claim (the OAuth client the access
+    /// token was issued to). An empty/whitespace value is treated as absent so
+    /// a caller cannot satisfy the profile's non-empty requirement with a blank.
+    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
+        let value = client_id.into();
+        self.client_id = (!value.trim().is_empty()).then_some(value);
+        self
+    }
+
     /// Set the OAuth 2.0 granted scope claim.
     pub fn with_scope(mut self, scope: Option<String>) -> Self {
         self.scope = scope.filter(|value| !value.trim().is_empty());
@@ -394,7 +840,10 @@ impl Claims {
     /// An absent claim yields an empty iterator, keeping scope-based consumers
     /// fail closed for legacy and non-OAuth tokens.
     pub fn granted_scopes(&self) -> impl Iterator<Item = &str> {
-        self.scope.as_deref().into_iter().flat_map(str::split_whitespace)
+        self.scope
+            .as_deref()
+            .into_iter()
+            .flat_map(str::split_whitespace)
     }
 
     /// Return whether this token's signed grant contains `required` exactly.
@@ -414,14 +863,26 @@ impl Claims {
     /// OKP JWK object with `kty: "OKP"`, `crv: "Ed25519"`, `x: <base64url>`.
     pub fn with_cnf_jwk(mut self, key_bytes: &[u8; 32]) -> Self {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        self.cnf = Some(Cnf {
-            jwk: Some(CnfJwk {
-                kty: "OKP".to_owned(),
-                crv: "Ed25519".to_owned(),
-                x: URL_SAFE_NO_PAD.encode(key_bytes),
-            }),
-            jkt: None,
+        // Merge, never replace: a previously-stamped `hs_signer_suite` (or
+        // `jkt`) survives adding the legacy `jwk` binding, and vice versa.
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.jwk = Some(CnfJwk {
+            kty: "OKP".to_owned(),
+            crv: "Ed25519".to_owned(),
+            x: URL_SAFE_NO_PAD.encode(key_bytes),
         });
+        self.cnf = Some(cnf);
+        self
+    }
+
+    /// Set the v16 `cnf.hs_signer_suite` confirmation (frozen WS-A profile
+    /// §1.1/§5): the base64url signer-suite content thumbprint. Merged into any
+    /// existing `cnf` so a legacy `jwk`/`jkt` binding is preserved alongside it.
+    /// Compute `thumbprint_b64url` from [`crate::auth::signer_suite_thumbprint`].
+    pub fn with_cnf_hs_signer_suite(mut self, thumbprint_b64url: String) -> Self {
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.hs_signer_suite = Some(thumbprint_b64url);
+        self.cnf = Some(cnf);
         self
     }
 
@@ -431,10 +892,18 @@ impl Claims {
     /// computed per RFC 7638: SHA-256 of the lexicographic canonical JWK JSON,
     /// base64url-encoded.
     pub fn with_cnf_jkt(mut self, key_bytes: &[u8; 32]) -> Self {
-        self.cnf = Some(Cnf {
-            jwk: None,
-            jkt: Some(compute_jkt(key_bytes)),
-        });
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.jkt = Some(compute_jkt(key_bytes));
+        self.cnf = Some(cnf);
+        self
+    }
+
+    /// Set the RFC 9449 `cnf.jkt` from a PRE-COMPUTED thumbprint string (e.g. a
+    /// verified DPoP proof's `jkt`). Merged into any existing `cnf`.
+    pub fn with_cnf_jkt_thumbprint(mut self, jkt: String) -> Self {
+        let mut cnf = self.cnf.take().unwrap_or_default();
+        cnf.jkt = Some(jkt);
+        self.cnf = Some(cnf);
         self
     }
 
@@ -444,6 +913,21 @@ impl Claims {
     /// PQ-forgery-resistant; the assurance axis is NOT carried here — it is
     /// derived from the verified key material at enforcement time.
     pub fn with_clearance(mut self, clearance: crate::auth::mac::SecurityLabel) -> Self {
+        // Project to the two-axis wire form (level + compartments); the
+        // assurance axis is dropped — it is never issuer-asserted (v16 §11).
+        self.clearance = Some(crate::auth::mac::CredentialClearance::from_label(clearance));
+        self
+    }
+
+    /// Set the MAC clearance claim from its two-axis wire projection directly.
+    /// Used when FORWARDING an already-projected clearance (e.g. re-stamping a
+    /// verified source credential's clearance onto a derived ticket) — the
+    /// value is copied through unchanged. Prefer [`Self::with_clearance`] when
+    /// starting from a full `SecurityLabel`.
+    pub fn with_credential_clearance(
+        mut self,
+        clearance: crate::auth::mac::CredentialClearance,
+    ) -> Self {
         self.clearance = Some(clearance);
         self
     }
@@ -520,7 +1004,7 @@ impl Claims {
     /// is NOT thereby trusted to assert MAC clearance on this node — honoring it
     /// would let any trusted-for-identity federated IdP mint MAC clearance.
     /// Federated-path decode therefore drops the claim before the MAC PDP can
-    /// read it ([`crate::auth::mac::SubjectContextClaims::clearance_label`]
+    /// read it ([`crate::auth::mac::SubjectContextClaims::credential_clearance`]
     /// returns `None` ⇒ unlabeled ⇒ deny). Local-issuer tokens are unaffected.
     pub fn strip_federated_clearance(&mut self, local_issuers: &[&str]) {
         if !self.is_local_to(local_issuers) {
@@ -578,7 +1062,7 @@ impl Claims {
 // Classical — the load-bearing #548 invariant: assurance is a property of the
 // verified identity, not a grant.
 impl crate::auth::mac::SubjectContextClaims for Claims {
-    fn clearance_label(&self) -> Option<crate::auth::mac::SecurityLabel> {
+    fn credential_clearance(&self) -> Option<crate::auth::mac::CredentialClearance> {
         self.clearance
     }
 }
@@ -587,6 +1071,33 @@ impl crate::auth::mac::SubjectContextClaims for Claims {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn federate_host_requires_exact_canonical_https_origin() {
+        for host in [
+            FEDERATE_STAGING_HOST,
+            "https://vm-a.example",
+            "https://vm-b.example:8443",
+        ] {
+            let configured = FederateHost::new(host).unwrap();
+            assert_eq!(configured.as_str(), host);
+            assert_eq!(configured.token_endpoint(), format!("{host}/oauth/token"));
+        }
+        for host in [
+            "http://vm.example",
+            "https://vm.example/",
+            "https://VM.example",
+            "https://vm.example:443",
+            "https://user@vm.example",
+            "https://vm.example/path",
+            "https://vm.example?",
+            "https://vm.example#",
+            " https://vm.example",
+            "https://vm.example\\evil",
+        ] {
+            assert!(FederateHost::new(host).is_err(), "{host}");
+        }
+    }
 
     #[test]
     fn oauth_scope_claim_is_exact_and_absence_fails_closed() {
@@ -620,13 +1131,41 @@ mod tests {
     }
 
     #[test]
+    fn federate_profile_has_one_cnf_key_and_top_level_hybrid_commitment() {
+        let ed = [0x01; 32];
+        let claims = Claims::new("alice".to_owned(), 1000, 1300)
+            .with_cnf_jwk(&ed)
+            .with_federate_signer_suite("n47qkIMqPn-EuRo0YmrWkGFyyCY0UmVhKE19Bxbtt0U".to_owned());
+        let json = serde_json::to_value(&claims).unwrap();
+        assert_eq!(json["hs_profile"], "federate-session-v1");
+        assert_eq!(
+            json["hs_signer_suite_v1"],
+            "n47qkIMqPn-EuRo0YmrWkGFyyCY0UmVhKE19Bxbtt0U"
+        );
+        assert_eq!(json["cnf"].as_object().unwrap().len(), 1);
+        assert_eq!(json["cnf"]["jwk"]["kty"], "OKP");
+        assert_eq!(json["cnf"]["jwk"]["crv"], "Ed25519");
+        assert_eq!(
+            json["cnf"]["jwk"]["x"],
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+        );
+        assert!(json["cnf"].get("hs_signer_suite").is_none());
+        assert!(json["cnf"].get("jkt").is_none());
+        let decoded: Claims = serde_json::from_value(json).unwrap();
+        assert!(decoded.has_federate_profile_marker());
+    }
+
+    #[test]
     fn test_act_claim_serde_roundtrip_and_default_none() {
         // Non-delegated token: `act` absent, and (skip_serializing_if) omitted
         // from the JSON entirely — no empty `act` on the wire.
         let plain = Claims::new("alice".to_owned(), 1000, 2000);
         assert!(plain.act.is_none());
         let json = serde_json::to_string(&plain).unwrap();
-        assert!(!json.contains("\"act\""), "plain token must not carry act: {json}");
+        assert!(
+            !json.contains("\"act\""),
+            "plain token must not carry act: {json}"
+        );
 
         // Delegated token: sub = delegator (user), act = actor (service:mcp),
         // with a nested hop to exercise RFC 8693 §4.1 multi-hop.
@@ -645,7 +1184,11 @@ mod tests {
         let json = serde_json::to_string(&delegated).unwrap();
         let back: Claims = serde_json::from_str(&json).unwrap();
         assert_eq!(back.sub, "alice", "sub stays the delegator");
-        assert_eq!(back.act, Some(actor), "act round-trips including the nested hop");
+        assert_eq!(
+            back.act,
+            Some(actor),
+            "act round-trips including the nested hop"
+        );
         assert_eq!(
             back.cap.as_deref(),
             Some("infer@mac://model/qwen-7b"),
@@ -666,7 +1209,10 @@ mod tests {
             act: None,
         });
         let dbg = format!("{claims:?}");
-        assert!(dbg.contains("service:mcp"), "act is not secret, must be visible");
+        assert!(
+            dbg.contains("service:mcp"),
+            "act is not secret, must be visible"
+        );
         assert!(dbg.contains("act:"));
     }
 
@@ -704,11 +1250,7 @@ mod tests {
     };
 
     fn fu5_clearance() -> SecurityLabel {
-        SecurityLabel::new(
-            Level::Secret,
-            Assurance::PqHybrid,
-            CompartmentSet::EMPTY,
-        )
+        SecurityLabel::new(Level::Secret, Assurance::PqHybrid, CompartmentSet::EMPTY)
     }
 
     /// A federated token (issuer not in `local_issuers`) carrying a `clearance`
@@ -734,7 +1276,7 @@ mod tests {
             "a federated token's clearance MUST be ignored (Fu5/#677)"
         );
         assert!(
-            claims.clearance_label().is_none(),
+            claims.credential_clearance().is_none(),
             "the MAC PDP reads None ⇒ unlabeled ⇒ deny"
         );
     }
@@ -769,6 +1311,58 @@ mod tests {
         assert!(
             claims.clearance.is_none(),
             "an unconfigured node honors no clearance (deny-by-default)"
+        );
+    }
+
+    /// Exact-one session parsing (v16 §3.3): a credential carries AT MOST ONE
+    /// session identifier in a disjoint namespace. Both-present is ambiguous
+    /// and rejects (an active OIDC `sid` must never mask a revoked/unknown
+    /// `workload_session_id`); a present-but-empty identifier is malformed and
+    /// rejects; neither is `Ok(None)`. This is the single parser every
+    /// authorization and cache-insertion path uses — never `sid.or(wsid)`.
+    #[test]
+    fn session_key_is_exact_one_never_or_else() {
+        use crate::auth::credential::SessionIdentifier;
+        let base =
+            || Claims::new("alice".to_owned(), 0, 100).with_issuer("https://iss.test".to_owned());
+
+        // Neither → no session.
+        assert_eq!(base().session_key(), Ok(None));
+
+        // sid only → the OIDC namespace, issuer-scoped.
+        let oidc = base().with_sid("s1").session_key().unwrap().unwrap();
+        assert_eq!(oidc.issuer, "https://iss.test");
+        assert!(matches!(oidc.id, SessionIdentifier::OidcSid(ref v) if v == "s1"));
+
+        // workload id only → the disjoint workload namespace.
+        let wl = base()
+            .with_workload_session_id("w1")
+            .session_key()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(wl.id, SessionIdentifier::WorkloadSessionId(ref v) if v == "w1"));
+
+        // Both present → ambiguous, rejected (no masking).
+        assert_eq!(
+            base()
+                .with_sid("s1")
+                .with_workload_session_id("w1")
+                .session_key(),
+            Err(SessionClaimError::AmbiguousSessionClaims)
+        );
+
+        // Present-but-empty (or whitespace) identifier → malformed, rejected.
+        assert_eq!(
+            base().with_sid("").session_key(),
+            Err(SessionClaimError::EmptySessionIdentifier)
+        );
+        assert_eq!(
+            base().with_sid("   ").session_key(),
+            Err(SessionClaimError::EmptySessionIdentifier)
+        );
+        assert_eq!(
+            base().with_workload_session_id("").session_key(),
+            Err(SessionClaimError::EmptySessionIdentifier)
         );
     }
 
@@ -1073,7 +1667,7 @@ impl IdTokenClaims {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod id_token_tests {
     use super::*;
 
@@ -1152,5 +1746,90 @@ mod id_token_tests {
     fn test_one_or_many_collapse_single_element() {
         let aud = OneOrMany::from_vec(vec!["only-one".into()]);
         assert_eq!(aud, OneOrMany::One("only-one".into()));
+    }
+
+    // ── Delegation actor chain (RFC 8693 `act`) ─────────────────────────
+
+    /// `terminal_actor()` resolves the deepest hop of the delegation chain.
+    /// (v16 credentials are Reusable-only; the one-shot credential-use profile
+    /// was cut from scope — see the module comment.)
+    #[test]
+    fn terminal_actor_resolves_the_deepest_delegation_hop() {
+        let inner = ActClaim {
+            sub: "service:worker".into(),
+            clearance: None,
+            act: None,
+        };
+        let outer = ActClaim {
+            sub: "service:mcp".into(),
+            clearance: None,
+            act: Some(Box::new(inner)),
+        };
+        let c = Claims::new("user:alice".into(), 1000, 1030).with_actor(Some(outer));
+        assert_eq!(c.terminal_actor(), Some("service:worker"));
+
+        // No delegation chain resolves to no terminal actor.
+        let plain = Claims::new("user:alice".into(), 1000, 1030);
+        assert_eq!(plain.terminal_actor(), None);
+    }
+
+    #[test]
+    fn federate_generation_is_signed_jwt_only_and_canonical() {
+        let original = [0x42; 32];
+        let claims = Claims::new("alice".into(), 1, 2).with_session_authority_generation(original);
+        assert_eq!(
+            claims.session_authority_generation().unwrap(),
+            Some(original)
+        );
+        let json = serde_json::to_vec(&claims).unwrap();
+        let decoded: Claims = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            decoded.session_authority_generation().unwrap(),
+            Some(original)
+        );
+        let mut malformed = decoded.clone();
+        for bad in [
+            "",
+            "A",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
+        ] {
+            malformed.hs_session_authority_generation = Some(bad.into());
+            assert!(
+                malformed.session_authority_generation().is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        assert!(Claims::new("alice".into(), 1, 2)
+            .session_authority_generation()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn federate_signer_inventory_is_signed_jwt_only_and_canonical() {
+        let original = [0x24; 32];
+        let claims = Claims::new("alice".into(), 1, 2).with_federate_signer_inventory(original);
+        assert_eq!(claims.federate_signer_inventory().unwrap(), Some(original));
+        let json = serde_json::to_vec(&claims).unwrap();
+        let decoded: Claims = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.federate_signer_inventory().unwrap(), Some(original));
+        let mut malformed = decoded.clone();
+        for bad in [
+            "",
+            "A",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
+        ] {
+            malformed.hs_signer_inventory_v1 = Some(bad.into());
+            assert!(
+                malformed.federate_signer_inventory().is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        assert!(Claims::new("alice".into(), 1, 2)
+            .federate_signer_inventory()
+            .unwrap()
+            .is_none());
     }
 }

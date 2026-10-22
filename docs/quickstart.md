@@ -89,10 +89,10 @@ cargo build --release --features download-libtorch
 
 | Variant | URL |
 |---------|-----|
-| CPU | https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.10.0%2Bcpu.zip |
-| CUDA 12.8 | https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.10.0%2Bcu128.zip |
-| CUDA 13.0 | https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-2.10.0%2Bcu130.zip |
-| ROCm 7.1 | https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.10.0%2Brocm7.1.zip |
+| CPU | https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.11.0%2Bcpu.zip |
+| CUDA 12.8 | https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.11.0%2Bcu128.zip |
+| CUDA 13.0 | https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-2.11.0%2Bcu130.zip |
+| ROCm 7.1 | https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-2.11.0%2Brocm7.1.zip |
 
 Then:
 
@@ -140,7 +140,7 @@ Tip: `hyprstream service install --start` installs and starts the services in on
 
 ### 2. Run the setup wizard (required)
 
-The wizard is the first-time bootstrap: it creates the trust root and service credentials, applies policy templates, creates your user, and mints an API token. **Services will fail to start without the credentials the wizard creates.**
+The wizard is the first-time bootstrap: it creates this node's own signing key, a per-service keypair and CA-signed JWT for every registered service, applies policy templates, creates your user, and mints an API token. **Services will fail to start without the credentials the wizard creates.**
 
 Interactive (TUI auto-detected):
 
@@ -155,6 +155,8 @@ hyprstream wizard -y --start
 ```
 
 Running `hyprstream` with no subcommand on a fresh machine also launches the wizard automatically.
+
+**The wizard does not create deployment trust.** Every `hyprstream service start` (including the one `--start` above runs for you) additionally requires the deployment trust material described in [deployment-registry-trust.md](deployment-registry-trust.md) — by default the four OS-owned files under `/etc/hyprstream/trust/` — before it will come up; there is no dev bypass. Provision that once per deployment with the `hyprstream trust` commands in [deployment-trust-ceremony.md](deployment-trust-ceremony.md) (a software-recipient run is fine for local development; a hardware-token ceremony is required for anything real) before running the wizard's `--start`, or run it separately with `hyprstream service start` afterward.
 
 Additional policy templates can be applied later with `hyprstream quick policy apply-template <name>`, e.g.:
 

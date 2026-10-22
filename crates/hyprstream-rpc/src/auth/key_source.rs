@@ -30,7 +30,7 @@
 #![allow(clippy::disallowed_types)]
 
 use anyhow::Result;
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -97,6 +97,17 @@ pub trait JwtKeySource: Send + Sync + 'static {
         super::global_composite_key_set()
     }
 
+    /// Resolve the exact composite verification pair for a JOSE `kid`.
+    ///
+    /// The default consults the composite key ledger. Sources that also hold
+    /// an out-of-ledger CA composite pair (the service-JWT plane, where the
+    /// ML-DSA-65 half is derived from the CA JWT signing key rather than
+    /// rotated through the ledger) override this to consult it as well.
+    /// An unknown `kid` resolves to `None` — verification fails closed.
+    fn composite_pair(&self, kid: &str) -> Option<super::CompositeKeyPair> {
+        self.composite_key_set().snapshot().pair(kid).cloned()
+    }
+
     /// Return the list of `alg` values bound to a given `kid` in the JWKS.
     ///
     /// This is used as a **stripping defense**: when a JWKS entry carries a
@@ -138,6 +149,13 @@ pub struct ClusterKeySource {
     local_issuers_vec: Vec<String>,
     ml_dsa_vks: Arc<std::sync::RwLock<Vec<crate::crypto::pq::MlDsaVerifyingKey>>>,
     composite_keys: Arc<super::CompositeKeySet>,
+    /// Out-of-ledger CA composite pair for hybrid service-JWT verification.
+    ///
+    /// The CA's ML-DSA-65 half is derived from the CA JWT signing key rather
+    /// than rotated through the composite ledger, so the ledger never lists
+    /// its kid. Holding the exact pair here lets a hybrid service WIT resolve
+    /// without weakening the ledger: any other kid still fails closed.
+    ca_composite: Option<super::CompositeKeyPair>,
 }
 
 fn local_issuer_aliases(local_issuer_url: &str) -> Vec<String> {
@@ -172,6 +190,7 @@ impl ClusterKeySource {
             local_issuers_vec,
             ml_dsa_vks: Arc::new(std::sync::RwLock::new(Vec::new())),
             composite_keys: super::global_composite_key_set(),
+            ca_composite: None,
         }
     }
 
@@ -189,6 +208,32 @@ impl ClusterKeySource {
     /// Override the composite key ledger, primarily for isolated service instances.
     pub fn with_composite_key_set(mut self, keys: Arc<super::CompositeKeySet>) -> Self {
         self.composite_keys = keys;
+        self
+    }
+
+    /// Bind the CA's derived ML-DSA-65 verifying key so the CA composite kid
+    /// resolves to BOTH halves (this ML-DSA key + the CA Ed25519 key).
+    ///
+    /// This is how hybrid service WITs — signed by the exact pair
+    /// `(derived ML-DSA, CA Ed25519)` — verify on the dispatch plane. The
+    /// pair is registered under the Policy role: it belongs to the CA /
+    /// service-certification signing domain, so role-constrained consumers
+    /// (service-key certification, announcements) accept it while the
+    /// OAuth-role token-issuance domain stays separate.
+    pub fn with_ca_composite_key(
+        mut self,
+        ml_dsa_vk: crate::crypto::pq::MlDsaVerifyingKey,
+    ) -> Self {
+        let kid = super::jwt::composite_kid(&ml_dsa_vk, &self.ca_verifying_key);
+        self.ca_composite = Some(super::CompositeKeyPair::verifying(
+            kid,
+            ml_dsa_vk,
+            self.ca_verifying_key,
+            super::CompositePairRole::Policy,
+            super::CompositePairState::Active,
+            0,
+            i64::MAX,
+        ));
         self
     }
 
@@ -236,6 +281,17 @@ impl JwtKeySource for ClusterKeySource {
 
     fn composite_key_set(&self) -> Arc<super::CompositeKeySet> {
         self.composite_keys.clone()
+    }
+
+    fn composite_pair(&self, kid: &str) -> Option<super::CompositeKeyPair> {
+        if let Some(pair) = self.composite_keys.snapshot().pair(kid) {
+            return Some(pair.clone());
+        }
+        // Exact-kid match only: any other kid stays unresolvable (fail closed).
+        self.ca_composite
+            .as_ref()
+            .filter(|pair| pair.kid() == kid)
+            .cloned()
     }
 }
 
@@ -329,6 +385,10 @@ impl JwtKeySource for FederatedKeySource {
         self.local.composite_key_set()
     }
 
+    fn composite_pair(&self, kid: &str) -> Option<super::CompositeKeyPair> {
+        self.local.composite_pair(kid)
+    }
+
     fn kid_algs(&self, issuer: &str, kid: &str) -> Vec<String> {
         self.local.kid_algs(issuer, kid)
     }
@@ -420,6 +480,10 @@ pub struct JwksKeySource {
     /// rotated/JWKS-published key, and is irrelevant to federated issuers.
     local_ca_key: Option<VerifyingKey>,
     local_ca_kid: Option<String>,
+    /// Out-of-ledger CA composite pair for hybrid service-JWT verification —
+    /// the JWKS-backed twin of `ClusterKeySource::ca_composite`, and offline
+    /// for the same startup-ordering reason as `local_ca_key`.
+    local_ca_composite: Option<super::CompositeKeyPair>,
 }
 
 impl JwksKeySource {
@@ -438,6 +502,7 @@ impl JwksKeySource {
             ml_dsa_vks: Arc::new(std::sync::RwLock::new(Vec::new())),
             local_ca_key: None,
             local_ca_kid: None,
+            local_ca_composite: None,
         }
     }
 
@@ -459,6 +524,29 @@ impl JwksKeySource {
             },
         ));
         self.local_ca_key = Some(ca_vk);
+        self
+    }
+
+    /// Bind the CA's derived ML-DSA-65 verifying key so the CA composite kid
+    /// resolves to BOTH halves (this ML-DSA key + the CA Ed25519 key) for
+    /// hybrid service-JWT verification. Registered under the Policy role —
+    /// the CA / service-certification signing domain — exactly like
+    /// [`ClusterKeySource::with_ca_composite_key`].
+    pub fn with_local_ca_composite(
+        mut self,
+        ml_dsa_vk: crate::crypto::pq::MlDsaVerifyingKey,
+        ca_vk: VerifyingKey,
+    ) -> Self {
+        let kid = super::jwt::composite_kid(&ml_dsa_vk, &ca_vk);
+        self.local_ca_composite = Some(super::CompositeKeyPair::verifying(
+            kid,
+            ml_dsa_vk,
+            ca_vk,
+            super::CompositePairRole::Policy,
+            super::CompositePairState::Active,
+            0,
+            i64::MAX,
+        ));
         self
     }
 
@@ -592,7 +680,8 @@ impl JwksKeySource {
         // resolution must not depend on it. Never overrides a JWKS-published
         // (rotated) key because it's keyed on the exact CA thumbprint.
         if self.is_local(issuer) {
-            if let (Some(ca_kid), Some(ca_key)) = (self.local_ca_kid.as_deref(), self.local_ca_key) {
+            if let (Some(ca_kid), Some(ca_key)) = (self.local_ca_kid.as_deref(), self.local_ca_key)
+            {
                 if ca_kid == kid_str {
                     return Ok(ca_key);
                 }
@@ -745,6 +834,17 @@ impl JwtKeySource for JwksKeySource {
             .clone()
     }
 
+    fn composite_pair(&self, kid: &str) -> Option<super::CompositeKeyPair> {
+        if let Some(pair) = self.composite_key_set().snapshot().pair(kid) {
+            return Some(pair.clone());
+        }
+        // Exact-kid match only: any other kid stays unresolvable (fail closed).
+        self.local_ca_composite
+            .as_ref()
+            .filter(|pair| pair.kid() == kid)
+            .cloned()
+    }
+
     fn kid_algs(&self, issuer: &str, kid: &str) -> Vec<String> {
         self.kid_alg_map
             .read()
@@ -793,7 +893,9 @@ mod tests {
             Box::pin(async move { anyhow::bail!("network must not be used") })
         });
         let jwks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "https://pds.example.test/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "https://pds.example.test/oauth/jwks".to_owned(),
+            },
             configured.to_owned(),
             fetcher,
         )
@@ -859,18 +961,16 @@ mod tests {
 
         // Local issuer but a different kid -> CA fallback does NOT fire; the
         // JWKS fetch is attempted and fails -> error (not the CA key).
-        assert!(
-            ks.get_key("http://localhost:9080", Some("some-other-kid"))
-                .await
-                .is_err()
-        );
+        assert!(ks
+            .get_key("http://localhost:9080", Some("some-other-kid"))
+            .await
+            .is_err());
 
         // Non-local issuer is untrusted in isolated mode regardless of kid.
-        assert!(
-            ks.get_key("https://evil.example.com", Some("some-other-kid"))
-                .await
-                .is_err()
-        );
+        assert!(ks
+            .get_key("https://evil.example.com", Some("some-other-kid"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -992,7 +1092,7 @@ mod tests {
     /// kid-new/signed-by-kid-old substitution.
     #[tokio::test]
     async fn jwks_named_kid_cannot_substitute_another_published_key() -> anyhow::Result<()> {
-        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         use ed25519_dalek::Signer as _;
 
         let old = SigningKey::from_bytes(&[0x31; 32]);
@@ -1000,7 +1100,9 @@ mod tests {
         let new_kid = crate::auth::jwt::kid_for_key(&new);
         let jwks = mock_jwks_json(&[&old, &new]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
@@ -1038,13 +1140,18 @@ mod tests {
         let sk_b = SigningKey::from_bytes(&[0x22; 32]);
         let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
 
         let result = ks.get_key("http://localhost", None).await;
-        assert!(result.is_err(), "multi-key no-kid get_key must refuse arbitrary selection");
+        assert!(
+            result.is_err(),
+            "multi-key no-kid get_key must refuse arbitrary selection"
+        );
         let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(
             msg.contains("multiple Ed25519 keys") && msg.contains("no kid"),
@@ -1065,7 +1172,9 @@ mod tests {
 
         let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );
@@ -1091,7 +1200,9 @@ mod tests {
 
         let jwks = mock_jwks_json(&[&sk_a, &sk_b]);
         let ks = JwksKeySource::new(
-            JwksMode::Isolated { jwks_url: "http://localhost/oauth/jwks".to_owned() },
+            JwksMode::Isolated {
+                jwks_url: "http://localhost/oauth/jwks".to_owned(),
+            },
             "http://localhost".to_owned(),
             mock_fetcher(jwks),
         );

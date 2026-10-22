@@ -10,12 +10,12 @@
 use std::sync::Arc;
 
 use axum::{
-    Extension, Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Extension, Json,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signature, Signer as _, Verifier as _};
 use serde::{Deserialize, Serialize};
 
@@ -141,7 +141,21 @@ pub async fn exchange_workload_wit(
     if let Some(key) = bind_key {
         claims = claims.with_cnf_jwk(&key);
     }
-    let wit = hyprstream_rpc::auth::jwt::encode_service_jwt(&claims, &ca_key);
+    // Hybrid mint: this WIT is for calling local hyprstream services over the
+    // dispatch plane, whose mandatory Hybrid crypto policy rejects classical
+    // EdDSA tokens. (The JWT-SVID below stays EdDSA — it is consumed by
+    // external SPIFFE validators, not by the dispatch plane.)
+    let wit = match crate::auth::jwt::encode_service_jwt_hybrid_via_authority(&claims, &ca_key) {
+        Ok(wit) => wit,
+        Err(error) => {
+            tracing::warn!(%error, "WIT issuance refused: hybrid signing authority unavailable");
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                Some("WIT issuance not available — hybrid signing authority unavailable"),
+            );
+        }
+    };
 
     tracing::info!(
         source_issuer = %source.iss,
@@ -221,6 +235,9 @@ pub async fn issue_service_svid(
         iat: now,
         exp,
     };
+    // JWT-SVID stays classical EdDSA: it feeds the external SPIFFE interop
+    // contract (validated against the trust-domain bundle by SPIFFE-aware
+    // consumers), not the dispatch plane's Hybrid policy gate.
     let token = encode_jwt_svid(&claims, &signing_key);
 
     tracing::info!(

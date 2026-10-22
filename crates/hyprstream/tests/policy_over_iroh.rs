@@ -28,23 +28,23 @@ use git2db::Git2DB;
 use hyprstream_core::auth::PolicyManager;
 use hyprstream_core::config::TokenConfig;
 use hyprstream_core::services::PolicyService;
-use hyprstream_core::services::generated::policy_client::{
+use hyprstream_rpc_std::policy_client::{
     PolicyCheck, PolicyClient, RegisterEventPrefix, SubscribeEventPrefix,
 };
 
-use hyprstream_rpc::crypto::CryptoPolicy;
 use hyprstream_rpc::crypto::hybrid_kem::{KemTrustStore, KeyedKemTrustStore};
+use hyprstream_rpc::crypto::CryptoPolicy;
 use hyprstream_rpc::envelope::{
-    EnvelopeVerifyConfig, InMemoryNonceCache, KeyedPqTrustStore, PqTrustStore,
-    install_verify_config,
+    install_verify_config, EnvelopeVerifyConfig, InMemoryNonceCache, KeyedPqTrustStore,
+    PqTrustStore,
 };
 use hyprstream_rpc::node_identity::{derive_mesh_kem_recipient, derive_mesh_mldsa_key};
 use hyprstream_rpc::rpc_client::RpcClientImpl;
 use hyprstream_rpc::signer::LocalSigner;
-use hyprstream_rpc::transport::TransportConfig;
 use hyprstream_rpc::transport::iroh_rpc::{IrohRpcProtocolHandler, LocalServiceBridge};
-use hyprstream_rpc::transport::iroh_substrate::{ALPN_HYPRSTREAM_RPC, IrohSubstrate, NoopHandler};
+use hyprstream_rpc::transport::iroh_substrate::{IrohSubstrate, NoopHandler, ALPN_HYPRSTREAM_RPC};
 use hyprstream_rpc::transport::iroh_transport::IrohTransport;
+use hyprstream_rpc::transport::TransportConfig;
 
 use iroh::{EndpointAddr, TransportAddr};
 
@@ -167,10 +167,7 @@ struct TestTokenAuthority {
 impl TestTokenAuthority {
     fn new(
         root_signing_key: &SigningKey,
-    ) -> Result<(
-        Self,
-        Arc<hyprstream_rpc::auth::CompositeKeySet>,
-    )> {
+    ) -> Result<(Self, Arc<hyprstream_rpc::auth::CompositeKeySet>)> {
         use hyprstream_rpc::auth::{
             CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
         };
@@ -181,10 +178,7 @@ impl TestTokenAuthority {
         ));
         let (ml_dsa, ml_dsa_vk) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
         let ml_dsa = Arc::new(ml_dsa);
-        let kid = hyprstream_core::auth::jwt::composite_kid(
-            &ml_dsa_vk,
-            &ed25519.verifying_key(),
-        );
+        let kid = hyprstream_core::auth::jwt::composite_kid(&ml_dsa_vk, &ed25519.verifying_key());
         let pair = CompositeKeyPair::verifying(
             kid,
             ml_dsa_vk,
@@ -204,6 +198,7 @@ impl TestTokenAuthority {
         let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), now, now + 300)
             .with_issuer(TEST_ISSUER.to_owned())
             .with_tenant(tenant.to_owned())
+            .with_client_id("hyprstream-oauth-client-1")
             .with_cnf_jwk(signer.verifying_key().as_bytes());
         hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
             &claims,
@@ -214,10 +209,13 @@ impl TestTokenAuthority {
 
     fn service_token(&self, subject: &str, signer: &SigningKey) -> String {
         let now = chrono::Utc::now().timestamp();
+        // Service credentials are WIT (`wit+jwt`), never `at+jwt`: the
+        // type-driven client_id requirement exempts them by construction, so
+        // this helper must not normalize service:* subjects into at+jwt.
         let claims = hyprstream_rpc::auth::Claims::new(subject.to_owned(), now, now + 300)
             .with_issuer(TEST_ISSUER.to_owned())
             .with_cnf_jwk(signer.verifying_key().as_bytes());
-        hyprstream_core::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+        hyprstream_core::auth::jwt::encode_composite_service_jwt(
             &claims,
             &self.ml_dsa,
             &self.ed25519,
@@ -225,8 +223,7 @@ impl TestTokenAuthority {
     }
 }
 
-async fn make_policy_service_with_manager_and_authority(
-) -> Result<(
+async fn make_policy_service_with_manager_and_authority() -> Result<(
     PolicyService,
     Arc<PolicyManager>,
     SigningKey,
@@ -259,6 +256,16 @@ async fn make_policy_service_with_manager_and_authority(
         TransportConfig::inproc("policy-over-iroh-unused"),
     )
     .with_jwt_key_source(Arc::new(key_source));
+
+    // Mirror the production bootstrap: the policy process always publishes
+    // the credential-revocation store at startup. Client JWTs carry a jti
+    // (the composite encoder injects one), so `verify_claims` fails closed
+    // without it. Get-or-init: the OnceLock is per test-binary process.
+    if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+        let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+            hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+        ));
+    }
 
     Ok((service, policy_manager, signing_key, temp, authority))
 }
@@ -339,13 +346,9 @@ async fn client_for_key_with_jwt(
         .connect(server_addr, ALPN_HYPRSTREAM_RPC)
         .await?;
     let transport = IrohTransport::new(conn);
-    let mut rpc = RpcClientImpl::new(
-        LocalSigner::new(signing_key),
-        transport,
-        Some(server_vk),
-    )
-    .with_request_kem_store(request_kem_store)
-    .with_response_pq_store(response_pq_store);
+    let mut rpc = RpcClientImpl::new(LocalSigner::new(signing_key), transport, Some(server_vk))
+        .with_request_kem_store(request_kem_store)
+        .with_response_pq_store(response_pq_store);
     if let Some(jwt) = jwt {
         rpc = rpc.with_default_jwt(jwt);
     }
@@ -399,7 +402,10 @@ async fn policy_check_allow_and_deny_over_iroh() -> Result<()> {
             operation: "manage".to_owned(),
         })
         .await?;
-    assert!(!deny_resp, "ungranted operation must be denied: {deny_resp:?}");
+    assert!(
+        !deny_resp,
+        "ungranted operation must be denied: {deny_resp:?}"
+    );
 
     client_substrate.shutdown().await?;
     server.shutdown().await?;
@@ -440,8 +446,18 @@ async fn policy_concurrent_checks_over_iroh() -> Result<()> {
         ("service:unknown", "policy:ResolveServiceKey", "query", true),
         ("service:oauth", "policy:IssueToken", "manage", true),
         ("service:policy", "policy:IssueToken", "manage", true),
-        ("service:oauth", "registry:DeleteEverything", "manage", false),
-        ("service:policy", "registry:DeleteEverything", "manage", false),
+        (
+            "service:oauth",
+            "registry:DeleteEverything",
+            "manage",
+            false,
+        ),
+        (
+            "service:policy",
+            "registry:DeleteEverything",
+            "manage",
+            false,
+        ),
         ("alice", "model:secret", "infer.generate", false),
         ("alice", "metrics:secret", "write", false),
     ];
@@ -588,13 +604,7 @@ async fn verified_domain_grant_is_effective_over_rpc() -> Result<()> {
         make_policy_service_with_manager_and_authority().await?;
     // Grant exists ONLY in domain "tenant-a".
     manager
-        .add_policy_with_domain(
-            TENANT_A_SUBJECT,
-            "tenant-a",
-            "data:orders",
-            "read",
-            "allow",
-        )
+        .add_policy_with_domain(TENANT_A_SUBJECT, "tenant-a", "data:orders", "read", "allow")
         .await?;
 
     let server_vk = server_signing.verifying_key();
@@ -681,8 +691,24 @@ async fn verified_tenant_domains_isolate_pairwise_rpc_callers() -> Result<()> {
             .await?;
     }
     // This would authorize an anonymous request under the old wildcard path.
-    manager.add_policy_with_domain("anonymous", "*", "policy:RegisterEventPrefix", "manage", "allow").await?;
-    manager.add_policy_with_domain("anonymous", "*", "publish:events:alpha.*", "register", "allow").await?;
+    manager
+        .add_policy_with_domain(
+            "anonymous",
+            "*",
+            "policy:RegisterEventPrefix",
+            "manage",
+            "allow",
+        )
+        .await?;
+    manager
+        .add_policy_with_domain(
+            "anonymous",
+            "*",
+            "publish:events:alpha.*",
+            "register",
+            "allow",
+        )
+        .await?;
 
     let server_vk = server_signing.verifying_key();
     let (server, server_addr) = serve_over_iroh(service, &server_signing).await?;
@@ -708,7 +734,13 @@ async fn verified_tenant_domains_isolate_pairwise_rpc_callers() -> Result<()> {
         Some(client_b_jwt),
     )
     .await?;
-    let (anonymous_substrate, anonymous_policy) = client_for(server_addr, server_vk, policy_request_kem_store(&server_signing)?, pq_store).await?;
+    let (anonymous_substrate, anonymous_policy) = client_for(
+        server_addr,
+        server_vk,
+        policy_request_kem_store(&server_signing)?,
+        pq_store,
+    )
+    .await?;
 
     policy_a
         .register_event_prefix(&RegisterEventPrefix {
@@ -751,7 +783,10 @@ async fn verified_tenant_domains_isolate_pairwise_rpc_callers() -> Result<()> {
     let Err(err) = err else {
         panic!("domain-less request must not fall back to wildcard policy");
     };
-    assert!(err.to_string().contains("no verified tenant domain"), "domain-less caller must fail closed, got: {err}");
+    assert!(
+        err.to_string().contains("no verified tenant domain"),
+        "domain-less caller must fail closed, got: {err}"
+    );
 
     // Release every caller-owned RPC handle before draining the substrates
     // (matches `iroh_rpc::rpc_request_response_round_trip` and

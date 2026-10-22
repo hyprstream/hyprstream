@@ -4,10 +4,10 @@
 //! Implementations can be in-process (channels) or remote (gRPC, etc.).
 
 use crate::config::GenerationResult;
-use crate::runtime::GenerationRequest;
-use crate::runtime::ModelInfo;
 use crate::training::TenantDeltaConfig;
 use async_trait::async_trait;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
 use std::path::Path;
 use thiserror::Error;
 
@@ -22,7 +22,10 @@ pub trait InferenceClient: Send + Sync {
     // === Generation ===
 
     /// Generate text (non-streaming, blocking until complete).
-    async fn generate(&self, request: GenerationRequest) -> Result<GenerationResult, InferenceError>;
+    async fn generate(
+        &self,
+        request: GenerationRequest,
+    ) -> Result<GenerationResult, InferenceError>;
 
     /// Start streaming generation, returns handle to receive text chunks.
     async fn generate_stream(
@@ -145,4 +148,3 @@ impl From<anyhow::Error> for InferenceError {
         Self::Internal(e.to_string())
     }
 }
-

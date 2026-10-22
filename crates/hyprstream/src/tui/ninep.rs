@@ -254,7 +254,11 @@ pub fn walk_path(state: &TuiState, from: TuiNodeId, name: &str) -> Option<TuiNod
         (TuiNodeId::WindowsDir, id_str) => {
             let w: u32 = id_str.parse().ok()?;
             // Verify window exists in some session
-            state.sessions.iter().any(|s| s.window(w).is_some()).then_some(TuiNodeId::WindowDir(w))
+            state
+                .sessions
+                .iter()
+                .any(|s| s.window(w).is_some())
+                .then_some(TuiNodeId::WindowDir(w))
         }
         (TuiNodeId::WindowDir(w), "ctl") => Some(TuiNodeId::WindowCtl(w)),
         (TuiNodeId::WindowDir(w), "cons") => Some(TuiNodeId::WindowCons(w)),
@@ -265,7 +269,9 @@ pub fn walk_path(state: &TuiState, from: TuiNodeId, name: &str) -> Option<TuiNod
         (TuiNodeId::PanesDir(w), id_str) => {
             let p: u32 = id_str.parse().ok()?;
             // Verify pane exists
-            state.sessions.iter()
+            state
+                .sessions
+                .iter()
                 .flat_map(|s| s.windows.iter())
                 .find(|win| win.id == w)
                 .and_then(|win| win.pane(p))
@@ -296,9 +302,18 @@ mod tests {
         let wid = window.id;
         let pid = window.panes[0].id;
 
-        assert_eq!(walk_path(&state, TuiNodeId::Root, "ctl"), Some(TuiNodeId::Ctl));
-        assert_eq!(walk_path(&state, TuiNodeId::Root, "new"), Some(TuiNodeId::New));
-        assert_eq!(walk_path(&state, TuiNodeId::Root, "windows"), Some(TuiNodeId::WindowsDir));
+        assert_eq!(
+            walk_path(&state, TuiNodeId::Root, "ctl"),
+            Some(TuiNodeId::Ctl)
+        );
+        assert_eq!(
+            walk_path(&state, TuiNodeId::Root, "new"),
+            Some(TuiNodeId::New)
+        );
+        assert_eq!(
+            walk_path(&state, TuiNodeId::Root, "windows"),
+            Some(TuiNodeId::WindowsDir)
+        );
         assert_eq!(
             walk_path(&state, TuiNodeId::WindowsDir, &wid.to_string()),
             Some(TuiNodeId::WindowDir(wid))
@@ -372,7 +387,10 @@ mod tests {
     fn test_fid_table() {
         let mut table = TuiFidTable::new();
         let fid = table.walk(TuiNodeId::Ctl);
-        assert!(matches!(table.get(fid), Some(TuiFidState::Walked(TuiNodeId::Ctl))));
+        assert!(matches!(
+            table.get(fid),
+            Some(TuiFidState::Walked(TuiNodeId::Ctl))
+        ));
 
         assert!(table.open(fid, true, false, 0));
         assert!(matches!(table.get(fid), Some(TuiFidState::Opened { .. })));

@@ -8,10 +8,10 @@
 //!
 //! Two main services:
 //!
-//! - **WorkerService**: CRI-aligned RuntimeClient + ImageClient
+//! - **WorkerService**: AGPL implementation of the canonical worker contracts
 //!   - PodSandbox = Kata VM (maps to CRI sandbox concept)
 //!   - Container = OCI container within VM
-//!   - ImageClient backed by Nydus RAFS for chunk-level deduplication
+//!   - Image operations backed by Nydus RAFS for chunk-level deduplication
 //!
 //! - **WorkflowService**: High-level workflow orchestration
 //!   - Discovers `.github/workflows/*.yml` from RegistryService repos
@@ -28,7 +28,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use hyprstream_workers::{WorkerService, RuntimeClient, ImageClient};
+//! use hyprstream_workers::WorkerService;
 //!
 //! // Create worker service
 //! let worker = WorkerService::new(config).await?;
@@ -56,9 +56,9 @@ pub mod runtime;
 // `WorkerService` can hold `Option<Arc<dyn ImageStore>>` without any cfg
 // mirror (#646). The concrete `RafsStore` impl + its `submit!` are
 // `oci-image`-gated (they pull the nydus deps); the trait surface is not.
+pub mod events;
 pub mod image;
 pub mod workflow;
-pub mod events;
 
 #[cfg(feature = "dbus")]
 pub mod dbus;
@@ -68,31 +68,35 @@ pub use config::{HypervisorType, ImageConfig, PoolConfig, WorkerConfig, Workflow
 pub use error::WorkerError;
 
 // Re-export service types
-pub use runtime::{WorkerService, SandboxBackend, SandboxHandle};
 #[cfg(feature = "nspawn")]
 pub use runtime::{NspawnBackend, NspawnConfig};
+pub use runtime::{SandboxBackend, SandboxHandle, WorkerService};
 // Inventory-based backend registry + fail-closed selection spine (#507)
 pub use runtime::{resolve_backend, BackendCtx, BackendRegistration};
 // Scheduling-substrate explain (#628): the shared SelectionReport<C> trace.
-pub use runtime::{explain_selection, BackendCandidate};
 #[cfg(feature = "kata")]
 pub use runtime::KataBackend;
+pub use runtime::{explain_selection, BackendCandidate};
 // The image-store trait seam is always available; only the concrete RAFS impl
 // (`RafsStore`) requires `oci-image`.
-pub use image::{ImageBackendRegistration, ImageStore};
 #[cfg(feature = "oci-image")]
 pub use image::RafsStore;
+pub use image::{ImageBackendRegistration, ImageStore};
 
-pub use workflow::WorkflowService;
 pub use events::{
-    // Publisher/Subscriber (moq-backed, no ZMQ context needed)
-    EventPublisher, EventSubscriber,
+    serialize_container_started,
+    serialize_container_stopped,
+    serialize_sandbox_started,
+    serialize_sandbox_stopped,
+    ContainerStarted,
+    ContainerStopped,
+    ReceivedEvent,
+    SandboxStarted,
+    SandboxStopped,
     // Event types
-    WorkerEvent, ReceivedEvent,
-    SandboxStarted, SandboxStopped, ContainerStarted, ContainerStopped,
-    serialize_sandbox_started, serialize_sandbox_stopped,
-    serialize_container_started, serialize_container_stopped,
+    WorkerEvent,
 };
+pub use workflow::WorkflowService;
 // Re-export the moq event origin init function for the factory
 pub use hyprstream_rpc::moq_event::{init_global_moq_event_origin, MoqEventOrigin};
 
@@ -100,24 +104,6 @@ pub use hyprstream_rpc::moq_event::{init_global_moq_event_origin, MoqEventOrigin
 pub use hyprstream_rpc::annotations_capnp;
 pub use hyprstream_rpc::common_capnp;
 pub use hyprstream_rpc::streaming_capnp;
-
-/// Generated Cap'n Proto code for resource-scoped worker schema
-pub mod worker_capnp {
-    #![allow(dead_code, clippy::all, clippy::unwrap_used, clippy::expect_used)]
-    #![allow(clippy::match_same_arms, clippy::semicolon_if_nothing_returned)]
-    #![allow(clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/worker_capnp.rs"));
-}
-
-/// Generated Cap'n Proto code for workflow service schema
-pub mod workflow_capnp {
-    #![allow(dead_code, clippy::all, clippy::unwrap_used, clippy::expect_used)]
-    #![allow(clippy::match_same_arms, clippy::semicolon_if_nothing_returned)]
-    #![allow(clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    include!(concat!(env!("OUT_DIR"), "/workflow_capnp.rs"));
-}
 
 /// Generated RPC dispatch code from `generate_rpc_service!` proc macro.
 ///

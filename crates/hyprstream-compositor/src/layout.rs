@@ -40,8 +40,15 @@ pub struct ScrollUpdate {
 /// Decoded frame content (full or incremental).
 #[derive(Debug)]
 pub enum FrameContent {
-    Full { cols: u16, rows: u16, cells: Vec<CellUpdate> },
-    Incremental { scrolls: Vec<ScrollUpdate>, deltas: Vec<CellUpdate> },
+    Full {
+        cols: u16,
+        rows: u16,
+        cells: Vec<CellUpdate>,
+    },
+    Incremental {
+        scrolls: Vec<ScrollUpdate>,
+        deltas: Vec<CellUpdate>,
+    },
 }
 
 /// A fully decoded TuiFrame ready for the compositor to apply.
@@ -108,9 +115,7 @@ impl PaneState {
     pub fn server_buf(pane_id: u32, cols: u16, rows: u16) -> Self {
         Self {
             storage: PaneStorage::ServerBuf {
-                buf: ratatui::buffer::Buffer::empty(
-                    ratatui::layout::Rect::new(0, 0, cols, rows),
-                ),
+                buf: ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, cols, rows)),
                 cursor: CursorState::default(),
             },
             source: PaneSource::Server { pane_id },
@@ -154,7 +159,11 @@ pub struct LayoutTree {
 
 impl LayoutTree {
     pub fn new(cols: u16, rows: u16) -> Self {
-        Self { panes: HashMap::new(), cols, rows }
+        Self {
+            panes: HashMap::new(),
+            cols,
+            rows,
+        }
     }
 
     /// Get or create a server pane backed by ANSI VT (WASM / ANSI mode).
@@ -196,24 +205,23 @@ impl LayoutTree {
         let rows = self.rows;
         let pane_id = frame.pane_id;
 
-        let pane = self.panes
+        let pane = self
+            .panes
             .entry(pane_id)
             .or_insert_with(|| PaneState::server_buf(pane_id, cols, rows));
 
         // Upgrade ServerVt → ServerBuf if this pane was previously ANSI-fed.
         if matches!(pane.storage, PaneStorage::ServerVt(_)) {
             pane.storage = PaneStorage::ServerBuf {
-                buf: ratatui::buffer::Buffer::empty(
-                    ratatui::layout::Rect::new(0, 0, cols, rows),
-                ),
+                buf: ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, cols, rows)),
                 cursor: CursorState::default(),
             };
         }
 
         if let PaneStorage::ServerBuf { buf, cursor } = &mut pane.storage {
             apply_frame_to_buffer(buf, &frame.content);
-            cursor.x       = frame.cursor.x;
-            cursor.y       = frame.cursor.y;
+            cursor.x = frame.cursor.x;
+            cursor.y = frame.cursor.y;
             cursor.visible = frame.cursor.visible;
         }
     }
@@ -231,9 +239,9 @@ impl LayoutTree {
                         .build();
                 }
                 PaneStorage::ServerBuf { buf, .. } => {
-                    *buf = ratatui::buffer::Buffer::empty(
-                        ratatui::layout::Rect::new(0, 0, cols, rows),
-                    );
+                    *buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
+                        0, 0, cols, rows,
+                    ));
                 }
             }
         }
@@ -249,16 +257,14 @@ fn apply_frame_to_buffer(buf: &mut ratatui::buffer::Buffer, content: &FrameConte
     match content {
         FrameContent::Full { cols, rows, cells } => {
             // Replace the buffer entirely.
-            *buf = ratatui::buffer::Buffer::empty(
-                ratatui::layout::Rect::new(0, 0, *cols, *rows),
-            );
+            *buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, *cols, *rows));
             let width = *cols as usize;
             for cell in cells {
                 let idx = cell.y as usize * width + cell.x as usize;
                 if idx < buf.content.len() {
                     buf.content[idx].set_symbol(&cell.symbol);
-                    buf.content[idx].fg       = cell.fg;
-                    buf.content[idx].bg       = cell.bg;
+                    buf.content[idx].fg = cell.fg;
+                    buf.content[idx].bg = cell.bg;
                     buf.content[idx].modifier = cell.modifiers;
                 }
             }
@@ -272,8 +278,8 @@ fn apply_frame_to_buffer(buf: &mut ratatui::buffer::Buffer, content: &FrameConte
                 let idx = cell.y as usize * width + cell.x as usize;
                 if idx < buf.content.len() {
                     buf.content[idx].set_symbol(&cell.symbol);
-                    buf.content[idx].fg       = cell.fg;
-                    buf.content[idx].bg       = cell.bg;
+                    buf.content[idx].fg = cell.fg;
+                    buf.content[idx].bg = cell.bg;
                     buf.content[idx].modifier = cell.modifiers;
                 }
             }
@@ -285,7 +291,7 @@ fn apply_frame_to_buffer(buf: &mut ratatui::buffer::Buffer, content: &FrameConte
 fn apply_scroll(buf: &mut ratatui::buffer::Buffer, scroll: &ScrollUpdate) {
     let width = buf.area.width as usize;
     let height = buf.area.height as usize;
-    let top    = scroll.top as usize;
+    let top = scroll.top as usize;
     let bottom = (scroll.bottom as usize).min(height.saturating_sub(1));
 
     if scroll.amount > 0 {
@@ -323,7 +329,9 @@ fn apply_scroll(buf: &mut ratatui::buffer::Buffer, scroll: &ScrollUpdate) {
                     buf.content[dst + x] = ratatui::buffer::Cell::default();
                 }
             }
-            if dst_y == top { break; }
+            if dst_y == top {
+                break;
+            }
             dst_y -= 1;
         }
     }

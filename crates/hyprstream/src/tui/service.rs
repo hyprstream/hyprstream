@@ -5,8 +5,8 @@
 //! by the frame loop task (not in the service struct).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,16 +17,51 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use hyprstream_rpc::moq_stream::{AnyStreamPublisher, global_moq_origin};
+use hyprstream_rpc::moq_stream::{global_moq_origin, AnyStreamPublisher};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::streaming::{StreamChannel, StreamContext};
-use hyprstream_rpc::{EnvelopeContext, RequestService, Continuation};
+use hyprstream_rpc::{Continuation, EnvelopeContext, RequestService};
 
-use crate::tui_capnp;
-use crate::services::PolicyClient;
-use super::state::{TuiState, TuiEvent};
 use super::diff;
+use super::state::{TuiEvent, TuiState};
 use super::vte_parser;
+use hyprstream_rpc_std::policy_client::PolicyClient;
+use hyprstream_rpc_std::tui_capnp;
+
+/// TUI service-to-service calls must carry the credential bound to the TUI
+/// signing key. A missing or blank attestation is a construction error, never
+/// a tokenless fallback that changes downstream admission semantics.
+pub(crate) fn required_service_token(signing_key: &SigningKey) -> Result<String> {
+    nonempty_service_token(crate::services::factories::service_token(signing_key))
+}
+
+fn nonempty_service_token(token: Option<String>) -> Result<String> {
+    token
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("TUI service credential is unavailable"))
+}
+
+pub(crate) fn production_model_client(
+    signing_key: SigningKey,
+) -> Result<hyprstream_rpc_std::model_client::ModelClient> {
+    let token = required_service_token(&signing_key)?;
+    hyprstream_rpc_std::model_client::ModelClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider,
+        signing_key,
+        Some(token),
+    )
+}
+
+pub(crate) fn production_registry_client(
+    signing_key: SigningKey,
+) -> Result<hyprstream_rpc_std::registry_client::RegistryClient> {
+    let token = required_service_token(&signing_key)?;
+    hyprstream_rpc_std::registry_client::RegistryClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider,
+        signing_key,
+        Some(token),
+    )
+}
 
 // ============================================================================
 // Display Mode
@@ -94,7 +129,10 @@ pub(crate) enum FrameLoopCommand {
     /// Evict a viewer by ID (disconnect).
     EvictViewer { viewer_id: u32 },
     /// Attach a process to a pane.
-    SpawnProcess { pane_id: u32, process: super::process::PaneProcess },
+    SpawnProcess {
+        pane_id: u32,
+        process: super::process::PaneProcess,
+    },
     /// Notify the frame loop that a pane was resized.
     Resize { pane_id: u32, cols: u16, rows: u16 },
     /// Kill the process attached to a pane (called when window/pane is closed).
@@ -160,6 +198,13 @@ pub struct TuiService {
     /// Lazily-spawned VFS proxy sender (shared across all ChatApps).
     /// Initialized on first ChatApp spawn within the service's async context.
     vfs_proxy_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>>,
+    /// Configured Federate TUI client-class id for the W1.3 consumer gate.
+    /// `None` = the class is unconfigured: any credential carrying TUI
+    /// federate markers is denied (default-deny, the W1.1 invariant). Also
+    /// serves as the marker-independent class pin: a credential whose
+    /// (iss, client_id) names the configured class is gated even with every
+    /// TUI marker stripped.
+    federate_tui_client: Option<String>,
 }
 
 impl TuiService {
@@ -186,6 +231,7 @@ impl TuiService {
             vfs_ns: None,
             vfs_subject: None,
             vfs_proxy_tx: std::sync::OnceLock::new(),
+            federate_tui_client: None,
         }
     }
 
@@ -210,6 +256,64 @@ impl TuiService {
         self
     }
 
+    /// Configure the Federate TUI client class this service consumes (W1.3).
+    /// `None` keeps the gate fail-closed for TUI-markered credentials.
+    pub fn with_federate_tui_client(mut self, client: Option<String>) -> Self {
+        self.federate_tui_client = client;
+        self
+    }
+
+    /// Whether a credential is TUI-CLASSIFIED at this service: it carries
+    /// any TUI federate marker, or its (iss, client_id) equals this
+    /// service's audience and the authority-owned class pin — the configured
+    /// TUI client id from this service's wiring OR the process-global
+    /// reservation installed from the deployment config at startup. The pin
+    /// mirrors the www reserved (iss, client_id) predicate, so a
+    /// class-shaped credential with every marker stripped still cannot fall
+    /// through to generic handling — including on a TuiService instance the
+    /// class was not wired into (the gate then denies: no configured class
+    /// to verify against).
+    fn is_federate_tui_classified(&self, claims: &hyprstream_rpc::auth::Claims) -> bool {
+        claims.has_federate_tui_profile_marker()
+            || (self.expected_audience.as_deref() == Some(claims.iss.as_str())
+                && claims.client_id.as_deref().is_some_and(|id| {
+                    Some(id) == self.federate_tui_client.as_deref()
+                        || Some(id) == hyprstream_rpc::auth::federate_tui_class_client()
+                }))
+    }
+
+    /// W1.3 consumer gate: admit a TUI-class federate credential for exactly
+    /// the operation class requested. The credential must verify against the
+    /// exact configured class — complete TUI marker set, no www markers,
+    /// `tui`-resource scopes only, holder-binding shape — and carry the
+    /// scope this operation needs. Fail-closed when the class is not
+    /// configured on this service. The holder's cnf.jwk binding to the
+    /// envelope signer was already enforced by the RPC layer (svc.rs R2).
+    #[cfg(feature = "postgres")]
+    fn admit_federate_tui(
+        &self,
+        claims: &hyprstream_rpc::auth::Claims,
+        required_scope: &str,
+    ) -> Result<()> {
+        let client = self.federate_tui_client.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Federate TUI client class is not configured on this service")
+        })?;
+        let audience = self.expected_audience.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("no expected audience for Federate TUI credential verification")
+        })?;
+        let host = crate::services::oauth::federate_source::FederateHost::new(audience)
+            .map_err(|_| anyhow::anyhow!("service audience is not a Federate host"))?;
+        let facts = crate::services::oauth::federate_proof::verify_tui_credential_claims(
+            claims, &host, client,
+        )
+        .map_err(|_| anyhow::anyhow!("Federate TUI credential profile rejected"))?;
+        anyhow::ensure!(
+            facts.scopes.iter().any(|scope| scope == required_scope),
+            "Federate TUI credential lacks the scope this operation requires"
+        );
+        Ok(())
+    }
+
     /// Attach a VFS namespace so ChatApps spawned via RPC have VFS access.
     ///
     /// The VFS proxy task is spawned lazily on the first ChatApp spawn,
@@ -224,6 +328,13 @@ impl TuiService {
         self
     }
 
+    /// Test-only observation point for the W1.3 consumer dispatch fixture
+    /// (the fixture itself is postgres-gated, so this accessor is too).
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) async fn test_session_count(&self) -> usize {
+        self.state.read().await.sessions.len()
+    }
+
     /// Get the VFS proxy sender, spawning a dedicated proxy thread on first call.
     fn vfs_proxy(&self) -> Option<&tokio::sync::mpsc::Sender<hyprstream_vfs::proxy::VfsRequest>> {
         let (ns, subject) = match (&self.vfs_ns, &self.vfs_subject) {
@@ -231,10 +342,7 @@ impl TuiService {
             _ => return None,
         };
         Some(self.vfs_proxy_tx.get_or_init(|| {
-            super::vfs::spawn_dedicated_vfs_proxy(
-                std::sync::Arc::clone(ns),
-                subject.clone(),
-            )
+            super::vfs::spawn_dedicated_vfs_proxy(std::sync::Arc::clone(ns), subject.clone())
         }))
     }
 
@@ -242,23 +350,30 @@ impl TuiService {
     ///
     /// All callers are authorized via Casbin: system (node key) gets full access,
     /// external callers require explicit policy grants.
-    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+    async fn authorize(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> Result<()> {
         let subject = ctx.subject().to_string();
         let domain = ctx.domain()?;
-        let policy_client = self.policy_client.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Authorization denied: no policy client configured")
-        })?;
-        let request = crate::services::generated::policy_client::PolicyCheck {
+        let policy_client = self
+            .policy_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Authorization denied: no policy client configured"))?;
+        let request = hyprstream_rpc_std::policy_client::PolicyCheck {
             subject: subject.clone(),
             domain,
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let allowed = crate::services::policy::check_with_verified_bearer(
+        let allowed = crate::services::policy::check_with_holder_evidence(
             policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
+            ctx.original_holder_evidence(),
         )
         .await
         .unwrap_or_else(|e| {
@@ -266,7 +381,12 @@ impl TuiService {
             false
         });
         if !allowed {
-            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource);
+            anyhow::bail!(
+                "Unauthorized: {} cannot {} on {}",
+                subject,
+                operation,
+                resource
+            );
         }
         Ok(())
     }
@@ -302,7 +422,10 @@ impl TuiService {
             }
         } else {
             if state.session(session_id).is_none() {
-                return Ok((self.build_error_response(request_id, "session not found", "NOT_FOUND")?, None));
+                return Ok((
+                    self.build_error_response(request_id, "session not found", "NOT_FOUND")?,
+                    None,
+                ));
             }
             session_id
         };
@@ -331,14 +454,29 @@ impl TuiService {
 
         let session = match state.session(sid) {
             Some(s) => s,
-            None => return Ok((self.build_error_response(request_id, "session not found", "NOT_FOUND")?, None)),
+            None => {
+                return Ok((
+                    self.build_error_response(request_id, "session not found", "NOT_FOUND")?,
+                    None,
+                ))
+            }
         };
         use crate::tui::state::PaneBackend;
-        let windows: Vec<_> = session.windows.iter().map(|w| {
-            (w.id, w.name.clone(),
-             w.panes.iter().map(|p| (p.id, p.size(), p.backend == PaneBackend::Private)).collect::<Vec<_>>(),
-             w.active_pane_id)
-        }).collect();
+        let windows: Vec<_> = session
+            .windows
+            .iter()
+            .map(|w| {
+                (
+                    w.id,
+                    w.name.clone(),
+                    w.panes
+                        .iter()
+                        .map(|p| (p.id, p.size(), p.backend == PaneBackend::Private))
+                        .collect::<Vec<_>>(),
+                    w.active_pane_id,
+                )
+            })
+            .collect();
 
         drop(state);
 
@@ -368,7 +506,8 @@ impl TuiService {
                         hex::encode(topic_bytes),
                         mac_key,
                         [0u8; 32],
-                    ).with_reach_config(reach_config.clone()))
+                    )
+                    .with_reach_config(reach_config.clone()))
                 }
             }
         };
@@ -392,9 +531,8 @@ impl TuiService {
             (stdout_ctx.topic(), stdout_ctx.mac_key(), &stdout_moq_path),
         ];
 
-        let response = self.build_connect_response(
-            request_id, viewer_id, sid, &windows, &streams,
-        )?;
+        let response =
+            self.build_connect_response(request_id, viewer_id, sid, &windows, &streams)?;
 
         let viewer_cancel = CancellationToken::new();
         let pending = PendingViewer {
@@ -421,7 +559,16 @@ impl TuiService {
                 let s = Arc::clone(&tui_state);
                 let c = cancel.clone();
                 let sq = Arc::clone(&stdin_queues);
-                tokio::task::spawn_local(run_frame_loop(s, sid, rx, sk, c, sq, reach_config, moq_origin));
+                tokio::task::spawn_local(run_frame_loop(
+                    s,
+                    sid,
+                    rx,
+                    sk,
+                    c,
+                    sq,
+                    reach_config,
+                    moq_origin,
+                ));
                 info!(session_id = sid, "Frame loop spawned");
                 (tx, cancel)
             });
@@ -433,7 +580,11 @@ impl TuiService {
             // If the pane was resized, notify the attached process so it redraws
             // at the new terminal size (e.g. ChatApp spawned before viewer connected).
             if let Some(pane_id) = resized_pane {
-                let _ = sender.send(FrameLoopCommand::Resize { pane_id, cols, rows });
+                let _ = sender.send(FrameLoopCommand::Resize {
+                    pane_id,
+                    cols,
+                    rows,
+                });
             }
         });
 
@@ -448,10 +599,25 @@ impl TuiService {
             if let Some(wid) = state.create_window(sid) {
                 let window = match state.session(sid).and_then(|s| s.window(wid)) {
                     Some(w) => w,
-                    None => return self.build_error_response(request_id, "window not found", "NOT_FOUND"),
+                    None => {
+                        return self.build_error_response(
+                            request_id,
+                            "window not found",
+                            "NOT_FOUND",
+                        )
+                    }
                 };
-                let panes: Vec<_> = window.panes.iter()
-                    .map(|p| (p.id, p.size(), p.title.clone(), p.backend == PaneBackend::Private))
+                let panes: Vec<_> = window
+                    .panes
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.id,
+                            p.size(),
+                            p.title.clone(),
+                            p.backend == PaneBackend::Private,
+                        )
+                    })
                     .collect();
                 return self.build_window_response(request_id, window.id, &window.name, &panes);
             }
@@ -470,18 +636,30 @@ impl TuiService {
         if let Some(session) = state.session(sid) {
             let generation = state.generation();
             let active_window_id = session.active_window_id;
-            let windows: Vec<_> = session.windows.iter().map(|w| {
-                let panes: Vec<_> = w.panes.iter().map(|p| (p.id, p.size(), p.title.clone())).collect();
-                (w.id, w.name.clone(), panes, w.active_pane_id)
-            }).collect();
+            let windows: Vec<_> = session
+                .windows
+                .iter()
+                .map(|w| {
+                    let panes: Vec<_> = w
+                        .panes
+                        .iter()
+                        .map(|p| (p.id, p.size(), p.title.clone()))
+                        .collect();
+                    (w.id, w.name.clone(), panes, w.active_pane_id)
+                })
+                .collect();
 
             if let Some(window) = session.active_window() {
                 if let Some(pane) = window.active_pane() {
                     let buf = pane.active_buffer();
                     let frame_diff = diff::compute_diff(buf, None, generation, pane.cursor);
                     return self.build_snapshot_response(
-                        request_id, sid, generation, active_window_id,
-                        &frame_diff, &windows,
+                        request_id,
+                        sid,
+                        generation,
+                        active_window_id,
+                        &frame_diff,
+                        &windows,
                     );
                 }
             }
@@ -500,12 +678,25 @@ impl TuiService {
 
         if let Some(session) = state.session(sid) {
             use crate::tui::state::PaneBackend;
-            let windows: Vec<_> = session.windows.iter().map(|w| {
-                let panes: Vec<_> = w.panes.iter().map(|p| {
-                    (p.id, p.size(), p.title.clone(), p.backend == PaneBackend::Private)
-                }).collect();
-                (w.id, w.name.clone(), panes, w.active_pane_id)
-            }).collect();
+            let windows: Vec<_> = session
+                .windows
+                .iter()
+                .map(|w| {
+                    let panes: Vec<_> = w
+                        .panes
+                        .iter()
+                        .map(|p| {
+                            (
+                                p.id,
+                                p.size(),
+                                p.title.clone(),
+                                p.backend == PaneBackend::Private,
+                            )
+                        })
+                        .collect();
+                    (w.id, w.name.clone(), panes, w.active_pane_id)
+                })
+                .collect();
 
             let mut msg = Builder::new_default();
             {
@@ -556,7 +747,12 @@ impl TuiService {
         Ok(buf)
     }
 
-    async fn handle_send_input(&self, request_id: u64, viewer_id: u32, data: &[u8]) -> Result<Vec<u8>> {
+    async fn handle_send_input(
+        &self,
+        request_id: u64,
+        viewer_id: u32,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
         // Send input to the frame loop for the viewer's session
         let sessions = self.sessions.read().await;
         for (sender, _) in sessions.values() {
@@ -583,7 +779,8 @@ impl TuiService {
             let mut state = self.state.write().await;
             let sid = state.sessions.last().map(|s| s.id).unwrap_or(0);
             // Collect pane IDs before removing the window from state.
-            let pane_ids: Vec<u32> = state.session(sid)
+            let pane_ids: Vec<u32> = state
+                .session(sid)
                 .and_then(|sess| sess.window(window_id))
                 .map(|w| w.panes.iter().map(|p| p.id).collect())
                 .unwrap_or_default();
@@ -630,10 +827,19 @@ impl TuiService {
         }
     }
 
-    async fn handle_split_pane(&self, request_id: u64, horizontal: bool, ratio: f32) -> Result<Vec<u8>> {
+    async fn handle_split_pane(
+        &self,
+        request_id: u64,
+        horizontal: bool,
+        ratio: f32,
+    ) -> Result<Vec<u8>> {
         let mut state = self.state.write().await;
         let sid = state.sessions.last().map(|s| s.id).unwrap_or(0);
-        let ratio = if ratio <= 0.0 || ratio >= 1.0 { 0.5 } else { ratio };
+        let ratio = if ratio <= 0.0 || ratio >= 1.0 {
+            0.5
+        } else {
+            ratio
+        };
 
         if let Some((pane_id, cols, rows)) = state.split_pane(sid, horizontal, ratio) {
             let mut msg = Builder::new_default();
@@ -668,7 +874,11 @@ impl TuiService {
             serialize::write_message(&mut buf, &msg)?;
             Ok(buf)
         } else {
-            self.build_error_response(request_id, "pane not found or is the last pane", "NOT_FOUND")
+            self.build_error_response(
+                request_id,
+                "pane not found or is the last pane",
+                "NOT_FOUND",
+            )
         }
     }
 
@@ -718,7 +928,11 @@ impl TuiService {
             (sid, cols, rows)
         };
 
-        let cwd_path = if cwd.is_empty() { None } else { Some(std::path::PathBuf::from(cwd)) };
+        let cwd_path = if cwd.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(cwd))
+        };
 
         let process = match super::process::spawn_pty_process(cwd_path, cols, rows) {
             Ok(p) => p,
@@ -824,16 +1038,23 @@ impl TuiService {
                 pane_id
             } else {
                 use crate::tui::state::PaneBackend;
-                state.session(sid)
+                state
+                    .session(sid)
                     .and_then(|s| s.active_window())
                     .and_then(|w| {
                         // Prefer the active pane if it's not private; otherwise
                         // fall back to the first non-private pane in the window.
                         let ap = w.active_pane();
-                        if ap.map(|p| p.backend != PaneBackend::Private).unwrap_or(false) {
+                        if ap
+                            .map(|p| p.backend != PaneBackend::Private)
+                            .unwrap_or(false)
+                        {
                             ap.map(|p| p.id)
                         } else {
-                            w.panes.iter().find(|p| p.backend != PaneBackend::Private).map(|p| p.id)
+                            w.panes
+                                .iter()
+                                .find(|p| p.backend != PaneBackend::Private)
+                                .map(|p| p.id)
                         }
                     })
                     .unwrap_or(1)
@@ -844,23 +1065,22 @@ impl TuiService {
         let registry_models_dir = std::path::PathBuf::from(registry_dir);
 
         let models = {
-            let registry_client: crate::services::RegistryClient =
-                crate::services::RegistryClient::from_resolver(
-                    self.signing_key.clone(),
-                    None,
-                )?;
-            let model_client_for_status = crate::services::generated::model_client::ModelClient::from_resolver(
-                self.signing_key.clone(),
-                None,
-            )?;
+            let registry_client = production_registry_client(self.signing_key.clone())?;
+            let model_client_for_status = production_model_client(self.signing_key.clone())?;
             let status_timeout = std::time::Duration::from_millis(500);
-            let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
+            let all_status_req = hyprstream_rpc_std::model_client::StatusRequest {
+                model_ref: String::new(),
+            };
             let (repos_result, status_result) = tokio::join!(
                 registry_client.list(),
-                tokio::time::timeout(status_timeout, model_client_for_status.status(&all_status_req)),
+                tokio::time::timeout(
+                    status_timeout,
+                    model_client_for_status.status(&all_status_req)
+                ),
             );
             let status_map: std::collections::HashMap<String, bool> = match status_result {
-                Ok(Ok(entries)) => entries.into_iter()
+                Ok(Ok(entries)) => entries
+                    .into_iter()
                     // Only mark as loaded when the model is fully ready.
                     // "loading" means GPU load is still in progress.
                     .map(|e| (e.model_ref, e.status == "loaded"))
@@ -874,16 +1094,27 @@ impl TuiService {
                     .flat_map(|r| {
                         let name = r.name.clone();
                         let rmd = registry_models_dir.clone();
-                        r.worktrees.into_iter().map(|wt| {
-                            let branch = if wt.branch_name.is_empty() { "main".to_owned() } else { wt.branch_name };
-                            let model_ref = format!("{}:{}", name, branch);
-                            let loaded = *status_map.get(&model_ref).unwrap_or(&false);
-                            let path = rmd.join(&name).join("worktrees").join(&branch);
-                            hyprstream_tui::shell_app::ModelEntry {
-                                model_ref, path, loaded,
-                                ahead: 0, behind: 0, is_dirty: false,
-                            }
-                        }).collect::<Vec<_>>()
+                        r.worktrees
+                            .into_iter()
+                            .map(|wt| {
+                                let branch = if wt.branch_name.is_empty() {
+                                    "main".to_owned()
+                                } else {
+                                    wt.branch_name
+                                };
+                                let model_ref = format!("{}:{}", name, branch);
+                                let loaded = *status_map.get(&model_ref).unwrap_or(&false);
+                                let path = rmd.join(&name).join("worktrees").join(&branch);
+                                hyprstream_tui::shell_app::ModelEntry {
+                                    model_ref,
+                                    path,
+                                    loaded,
+                                    ahead: 0,
+                                    behind: 0,
+                                    is_dirty: false,
+                                }
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>(),
                 Err(_) => vec![],
@@ -894,360 +1125,469 @@ impl TuiService {
         let sk_load = self.signing_key.clone();
         let handle_load = handle.clone();
         let load_fn: Box<dyn Fn(&str, hyprstream_tui::shell_app::ModelStatusSender) + Send> =
-            Box::new(move |model_ref: &str, tx: hyprstream_tui::shell_app::ModelStatusSender| {
-                let sk  = sk_load.clone();
-                let mr  = model_ref.to_owned();
-                let h   = handle_load.clone();
-                // Submit load — returns "accepted" immediately (Continuation pattern).
-                h.block_on(async {
-                    let client = match crate::services::generated::model_client::ModelClient::from_resolver(
-                        sk.clone(),
-                        None,
-                    ) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!("Failed to create ModelClient: {e}");
-                            return;
+            Box::new(
+                move |model_ref: &str, tx: hyprstream_tui::shell_app::ModelStatusSender| {
+                    let sk = sk_load.clone();
+                    let mr = model_ref.to_owned();
+                    let h = handle_load.clone();
+                    // Submit load — returns "accepted" immediately (Continuation pattern).
+                    h.block_on(async {
+                        let client = match production_model_client(sk.clone()) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!("Failed to create ModelClient: {e}");
+                                return;
+                            }
+                        };
+                        let _ = client
+                            .load(&hyprstream_rpc_std::model_client::LoadModelRequest {
+                                model_ref: mr.clone(),
+                                max_context: None,
+                                kv_quant: None,
+                            })
+                            .await;
+                    });
+                    // Poll status in a background thread so we don't block the ShellApp.
+                    let sk_poll = sk.clone();
+                    let mr_poll = mr.clone();
+                    let h_poll = h.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..60u32 {
+                            // max ~2 minutes (60 × 2 s)
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            let loaded = h_poll.block_on(async {
+                                let client = match production_model_client(sk_poll.clone()) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        tracing::warn!("Failed to create ModelClient: {e}");
+                                        return false;
+                                    }
+                                };
+                                client
+                                    .status(&hyprstream_rpc_std::model_client::StatusRequest {
+                                        model_ref: mr_poll.clone(),
+                                    })
+                                    .await
+                                    .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
+                            });
+                            if loaded {
+                                let _ = tx.send((mr_poll, true));
+                                return;
+                            }
                         }
-                    };
-                    let _ = client.load(&crate::services::generated::model_client::LoadModelRequest {
-                        model_ref: mr.clone(),
-                        max_context: None,
-                        kv_quant: None,
-                    }).await;
-                });
-                // Poll status in a background thread so we don't block the ShellApp.
-                let sk_poll = sk.clone();
-                let mr_poll = mr.clone();
-                let h_poll  = h.clone();
-                std::thread::spawn(move || {
-                    for _ in 0..60u32 {   // max ~2 minutes (60 × 2 s)
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        let loaded = h_poll.block_on(async {
-                            let client = match crate::services::generated::model_client::ModelClient::from_resolver(
-                                sk_poll.clone(),
-                                None,
-                            ) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    tracing::warn!("Failed to create ModelClient: {e}");
-                                    return false;
-                                }
-                            };
-                            client.status(&crate::services::generated::model_client::StatusRequest { model_ref: mr_poll.clone() }).await
-                                .is_ok_and(|es| es.iter().any(|e| e.status == "loaded"))
-                        });
-                        if loaded {
-                            let _ = tx.send((mr_poll, true));
-                            return;
-                        }
-                    }
-                    // Timed out — clear the "Loading…" indicator.
-                    let _ = tx.send((mr_poll, false));
-                });
-            });
+                        // Timed out — clear the "Loading…" indicator.
+                        let _ = tx.send((mr_poll, false));
+                    });
+                },
+            );
         let sk_unload = self.signing_key.clone();
         let handle_unload = handle.clone();
         let unload_fn: Box<dyn Fn(&str) -> bool + Send> = Box::new(move |model_ref: &str| {
             let sk = sk_unload.clone();
             let mr = model_ref.to_owned();
             handle_unload.block_on(async move {
-                let client = match crate::services::generated::model_client::ModelClient::from_resolver(
-                    sk.clone(),
-                    None,
-                ) {
+                let client = match production_model_client(sk.clone()) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!("Failed to create ModelClient: {e}");
                         return false;
                     }
                 };
-                client.unload(&crate::services::generated::model_client::UnloadModelRequest { model_ref: mr.clone() }).await.is_ok()
+                client
+                    .unload(&hyprstream_rpc_std::model_client::UnloadModelRequest {
+                        model_ref: mr.clone(),
+                    })
+                    .await
+                    .is_ok()
             })
         });
 
         let git_ops = {
-            use hyprstream_tui::shell_app::{GitOps, GitOpProgress, GitProgressSender, ModelEntry as ShellModelEntry};
-            use crate::services::generated::registry_client::{CloneRequest, CreateWorktreeRequest, PushRequest, UpdateRequest, RegistryRpc};
             use hyprstream_rpc::streaming::StreamPayload;
+            use hyprstream_rpc_std::registry_client::{
+                CloneRequest, CreateWorktreeRequest, PushRequest, RegistryRpc, UpdateRequest,
+            };
+            use hyprstream_tui::shell_app::{
+                GitOpProgress, GitOps, GitProgressSender, ModelEntry as ShellModelEntry,
+            };
 
             let sk_clone = self.signing_key.clone();
             let h_clone = handle.clone();
             let rmd_clone = registry_models_dir.clone();
-            let clone_fn: hyprstream_tui::shell_app::CloneFn = Box::new(move |url, name, branch, tx: GitProgressSender| {
-                let sk = sk_clone.clone();
-                let h = h_clone.clone();
-                let rmd = rmd_clone.clone();
-                std::thread::spawn(move || {
-                    h.block_on(async {
-                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
-                                return;
-                            }
-                        };
-                        let model_name = name.unwrap_or_else(|| {
-                            url.rsplit('/').next().unwrap_or("model")
-                                .trim_end_matches(".git").to_owned()
-                        });
-                        let _ = tx.send(GitOpProgress::CloneProgress { stage: "Connecting…".to_owned(), pct: 0 });
+            let clone_fn: hyprstream_tui::shell_app::CloneFn =
+                Box::new(move |url, name, branch, tx: GitProgressSender| {
+                    let sk = sk_clone.clone();
+                    let h = h_clone.clone();
+                    let rmd = rmd_clone.clone();
+                    std::thread::spawn(move || {
+                        h.block_on(async {
+                            let registry = match production_registry_client(sk) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let _ = tx.send(GitOpProgress::Failed(format!(
+                                        "Failed to create RegistryClient: {e}"
+                                    )));
+                                    return;
+                                }
+                            };
+                            let model_name = name.unwrap_or_else(|| {
+                                url.rsplit('/')
+                                    .next()
+                                    .unwrap_or("model")
+                                    .trim_end_matches(".git")
+                                    .to_owned()
+                            });
+                            let _ = tx.send(GitOpProgress::CloneProgress {
+                                stage: "Connecting…".to_owned(),
+                                pct: 0,
+                            });
 
-                        let mut stream_handle = match RegistryRpc::clone_stream(&registry, &CloneRequest {
-                            url: url.clone(),
-                            name: model_name.clone(),
-                            shallow: false,
-                            depth: 0,
-                            branch: branch.unwrap_or_default(),
-                        }).await {
-                            Ok(h) => h,
-                            Err(e) => {
-                                let _ = tx.send(GitOpProgress::Failed(format!("Clone failed: {e}")));
-                                return;
-                            }
-                        };
+                            let mut stream_handle = match RegistryRpc::clone_stream(
+                                &registry,
+                                &CloneRequest {
+                                    url: url.clone(),
+                                    name: model_name.clone(),
+                                    shallow: false,
+                                    depth: 0,
+                                    branch: branch.unwrap_or_default(),
+                                },
+                            )
+                            .await
+                            {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(GitOpProgress::Failed(format!("Clone failed: {e}")));
+                                    return;
+                                }
+                            };
 
-                        loop {
-                            match stream_handle.recv_next().await {
-                                Ok(Some(StreamPayload::Data(data))) => {
-                                    if let Ok(text) = String::from_utf8(data) {
-                                        let parts: Vec<&str> = text.split(':').collect();
-                                        if parts.len() >= 3 {
-                                            let stage = parts[0];
-                                            let current: u64 = parts[1].parse().unwrap_or(0);
-                                            let total: u64 = parts[2].parse().unwrap_or(0);
-                                            let pct = (current * 70).checked_div(total).map(|v| v.min(70) as u8).unwrap_or(0);
-                                            let label = match stage {
-                                                "fetch" => "Fetching objects",
-                                                "indexing" => "Indexing",
-                                                "smudge" => "Downloading model files",
-                                                "lfs" => "Downloading LFS files",
-                                                other => other,
-                                            };
-                                            let _ = tx.send(GitOpProgress::CloneProgress {
-                                                stage: label.to_owned(),
-                                                pct,
-                                            });
+                            loop {
+                                match stream_handle.recv_next().await {
+                                    Ok(Some(StreamPayload::Data(data))) => {
+                                        if let Ok(text) = String::from_utf8(data) {
+                                            let parts: Vec<&str> = text.split(':').collect();
+                                            if parts.len() >= 3 {
+                                                let stage = parts[0];
+                                                let current: u64 = parts[1].parse().unwrap_or(0);
+                                                let total: u64 = parts[2].parse().unwrap_or(0);
+                                                let pct = (current * 70)
+                                                    .checked_div(total)
+                                                    .map(|v| v.min(70) as u8)
+                                                    .unwrap_or(0);
+                                                let label = match stage {
+                                                    "fetch" => "Fetching objects",
+                                                    "indexing" => "Indexing",
+                                                    "smudge" => "Downloading model files",
+                                                    "lfs" => "Downloading LFS files",
+                                                    other => other,
+                                                };
+                                                let _ = tx.send(GitOpProgress::CloneProgress {
+                                                    stage: label.to_owned(),
+                                                    pct,
+                                                });
+                                            }
                                         }
                                     }
+                                    Ok(Some(StreamPayload::Complete(_))) | Ok(None) => break,
+                                    Ok(Some(StreamPayload::Error(message))) => {
+                                        let _ = tx.send(GitOpProgress::Failed(format!(
+                                            "Clone failed: {message}"
+                                        )));
+                                        return;
+                                    }
+                                    Ok(Some(StreamPayload::Tagged { .. })) => {}
+                                    Err(e) => {
+                                        let _ = tx.send(GitOpProgress::Failed(format!(
+                                            "Clone stream error: {e}"
+                                        )));
+                                        return;
+                                    }
                                 }
-                                Ok(Some(StreamPayload::Complete(_))) | Ok(None) => break,
-                                Ok(Some(StreamPayload::Error(message))) => {
-                                    let _ = tx.send(GitOpProgress::Failed(format!("Clone failed: {message}")));
-                                    return;
-                                }
-                                Ok(Some(StreamPayload::Tagged { .. })) => {}
+                            }
+
+                            let _ = tx.send(GitOpProgress::CloneProgress {
+                                stage: "Creating worktree…".to_owned(),
+                                pct: 80,
+                            });
+
+                            let tracked = match registry.get_by_name(&model_name).await {
+                                Ok(t) => t,
                                 Err(e) => {
-                                    let _ = tx.send(GitOpProgress::Failed(format!("Clone stream error: {e}")));
+                                    let _ = tx.send(GitOpProgress::Failed(format!(
+                                        "Failed to get repo: {e}"
+                                    )));
                                     return;
                                 }
-                            }
-                        }
+                            };
+                            let repo_client = registry.repo(&tracked.id);
+                            let wt_branch = if tracked.tracking_ref.is_empty() {
+                                "main".to_owned()
+                            } else {
+                                tracked.tracking_ref.clone()
+                            };
+                            let _ = repo_client
+                                .create_worktree(&CreateWorktreeRequest {
+                                    branch: wt_branch.clone(),
+                                })
+                                .await;
 
-                        let _ = tx.send(GitOpProgress::CloneProgress { stage: "Creating worktree…".to_owned(), pct: 80 });
-
-                        let tracked = match registry.get_by_name(&model_name).await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to get repo: {e}")));
-                                return;
-                            }
-                        };
-                        let repo_client = registry.repo(&tracked.id);
-                        let wt_branch = if tracked.tracking_ref.is_empty() { "main".to_owned() } else { tracked.tracking_ref.clone() };
-                        let _ = repo_client.create_worktree(&CreateWorktreeRequest {
-                            branch: wt_branch.clone(),
-                        }).await;
-
-                        let model_ref = format!("{model_name}:{wt_branch}");
-                        let path = rmd.join(&model_name).join("worktrees").join(&wt_branch);
-                        let _ = tx.send(GitOpProgress::Done {
-                            message: format!("Cloned {model_name} successfully"),
-                            new_model: Some(ShellModelEntry {
-                                model_ref, path, loaded: false,
-                                ahead: 0, behind: 0, is_dirty: false,
-                            }),
+                            let model_ref = format!("{model_name}:{wt_branch}");
+                            let path = rmd.join(&model_name).join("worktrees").join(&wt_branch);
+                            let _ = tx.send(GitOpProgress::Done {
+                                message: format!("Cloned {model_name} successfully"),
+                                new_model: Some(ShellModelEntry {
+                                    model_ref,
+                                    path,
+                                    loaded: false,
+                                    ahead: 0,
+                                    behind: 0,
+                                    is_dirty: false,
+                                }),
+                            });
                         });
                     });
                 });
-            });
 
             let sk_pull = self.signing_key.clone();
             let h_pull = handle.clone();
-            let pull_fn: hyprstream_tui::shell_app::PullFn = Box::new(move |model_ref, tx: GitProgressSender| {
-                let sk = sk_pull.clone();
-                let h = h_pull.clone();
-                std::thread::spawn(move || {
-                    h.block_on(async {
-                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
-                                return;
+            let pull_fn: hyprstream_tui::shell_app::PullFn =
+                Box::new(move |model_ref, tx: GitProgressSender| {
+                    let sk = sk_pull.clone();
+                    let h = h_pull.clone();
+                    std::thread::spawn(move || {
+                        h.block_on(async {
+                            let registry = match production_registry_client(sk) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let _ = tx.send(GitOpProgress::Failed(format!(
+                                        "Failed to create RegistryClient: {e}"
+                                    )));
+                                    return;
+                                }
+                            };
+                            let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
+                            let tracked = match registry.get_by_name(model_name).await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    let _ =
+                                        tx.send(GitOpProgress::Failed(format!("Not found: {e}")));
+                                    return;
+                                }
+                            };
+                            let repo_client = registry.repo(&tracked.id);
+                            let _ = tx.send(GitOpProgress::Status("Fetching…".to_owned()));
+                            match repo_client
+                                .update(&UpdateRequest {
+                                    refspec: String::new(),
+                                })
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = tx.send(GitOpProgress::Done {
+                                        message: format!("Pulled {model_ref}"),
+                                        new_model: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        tx.send(GitOpProgress::Failed(format!("Pull failed: {e}")));
+                                }
                             }
-                        };
-                        let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
-                        let tracked = match registry.get_by_name(model_name).await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                let _ = tx.send(GitOpProgress::Failed(format!("Not found: {e}")));
-                                return;
-                            }
-                        };
-                        let repo_client = registry.repo(&tracked.id);
-                        let _ = tx.send(GitOpProgress::Status("Fetching…".to_owned()));
-                        match repo_client.update(&UpdateRequest { refspec: String::new() }).await {
-                            Ok(()) => {
-                                let _ = tx.send(GitOpProgress::Done {
-                                    message: format!("Pulled {model_ref}"),
-                                    new_model: None,
-                                });
-                            }
-                            Err(e) => {
-                                let _ = tx.send(GitOpProgress::Failed(format!("Pull failed: {e}")));
-                            }
-                        }
+                        });
                     });
                 });
-            });
 
             let sk_push = self.signing_key.clone();
             let h_push = handle.clone();
-            let push_fn: hyprstream_tui::shell_app::PushFn = Box::new(move |model_ref, tx: GitProgressSender| {
-                let sk = sk_push.clone();
-                let h = h_push.clone();
-                std::thread::spawn(move || {
-                    h.block_on(async {
-                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                let _ = tx.send(GitOpProgress::Failed(format!("Failed to create RegistryClient: {e}")));
-                                return;
+            let push_fn: hyprstream_tui::shell_app::PushFn =
+                Box::new(move |model_ref, tx: GitProgressSender| {
+                    let sk = sk_push.clone();
+                    let h = h_push.clone();
+                    std::thread::spawn(move || {
+                        h.block_on(async {
+                            let registry = match production_registry_client(sk) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let _ = tx.send(GitOpProgress::Failed(format!(
+                                        "Failed to create RegistryClient: {e}"
+                                    )));
+                                    return;
+                                }
+                            };
+                            let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
+                            let branch = model_ref.split(':').nth(1).unwrap_or("main");
+                            let tracked = match registry.get_by_name(model_name).await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    let _ =
+                                        tx.send(GitOpProgress::Failed(format!("Not found: {e}")));
+                                    return;
+                                }
+                            };
+                            let repo_client = registry.repo(&tracked.id);
+                            let _ = tx.send(GitOpProgress::Status("Pushing…".to_owned()));
+                            let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+                            match repo_client
+                                .push(&PushRequest {
+                                    remote: "origin".to_owned(),
+                                    refspec,
+                                    force: false,
+                                })
+                                .await
+                            {
+                                Ok(()) => {
+                                    let _ = tx.send(GitOpProgress::Done {
+                                        message: format!("Pushed {model_ref}"),
+                                        new_model: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        tx.send(GitOpProgress::Failed(format!("Push failed: {e}")));
+                                }
                             }
-                        };
-                        let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
-                        let branch = model_ref.split(':').nth(1).unwrap_or("main");
-                        let tracked = match registry.get_by_name(model_name).await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                let _ = tx.send(GitOpProgress::Failed(format!("Not found: {e}")));
-                                return;
-                            }
-                        };
-                        let repo_client = registry.repo(&tracked.id);
-                        let _ = tx.send(GitOpProgress::Status("Pushing…".to_owned()));
-                        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-                        match repo_client.push(&PushRequest {
-                            remote: "origin".to_owned(),
-                            refspec,
-                            force: false,
-                        }).await {
-                            Ok(()) => {
-                                let _ = tx.send(GitOpProgress::Done {
-                                    message: format!("Pushed {model_ref}"),
-                                    new_model: None,
-                                });
-                            }
-                            Err(e) => {
-                                let _ = tx.send(GitOpProgress::Failed(format!("Push failed: {e}")));
-                            }
-                        }
+                        });
                     });
                 });
-            });
 
             let sk_status = self.signing_key.clone();
             let h_status = handle.clone();
-            let fetch_status_fn: hyprstream_tui::shell_app::FetchStatusFn = Box::new(move |model_refs, tx| {
-                let sk = sk_status.clone();
-                let h = h_status.clone();
-                std::thread::spawn(move || {
-                    h.block_on(async {
-                        let registry = match crate::services::RegistryClient::from_resolver(sk, None) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::warn!("Failed to create RegistryClient: {e}");
-                                return;
-                            }
-                        };
-                        for mr in model_refs {
-                            let model_name = mr.split(':').next().unwrap_or(&mr);
-                            if let Ok(tracked) = registry.get_by_name(model_name).await {
-                                let repo_client = registry.repo(&tracked.id);
-                                if let Ok(status) = repo_client.status().await {
-                                    let _ = tx.send((mr, status.ahead, status.behind, !status.is_clean));
+            let fetch_status_fn: hyprstream_tui::shell_app::FetchStatusFn =
+                Box::new(move |model_refs, tx| {
+                    let sk = sk_status.clone();
+                    let h = h_status.clone();
+                    std::thread::spawn(move || {
+                        h.block_on(async {
+                            let registry = match production_registry_client(sk) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!("Failed to create RegistryClient: {e}");
+                                    return;
+                                }
+                            };
+                            for mr in model_refs {
+                                let model_name = mr.split(':').next().unwrap_or(&mr);
+                                if let Ok(tracked) = registry.get_by_name(model_name).await {
+                                    let repo_client = registry.repo(&tracked.id);
+                                    if let Ok(status) = repo_client.status().await {
+                                        let _ = tx.send((
+                                            mr,
+                                            status.ahead,
+                                            status.behind,
+                                            !status.is_clean,
+                                        ));
+                                    }
                                 }
                             }
-                        }
+                        });
                     });
                 });
-            });
 
             let sk_refresh = self.signing_key.clone();
             let h_refresh = handle.clone();
             let rmd_refresh = registry_models_dir.clone();
-            let refresh_fn: hyprstream_tui::shell_app::RefreshFn = Box::new(move |tx: GitProgressSender| {
-                let sk = sk_refresh.clone();
-                let h = h_refresh.clone();
-                let rmd = rmd_refresh.clone();
-                std::thread::spawn(move || {
-                    h.block_on(async {
-                        let registry_client = match crate::services::RegistryClient::from_resolver(sk.clone(), None) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::warn!("model-list refresh: RegistryClient: {e}");
-                                return;
-                            }
-                        };
-                        let model_client = match crate::services::generated::model_client::ModelClient::from_resolver(sk, None) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::warn!("model-list refresh: ModelClient: {e}");
-                                return;
-                            }
-                        };
-                        let status_timeout = std::time::Duration::from_millis(500);
-                        let all_status_req = crate::services::generated::model_client::StatusRequest { model_ref: String::new() };
-                        let (repos_result, status_result) = tokio::join!(
-                            registry_client.list(),
-                            tokio::time::timeout(status_timeout, model_client.status(&all_status_req)),
-                        );
-                        let status_map: std::collections::HashMap<String, bool> = match status_result {
-                            Ok(Ok(entries)) => entries.into_iter()
-                                .map(|e| (e.model_ref, e.status == "loaded"))
-                                .collect(),
-                            _ => std::collections::HashMap::new(),
-                        };
-                        let models: Vec<hyprstream_tui::shell_app::ModelEntry> = match repos_result {
-                            Ok(repos) => repos
-                                .into_iter()
-                                .filter(|r| !r.name.is_empty())
-                                .flat_map(|r| {
-                                    let name = r.name.clone();
-                                    let rmd = rmd.clone();
-                                    r.worktrees.into_iter().map(|wt| {
-                                        let branch = if wt.branch_name.is_empty() { "main".to_owned() } else { wt.branch_name };
-                                        let model_ref = format!("{name}:{branch}");
-                                        let loaded = *status_map.get(&model_ref).unwrap_or(&false);
-                                        let path = rmd.join(&name).join("worktrees").join(&branch);
-                                        hyprstream_tui::shell_app::ModelEntry {
-                                            model_ref, path, loaded,
-                                            ahead: 0, behind: 0, is_dirty: false,
-                                        }
-                                    }).collect::<Vec<_>>()
-                                })
-                                .collect(),
-                            Err(_) => vec![],
-                        };
-                        let _ = tx.send(GitOpProgress::ModelList(models));
+            let refresh_fn: hyprstream_tui::shell_app::RefreshFn =
+                Box::new(move |tx: GitProgressSender| {
+                    let sk = sk_refresh.clone();
+                    let h = h_refresh.clone();
+                    let rmd = rmd_refresh.clone();
+                    std::thread::spawn(move || {
+                        h.block_on(async {
+                            let registry_client = match production_registry_client(sk.clone()) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!("model-list refresh: RegistryClient: {e}");
+                                    return;
+                                }
+                            };
+                            let model_client = match production_model_client(sk) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!("model-list refresh: ModelClient: {e}");
+                                    return;
+                                }
+                            };
+                            let status_timeout = std::time::Duration::from_millis(500);
+                            let all_status_req = hyprstream_rpc_std::model_client::StatusRequest {
+                                model_ref: String::new(),
+                            };
+                            let (repos_result, status_result) = tokio::join!(
+                                registry_client.list(),
+                                tokio::time::timeout(
+                                    status_timeout,
+                                    model_client.status(&all_status_req)
+                                ),
+                            );
+                            let status_map: std::collections::HashMap<String, bool> =
+                                match status_result {
+                                    Ok(Ok(entries)) => entries
+                                        .into_iter()
+                                        .map(|e| (e.model_ref, e.status == "loaded"))
+                                        .collect(),
+                                    _ => std::collections::HashMap::new(),
+                                };
+                            let models: Vec<hyprstream_tui::shell_app::ModelEntry> =
+                                match repos_result {
+                                    Ok(repos) => repos
+                                        .into_iter()
+                                        .filter(|r| !r.name.is_empty())
+                                        .flat_map(|r| {
+                                            let name = r.name.clone();
+                                            let rmd = rmd.clone();
+                                            r.worktrees
+                                                .into_iter()
+                                                .map(|wt| {
+                                                    let branch = if wt.branch_name.is_empty() {
+                                                        "main".to_owned()
+                                                    } else {
+                                                        wt.branch_name
+                                                    };
+                                                    let model_ref = format!("{name}:{branch}");
+                                                    let loaded = *status_map
+                                                        .get(&model_ref)
+                                                        .unwrap_or(&false);
+                                                    let path = rmd
+                                                        .join(&name)
+                                                        .join("worktrees")
+                                                        .join(&branch);
+                                                    hyprstream_tui::shell_app::ModelEntry {
+                                                        model_ref,
+                                                        path,
+                                                        loaded,
+                                                        ahead: 0,
+                                                        behind: 0,
+                                                        is_dirty: false,
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .collect(),
+                                    Err(_) => vec![],
+                                };
+                            let _ = tx.send(GitOpProgress::ModelList(models));
+                        });
                     });
                 });
-            });
 
-            GitOps { clone_fn, pull_fn, push_fn, fetch_status_fn, refresh_fn }
+            GitOps {
+                clone_fn,
+                pull_fn,
+                push_fn,
+                fetch_status_fn,
+                refresh_fn,
+            }
         };
 
-        let app = hyprstream_tui::shell_app::ShellApp::new(models, cols, rows, load_fn, unload_fn, Some(git_ops), Some(registry_models_dir.clone()));
+        let app = hyprstream_tui::shell_app::ShellApp::new(
+            models,
+            cols,
+            rows,
+            load_fn,
+            unload_fn,
+            Some(git_ops),
+            Some(registry_models_dir.clone()),
+        );
         let config = waxterm::app::TerminalConfig::new().cols(cols).rows(rows);
         let process = super::process::spawn_app_process(app, config);
 
@@ -1268,7 +1608,10 @@ impl TuiService {
         let continuation: Continuation = Box::pin(async move {
             let reg = sessions_reg.read().await;
             if let Some((sender, _)) = reg.get(&sid) {
-                let _ = sender.send(FrameLoopCommand::SpawnProcess { pane_id: active_pane_id, process });
+                let _ = sender.send(FrameLoopCommand::SpawnProcess {
+                    pane_id: active_pane_id,
+                    process,
+                });
             }
         });
 
@@ -1314,10 +1657,16 @@ impl TuiService {
                     .and_then(|s| s.active_window())
                     .and_then(|w| {
                         let ap = w.active_pane();
-                        if ap.map(|p| p.backend != PaneBackend::Private).unwrap_or(false) {
+                        if ap
+                            .map(|p| p.backend != PaneBackend::Private)
+                            .unwrap_or(false)
+                        {
                             ap.map(|p| p.id)
                         } else {
-                            w.panes.iter().find(|p| p.backend != PaneBackend::Private).map(|p| p.id)
+                            w.panes
+                                .iter()
+                                .find(|p| p.backend != PaneBackend::Private)
+                                .map(|p| p.id)
                         }
                     })
                     .unwrap_or(1)
@@ -1327,12 +1676,20 @@ impl TuiService {
             // regardless of when viewers connect and resize the pane.
             let pane_size = state
                 .session(sid)
-                .and_then(|s| s.windows.iter().find(|w| w.panes.iter().any(|p| p.id == active_pane_id)))
+                .and_then(|s| {
+                    s.windows
+                        .iter()
+                        .find(|w| w.panes.iter().any(|p| p.id == active_pane_id))
+                })
                 .and_then(|w| w.panes.iter().find(|p| p.id == active_pane_id))
                 .map(super::state::TuiPane::size);
             let (cols, rows) = pane_size.unwrap_or((cols, rows));
             (sid, active_pane_id, cols, rows)
         };
+
+        let model_ref = model_ref.to_owned();
+        let (tool_caller, tool_descriptions, openai_tools) =
+            super::rpc_transport::make_tool_caller(&self.signing_key)?;
 
         // Rename the window to "Chat: model_ref" so the titlebar is meaningful.
         {
@@ -1347,11 +1704,6 @@ impl TuiService {
             }
         }
 
-        let model_ref = model_ref.to_owned();
-
-        let (tool_caller, tool_descriptions, openai_tools) =
-            super::rpc_transport::make_tool_caller(&self.signing_key);
-
         let gen_config = std::sync::Arc::new(parking_lot::RwLock::new(
             hyprstream_tui::chat_app::ChatGenConfig::default(),
         ));
@@ -1362,39 +1714,46 @@ impl TuiService {
             std::sync::Arc::clone(&gen_config),
         );
 
-        let app = hyprstream_tui::chat_app::ChatApp::new(
-            model_ref.clone(),
-            cols,
-            rows,
-            spawner,
-        )
-        .with_gen_config(gen_config)
-        .with_tool_caller(
-            tool_caller,
-            tool_descriptions,
-            crate::storage::ModelRef::parse(&model_ref)
-                .ok()
-                .and_then(|mr| {
-                    let branch = match &mr.git_ref {
-                        crate::storage::GitRef::Branch(name) => name.clone(),
-                        _ => "main".to_owned(),
-                    };
-                    crate::storage::StoragePaths::new().ok()
-                        .and_then(|sp| sp.worktree_path(mr.name(), &branch).ok())
-                })
-                .map(|path| {
-                    let arch = crate::runtime::model_config::ModelConfig::detect_architecture(&path);
-                    match crate::api::tools::ToolCallFormat::from_architecture(&arch) {
-                        crate::api::tools::ToolCallFormat::Qwen3Xml      => hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml,
-                        crate::api::tools::ToolCallFormat::Qwen35XmlParam => hyprstream_tui::chat_app::ToolCallFormat::Qwen35XmlParam,
-                        crate::api::tools::ToolCallFormat::LlamaJson     => hyprstream_tui::chat_app::ToolCallFormat::LlamaJson,
-                        crate::api::tools::ToolCallFormat::MistralJson   => hyprstream_tui::chat_app::ToolCallFormat::MistralJson,
-                        crate::api::tools::ToolCallFormat::None          => hyprstream_tui::chat_app::ToolCallFormat::None,
-                    }
-                })
-                .unwrap_or(hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml),
-        )
-        .with_server_spawned();
+        let app = hyprstream_tui::chat_app::ChatApp::new(model_ref.clone(), cols, rows, spawner)
+            .with_gen_config(gen_config)
+            .with_tool_caller(
+                tool_caller,
+                tool_descriptions,
+                crate::storage::ModelRef::parse(&model_ref)
+                    .ok()
+                    .and_then(|mr| {
+                        let branch = match &mr.git_ref {
+                            crate::storage::GitRef::Branch(name) => name.clone(),
+                            _ => "main".to_owned(),
+                        };
+                        crate::storage::StoragePaths::new()
+                            .ok()
+                            .and_then(|sp| sp.worktree_path(mr.name(), &branch).ok())
+                    })
+                    .map(|path| {
+                        let arch =
+                            crate::runtime::model_config::ModelConfig::detect_architecture(&path);
+                        match crate::api::tools::ToolCallFormat::from_architecture(&arch) {
+                            crate::api::tools::ToolCallFormat::Qwen3Xml => {
+                                hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml
+                            }
+                            crate::api::tools::ToolCallFormat::Qwen35XmlParam => {
+                                hyprstream_tui::chat_app::ToolCallFormat::Qwen35XmlParam
+                            }
+                            crate::api::tools::ToolCallFormat::LlamaJson => {
+                                hyprstream_tui::chat_app::ToolCallFormat::LlamaJson
+                            }
+                            crate::api::tools::ToolCallFormat::MistralJson => {
+                                hyprstream_tui::chat_app::ToolCallFormat::MistralJson
+                            }
+                            crate::api::tools::ToolCallFormat::None => {
+                                hyprstream_tui::chat_app::ToolCallFormat::None
+                            }
+                        }
+                    })
+                    .unwrap_or(hyprstream_tui::chat_app::ToolCallFormat::Qwen3Xml),
+            )
+            .with_server_spawned();
 
         // Wire VFS namespace if available, using the shared proxy sender.
         let app = if let (Some(vfs_ns), Some(vfs_subject), Some(vfs_tx)) =
@@ -1454,7 +1813,11 @@ impl TuiService {
         if pane_id != 0 {
             let reg = self.sessions.read().await;
             if let Some((sender, _)) = reg.get(&session_id) {
-                let _ = sender.send(FrameLoopCommand::Resize { pane_id, cols, rows });
+                let _ = sender.send(FrameLoopCommand::Resize {
+                    pane_id,
+                    cols,
+                    rows,
+                });
             }
         }
 
@@ -1505,7 +1868,8 @@ impl TuiService {
                 if let Some(window) = session.windows.iter_mut().find(|w| w.id == wid) {
                     let rows_inner = rows.max(1);
                     let cols_inner = cols.max(1);
-                    let mut pane = crate::tui::state::TuiPane::new(next_id, cols_inner, rows_inner, 0);
+                    let mut pane =
+                        crate::tui::state::TuiPane::new(next_id, cols_inner, rows_inner, 0);
                     pane.backend = PaneBackend::Private;
                     pane.title = name.to_owned();
                     window.panes.push(pane);
@@ -1513,7 +1877,11 @@ impl TuiService {
                     // publishing the existing ShellApp pane (non-private).
                     next_id
                 } else {
-                    return Err(anyhow::anyhow!("window {} not found in session {}", wid, sid));
+                    return Err(anyhow::anyhow!(
+                        "window {} not found in session {}",
+                        wid,
+                        sid
+                    ));
                 }
             } else {
                 return Err(anyhow::anyhow!("session {} not found", sid));
@@ -1575,7 +1943,12 @@ impl TuiService {
             connect.set_viewer_id(viewer_id);
             connect.set_session_id(session_id);
 
-            let reach = self.reach_config.read().reach();
+            let reach_config = self.reach_config.read();
+            let reach = reach_config.reach();
+            let moql_server_identity = reach_config
+                .moql_server_identity
+                .clone()
+                .unwrap_or_default();
 
             // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
             let mut stream_list = connect.reborrow().init_streams(streams.len() as u32);
@@ -1584,6 +1957,8 @@ impl TuiService {
                 si.set_topic(topic);
                 si.set_mac_key(*mac_key);
                 si.set_broadcast_path(broadcast_path);
+                let mut witness = si.reborrow().init_moql_server_identity();
+                hyprstream_rpc::capnp::ToCapnp::write_to(&moql_server_identity, &mut witness);
                 // Encode the networked reach via the shared generated ToCapnp impl
                 // (Destination::write_to), so the wire bytes match the inference
                 // StreamInfo's `announcedAt` 1:1.
@@ -1702,9 +2077,28 @@ impl TuiService {
     }
 }
 
+/// The TUI-class scope a federate credential must carry for a request (W1.3).
+/// Maps the service's operation vocabulary onto the TUI session ceiling:
+/// `connect` to attach a viewer, `query` for read-only views, `write` for
+/// everything that mutates state, feeds input, or spawns.
+#[cfg(feature = "postgres")]
+fn federate_tui_required_scope(
+    request: &tui_capnp::tui_request::Reader<'_>,
+) -> Result<&'static str> {
+    Ok(match request.which()? {
+        tui_capnp::tui_request::Which::Connect(_) => "connect:tui:session",
+        tui_capnp::tui_request::Which::Snapshot(_)
+        | tui_capnp::tui_request::Which::ListWindows(_)
+        | tui_capnp::tui_request::Which::PollStdin(_) => "query:tui:session",
+        _ => "write:tui:session",
+    })
+}
+
 #[async_trait(?Send)]
 impl RequestService for TuiService {
-    fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
+    fn producer_reach_config_handle(
+        &self,
+    ) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
         Some(self.reach_config.clone())
     }
 
@@ -1712,17 +2106,43 @@ impl RequestService for TuiService {
         Some(self.moq_origin.clone())
     }
 
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf; the hand-written dispatch below reads from
+        // the same decoded message.
+        crate::services::generated::tui_client::decode_tui_request_body(signed_body)
+    }
+
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
-        let reader = serialize::read_message_from_flat_slice(
-            &mut &payload[..],
-            capnp::message::ReaderOptions::default(),
-        )?;
-        let request = reader.get_root::<tui_capnp::tui_request::Reader<'_>>()?;
+        let request = body.root::<tui_capnp::tui_request::Reader<'_>>()?;
         let request_id = request.get_id();
+
+        // W1.3 consumer gate: a TUI-classified credential (markers OR the
+        // class pin — see is_federate_tui_classified) is admitted only after
+        // full class verification, which REQUIRES the complete marker set,
+        // plus the scope this operation needs. Unclassified credentials take
+        // the pre-existing path unchanged; www-class credentials never reach
+        // this service (the svc.rs deferred branch denies them here). The
+        // mint path exists only in postgres builds, so other builds deny
+        // classified credentials unconditionally (fail-closed).
+        if let Some(claims) = _ctx.claims() {
+            if self.is_federate_tui_classified(claims) {
+                #[cfg(feature = "postgres")]
+                {
+                    let required = federate_tui_required_scope(&request)?;
+                    self.admit_federate_tui(claims, required)?;
+                }
+                #[cfg(not(feature = "postgres"))]
+                anyhow::bail!("Federate TUI credentials require the postgres build profile");
+            }
+        }
 
         match request.which()? {
             tui_capnp::tui_request::Which::Connect(connect_reader) => {
@@ -1735,7 +2155,8 @@ impl RequestService for TuiService {
                     tui_capnp::DisplayMode::Structured => DisplayMode::Structured,
                     _ => DisplayMode::Ansi,
                 };
-                self.handle_connect(request_id, sid, display_mode, cols, rows, _ctx).await
+                self.handle_connect(request_id, sid, display_mode, cols, rows, _ctx)
+                    .await
             }
             tui_capnp::tui_request::Which::CreateWindow(()) => {
                 Ok((self.handle_create_window(request_id).await?, None))
@@ -1743,9 +2164,10 @@ impl RequestService for TuiService {
             tui_capnp::tui_request::Which::Snapshot(sid) => {
                 Ok((self.handle_snapshot(request_id, sid).await?, None))
             }
-            tui_capnp::tui_request::Which::ListWindows(session_id) => {
-                Ok((self.handle_list_windows(request_id, session_id).await?, None))
-            }
+            tui_capnp::tui_request::Which::ListWindows(session_id) => Ok((
+                self.handle_list_windows(request_id, session_id).await?,
+                None,
+            )),
             tui_capnp::tui_request::Which::Disconnect(viewer_id) => {
                 Ok((self.handle_disconnect(request_id, viewer_id).await?, None))
             }
@@ -1768,7 +2190,11 @@ impl RequestService for TuiService {
                     tui_capnp::SplitDirection::Vertical => false,
                 };
                 let ratio = split.get_ratio();
-                Ok((self.handle_split_pane(request_id, horizontal, ratio).await?, None))
+                Ok((
+                    self.handle_split_pane(request_id, horizontal, ratio)
+                        .await?,
+                    None,
+                ))
             }
             tui_capnp::tui_request::Which::ClosePane(pane_id) => {
                 Ok((self.handle_close_pane(request_id, pane_id).await?, None))
@@ -1780,14 +2206,18 @@ impl RequestService for TuiService {
                 let input = input_reader?;
                 let viewer_id = input.get_viewer_id();
                 let data = input.get_data()?;
-                Ok((self.handle_send_input(request_id, viewer_id, data).await?, None))
+                Ok((
+                    self.handle_send_input(request_id, viewer_id, data).await?,
+                    None,
+                ))
             }
             tui_capnp::tui_request::Which::SpawnShell(spawn_reader) => {
                 let spawn = spawn_reader?;
                 let sid = spawn.get_session_id();
                 let pane_id = spawn.get_pane_id();
                 let cwd = spawn.get_cwd()?.to_str().unwrap_or("");
-                self.authorize(_ctx, "tui:shell", "spawn").await
+                self.authorize(_ctx, "tui:shell", "spawn")
+                    .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 self.handle_spawn_shell(request_id, sid, pane_id, cwd).await
             }
@@ -1795,7 +2225,8 @@ impl RequestService for TuiService {
                 Ok((self.handle_poll_stdin(request_id, viewer_id).await?, None))
             }
             tui_capnp::tui_request::Which::SpawnChromeShell(req_reader) => {
-                self.authorize(_ctx, "tui:shell", "spawn").await
+                self.authorize(_ctx, "tui:shell", "spawn")
+                    .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 let req = req_reader?;
                 let sid = req.get_session_id();
@@ -1803,10 +2234,12 @@ impl RequestService for TuiService {
                 let cols = req.get_cols();
                 let rows = req.get_rows();
                 let pane_id = req.get_pane_id();
-                self.handle_spawn_chrome_shell(request_id, sid, &registry_dir, cols, rows, pane_id).await
+                self.handle_spawn_chrome_shell(request_id, sid, &registry_dir, cols, rows, pane_id)
+                    .await
             }
             tui_capnp::tui_request::Which::SpawnChatApp(req_reader) => {
-                self.authorize(_ctx, "tui:chat", "spawn").await
+                self.authorize(_ctx, "tui:chat", "spawn")
+                    .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 let req = req_reader?;
                 let sid = req.get_session_id();
@@ -1814,10 +2247,12 @@ impl RequestService for TuiService {
                 let cols = req.get_cols();
                 let rows = req.get_rows();
                 let pane_id = req.get_pane_id();
-                self.handle_spawn_chat_app(request_id, sid, &model_ref, cols, rows, pane_id).await
+                self.handle_spawn_chat_app(request_id, sid, &model_ref, cols, rows, pane_id)
+                    .await
             }
             tui_capnp::tui_request::Which::CreatePrivatePane(req_reader) => {
-                self.authorize(_ctx, "tui:private", "create").await
+                self.authorize(_ctx, "tui:private", "create")
+                    .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 let req = req_reader?;
                 let session_id = req.get_session_id();
@@ -1825,7 +2260,13 @@ impl RequestService for TuiService {
                 let cols = req.get_cols();
                 let rows = req.get_rows();
                 let name = req.get_name()?.to_str().unwrap_or("chat").to_owned();
-                Ok((self.handle_create_private_pane(request_id, session_id, window_id, cols, rows, &name).await?, None))
+                Ok((
+                    self.handle_create_private_pane(
+                        request_id, session_id, window_id, cols, rows, &name,
+                    )
+                    .await?,
+                    None,
+                ))
             }
         }
     }
@@ -2431,8 +2872,200 @@ pub(crate) async fn run_frame_loop(
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── W1.3: the Federate TUI client-class consumer gate ─────────────────
+
+    #[cfg(feature = "postgres")]
+    const GATE_HOST: &str = "https://tui-gate.test";
+    #[cfg(feature = "postgres")]
+    const GATE_TUI_CLIENT: &str = "hyprstream-tui-staging";
+
+    #[cfg(feature = "postgres")]
+    fn gate_service(configured: bool) -> TuiService {
+        TuiService::new(
+            Arc::new(RwLock::new(TuiState::new(80, 24, 1000))),
+            TransportConfig::ipc(std::path::PathBuf::from(
+                "/tmp/hyprstream-tui-gate-test.sock",
+            )),
+            SigningKey::from_bytes(&[9; 32]),
+        )
+        .with_expected_audience(GATE_HOST.into())
+        .with_federate_tui_client(configured.then(|| GATE_TUI_CLIENT.to_owned()))
+    }
+
+    #[cfg(feature = "postgres")]
+    fn gate_claims(scopes: &str) -> hyprstream_rpc::auth::Claims {
+        use base64::Engine as _;
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[61; 32])
+            .verifying_key()
+            .to_bytes();
+        let pq = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[62; 32]),
+        );
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = hyprstream_rpc::auth::Claims::new(
+            "did:plc:abcdefghijklmnopqrstuvwx".into(),
+            now,
+            now + 60,
+        )
+        .with_issuer(GATE_HOST.into())
+        .with_audience(Some(GATE_HOST.into()))
+        .with_client_id(GATE_TUI_CLIENT)
+        .with_tenant("tenant-a".into())
+        .with_sid("tui-sid")
+        .with_scope(Some(scopes.to_owned()))
+        .with_cnf_jwk(&ed)
+        .with_federate_tui_markers(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&pq),
+            crate::services::oauth::federate_source::ISSUER.into(),
+            "opaque-oidc-subject".into(),
+        );
+        claims.jti = Some("tui-jti".into());
+        claims
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_gate_admits_the_configured_class_with_the_required_scope() {
+        let service = gate_service(true);
+        let claims = gate_claims("connect:tui:session query:tui:session write:tui:session");
+        for required in [
+            "connect:tui:session",
+            "query:tui:session",
+            "write:tui:session",
+        ] {
+            service
+                .admit_federate_tui(&claims, required)
+                .expect(required);
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_gate_default_denies_when_unconfigured() {
+        let service = gate_service(false);
+        let claims = gate_claims("connect:tui:session");
+        assert!(service
+            .admit_federate_tui(&claims, "connect:tui:session")
+            .is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_gate_denies_a_missing_required_scope() {
+        let service = gate_service(true);
+        let claims = gate_claims("connect:tui:session");
+        assert!(service
+            .admit_federate_tui(&claims, "connect:tui:session")
+            .is_ok());
+        assert!(service
+            .admit_federate_tui(&claims, "write:tui:session")
+            .is_err());
+        assert!(service
+            .admit_federate_tui(&claims, "query:tui:session")
+            .is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_gate_denies_mixed_markers_and_class_substitution() {
+        let service = gate_service(true);
+        let mut mixed = gate_claims("connect:tui:session");
+        mixed.hs_profile = Some("federate-session-v1".into());
+        assert!(service
+            .admit_federate_tui(&mixed, "connect:tui:session")
+            .is_err());
+        let mut wrong_client = gate_claims("connect:tui:session");
+        wrong_client.client_id = Some("other-client".into());
+        assert!(service
+            .admit_federate_tui(&wrong_client, "connect:tui:session")
+            .is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_class_pin_holds_with_all_markers_stripped() {
+        let service = gate_service(true);
+        // Every TUI marker stripped; the class pin (iss + configured
+        // client_id) still classifies the credential, and the gate denies
+        // it for the incomplete marker set.
+        let mut stripped = gate_claims("connect:tui:session");
+        stripped.hs_tui_profile = None;
+        stripped.hs_tui_signer_pq_key_v1 = None;
+        stripped.hs_tui_source_issuer_v1 = None;
+        stripped.hs_tui_source_subject_v1 = None;
+        assert!(!stripped.has_federate_tui_profile_marker());
+        assert!(service.is_federate_tui_classified(&stripped));
+        assert!(service
+            .admit_federate_tui(&stripped, "connect:tui:session")
+            .is_err());
+        // A credential naming a different client with no markers is NOT
+        // classified and keeps the legacy path (gate never applies).
+        let mut ordinary = gate_claims("connect:tui:session");
+        ordinary.hs_tui_profile = None;
+        ordinary.hs_tui_signer_pq_key_v1 = None;
+        ordinary.hs_tui_source_issuer_v1 = None;
+        ordinary.hs_tui_source_subject_v1 = None;
+        ordinary.client_id = Some("ordinary-local-client".into());
+        assert!(!service.is_federate_tui_classified(&ordinary));
+        // The pin requires the issuer to equal the service audience.
+        let mut wrong_iss = stripped.clone();
+        wrong_iss.iss = "https://other-cell.example".into();
+        assert!(!service.is_federate_tui_classified(&wrong_iss));
+        // Unconfigured service: the marker set still classifies. (The
+        // stripped-shape behavior without the per-service wiring depends on
+        // the process-global class reservation, which the dispatch fixture
+        // w13 covers with the reservation installed.)
+        let unconfigured = gate_service(false);
+        assert!(unconfigured.is_federate_tui_classified(&gate_claims("connect:tui:session")));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_tui_scope_map_covers_the_operation_vocabulary() {
+        fn required(build: impl Fn(&mut tui_capnp::tui_request::Builder<'_>)) -> &'static str {
+            let mut msg = Builder::new_default();
+            let mut req = msg.init_root::<tui_capnp::tui_request::Builder<'_>>();
+            req.set_id(1);
+            build(&mut req);
+            federate_tui_required_scope(&req.reborrow_as_reader()).unwrap()
+        }
+        assert_eq!(
+            required(|r| {
+                r.reborrow().init_connect();
+            }),
+            "connect:tui:session"
+        );
+        assert_eq!(required(|r| r.set_snapshot(0)), "query:tui:session");
+        assert_eq!(required(|r| r.set_list_windows(0)), "query:tui:session");
+        assert_eq!(required(|r| r.set_poll_stdin(1)), "query:tui:session");
+        assert_eq!(
+            required(|r| {
+                r.reborrow().init_send_input();
+            }),
+            "write:tui:session"
+        );
+        assert_eq!(
+            required(|r| {
+                r.reborrow().init_spawn_shell();
+            }),
+            "write:tui:session"
+        );
+        assert_eq!(required(|r| r.set_disconnect(1)), "write:tui:session");
+    }
+
+    #[test]
+    fn service_clients_fail_closed_without_a_nonempty_service_token() {
+        assert!(nonempty_service_token(None).is_err());
+        assert!(nonempty_service_token(Some(" \t".to_owned())).is_err());
+        assert_eq!(
+            nonempty_service_token(Some("bound.jwt".to_owned())).unwrap(),
+            "bound.jwt"
+        );
+    }
 
     #[test]
     fn test_display_mode() {
@@ -2454,7 +3087,17 @@ mod tests {
         use hyprstream_rpc::moq_stream::{NodeStreamReach, ProducerReachConfig};
 
         let addr: std::net::SocketAddr = "127.0.0.1:4433".parse().expect("addr");
+        let server_identity = hyprstream_rpc::stream_info::MoqlServerIdentity {
+            did: "did:at9p:tui".to_owned(),
+            epoch: 7,
+            head_digest: vec![0x22; 64],
+            expires_at_unix_ms: hyprstream_rpc::envelope::current_timestamp() + 60_000,
+            ed25519: [0x23; 32],
+            ml_dsa65: vec![0x24; 1952],
+        };
         let reach = ProducerReachConfig {
+            moql_server_identity: Some(server_identity.clone()),
+            relay_moql_server_identity: None,
             iroh_node_id: None,
             quic_reach: Some(NodeStreamReach {
                 addr,
@@ -2462,7 +3105,8 @@ mod tests {
                 cert_hashes: vec![[0x11u8; 32]],
             }),
             relay: None,
-        }.reach();
+        }
+        .reach();
         assert!(
             !reach.is_empty(),
             "local ProducerReachConfig must produce a dialable reach"
@@ -2475,6 +3119,8 @@ mod tests {
             si.set_topic("deadbeef");
             si.set_mac_key(&[7u8; 32]);
             si.set_broadcast_path("local/streams/deadbeef");
+            let mut witness = si.reborrow().init_moql_server_identity();
+            hyprstream_rpc::capnp::ToCapnp::write_to(&server_identity, &mut witness);
             let mut reach_list = si.reborrow().init_announced_at(reach.len() as u32);
             for (j, dest) in reach.iter().enumerate() {
                 let mut db = reach_list.reborrow().get(j as u32);
@@ -2486,13 +3132,13 @@ mod tests {
 
         // Decode through the generated client StreamInfo and assert the reach
         // carries the Quic dial parameters intact.
-        let reader = serialize::read_message(&buf[..], capnp::message::ReaderOptions::new())
-            .expect("read");
+        let reader =
+            serialize::read_message(&buf[..], capnp::message::ReaderOptions::new()).expect("read");
         let si_reader = reader
             .get_root::<tui_capnp::stream_info::Reader<'_>>()
             .expect("root");
         let decoded =
-            crate::services::generated::tui_client::StreamInfo::read_from(si_reader).expect("decode");
+            hyprstream_rpc_std::tui_client::StreamInfo::read_from(si_reader).expect("decode");
 
         assert_eq!(
             decoded.announced_at.len(),
@@ -2503,6 +3149,10 @@ mod tests {
         assert_eq!(
             decoded.announced_at, reach,
             "decoded StreamInfo.announcedAt must round-trip the producer reach exactly"
+        );
+        assert_eq!(
+            decoded.moql_server_identity, server_identity,
+            "decoded TUI StreamInfo must retain its resolver-verified server witness"
         );
         match &decoded.announced_at[0].transport {
             hyprstream_rpc::stream_info::TransportConfig::Quic(q) => {

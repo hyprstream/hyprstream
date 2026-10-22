@@ -52,7 +52,10 @@ fn generated_paths_match_docexample_convention() {
 fn write_verbs_share_the_ctl_node() {
     for verb in ["clone", "register", "remove"] {
         let n = find(verb);
-        assert_eq!(n.path, "ctl", "`{verb}` must project to the shared ctl node");
+        assert_eq!(
+            n.path, "ctl",
+            "`{verb}` must project to the shared ctl node"
+        );
         assert_eq!(n.kind, VfsNodeKind::Ctl);
     }
     // …and the query reads must NOT collapse onto ctl.
@@ -90,19 +93,33 @@ fn repo_projects_as_a_subdirectory_with_children() {
     );
 
     let (prefix, sub) = hyprstream_rpc_std::registry_client::vfs_nodes_repo();
-    assert_eq!(prefix, "repo/{repoId}", "subdir carries the $vfsPath prefix");
+    assert_eq!(
+        prefix, "repo/{repoId}",
+        "subdir carries the $vfsPath prefix"
+    );
     let has = |m: &str| sub.iter().any(|n| n.method == m);
     // Representative children the old prose implied under a repo dir.
     assert!(has("status"), "repo subdir must expose `status`");
     assert!(has("get_head"), "repo subdir must expose the head read");
-    assert!(has("list_branches"), "repo subdir must expose branch listing");
-    assert!(has("commit"), "repo subdir must expose the `commit` ctl verb");
+    assert!(
+        has("list_branches"),
+        "repo subdir must expose branch listing"
+    );
+    assert!(
+        has("commit"),
+        "repo subdir must expose the `commit` ctl verb"
+    );
 
     // The subdir table obeys the same scope→kind soundness as the top level.
     for n in sub {
         let is_read = matches!(n.scope, "query" | "subscribe" | "");
         if is_read {
-            assert_ne!(n.kind, VfsNodeKind::Ctl, "repo `{}` read must not be a ctl", n.method);
+            assert_ne!(
+                n.kind,
+                VfsNodeKind::Ctl,
+                "repo `{}` read must not be a ctl",
+                n.method
+            );
         }
     }
 }
@@ -125,7 +142,10 @@ fn scope_and_kind_are_consistent() {
             );
         } else {
             assert!(
-                !matches!(n.kind, VfsNodeKind::File | VfsNodeKind::Dir | VfsNodeKind::Query),
+                !matches!(
+                    n.kind,
+                    VfsNodeKind::File | VfsNodeKind::Dir | VfsNodeKind::Query
+                ),
                 "write/manage method `{}` must not project to a read-only node",
                 n.method
             );

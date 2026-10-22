@@ -41,7 +41,8 @@ pub enum SyntheticNode {
     /// Control file: write input, read response. Mutations go here (Plan9 ctl pattern).
     /// The handler receives the caller's `Subject` so it can enforce per-caller authorization.
     CtlFile {
-        handler: Box<dyn Fn(&[u8], &hyprstream_rpc::Subject) -> Result<Vec<u8>, String> + Send + Sync>,
+        handler:
+            Box<dyn Fn(&[u8], &hyprstream_rpc::Subject) -> Result<Vec<u8>, String> + Send + Sync>,
     },
     /// Status file backed by `tokio::sync::watch`. Always returns the latest value.
     /// Stores the Sender so receivers can be cloned per-fid at walk time.
@@ -54,7 +55,14 @@ pub enum SyntheticNode {
     /// (e.g., forwarding to remote services). Must resolve as `ResolvedNode::Static`
     /// to avoid holding DashMap guards across await points.
     AsyncCtlFile {
-        handler: Box<dyn Fn(Vec<u8>, hyprstream_rpc::Subject) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>> + Send + Sync>,
+        handler: Box<
+            dyn Fn(
+                    Vec<u8>,
+                    hyprstream_rpc::Subject,
+                ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>
+                + Send
+                + Sync,
+        >,
     },
 }
 
@@ -139,11 +147,19 @@ pub struct SyntheticQid {
 
 impl SyntheticQid {
     pub fn dir(path_str: &str) -> Self {
-        Self { qtype: QTDIR, version: 1, path: hash_path(path_str) }
+        Self {
+            qtype: QTDIR,
+            version: 1,
+            path: hash_path(path_str),
+        }
     }
 
     pub fn file(path_str: &str) -> Self {
-        Self { qtype: QTFILE, version: 1, path: hash_path(path_str) }
+        Self {
+            qtype: QTFILE,
+            version: 1,
+            path: hash_path(path_str),
+        }
     }
 }
 
@@ -197,7 +213,9 @@ pub struct SyntheticFidTable {
 }
 
 impl Default for SyntheticFidTable {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SyntheticFidTable {
@@ -211,13 +229,21 @@ impl SyntheticFidTable {
 
     fn alloc_fid(&self, owner: &str) -> Result<u32, &'static str> {
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
-        let count = self.client_counts
+        let count = self
+            .client_counts
             .entry(owner.to_owned())
             .or_insert_with(|| AtomicU32::new(0));
         // Atomic check-and-increment to prevent exceeding per-client limit on ARM.
-        if count.fetch_update(AcqRel, Acquire, |c| {
-            if c >= crate::services::types::MAX_FIDS_PER_CLIENT { None } else { Some(c + 1) }
-        }).is_err() {
+        if count
+            .fetch_update(AcqRel, Acquire, |c| {
+                if c >= crate::services::types::MAX_FIDS_PER_CLIENT {
+                    None
+                } else {
+                    Some(c + 1)
+                }
+            })
+            .is_err()
+        {
             return Err("too many open fids");
         }
         if self.fids.len() as u32 >= crate::services::types::MAX_FIDS_GLOBAL {
@@ -227,7 +253,9 @@ impl SyntheticFidTable {
         // Retry on collision using atomic entry() to avoid TOCTOU.
         for _ in 0..1000 {
             let fid = self.next_fid.fetch_add(1, Relaxed);
-            if fid == 0 { continue; } // 0 is reserved for root
+            if fid == 0 {
+                continue;
+            } // 0 is reserved for root
             if let dashmap::mapref::entry::Entry::Vacant(_) = self.fids.entry(fid) {
                 // Fid is available — caller will insert via insert_at().
                 return Ok(fid);
@@ -241,7 +269,11 @@ impl SyntheticFidTable {
         self.fids.insert(fid, entry);
     }
 
-    fn get_verified(&self, fid: u32, owner: &str) -> Result<dashmap::mapref::one::Ref<'_, u32, FidEntry>, &'static str> {
+    fn get_verified(
+        &self,
+        fid: u32,
+        owner: &str,
+    ) -> Result<dashmap::mapref::one::Ref<'_, u32, FidEntry>, &'static str> {
         let entry = self.fids.get(&fid).ok_or("fid not found")?;
         if entry.owner != owner {
             return Err("fid not owned by caller");
@@ -329,7 +361,12 @@ impl SyntheticTree {
     ///
     /// If `newfid` is Some and > 0, uses the client-chosen fid (9P protocol).
     /// If `newfid` is None or 0, auto-allocates a server-side fid.
-    pub fn walk(&self, wnames: &[String], owner: &str, newfid: Option<u32>) -> Result<(u32, SyntheticQid), String> {
+    pub fn walk(
+        &self,
+        wnames: &[String],
+        owner: &str,
+        newfid: Option<u32>,
+    ) -> Result<(u32, SyntheticQid), String> {
         let fid = match newfid {
             Some(f) if f > 0 => {
                 // Client-chosen fid — check not already in use, count against limits.
@@ -337,12 +374,21 @@ impl SyntheticTree {
                     return Err("fid already in use".to_owned());
                 }
                 use std::sync::atomic::Ordering::{AcqRel, Acquire};
-                let count = self.fid_table.client_counts
+                let count = self
+                    .fid_table
+                    .client_counts
                     .entry(owner.to_owned())
                     .or_insert_with(|| AtomicU32::new(0));
-                if count.fetch_update(AcqRel, Acquire, |c| {
-                    if c >= crate::services::types::MAX_FIDS_PER_CLIENT { None } else { Some(c + 1) }
-                }).is_err() {
+                if count
+                    .fetch_update(AcqRel, Acquire, |c| {
+                        if c >= crate::services::types::MAX_FIDS_PER_CLIENT {
+                            None
+                        } else {
+                            Some(c + 1)
+                        }
+                    })
+                    .is_err()
+                {
                     return Err("too many open fids".to_owned());
                 }
                 f
@@ -356,11 +402,17 @@ impl SyntheticTree {
             self.resolve_walk(wnames)?
         };
 
-        self.fid_table.insert(fid, FidEntry {
-            state: FidState::Walked { resolved, qid: qid.clone() },
-            owner: owner.to_owned(),
-            last_accessed: AtomicU64::new(now_secs()),
-        });
+        self.fid_table.insert(
+            fid,
+            FidEntry {
+                state: FidState::Walked {
+                    resolved,
+                    qid: qid.clone(),
+                },
+                owner: owner.to_owned(),
+                last_accessed: AtomicU64::new(now_secs()),
+            },
+        );
 
         Ok((fid, qid))
     }
@@ -433,7 +485,12 @@ impl SyntheticTree {
         }
     }
 
-    fn read_from_node(&self, node: Option<&SyntheticNode>, offset: u64, count: u32) -> Result<Vec<u8>, String> {
+    fn read_from_node(
+        &self,
+        node: Option<&SyntheticNode>,
+        offset: u64,
+        count: u32,
+    ) -> Result<Vec<u8>, String> {
         match node {
             Some(SyntheticNode::ReadFile(gen)) => {
                 let content = gen();
@@ -442,22 +499,34 @@ impl SyntheticTree {
                 Ok(content[start..end].to_vec())
             }
             Some(SyntheticNode::Dir { children }) => {
-                if offset > 0 { return Ok(vec![]); }
+                if offset > 0 {
+                    return Ok(vec![]);
+                }
                 Ok(encode_dir_entries(
-                    &children.keys().map(|k| DirEntry {
-                        name: k.clone(),
-                        is_dir: matches!(children.get(k), Some(SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. })),
-                        size: 0,
-                        stat: None,
-                    }).collect::<Vec<_>>(),
+                    &children
+                        .keys()
+                        .map(|k| DirEntry {
+                            name: k.clone(),
+                            is_dir: matches!(
+                                children.get(k),
+                                Some(SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. })
+                            ),
+                            size: 0,
+                            stat: None,
+                        })
+                        .collect::<Vec<_>>(),
                     count,
                 ))
             }
             Some(SyntheticNode::DynamicDir { list, .. }) => {
-                if offset > 0 { return Ok(vec![]); }
+                if offset > 0 {
+                    return Ok(vec![]);
+                }
                 Ok(encode_dir_entries(&list(), count))
             }
-            Some(SyntheticNode::CtlFile { .. }) | Some(SyntheticNode::AsyncCtlFile { .. }) => Ok(vec![]),
+            Some(SyntheticNode::CtlFile { .. }) | Some(SyntheticNode::AsyncCtlFile { .. }) => {
+                Ok(vec![])
+            }
             Some(SyntheticNode::WatchFile(sender)) => {
                 // Borrow the latest value from the watch channel — instant, no await.
                 // NOTE: For Dynamic nodes this runs under a DashMap guard. That's acceptable
@@ -470,7 +539,9 @@ impl SyntheticTree {
                 Ok(data[start..end].to_vec())
             }
             // OneshotFile requires async — cannot be read on the sync path.
-            Some(SyntheticNode::OneshotFile(_)) => Err("OneshotFile requires async read (use Mount trait)".to_owned()),
+            Some(SyntheticNode::OneshotFile(_)) => {
+                Err("OneshotFile requires async read (use Mount trait)".to_owned())
+            }
             None => Err("path not found in tree".to_owned()),
         }
     }
@@ -496,14 +567,18 @@ impl SyntheticTree {
 
     fn readdir_from_node(&self, node: Option<&SyntheticNode>) -> Result<Vec<DirEntry>, String> {
         match node {
-            Some(SyntheticNode::Dir { children }) => {
-                Ok(children.keys().map(|k| DirEntry {
+            Some(SyntheticNode::Dir { children }) => Ok(children
+                .keys()
+                .map(|k| DirEntry {
                     name: k.clone(),
-                    is_dir: matches!(children.get(k), Some(SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. })),
+                    is_dir: matches!(
+                        children.get(k),
+                        Some(SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. })
+                    ),
                     size: 0,
                     stat: None,
-                }).collect())
-            }
+                })
+                .collect()),
             Some(SyntheticNode::DynamicDir { list, .. }) => Ok(list()),
             _ => Err("not a directory".to_owned()),
         }
@@ -516,10 +591,22 @@ impl SyntheticTree {
     ///
     /// For ctl files, the handler closure is invoked and the response is buffered
     /// for subsequent reads. Response buffer is capped at MAX_RESPONSE_BUF.
-    pub fn write(&self, fid: u32, _offset: u64, data: &[u8], owner: &str, subject: &hyprstream_rpc::Subject) -> Result<u32, String> {
+    pub fn write(
+        &self,
+        fid: u32,
+        _offset: u64,
+        data: &[u8],
+        owner: &str,
+        subject: &hyprstream_rpc::Subject,
+    ) -> Result<u32, String> {
         let entry = self.fid_table.get_verified(fid, owner)?;
         match &entry.state {
-            FidState::Opened { resolved, mode, response_buf, .. } => {
+            FidState::Opened {
+                resolved,
+                mode,
+                response_buf,
+                ..
+            } => {
                 let base_mode = *mode & 0x03;
                 if base_mode != hyprstream_vfs::OWRITE && base_mode != hyprstream_vfs::ORDWR {
                     return Err("fid not open for writing".to_owned());
@@ -606,7 +693,9 @@ impl SyntheticTree {
         // Walked all static components.
         let full_path = static_path.join("/");
         let qid = match current {
-            SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. } => SyntheticQid::dir(&full_path),
+            SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. } => {
+                SyntheticQid::dir(&full_path)
+            }
             _ => SyntheticQid::file(&full_path),
         };
         Ok((qid, ResolvedNode::Static(static_path)))
@@ -620,15 +709,15 @@ impl SyntheticTree {
         parent_name: &str,
         remaining: &[String],
     ) -> Result<(SyntheticQid, ResolvedNode), String> {
-        let subtree = resolve(parent_name)
-            .ok_or("cannot resolve dynamic child")?;
+        let subtree = resolve(parent_name).ok_or("cannot resolve dynamic child")?;
 
         // Walk remaining components through the subtree.
         let mut current = subtree;
         for (i, name) in remaining.iter().enumerate() {
             match current {
                 SyntheticNode::Dir { mut children } => {
-                    current = children.remove(name)
+                    current = children
+                        .remove(name)
                         .ok_or_else(|| format!("not found: {}", name))?;
                 }
                 _ => return Err(format!("not a directory at: {}", remaining[..i].join("/"))),
@@ -637,7 +726,9 @@ impl SyntheticTree {
 
         let full_path = remaining.join("/");
         let qid = match &current {
-            SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. } => SyntheticQid::dir(&full_path),
+            SyntheticNode::Dir { .. } | SyntheticNode::DynamicDir { .. } => {
+                SyntheticQid::dir(&full_path)
+            }
             _ => SyntheticQid::file(&full_path),
         };
         Ok((qid, ResolvedNode::Dynamic(current)))
@@ -680,28 +771,52 @@ fn encode_dir_entries(entries: &[DirEntry], max_bytes: u32) -> Vec<u8> {
 
 #[async_trait::async_trait]
 impl hyprstream_vfs::Mount for SyntheticTree {
-    async fn walk(&self, components: &[&str], caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Fid, hyprstream_vfs::MountError> {
+    async fn walk(
+        &self,
+        components: &[&str],
+        caller: &hyprstream_rpc::Subject,
+    ) -> Result<hyprstream_vfs::Fid, hyprstream_vfs::MountError> {
         let wnames: Vec<String> = components.iter().map(|s| (*s).to_owned()).collect();
         let owner = caller.to_string();
-        let (fid, _qid) = self.walk(&wnames, &owner, None).map_err(hyprstream_vfs::MountError::NotFound)?;
+        let (fid, _qid) = self
+            .walk(&wnames, &owner, None)
+            .map_err(hyprstream_vfs::MountError::NotFound)?;
         Ok(hyprstream_vfs::Fid::new(fid))
     }
 
-    async fn open(&self, fid: &mut hyprstream_vfs::Fid, mode: u8, caller: &hyprstream_rpc::Subject) -> Result<(), hyprstream_vfs::MountError> {
-        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
+    async fn open(
+        &self,
+        fid: &mut hyprstream_vfs::Fid,
+        mode: u8,
+        caller: &hyprstream_rpc::Subject,
+    ) -> Result<(), hyprstream_vfs::MountError> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| {
+            hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into())
+        })?;
         let owner = caller.to_string();
-        self.open(fid_u32, mode, &owner).map_err(hyprstream_vfs::MountError::Io)?;
+        self.open(fid_u32, mode, &owner)
+            .map_err(hyprstream_vfs::MountError::Io)?;
         Ok(())
     }
 
-    async fn read(&self, fid: &hyprstream_vfs::Fid, offset: u64, count: u32, caller: &hyprstream_rpc::Subject) -> Result<Vec<u8>, hyprstream_vfs::MountError> {
-        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
+    async fn read(
+        &self,
+        fid: &hyprstream_vfs::Fid,
+        offset: u64,
+        count: u32,
+        caller: &hyprstream_rpc::Subject,
+    ) -> Result<Vec<u8>, hyprstream_vfs::MountError> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| {
+            hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into())
+        })?;
         let owner = caller.to_string();
 
         // Check for OneshotFile — requires async read. Extract the Arc<OneshotState>
         // from the DashMap guard before awaiting to avoid holding !Send guard across .await.
         {
-            let entry = self.fid_table.get_verified(fid_u32, &owner)
+            let entry = self
+                .fid_table
+                .get_verified(fid_u32, &owner)
                 .map_err(|e| hyprstream_vfs::MountError::Io(e.to_owned()))?;
             if let FidState::Opened { resolved, .. } = &entry.state {
                 let node = match resolved {
@@ -711,8 +826,7 @@ impl hyprstream_vfs::Mount for SyntheticTree {
                 if let Some(SyntheticNode::OneshotFile(state)) = node {
                     let state = Arc::clone(state);
                     drop(entry); // Drop DashMap guard before await.
-                    let data = state.read().await
-                        .map_err(hyprstream_vfs::MountError::Io)?;
+                    let data = state.read().await.map_err(hyprstream_vfs::MountError::Io)?;
                     let start = std::cmp::min(offset as usize, data.len());
                     let end = std::cmp::min(start + count as usize, data.len());
                     return Ok(data[start..end].to_vec());
@@ -721,21 +835,34 @@ impl hyprstream_vfs::Mount for SyntheticTree {
         }
 
         // Non-async path (ReadFile, WatchFile, Dir, CtlFile response buffer, etc.)
-        self.read(fid_u32, offset, count, &owner).map_err(hyprstream_vfs::MountError::Io)
+        self.read(fid_u32, offset, count, &owner)
+            .map_err(hyprstream_vfs::MountError::Io)
     }
 
-    async fn write(&self, fid: &hyprstream_vfs::Fid, offset: u64, data: &[u8], caller: &hyprstream_rpc::Subject) -> Result<u32, hyprstream_vfs::MountError> {
-        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
+    async fn write(
+        &self,
+        fid: &hyprstream_vfs::Fid,
+        offset: u64,
+        data: &[u8],
+        caller: &hyprstream_rpc::Subject,
+    ) -> Result<u32, hyprstream_vfs::MountError> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| {
+            hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into())
+        })?;
         let owner = caller.to_string();
 
         // Check for AsyncCtlFile — requires async handler. Extract handler, drop guard, await.
         {
-            let entry = self.fid_table.get_verified(fid_u32, &owner)
+            let entry = self
+                .fid_table
+                .get_verified(fid_u32, &owner)
                 .map_err(|e| hyprstream_vfs::MountError::Io(e.to_owned()))?;
             if let FidState::Opened { resolved, mode, .. } = &entry.state {
                 let base_mode = *mode & 0x03;
                 if base_mode != hyprstream_vfs::OWRITE && base_mode != hyprstream_vfs::ORDWR {
-                    return Err(hyprstream_vfs::MountError::Io("fid not open for writing".to_owned()));
+                    return Err(hyprstream_vfs::MountError::Io(
+                        "fid not open for writing".to_owned(),
+                    ));
                 }
                 let node = match resolved {
                     ResolvedNode::Static(path) => self.resolve_node(path),
@@ -745,8 +872,7 @@ impl hyprstream_vfs::Mount for SyntheticTree {
                     let fut = handler(data.to_vec(), caller.clone());
                     let written = data.len() as u32;
                     drop(entry); // Release DashMap guard before await.
-                    let result = fut.await
-                        .map_err(hyprstream_vfs::MountError::Io)?;
+                    let result = fut.await.map_err(hyprstream_vfs::MountError::Io)?;
                     // Re-acquire guard to write response buffer. If the fid was
                     // clunked during the await, the handler already ran (side-effect
                     // committed) but nobody will read the response — return Ok(written)
@@ -765,18 +891,35 @@ impl hyprstream_vfs::Mount for SyntheticTree {
         }
 
         // Non-async path (sync CtlFile, etc.)
-        self.write(fid_u32, offset, data, &owner, caller).map_err(hyprstream_vfs::MountError::Io)
+        self.write(fid_u32, offset, data, &owner, caller)
+            .map_err(hyprstream_vfs::MountError::Io)
     }
 
-    async fn readdir(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<Vec<hyprstream_vfs::DirEntry>, hyprstream_vfs::MountError> {
-        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
-        let entries = self.readdir_entries(fid_u32, &caller.to_string()).map_err(hyprstream_vfs::MountError::Io)?;
+    async fn readdir(
+        &self,
+        fid: &hyprstream_vfs::Fid,
+        caller: &hyprstream_rpc::Subject,
+    ) -> Result<Vec<hyprstream_vfs::DirEntry>, hyprstream_vfs::MountError> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| {
+            hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into())
+        })?;
+        let entries = self
+            .readdir_entries(fid_u32, &caller.to_string())
+            .map_err(hyprstream_vfs::MountError::Io)?;
         Ok(entries)
     }
 
-    async fn stat(&self, fid: &hyprstream_vfs::Fid, caller: &hyprstream_rpc::Subject) -> Result<hyprstream_vfs::Stat, hyprstream_vfs::MountError> {
-        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into()))?;
-        let (qid, name) = self.stat(fid_u32, &caller.to_string()).map_err(hyprstream_vfs::MountError::Io)?;
+    async fn stat(
+        &self,
+        fid: &hyprstream_vfs::Fid,
+        caller: &hyprstream_rpc::Subject,
+    ) -> Result<hyprstream_vfs::Stat, hyprstream_vfs::MountError> {
+        let fid_u32 = *fid.downcast_ref::<u32>().ok_or_else(|| {
+            hyprstream_vfs::MountError::InvalidArgument("invalid fid type".into())
+        })?;
+        let (qid, name) = self
+            .stat(fid_u32, &caller.to_string())
+            .map_err(hyprstream_vfs::MountError::Io)?;
         Ok(hyprstream_vfs::Stat {
             qtype: qid.qtype,
             // SyntheticQid version is a constant (no change-detection); path is
@@ -811,26 +954,34 @@ mod tests {
 
     fn make_tree() -> SyntheticTree {
         let mut children = HashMap::new();
-        children.insert("status".to_owned(), SyntheticNode::ReadFile(
-            Box::new(|| b"loaded\n".to_vec()),
-        ));
-        children.insert("ctl".to_owned(), SyntheticNode::CtlFile {
-            handler: Box::new(|data, _subject| {
-                let cmd = String::from_utf8_lossy(data);
-                Ok(format!("ok: {}", cmd.trim()).into_bytes())
-            }),
-        });
+        children.insert(
+            "status".to_owned(),
+            SyntheticNode::ReadFile(Box::new(|| b"loaded\n".to_vec())),
+        );
+        children.insert(
+            "ctl".to_owned(),
+            SyntheticNode::CtlFile {
+                handler: Box::new(|data, _subject| {
+                    let cmd = String::from_utf8_lossy(data);
+                    Ok(format!("ok: {}", cmd.trim()).into_bytes())
+                }),
+            },
+        );
 
         let mut root_children = HashMap::new();
         root_children.insert("test-model".to_owned(), SyntheticNode::Dir { children });
 
-        SyntheticTree::new(SyntheticNode::Dir { children: root_children })
+        SyntheticTree::new(SyntheticNode::Dir {
+            children: root_children,
+        })
     }
 
     #[test]
     fn walk_and_read_file() {
         let tree = make_tree();
-        let (fid, qid) = tree.walk(&["test-model".into(), "status".into()], "alice", None).unwrap();
+        let (fid, qid) = tree
+            .walk(&["test-model".into(), "status".into()], "alice", None)
+            .unwrap();
         assert_eq!(qid.qtype, QTFILE);
         tree.open(fid, OREAD, "alice").unwrap();
         let data = tree.read(fid, 0, 1024, "alice").unwrap();
@@ -852,9 +1003,19 @@ mod tests {
     #[test]
     fn ctl_write_then_read() {
         let tree = make_tree();
-        let (fid, _) = tree.walk(&["test-model".into(), "ctl".into()], "alice", None).unwrap();
+        let (fid, _) = tree
+            .walk(&["test-model".into(), "ctl".into()], "alice", None)
+            .unwrap();
         tree.open(fid, OWRITE, "alice").unwrap();
-        let written = tree.write(fid, 0, b"load", "alice", &hyprstream_rpc::Subject::new("alice")).unwrap();
+        let written = tree
+            .write(
+                fid,
+                0,
+                b"load",
+                "alice",
+                &hyprstream_rpc::Subject::new("alice"),
+            )
+            .unwrap();
         assert_eq!(written, 4);
         // Read the response.
         let resp = tree.read(fid, 0, 1024, "alice").unwrap();
@@ -865,7 +1026,9 @@ mod tests {
     #[test]
     fn fid_ownership_enforced() {
         let tree = make_tree();
-        let (fid, _) = tree.walk(&["test-model".into(), "status".into()], "alice", None).unwrap();
+        let (fid, _) = tree
+            .walk(&["test-model".into(), "status".into()], "alice", None)
+            .unwrap();
         assert!(tree.open(fid, OREAD, "bob").is_err());
         tree.clunk(fid, "alice");
     }
@@ -879,7 +1042,9 @@ mod tests {
     #[test]
     fn stat_returns_qid() {
         let tree = make_tree();
-        let (fid, _) = tree.walk(&["test-model".into(), "status".into()], "alice", None).unwrap();
+        let (fid, _) = tree
+            .walk(&["test-model".into(), "status".into()], "alice", None)
+            .unwrap();
         let (qid, _name) = tree.stat(fid, "alice").unwrap();
         assert_eq!(qid.qtype, QTFILE);
         tree.clunk(fid, "alice");
@@ -888,15 +1053,28 @@ mod tests {
     #[test]
     fn dynamic_dir() {
         let tree = SyntheticTree::new(SyntheticNode::DynamicDir {
-            list: Box::new(|| vec![
-                DirEntry { name: "model-a".into(), is_dir: true, size: 0, stat: None },
-                DirEntry { name: "model-b".into(), is_dir: true, size: 0, stat: None },
-            ]),
+            list: Box::new(|| {
+                vec![
+                    DirEntry {
+                        name: "model-a".into(),
+                        is_dir: true,
+                        size: 0,
+                        stat: None,
+                    },
+                    DirEntry {
+                        name: "model-b".into(),
+                        is_dir: true,
+                        size: 0,
+                        stat: None,
+                    },
+                ]
+            }),
             resolve: Box::new(|_name| {
                 let mut children = HashMap::new();
-                children.insert("status".to_owned(), SyntheticNode::ReadFile(
-                    Box::new(|| b"loaded\n".to_vec()),
-                ));
+                children.insert(
+                    "status".to_owned(),
+                    SyntheticNode::ReadFile(Box::new(|| b"loaded\n".to_vec())),
+                );
                 Some(SyntheticNode::Dir { children })
             }),
         });
@@ -910,7 +1088,9 @@ mod tests {
         tree.clunk(fid, "alice");
 
         // Walk to a dynamic child's file.
-        let (fid2, qid2) = tree.walk(&["model-a".into(), "status".into()], "alice", None).unwrap();
+        let (fid2, qid2) = tree
+            .walk(&["model-a".into(), "status".into()], "alice", None)
+            .unwrap();
         assert_eq!(qid2.qtype, QTFILE);
         tree.open(fid2, OREAD, "alice").unwrap();
         let content = tree.read(fid2, 0, 1024, "alice").unwrap();
@@ -930,7 +1110,10 @@ mod tests {
         ns.mount("/srv/model", Arc::new(tree)).unwrap();
 
         let caller = Subject::new("alice");
-        let data = ns.cat("/srv/model/test-model/status", &caller).await.unwrap();
+        let data = ns
+            .cat("/srv/model/test-model/status", &caller)
+            .await
+            .unwrap();
         assert_eq!(data, b"loaded\n");
     }
 
@@ -946,7 +1129,10 @@ mod tests {
         let caller = Subject::new("alice");
 
         // ctl: write command + read response in one fid lifecycle.
-        let resp = ns.ctl("/srv/model/test-model/ctl", b"load", &caller).await.unwrap();
+        let resp = ns
+            .ctl("/srv/model/test-model/ctl", b"load", &caller)
+            .await
+            .unwrap();
         assert_eq!(resp, b"ok: load");
     }
 
@@ -973,23 +1159,33 @@ mod tests {
 
         // Build a dynamic tree (like the model service would).
         let tree = SyntheticTree::new(SyntheticNode::DynamicDir {
-            list: Box::new(|| vec![
-                DirEntry { name: "qwen3:main".into(), is_dir: true, size: 0, stat: None },
-            ]),
+            list: Box::new(|| {
+                vec![DirEntry {
+                    name: "qwen3:main".into(),
+                    is_dir: true,
+                    size: 0,
+                    stat: None,
+                }]
+            }),
             resolve: Box::new(|_name| {
                 let mut children = HashMap::new();
-                children.insert("status".to_owned(), SyntheticNode::ReadFile(
-                    Box::new(|| b"loaded\n".to_vec()),
-                ));
-                children.insert("defaults".to_owned(), SyntheticNode::ReadFile(
-                    Box::new(|| b"{\"temperature\": 0.7}\n".to_vec()),
-                ));
-                children.insert("ctl".to_owned(), SyntheticNode::CtlFile {
-                    handler: Box::new(|data, _subject| {
-                        let cmd = String::from_utf8_lossy(data);
-                        Ok(format!("ctl: {}\n", cmd.trim()).into_bytes())
-                    }),
-                });
+                children.insert(
+                    "status".to_owned(),
+                    SyntheticNode::ReadFile(Box::new(|| b"loaded\n".to_vec())),
+                );
+                children.insert(
+                    "defaults".to_owned(),
+                    SyntheticNode::ReadFile(Box::new(|| b"{\"temperature\": 0.7}\n".to_vec())),
+                );
+                children.insert(
+                    "ctl".to_owned(),
+                    SyntheticNode::CtlFile {
+                        handler: Box::new(|data, _subject| {
+                            let cmd = String::from_utf8_lossy(data);
+                            Ok(format!("ctl: {}\n", cmd.trim()).into_bytes())
+                        }),
+                    },
+                );
                 Some(SyntheticNode::Dir { children })
             }),
         });
@@ -1000,15 +1196,24 @@ mod tests {
         let caller = Subject::new("alice");
 
         // Read model status through the VFS.
-        let status = ns.cat("/srv/model/qwen3:main/status", &caller).await.unwrap();
+        let status = ns
+            .cat("/srv/model/qwen3:main/status", &caller)
+            .await
+            .unwrap();
         assert_eq!(status, b"loaded\n");
 
         // Read model defaults.
-        let defaults = ns.cat("/srv/model/qwen3:main/defaults", &caller).await.unwrap();
+        let defaults = ns
+            .cat("/srv/model/qwen3:main/defaults", &caller)
+            .await
+            .unwrap();
         assert!(defaults.starts_with(b"{\"temperature\""));
 
         // Write to ctl and read response (single fid lifecycle).
-        let resp = ns.ctl("/srv/model/qwen3:main/ctl", b"load", &caller).await.unwrap();
+        let resp = ns
+            .ctl("/srv/model/qwen3:main/ctl", b"load", &caller)
+            .await
+            .unwrap();
         assert_eq!(resp, b"ctl: load\n");
     }
 
@@ -1025,7 +1230,10 @@ mod tests {
         let bob = Subject::new("bob");
 
         // Both tenants can read (cat does walk+open+read+clunk atomically).
-        let data_a = ns.cat("/srv/model/test-model/status", &alice).await.unwrap();
+        let data_a = ns
+            .cat("/srv/model/test-model/status", &alice)
+            .await
+            .unwrap();
         let data_b = ns.cat("/srv/model/test-model/status", &bob).await.unwrap();
         assert_eq!(data_a, data_b);
         assert_eq!(data_a, b"loaded\n");
@@ -1039,9 +1247,13 @@ mod tests {
         let tree = make_tree();
         let mut ns = Namespace::new();
         ns.mount("/srv/model", Arc::new(tree)).unwrap();
-        ns.mount("/srv/worker", Arc::new(
-            SyntheticTree::new(SyntheticNode::Dir { children: HashMap::new() }),
-        )).unwrap();
+        ns.mount(
+            "/srv/worker",
+            Arc::new(SyntheticTree::new(SyntheticNode::Dir {
+                children: HashMap::new(),
+            })),
+        )
+        .unwrap();
 
         let caller = Subject::new("alice");
 
@@ -1050,11 +1262,17 @@ mod tests {
         let _ = sandbox.unmount("/srv/worker");
 
         // Parent can access both.
-        assert!(ns.cat("/srv/model/test-model/status", &caller).await.is_ok());
+        assert!(ns
+            .cat("/srv/model/test-model/status", &caller)
+            .await
+            .is_ok());
         assert!(ns.ls("/srv/worker", &caller).await.is_ok());
 
         // Child can access model but not worker.
-        assert!(sandbox.cat("/srv/model/test-model/status", &caller).await.is_ok());
+        assert!(sandbox
+            .cat("/srv/model/test-model/status", &caller)
+            .await
+            .is_ok());
         assert!(sandbox.ls("/srv/worker", &caller).await.is_err());
     }
 
@@ -1115,14 +1333,17 @@ mod tests {
         use hyprstream_vfs::{Namespace, Subject};
 
         let mut children = HashMap::new();
-        children.insert("ctl".to_owned(), SyntheticNode::AsyncCtlFile {
-            handler: Box::new(|data, _subject| {
-                Box::pin(async move {
-                    let cmd = String::from_utf8_lossy(&data);
-                    Ok(format!("async: {}", cmd.trim()).into_bytes())
-                })
-            }),
-        });
+        children.insert(
+            "ctl".to_owned(),
+            SyntheticNode::AsyncCtlFile {
+                handler: Box::new(|data, _subject| {
+                    Box::pin(async move {
+                        let cmd = String::from_utf8_lossy(&data);
+                        Ok(format!("async: {}", cmd.trim()).into_bytes())
+                    })
+                }),
+            },
+        );
         let tree = SyntheticTree::new(SyntheticNode::Dir { children });
 
         let mut ns = Namespace::new();

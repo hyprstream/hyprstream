@@ -98,9 +98,12 @@ struct PyFid {
 // devfile callback type aliases
 // ─────────────────────────────────────────────────────────────────────────────
 
-type PyCtl = ControlFile<Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>>;
+type PyCtl = ControlFile<
+    Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>,
+>;
 type ListFn = Box<dyn Fn() -> DevFuture<'static, Vec<String>> + Send + Sync>;
-type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync>;
+type GetFn =
+    Box<dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync>;
 type FieldDir = DynamicDir<ListFn, GetFn>;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,14 +185,15 @@ impl PythonMount {
         let eval = ControlFile::new(Box::new(eval_handler) as _);
 
         let stdout_tx = tx.clone();
-        let stdout_handler = move |data: Vec<u8>| -> DevFuture<'static, Result<Vec<u8>, MountError>> {
-            let tx = stdout_tx.clone();
-            let code = String::from_utf8_lossy(&data).into_owned();
-            Box::pin(async move {
-                let r = request(&tx, |resp| PyCommand::Exec { code, resp }).await?;
-                Ok(render(r))
-            })
-        };
+        let stdout_handler =
+            move |data: Vec<u8>| -> DevFuture<'static, Result<Vec<u8>, MountError>> {
+                let tx = stdout_tx.clone();
+                let code = String::from_utf8_lossy(&data).into_owned();
+                Box::pin(async move {
+                    let r = request(&tx, |resp| PyCommand::Exec { code, resp }).await?;
+                    Ok(render(r))
+                })
+            };
         let stdout = ControlFile::new(Box::new(stdout_handler) as _);
 
         let vars_list_tx = tx.clone();
@@ -197,8 +201,11 @@ impl PythonMount {
         let vars = DynamicDir::new(
             Box::new(move || {
                 let tx = vars_list_tx.clone();
-                Box::pin(async move { request(&tx, |resp| PyCommand::ListVars { resp }).await.unwrap_or_default() })
-                    as DevFuture<'static, _>
+                Box::pin(async move {
+                    request(&tx, |resp| PyCommand::ListVars { resp })
+                        .await
+                        .unwrap_or_default()
+                }) as DevFuture<'static, _>
             }) as ListFn,
             Box::new(move |name: String| {
                 let tx = vars_get_tx.clone();
@@ -217,8 +224,11 @@ impl PythonMount {
         let defs = DynamicDir::new(
             Box::new(move || {
                 let tx = defs_list_tx.clone();
-                Box::pin(async move { request(&tx, |resp| PyCommand::ListDefs { resp }).await.unwrap_or_default() })
-                    as DevFuture<'static, _>
+                Box::pin(async move {
+                    request(&tx, |resp| PyCommand::ListDefs { resp })
+                        .await
+                        .unwrap_or_default()
+                }) as DevFuture<'static, _>
             }) as ListFn,
             Box::new(move |name: String| {
                 let tx = defs_get_tx.clone();
@@ -424,7 +434,9 @@ mod tests {
                     "mount test: pyguest wasm not built but running under CI — build the \
                      pyguest and set HYPRSTREAM_PYGUEST_WASM"
                 );
-                eprintln!("SKIP mount test: guest wasm not built (set CI=1 to make this a failure)");
+                eprintln!(
+                    "SKIP mount test: guest wasm not built (set CI=1 to make this a failure)"
+                );
                 None
             }
         }

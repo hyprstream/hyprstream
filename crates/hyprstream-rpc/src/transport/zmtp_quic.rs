@@ -40,8 +40,10 @@ use tokio::sync::Notify;
 use tracing::{debug, error, trace};
 
 // Re-export pure framing types from zmtp_framing (single source of truth).
-pub use crate::zmtp_framing::{ZmqSocketType, GREETING_SIZE, ZMTP_VERSION_MAJOR, ZMTP_VERSION_MINOR, MECHANISM_NULL};
 use crate::zmtp_framing;
+pub use crate::zmtp_framing::{
+    ZmqSocketType, GREETING_SIZE, MECHANISM_NULL, ZMTP_VERSION_MAJOR, ZMTP_VERSION_MINOR,
+};
 
 /// ALPN protocol identifier for ZMTP over QUIC.
 pub const ALPN_ZMTP3: &[u8] = b"zmtp3";
@@ -307,18 +309,14 @@ impl Multipart {
 // ============================================================================
 
 fn owned_quic_server_config(tls: rustls::ServerConfig) -> Result<quinn::ServerConfig> {
-    crate::transport::pq_provider::validate_internal_mesh_crypto_provider(
-        tls.crypto_provider(),
-    )?;
+    crate::transport::pq_provider::validate_internal_mesh_crypto_provider(tls.crypto_provider())?;
     Ok(quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
     )))
 }
 
 fn owned_quic_client_config(tls: rustls::ClientConfig) -> Result<quinn::ClientConfig> {
-    crate::transport::pq_provider::validate_internal_mesh_crypto_provider(
-        tls.crypto_provider(),
-    )?;
+    crate::transport::pq_provider::validate_internal_mesh_crypto_provider(tls.crypto_provider())?;
     Ok(quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
     )))
@@ -361,11 +359,7 @@ impl QuicRep {
     ///
     /// * `handler` - Async function to handle each request
     /// * `shutdown` - Shutdown signal
-    pub async fn accept_loop<H, Fut>(
-        &self,
-        handler: H,
-        shutdown: Arc<Notify>,
-    ) -> Result<()>
+    pub async fn accept_loop<H, Fut>(&self, handler: H, shutdown: Arc<Notify>) -> Result<()>
     where
         H: Fn(Multipart) -> Fut + Clone + Send + 'static,
         Fut: std::future::Future<Output = Result<Multipart>> + Send,
@@ -485,7 +479,7 @@ impl QuicRep {
                 Ok((send, recv)) => {
                     let service = Rc::clone(&service);
                     let nonce_cache = Arc::clone(&nonce_cache);
-                    let signing_key = signing_key.clone();  // Clone before spawn
+                    let signing_key = signing_key.clone(); // Clone before spawn
 
                     tokio::task::spawn_local(async move {
                         if let Err(e) = Self::handle_stream_service(
@@ -495,7 +489,9 @@ impl QuicRep {
                             server_pubkey,
                             signing_key,
                             nonce_cache,
-                        ).await {
+                        )
+                        .await
+                        {
                             debug!("Stream error: {}", e);
                         }
                     });
@@ -546,14 +542,17 @@ impl QuicRep {
         // subsecond::call wraps dispatch for hot-patching during dev
         // INV-2 (#1042): this legacy ZMTP entry point terminates a QUIC
         // stream — an untrusted carrier even on a loopback address.
-        let response_bytes = subsecond::call(|| crate::service::dispatch::process_request(
-            raw_bytes,
-            &*service,
-            EnvelopeVerification::AnySigner,
-            &signing_key,
-            &nonce_cache,
-            crate::transport::carrier::CarrierContext::quic(),
-        )).await?;
+        let response_bytes = subsecond::call(|| {
+            crate::service::dispatch::process_request(
+                raw_bytes,
+                &*service,
+                EnvelopeVerification::AnySigner,
+                &signing_key,
+                &nonce_cache,
+                crate::transport::carrier::CarrierContext::quic(),
+            )
+        })
+        .await?;
 
         // Send response
         let response = Multipart {
@@ -915,9 +914,15 @@ impl QuicSub {
     /// Subscribe to a topic prefix.
     ///
     /// Returns a receiver for messages matching this prefix.
-    pub async fn subscribe(&self, prefix: &[u8]) -> Result<tokio::sync::broadcast::Receiver<Bytes>> {
+    pub async fn subscribe(
+        &self,
+        prefix: &[u8],
+    ) -> Result<tokio::sync::broadcast::Receiver<Bytes>> {
         let (send, recv_stream) = self.conn.open_bi().await?;
-        let mut stream = ZmtpStream::new(QuicStream { send, recv: recv_stream });
+        let mut stream = ZmtpStream::new(QuicStream {
+            send,
+            recv: recv_stream,
+        });
 
         // Perform ZMTP handshake as client (SUB)
         stream.handshake(ZmqSocketType::Sub, false).await?;
@@ -1249,7 +1254,12 @@ where
         &self.name
     }
 
-    fn registrations(&self) -> Vec<(crate::registry::SocketKind, crate::transport::TransportConfig)> {
+    fn registrations(
+        &self,
+    ) -> Vec<(
+        crate::registry::SocketKind,
+        crate::transport::TransportConfig,
+    )> {
         // Register the QUIC endpoint *pinned* by the self-signed leaf cert's
         // SHA-256 — a plain (WebPki) registration would make clients CA-validate
         // a self-signed cert and fail.
@@ -1284,7 +1294,11 @@ where
             }
 
             // Run accept loop
-            if let Err(e) = self.rep.accept_loop_service(service, server_pubkey, signing_key, nonce_cache, shutdown).await {
+            if let Err(e) = self
+                .rep
+                .accept_loop_service(service, server_pubkey, signing_key, nonce_cache, shutdown)
+                .await
+            {
                 tracing::error!("QUIC accept loop error: {}", e);
             }
         });
@@ -1293,11 +1307,10 @@ where
     }
 }
 
-
 /// Compute SHA-256 hash of certificate for browser `serverCertificateHashes` (base64).
 pub fn cert_hash(cert_der: &[u8]) -> String {
     use base64::Engine;
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let hash = Sha256::digest(cert_der);
     base64::engine::general_purpose::STANDARD.encode(hash)
 }
@@ -1318,9 +1331,9 @@ pub fn server_tls_self_signed(name: &str) -> Result<(rustls::ServerConfig, Vec<u
     let mut cfg = rustls::ServerConfig::builder_with_provider(
         crate::transport::pq_provider::internal_mesh_crypto_provider(),
     )
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone().into()], key_der.into())?;
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_der.clone().into()], key_der.into())?;
 
     cfg.alpn_protocols = vec![ALPN_ZMTP3.to_vec()];
 
@@ -1338,9 +1351,9 @@ pub fn client_tls_pinned(cert_der: &[u8]) -> Result<rustls::ClientConfig> {
     let cfg = rustls::ClientConfig::builder_with_provider(
         crate::transport::pq_provider::internal_mesh_crypto_provider(),
     )
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
 
     let mut cfg = cfg;
     cfg.alpn_protocols = vec![ALPN_ZMTP3.to_vec()];
@@ -1356,9 +1369,9 @@ pub fn client_tls_system_roots() -> Result<rustls::ClientConfig> {
     let cfg = rustls::ClientConfig::builder_with_provider(
         crate::transport::pq_provider::internal_mesh_crypto_provider(),
     )
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
 
     let mut cfg = cfg;
     cfg.alpn_protocols = vec![ALPN_ZMTP3.to_vec()];
@@ -1394,7 +1407,7 @@ pub use crate::envelope::EnvelopeVerification;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::zmtp_framing::{build_greeting, validate_greeting, build_ready_metadata};
+    use crate::zmtp_framing::{build_greeting, build_ready_metadata, validate_greeting};
     use quinn::crypto::rustls::HandshakeData;
 
     #[test]
@@ -1443,7 +1456,10 @@ mod tests {
 
         let result = validate_greeting(&greeting);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("mechanism mismatch"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("mechanism mismatch"));
     }
 
     #[test]
@@ -1472,7 +1488,9 @@ mod tests {
         assert_eq!(value_len, 3); // "REP"
 
         // Value follows
-        let value = std::str::from_utf8(&metadata[value_len_start + 4..value_len_start + 4 + value_len]).unwrap();
+        let value =
+            std::str::from_utf8(&metadata[value_len_start + 4..value_len_start + 4 + value_len])
+                .unwrap();
         assert_eq!(value, "REP");
     }
 
@@ -1534,10 +1552,7 @@ mod tests {
             .negotiated_key_exchange_group;
 
         assert_eq!(client_group, rustls::NamedGroup::X25519MLKEM768);
-        assert_eq!(
-            accepted.await.unwrap(),
-            rustls::NamedGroup::X25519MLKEM768
-        );
+        assert_eq!(accepted.await.unwrap(), rustls::NamedGroup::X25519MLKEM768);
     }
 
     #[tokio::test]
@@ -1550,7 +1565,9 @@ mod tests {
         .await
         .err()
         .expect("public REQ seam must reject classical config before dialing");
-        assert!(err.to_string().contains("owned-mesh crypto policy mismatch"));
+        assert!(err
+            .to_string()
+            .contains("owned-mesh crypto policy mismatch"));
     }
 
     fn classical_client_config() -> rustls::ClientConfig {
@@ -1567,9 +1584,7 @@ mod tests {
 
     fn classical_server_config() -> rustls::ServerConfig {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
-            cert.key_pair.serialize_der(),
-        );
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -1583,9 +1598,12 @@ mod tests {
     }
 
     fn assert_owned_policy_error<T>(result: Result<T>, seam: &str) {
-        let err = result.err().unwrap_or_else(|| panic!("{seam} accepted classical config"));
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("{seam} accepted classical config"));
         assert!(
-            err.to_string().contains("owned-mesh crypto policy mismatch"),
+            err.to_string()
+                .contains("owned-mesh crypto policy mismatch"),
             "{seam} returned the wrong error: {err}"
         );
     }
@@ -1595,7 +1613,9 @@ mod tests {
         let err = QuicRep::bind("127.0.0.1:0".parse().unwrap(), classical_server_config())
             .err()
             .expect("public REP seam must reject classical config before bind");
-        assert!(err.to_string().contains("owned-mesh crypto policy mismatch"));
+        assert!(err
+            .to_string()
+            .contains("owned-mesh crypto policy mismatch"));
     }
 
     #[tokio::test]
@@ -1744,7 +1764,9 @@ mod tests {
             metadata[value_len_start + 2],
             metadata[value_len_start + 3],
         ]) as usize;
-        let value = std::str::from_utf8(&metadata[value_len_start + 4..value_len_start + 4 + value_len]).unwrap();
+        let value =
+            std::str::from_utf8(&metadata[value_len_start + 4..value_len_start + 4 + value_len])
+                .unwrap();
 
         // Build again for REQ
         let metadata_req = zmtp_framing::build_ready_metadata(ZmqSocketType::Req);
@@ -1756,7 +1778,10 @@ mod tests {
             metadata_req[value_len_start_req + 2],
             metadata_req[value_len_start_req + 3],
         ]) as usize;
-        let value_req = std::str::from_utf8(&metadata_req[value_len_start_req + 4..value_len_start_req + 4 + value_len_req]).unwrap();
+        let value_req = std::str::from_utf8(
+            &metadata_req[value_len_start_req + 4..value_len_start_req + 4 + value_len_req],
+        )
+        .unwrap();
 
         assert_eq!(name, "Socket-Type");
         assert_eq!(value, "REP");

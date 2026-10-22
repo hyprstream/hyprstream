@@ -64,3 +64,95 @@ jobs:
           else
             echo '::notice::No modern ROCm aarch64 wheel is currently available; keep ROCm AppImages x86_64-only.'
           fi
+
+  # Fail-closed enable gate for the GATED appimage-aarch64-cuda130 row in
+  # .github/build-matrix.json (native CI plan N3.1-N3.3). This job is
+  # EXPECTED TO FAIL on today's GPU-less Graviton pool — a red dispatch is
+  # the recorded proof that ARM CUDA rows must stay gated. It can only go
+  # green on a runner with a real NVIDIA device + driver, and its output
+  # (driver version, CUDA capability, device count) is the hardware evidence
+  # the manifest row requires in gate.hardware_proof before status may become
+  # active (enforced by scripts/check_build_matrix.py).
+  #
+  # Do NOT add `|| true`, continue-on-error, or a no-GPU pass path: that would
+  # convert the gate into a rubber stamp and let build-only linking pose as
+  # runtime CUDA support.
+  arm-cuda-enable-preflight:
+    name: ARM CUDA enable preflight (fail-closed)
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Explain the gate
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## ARM CUDA enable preflight (fail-closed)
+
+          Expected result on the current fleet: **failure** — no ARM64 host
+          has an attached NVIDIA GPU (spike run 32897623715 recorded
+          `torch.cuda.is_available() == False`). A green run on real hardware
+          is the evidence required to activate the gated
+          `appimage-aarch64-cuda130` row in `.github/build-matrix.json`.
+          Treat any green run without a recorded `nvidia-smi` below as
+          suspicious.
+          EOF
+
+      - name: Require an NVIDIA device on the host
+        run: |
+          set -euo pipefail
+          command -v nvidia-smi >/dev/null 2>&1 || {
+            echo '::error::arm-cuda-enable-preflight: no nvidia-smi on this runner — the arm64-cuda130 matrix row stays gated.' >&2
+            exit 1
+          }
+          nvidia-smi
+          nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv
+
+      - name: Build the arm64 CUDA libtorch spike image
+        run: |
+          podman build \
+            --target builder-cuda130-arm64-spike \
+            -t hyprstream-cuda130-arm64-spike:preflight \
+            -f Dockerfile \
+            .
+
+      - name: Runtime CUDA gate inside the toolchain image
+        run: |
+          podman run --rm \
+            --device nvidia.com/gpu=all \
+            -v "$PWD":/build:Z -w /build \
+            -e LIBTORCH=/opt/libtorch \
+            -e LD_LIBRARY_PATH=/opt/libtorch/lib \
+            -e LIBTORCH_BYPASS_VERSION_CHECK=1 \
+            hyprstream-cuda130-arm64-spike:preflight \
+            bash -euo pipefail -c '
+              test -s /opt/libtorch/lib/libtorch_cuda.so
+              python3 - <<PY
+              import sys, torch
+              print("torch", torch.__version__, "cuda", torch.version.cuda)
+              if not torch.cuda.is_available():
+                  print("torch.cuda.is_available() is False: device passthrough or driver is not usable", file=sys.stderr)
+                  sys.exit(1)
+              if torch.cuda.device_count() < 1:
+                  print("torch.cuda.device_count() < 1", file=sys.stderr)
+                  sys.exit(1)
+              p = torch.cuda.get_device_properties(0)
+              print(f"GPU0 {p.name} capability sm_{p.major}{p.minor}")
+              PY
+              # A CUDA build that silently resolves to CPU is exactly what
+              # this gate exists to catch: the linked binary must carry the
+              # CUDA runtime before packaging may claim the backend.
+              cargo build -p hyprstream --release --features otel
+              ldd target/release/hyprstream | grep -q libtorch_cuda
+            '
+
+      - name: Record activation evidence
+        if: success()
+        run: |
+          {
+            echo "## ARM CUDA preflight — green"
+            echo "- run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- record this URL in .github/build-matrix.json rows[appimage-aarch64-cuda130].gate.hardware_proof"
+          } >> "$GITHUB_STEP_SUMMARY"

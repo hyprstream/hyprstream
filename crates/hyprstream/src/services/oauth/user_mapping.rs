@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::config::{UserMappingStrategy, ProvisioningMode};
+use crate::config::{ProvisioningMode, UserMappingStrategy};
 
 /// Map an external OIDC identity to a local hyprstream subject.
 ///
@@ -76,7 +76,8 @@ pub fn should_provision(
 
             Err(anyhow!(
                 "User '{}' is not in the allowed domains: {:?}",
-                mapped_subject, allowed_domains
+                mapped_subject,
+                allowed_domains
             ))
         }
     }
@@ -90,20 +91,25 @@ mod tests {
     #[test]
     fn test_namespaced_mapping() {
         let claims = serde_json::json!({"sub": "12345", "email": "alice@example.com"});
-        let result = map_external_identity("keycloak", &claims, &UserMappingStrategy::Namespaced, "").unwrap();
+        let result =
+            map_external_identity("keycloak", &claims, &UserMappingStrategy::Namespaced, "")
+                .unwrap();
         assert_eq!(result, "keycloak:12345");
     }
 
     #[test]
     fn test_email_mapping_verified() {
-        let claims = serde_json::json!({"sub": "12345", "email": "alice@corp.com", "email_verified": true});
-        let result = map_external_identity("google", &claims, &UserMappingStrategy::Email, "").unwrap();
+        let claims =
+            serde_json::json!({"sub": "12345", "email": "alice@corp.com", "email_verified": true});
+        let result =
+            map_external_identity("google", &claims, &UserMappingStrategy::Email, "").unwrap();
         assert_eq!(result, "alice@corp.com");
     }
 
     #[test]
     fn test_email_mapping_unverified_fails() {
-        let claims = serde_json::json!({"sub": "12345", "email": "alice@corp.com", "email_verified": false});
+        let claims =
+            serde_json::json!({"sub": "12345", "email": "alice@corp.com", "email_verified": false});
         let result = map_external_identity("google", &claims, &UserMappingStrategy::Email, "");
         assert!(result.is_err());
     }
@@ -111,7 +117,9 @@ mod tests {
     #[test]
     fn test_claim_mapping() {
         let claims = serde_json::json!({"sub": "12345", "preferred_username": "alice"});
-        let strategy = UserMappingStrategy::Claim { name: "preferred_username".into() };
+        let strategy = UserMappingStrategy::Claim {
+            name: "preferred_username".into(),
+        };
         let result = map_external_identity("dex", &claims, &strategy, "").unwrap();
         assert_eq!(result, "alice");
     }
@@ -124,8 +132,11 @@ mod tests {
             &claims,
             &UserMappingStrategy::DidWeb,
             "https://hyprstream.example.com",
-        ).unwrap_err();
-        assert!(err.to_string().contains("path-form account minting is disabled"));
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("path-form account minting is disabled"));
     }
 
     #[test]
@@ -144,7 +155,8 @@ mod tests {
             &ProvisioningMode::Allowlist,
             "alice@corp.com",
             &["corp.com".into()],
-        ).unwrap());
+        )
+        .unwrap());
     }
 
     #[test]

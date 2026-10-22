@@ -786,18 +786,20 @@ mod tests {
         hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 60)
             .with_issuer("https://issuer.test".to_owned())
             .with_audience(Some("https://resource.test".to_owned()))
-            .with_cap(crate::services::oauth::mount_ticket::ticket_capability("ws", "/"))
+            .with_cap(crate::services::oauth::mount_ticket::ticket_capability(
+                "ws", "/",
+            ))
             .with_tenant("tenant.test".to_owned())
             .with_clearance(hyprstream_rpc::auth::mac::SecurityLabel::new(
                 hyprstream_rpc::auth::mac::Level::Secret,
                 hyprstream_rpc::auth::mac::Assurance::Classical,
                 hyprstream_rpc::auth::mac::CompartmentSet::EMPTY,
             ))
+            .with_client_id("hyprstream-oauth-client-1")
             .with_jti()
     }
 
-    fn mount_ticket_state(
-    ) -> (
+    fn mount_ticket_state() -> (
         ResourceAuthState,
         ed25519_dalek::SigningKey,
         hyprstream_rpc::crypto::pq::MlDsaSigningKey,
@@ -839,12 +841,17 @@ mod tests {
                 jwks_uri: Some(format!("{federation_issuer}/jwks")),
                 jwks_cache_ttl_secs: 300,
                 allow_http: false,
+                federate_tui_client: None,
             },
         );
-        let federation_fetcher = Arc::new(move |_url: &str| -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>> {
-            let federation_jwks = federation_jwks.clone();
-            Box::pin(async move { Ok(federation_jwks) })
-        });
+        let federation_fetcher = Arc::new(
+            move |_url: &str| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send>,
+            > {
+                let federation_jwks = federation_jwks.clone();
+                Box::pin(async move { Ok(federation_jwks) })
+            },
+        );
         let mut state = ResourceAuthState::new(
             ed25519.verifying_key(),
             "https://resource.test".to_owned(),
@@ -853,10 +860,18 @@ mod tests {
                 crate::auth::FederationKeyResolver::new(&trusted)
                     .with_jwks_fetcher(federation_fetcher),
             ),
-            Arc::new(hyprstream_rpc::auth::InMemoryJtiBlocklist::new()),
         );
         state.composite_key_set = composite_keys;
         state.dpop_jti_seen = Arc::new(hyprstream_util::TtlCache::new(8, 16));
+        // Mount-ticket verification fails closed without the process-global
+        // revocation store (one canonical store; no per-service plumbing).
+        // Install an in-memory authority when no other test in this binary
+        // got there first.
+        if hyprstream_rpc::auth::global_credential_revocation_store().is_none() {
+            let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
         (state, ed25519, ml_dsa, federation_ed25519)
     }
 
@@ -880,7 +895,8 @@ mod tests {
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("test header serializes")),
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("test claims serialize")),
         );
-        let mut signature = hyprstream_rpc::crypto::pq::ml_dsa_sign(ml_dsa, signing_input.as_bytes());
+        let mut signature =
+            hyprstream_rpc::crypto::pq::ml_dsa_sign(ml_dsa, signing_input.as_bytes());
         signature.extend_from_slice(&ed25519.sign(signing_input.as_bytes()).to_bytes());
         format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
     }
@@ -893,7 +909,9 @@ mod tests {
         let local = encode_mount_ticket(&local_claims, &ml_dsa, &ed25519);
         let first = verify_mount_ticket(&state, &local, "ws", "/").await;
         assert!(first.is_ok(), "local ticket rejected: {first:?}");
-        assert!(verify_mount_ticket(&state, &local, "ws", "/").await.is_err());
+        assert!(verify_mount_ticket(&state, &local, "ws", "/")
+            .await
+            .is_err());
         let occupied = state.dpop_jti_seen.len();
         assert_eq!(occupied, 1);
 
@@ -936,7 +954,9 @@ mod tests {
         ] {
             let token = encode_mount_ticket(&claims, &ml_dsa, &ed25519);
             assert!(
-                verify_mount_ticket(&state, &token, "ws", "/").await.is_err(),
+                verify_mount_ticket(&state, &token, "ws", "/")
+                    .await
+                    .is_err(),
                 "{case} ticket was accepted"
             );
             assert_eq!(

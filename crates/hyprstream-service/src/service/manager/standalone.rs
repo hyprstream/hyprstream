@@ -4,7 +4,9 @@
 //! Uses systemd-run when available, otherwise direct process spawning.
 
 use super::ServiceManager;
-use crate::service::spawner::{ProcessConfig, ProcessSpawner, SpawnedProcess, Spawnable, SpawnedService};
+use crate::service::spawner::{
+    ProcessConfig, ProcessSpawner, Spawnable, SpawnedProcess, SpawnedService,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -64,8 +66,8 @@ impl ServiceManager for StandaloneManager {
     async fn start(&self, service: &str) -> Result<()> {
         let exe = spawnable_exe()?;
 
-        let config = ProcessConfig::new(service, exe)
-            .args(["service", "start", service, "--foreground"]);
+        let config =
+            ProcessConfig::new(service, exe).args(["service", "start", service, "--foreground"]);
 
         let process = self.spawner.spawn(config).await?;
 
@@ -116,8 +118,12 @@ impl ServiceManager for StandaloneManager {
         // For standalone mode, spawn as subprocess
         let exe = spawnable_exe()?;
 
-        let config = ProcessConfig::new(service.name(), exe)
-            .args(["service", "start", service.name(), "--foreground"]);
+        let config = ProcessConfig::new(service.name(), exe).args([
+            "service",
+            "start",
+            service.name(),
+            "--foreground",
+        ]);
 
         let process = self.spawner.spawn(config).await?;
 

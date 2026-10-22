@@ -166,8 +166,11 @@ async fn did_anchored_bootstrap_boots_same_node() {
     ensure_trust_dir(&fixture.ca);
     hyprstream_discovery::bootstrap_deployment_process(
         node_key,
+        None,
         DeploymentTrustSource::DidAnchored(fixture.anchors()),
         false,
+        false,
+        &hyprstream_pds::rds::RdsConfig::default(),
     )
     .await
     .expect("same-node DID-anchored bootstrap must boot without network liveness");

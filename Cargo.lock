@@ -1863,6 +1863,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2113,6 +2114,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wasm-bindgen",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -3133,12 +3135,12 @@ dependencies = [
 
 [[package]]
 name = "curve25519-dalek"
-version = "5.0.0-pre.6"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "335f1947f241137a14106b6f5acc5918a5ede29c9d71d3f2cb1678d5075d9fc3"
+checksum = "b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23"
 dependencies = [
  "cfg-if 1.0.3",
- "cpufeatures 0.2.17",
+ "cpufeatures 0.3.0",
  "curve25519-dalek-derive",
  "digest 0.11.3",
  "fiat-crypto 0.3.0",
@@ -4774,11 +4776,11 @@ dependencies = [
 
 [[package]]
 name = "ed25519-dalek"
-version = "3.0.0-pre.7"
+version = "3.0.0-rc.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20449acd54b660981ae5caa2bcb56d1fe7f25f2e37a38ec507400fab034d4bb6"
+checksum = "b011170fe4f04665565b4110afef66774fe9ffff278f3eb5b81cc73d26e27d60"
 dependencies = [
- "curve25519-dalek 5.0.0-pre.6",
+ "curve25519-dalek 5.0.0",
  "ed25519 3.0.0",
  "rand_core 0.10.1",
  "serde",
@@ -5466,9 +5468,12 @@ dependencies = [
  "parking_lot 0.12.4",
  "rand 0.8.5",
  "redis-protocol",
+ "rustls 0.23.40",
+ "rustls-native-certs 0.7.3",
  "semver",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls 0.26.2",
  "tokio-stream",
  "tokio-util",
  "url",
@@ -5918,6 +5923,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -5942,6 +5948,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "bytes",
  "caps",
  "cas_client",
  "cas_object",
@@ -5949,6 +5956,7 @@ dependencies = [
  "config 0.13.4",
  "dashmap",
  "data",
+ "deduplication",
  "git-xet-filter",
  "git2",
  "hyprstream-containedfs",
@@ -5976,6 +5984,7 @@ dependencies = [
  "url",
  "uuid 1.18.1",
  "walkdir",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6653,7 +6662,7 @@ dependencies = [
  "hyper-util",
  "log",
  "rustls 0.23.40",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.1",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls 0.26.2",
@@ -6804,7 +6813,6 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "bitflags 2.11.0",
- "bitsandbytes-sys",
  "blake3",
  "bs58",
  "bytes",
@@ -6841,9 +6849,11 @@ dependencies = [
  "hyprstream-crypto",
  "hyprstream-discovery",
  "hyprstream-flight",
+ "hyprstream-inference",
  "hyprstream-ledger",
  "hyprstream-metrics",
  "hyprstream-p2p",
+ "hyprstream-pay",
  "hyprstream-pds",
  "hyprstream-pds-service",
  "hyprstream-rpc",
@@ -6851,6 +6861,7 @@ dependencies = [
  "hyprstream-rpc-derive",
  "hyprstream-rpc-std",
  "hyprstream-service",
+ "hyprstream-session-store",
  "hyprstream-tui",
  "hyprstream-util",
  "hyprstream-vfs",
@@ -6866,6 +6877,7 @@ dependencies = [
  "jsonwebtoken 10.3.0",
  "k256",
  "keyring",
+ "language-tags",
  "libc",
  "listenfd",
  "log",
@@ -6907,6 +6919,7 @@ dependencies = [
  "safetensors 0.4.5",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
  "shellexpand",
@@ -6921,6 +6934,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "tokio-rustls 0.26.2",
  "tokio-stream",
  "tokio-tungstenite 0.24.0",
  "tokio-util",
@@ -6934,6 +6948,8 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tui-logger",
+ "unicode-segmentation",
+ "uriparse",
  "url",
  "urlencoding",
  "users",
@@ -6944,6 +6960,7 @@ dependencies = [
  "web-transport-iroh",
  "web-transport-quinn",
  "webpki-roots 0.26.11",
+ "x509-parser",
  "xdg",
  "zeroize",
 ]
@@ -6964,6 +6981,7 @@ dependencies = [
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6982,6 +7000,28 @@ dependencies = [
  "tokio",
  "tower 0.5.2",
  "tracing",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hyprstream-bench"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hyprstream-decision",
+ "serde",
+ "serde_json",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hyprstream-calibration"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6993,6 +7033,7 @@ dependencies = [
  "serde",
  "serde_json",
  "waxterm",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7006,6 +7047,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 1.0.69",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7027,7 +7069,60 @@ dependencies = [
  "rand 0.8.5",
  "sha2 0.10.9",
  "subtle",
+ "workspace-hack",
  "zeroize",
+]
+
+[[package]]
+name = "hyprstream-decision"
+version = "0.1.0"
+dependencies = [
+ "arrow-array 56.2.0",
+ "arrow-schema 56.2.0",
+ "blake3",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 1.0.69",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hyprstream-decision-head"
+version = "0.1.0"
+dependencies = [
+ "hyprstream-decision",
+ "tch",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hyprstream-decision-stub"
+version = "0.1.0"
+dependencies = [
+ "arrow-array 56.2.0",
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema 56.2.0",
+ "axum 0.7.9",
+ "blake3",
+ "bytes",
+ "futures",
+ "hyprstream-decision",
+ "parking_lot 0.12.4",
+ "prost 0.13.5",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.13.1",
+ "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7038,20 +7133,25 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "bytes",
  "capnp",
- "capnpc",
  "chrono",
  "ed25519-dalek 2.2.0",
+ "fred",
+ "futures",
  "hex",
  "hyprstream-crypto",
  "hyprstream-k8s",
  "hyprstream-pds",
  "hyprstream-rpc",
- "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
+ "hyprstream-rpc-std",
  "hyprstream-service",
  "hyprstream-util",
+ "inventory",
+ "iroh",
  "libc",
+ "moq-net",
  "p256",
  "parking_lot 0.12.4",
  "proptest",
@@ -7064,7 +7164,10 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-postgres",
  "tracing",
+ "web-transport-iroh",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7108,6 +7211,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprstream-inference"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bitsandbytes-sys",
+ "chrono",
+ "dashmap",
+ "fastrand 2.3.0",
+ "futures",
+ "git2db",
+ "hex",
+ "hyprstream-rpc",
+ "hyprstream-rpc-std",
+ "image",
+ "json-threat-protection",
+ "libc",
+ "memmap2",
+ "minijinja",
+ "once_cell",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "parking_lot 0.12.4",
+ "reflink-copy",
+ "regex",
+ "safetensors 0.4.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tch",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hyprstream-k8s"
 version = "0.1.0"
 dependencies = [
@@ -7129,6 +7271,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7141,6 +7284,7 @@ dependencies = [
  "hyprstream-pds",
  "hyprstream-rpc",
  "rand 0.8.5",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7150,11 +7294,16 @@ dependencies = [
  "bitflags 2.11.0",
  "blake3",
  "ciborium",
+ "deadpool-postgres",
  "ed25519-dalek 2.2.0",
  "hyprstream-crypto",
  "proptest",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7176,6 +7325,7 @@ dependencies = [
  "git2",
  "git2db",
  "hex",
+ "hyprstream-metrics-api",
  "lazy_static",
  "num_cpus",
  "parking_lot 0.12.4",
@@ -7192,6 +7342,19 @@ dependencies = [
  "tonic 0.13.1",
  "tracing",
  "uuid 1.18.1",
+]
+
+[[package]]
+name = "hyprstream-metrics-api"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tonic 0.13.1",
+ "uuid 1.18.1",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7232,6 +7395,20 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
+]
+
+[[package]]
+name = "hyprstream-pay"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "ciborium",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7242,6 +7419,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bs58",
+ "deadpool-postgres",
  "ed25519-dalek 2.2.0",
  "git2",
  "git2db",
@@ -7249,19 +7427,29 @@ dependencies = [
  "hyprstream-crypto",
  "hyprstream-rpc",
  "iroh",
+ "num_cpus",
  "p256",
  "parking_lot 0.12.4",
  "proptest",
  "rand 0.8.5",
+ "rcgen",
  "rustix 1.1.4",
+ "rustls 0.23.40",
+ "rustls-pemfile 2.2.0",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tokio-rustls 0.26.2",
  "tokio-test",
  "tracing",
  "tracing-subscriber",
  "url",
+ "urlencoding",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7270,6 +7458,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.7.9",
  "ed25519-dalek 2.2.0",
  "hyprstream-crypto",
  "hyprstream-pds",
@@ -7282,6 +7471,8 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tower 0.5.2",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7289,6 +7480,7 @@ name = "hyprstream-resource"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7368,6 +7560,7 @@ dependencies = [
  "web-transport-trait",
  "webpki-roots 0.26.11",
  "whoami 1.6.1",
+ "workspace-hack",
  "x25519-dalek",
  "yamux",
  "zeroize",
@@ -7408,8 +7601,11 @@ dependencies = [
  "capnp",
  "capnpc",
  "console_error_panic_hook",
+ "ed25519-dalek 2.2.0",
  "getrandom 0.3.3",
+ "hex",
  "hyprstream-9p",
+ "hyprstream-pay",
  "hyprstream-rpc",
  "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
@@ -7422,15 +7618,19 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "sha2 0.10.9",
  "subsecond",
  "tokio",
  "tracing",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-async",
  "web-sys",
  "web-transport-trait",
  "web-transport-wasm",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7453,18 +7653,33 @@ dependencies = [
  "once_cell",
  "parking_lot 0.12.4",
  "rand 0.8.5",
+ "rcgen",
  "rustls 0.23.40",
  "serde",
  "serde_json",
  "systemd",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid 1.18.1",
  "web-transport-quinn",
  "which 7.0.3",
+ "workspace-hack",
  "zbus_systemd",
  "zeroize",
+]
+
+[[package]]
+name = "hyprstream-session-store"
+version = "0.1.0"
+dependencies = [
+ "hyprstream-rpc",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-postgres",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7475,12 +7690,12 @@ dependencies = [
  "anyhow",
  "avt",
  "capnp",
- "capnpc",
  "critical-section",
  "crossterm 0.29.0",
  "dirs-next",
  "edtui",
  "hyprstream-compositor",
+ "hyprstream-rpc-std",
  "hyprstream-vfs",
  "hyprstream-workers-python",
  "hyprstream-workers-tcl",
@@ -7496,6 +7711,7 @@ dependencies = [
  "tui-logger",
  "uuid 1.18.1",
  "waxterm",
+ "workspace-hack",
  "zeroize",
 ]
 
@@ -7504,6 +7720,7 @@ name = "hyprstream-util"
 version = "0.1.0"
 dependencies = [
  "parking_lot 0.12.4",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7519,6 +7736,7 @@ dependencies = [
  "parking_lot 0.12.4",
  "tempfile",
  "tokio",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7540,6 +7758,7 @@ dependencies = [
  "virtio-queue 0.12.0",
  "vm-memory 0.14.1",
  "vmm-sys-util 0.12.1",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7551,7 +7770,6 @@ dependencies = [
  "base64 0.21.7",
  "blake3",
  "capnp",
- "capnpc",
  "ch-config",
  "chrono",
  "curve25519-dalek 4.1.3",
@@ -7568,8 +7786,8 @@ dependencies = [
  "hyprstream-discovery",
  "hyprstream-k8s",
  "hyprstream-rpc",
- "hyprstream-rpc-build",
  "hyprstream-rpc-derive",
+ "hyprstream-rpc-std",
  "hyprstream-service",
  "hyprstream-vfs",
  "hyprstream-vfs-server",
@@ -7611,6 +7829,7 @@ dependencies = [
  "vsock 0.5.4",
  "walkdir",
  "which 7.0.3",
+ "workspace-hack",
  "zbus 4.4.0",
  "zeroize",
 ]
@@ -7626,6 +7845,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "wasmtime",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7637,6 +7857,7 @@ dependencies = [
  "molt",
  "serde_json",
  "tokio",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7652,6 +7873,7 @@ dependencies = [
  "tokio",
  "wasi-common",
  "wasmtime",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -8046,9 +8268,8 @@ dependencies = [
 
 [[package]]
 name = "iroh"
-version = "1.0.0-rc.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b98e206e3d3f2642f5c08c413755fc0ac19b54ae1a656af88be03454ce3ed2e6"
+version = "1.0.2"
+source = "git+https://github.com/ewindisch/iroh.git?rev=df6302e0561fadcbf91199ad15d564224a3e7d93#df6302e0561fadcbf91199ad15d564224a3e7d93"
 dependencies = [
  "backon",
  "blake3",
@@ -8057,7 +8278,7 @@ dependencies = [
  "ctutils",
  "data-encoding",
  "derive_more",
- "ed25519-dalek 3.0.0-pre.7",
+ "ed25519-dalek 3.0.0-rc.0",
  "futures-util",
  "getrandom 0.4.2",
  "hickory-resolver",
@@ -8082,7 +8303,6 @@ dependencies = [
  "rustc-hash",
  "rustls 0.23.40",
  "rustls-pki-types",
- "rustls-webpki 0.103.13",
  "serde",
  "smallvec",
  "strum 0.28.0",
@@ -8093,36 +8313,32 @@ dependencies = [
  "tracing",
  "url",
  "wasm-bindgen-futures",
- "webpki-roots 1.0.7",
 ]
 
 [[package]]
 name = "iroh-base"
-version = "1.0.0-rc.0"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2160a45265eba3bd290ce698f584c9b088bee47e518e9ec4460d5e5888ef660e"
+checksum = "6be73e16ee21c923aca9b3121aaa0db936f7c7ecc156ff47b8dac944c68d59a8"
 dependencies = [
- "curve25519-dalek 5.0.0-pre.6",
+ "curve25519-dalek 5.0.0",
  "data-encoding",
  "data-encoding-macro",
  "derive_more",
- "digest 0.11.3",
- "ed25519-dalek 3.0.0-pre.7",
+ "ed25519-dalek 3.0.0-rc.0",
  "getrandom 0.4.2",
  "n0-error",
  "rand 0.10.1",
  "serde",
- "sha2 0.11.0",
  "url",
  "zeroize",
- "zeroize_derive",
 ]
 
 [[package]]
 name = "iroh-blobs"
-version = "0.101.0"
+version = "0.103.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6e351f5c1db08dcfb456e6299bda0881e1ba95a360f0913a5e57344c1538fb2"
+checksum = "5be50b0e2d0a9ba65cee4e0dfb708b3704e02ad12bd4c14c6307e94245943126"
 dependencies = [
  "arrayvec",
  "bao-tree",
@@ -8160,9 +8376,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.0.0-rc.0"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8b6d2946350d398c9d2d795bb99b04f22e8414c8a8ad9c5c3c0c5b7899af9a4"
+checksum = "516e4eedc38e33ab69a6bd325520332dc3d67b25454e2d590ebb84a25240dd9a"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -8172,8 +8388,8 @@ dependencies = [
  "n0-error",
  "n0-future",
  "ndk-context",
+ "portable-atomic",
  "rand 0.10.1",
- "reqwest 0.13.4",
  "rustls 0.23.40",
  "simple-dns",
  "strum 0.28.0",
@@ -8197,9 +8413,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-metrics"
-version = "1.0.0-rc.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d102597d0ee523f17fdb672c532395e634dbe945429284c811430d63bacc0d8a"
+checksum = "291065721ad7c477b972e581bbc528df031dc8eb5e39fe1ff3300ae5dfb157ef"
 dependencies = [
  "iroh-metrics-derive",
  "itoa",
@@ -8212,9 +8428,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-metrics-derive"
-version = "1.0.0-rc.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91c8e0c97f1dc787107f388433c349397c565572fe6406d600ff7bb7b7fe3b30"
+checksum = "1ae5f0c4405d1fbc9fb16ff422ca40620e93dc36c30ecaba0c2aee3992b7bd48"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -8224,9 +8440,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.0.0-rc.0"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54f490405e42dd2ecf16be18a3587d2665401e94a498094f12322eaa6d5ebb2b"
+checksum = "8149bb6a57126225a07d6928846d82dcedfd24ea0f863ef7b2eb475e1d726354"
 dependencies = [
  "blake3",
  "bytes",
@@ -8270,9 +8486,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-tickets"
-version = "1.0.0-rc.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a4b7fbfa10582f6b4f6b013eef1d21987d3df5fd42c0f7707d5de6abd34f8e9"
+checksum = "da53233419ca36bf521ed45683b7748366f9b233032891eefc2d70567a84ac54"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -8284,9 +8500,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-util"
-version = "0.4.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7705450a124b2b05f7caad505620ab5ac3bf4eb6b85018e6b9bca36329fd031"
+checksum = "20e41eb982f15230c55f0a70a74a514360e1f565b07861924fd0e8db172b3d00"
 dependencies = [
  "derive_more",
  "iroh",
@@ -8298,9 +8514,9 @@ dependencies = [
 
 [[package]]
 name = "irpc"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d38567eed2ed120e1040386930eb3b9ce6ca8a94b13c20a1b3b6535f253b00c"
+checksum = "3623d6ff582b415904b29bbe6ebcb4a4f9a262ccdee05a45fdd003ef0950c386"
 dependencies = [
  "futures-util",
  "irpc-derive",
@@ -8316,9 +8532,9 @@ dependencies = [
 
 [[package]]
 name = "irpc-derive"
-version = "0.15.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d8030c02dce4c9a8aecfb6e0870ee13ba3060096d88f6c1309919af8f197793"
+checksum = "35c254013736de16472140d26904e6ac98e8f3887284dcf4af40f88c77411b56"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8974,6 +9190,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "language-tags"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4345964bb142484797b161f473a503a434de77149dd8c7427788c6e13379388"
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9442,7 +9664,7 @@ dependencies = [
  "crc",
  "document-features",
  "dyn-clone",
- "ed25519-dalek 3.0.0-pre.7",
+ "ed25519-dalek 3.0.0-rc.0",
  "flume",
  "futures-lite 2.6.1",
  "getrandom 0.4.2",
@@ -9908,9 +10130,9 @@ dependencies = [
 
 [[package]]
 name = "n0-error"
-version = "1.0.0-rc.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "223e946a84aa91644507a6b7865cfebbb9a231ace499041c747ab0fd30408212"
+checksum = "c37e81176a83a77d2514528b91bdafc70ef88aab428f0e1b91aebb8d99888895"
 dependencies = [
  "n0-error-macros",
  "spez",
@@ -9918,9 +10140,9 @@ dependencies = [
 
 [[package]]
 name = "n0-error-macros"
-version = "1.0.0-rc.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "565305a21e6b3bf26640ad98f05a0fda12d3ab4315394566b52a7bddb8b34828"
+checksum = "e2acd8b070213b0299282f884b4beba4e7b52d624fdcd504a3ad3665390c11e1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9950,9 +10172,9 @@ dependencies = [
 
 [[package]]
 name = "n0-watcher"
-version = "1.0.0-rc.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "928d8039a66cce5efcfd35e88b32d3defc8eba630b3ac451522997f563956a52"
+checksum = "bbc618745ad0b7414b149d0517ad8b5573b2fb4d4e2717add3d2446ce1fdd826"
 dependencies = [
  "derive_more",
  "n0-error",
@@ -10011,19 +10233,22 @@ dependencies = [
 
 [[package]]
 name = "netdev"
-version = "0.43.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57bacaf873ee4eab5646f99b381b271ec75e716902a67cf962c0f328c5eb5bfb"
+checksum = "569dfbdd2efd771b24ec9bb57f956e04d4fbfc72f62b2f11961723f9b3f4b020"
 dependencies = [
  "block2",
  "dispatch2",
  "dlopen2",
  "ipnet",
+ "jni 0.21.1",
  "libc",
  "mac-addr",
+ "ndk-context",
  "netlink-packet-core",
- "netlink-packet-route 0.29.0",
+ "netlink-packet-route",
  "netlink-sys",
+ "objc2",
  "objc2-core-foundation",
  "objc2-core-wlan",
  "objc2-foundation",
@@ -10044,21 +10269,9 @@ dependencies = [
 
 [[package]]
 name = "netlink-packet-route"
-version = "0.29.0"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df9854ea6ad14e3f4698a7f03b65bce0833dd2d81d594a0e4a984170537146b6"
-dependencies = [
- "bitflags 2.11.0",
- "libc",
- "log",
- "netlink-packet-core",
-]
-
-[[package]]
-name = "netlink-packet-route"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be8919612f6028ab4eacbbfe1234a9a43e3722c6e0915e7ff519066991905092"
+checksum = "e2288fcb784eb3defd5fb16f4c4160d5f477de192eac730f43e1d11c24d9a007"
 dependencies = [
  "bitflags 2.11.0",
  "libc",
@@ -10095,14 +10308,15 @@ dependencies = [
 
 [[package]]
 name = "netwatch"
-version = "0.17.0"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5bfbba77b994ce69f1d40fc66fd8abbd23df62ce4aea61fbb34d638106a2549"
+checksum = "4d9cbe01741347ef750d743d6690603f5eed8341e679fb51c8e629337aa11976"
 dependencies = [
  "atomic-waker",
  "bytes",
  "cfg_aliases",
  "derive_more",
+ "ipnet",
  "js-sys",
  "libc",
  "n0-error",
@@ -10110,7 +10324,7 @@ dependencies = [
  "n0-watcher",
  "netdev",
  "netlink-packet-core",
- "netlink-packet-route 0.30.0",
+ "netlink-packet-route",
  "netlink-proto",
  "netlink-sys",
  "noq-udp",
@@ -10250,9 +10464,9 @@ dependencies = [
 
 [[package]]
 name = "noq"
-version = "1.0.0-rc.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22739e0831e40f5ab7d6ac5317ed80bfe5fb3f44be57d23fa2eea8bff83fb303"
+checksum = "4bf95190af1bd4a00a10e8255ca0c8ddd9e9a9f5e79151d7a7eb6d56aff5dc89"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -10272,9 +10486,9 @@ dependencies = [
 
 [[package]]
 name = "noq-proto"
-version = "1.0.0-rc.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cee32450cf726b223ac4154003c93cb52fbde159ab1240990e88945bf3ae35e"
+checksum = "baa7b5ccd819a9c68a0d955e67a881032d09b1a17219b1f90b0997a0888e1a15"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -10300,9 +10514,9 @@ dependencies = [
 
 [[package]]
 name = "noq-udp"
-version = "1.0.0-rc.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78633d1fe1bde91d12bcabb230ac9edb890857414c6d44f3212e0d309525b5ff"
+checksum = "3137a52df66c20090a889828d1c655f21f52294cba64e5c4fbb04fc83eee7c8e"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -10998,15 +11212,14 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openssl"
-version = "0.10.73"
+version = "0.10.81"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8505734d46c8ab1e19a1dce3aef597ad87dcb4c37e7188231769bd6bd51cebf8"
+checksum = "77823a27f0babb03091cb9ed9ef80af3b39dbc82f97e8fa530374b7dafd87a45"
 dependencies = [
  "bitflags 2.11.0",
  "cfg-if 1.0.3",
  "foreign-types 0.3.2",
  "libc",
- "once_cell",
  "openssl-macros",
  "openssl-sys",
 ]
@@ -11039,9 +11252,9 @@ dependencies = [
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.109"
+version = "0.9.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90096e2e47630d78b7d1c20952dc621f957103f8bc2c8359ec81290d75238571"
+checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
 dependencies = [
  "cc",
  "libc",
@@ -12502,6 +12715,8 @@ dependencies = [
  "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
 ]
 
 [[package]]
@@ -13680,7 +13895,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls 0.23.40",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.1",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -14327,6 +14542,7 @@ dependencies = [
  "async-trait",
  "async-web-client",
  "aws-lc-rs",
+ "axum-server",
  "base64 0.22.1",
  "blocking",
  "chrono",
@@ -14343,6 +14559,19 @@ dependencies = [
  "tokio-util",
  "webpki-roots 0.26.11",
  "x509-parser",
+]
+
+[[package]]
+name = "rustls-native-certs"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5bfb394eeed242e909609f56089eecfe5fda225042e8b171791b9c95f5931e5"
+dependencies = [
+ "openssl-probe",
+ "rustls-pemfile 2.2.0",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework 2.11.1",
 ]
 
 [[package]]
@@ -14397,7 +14626,7 @@ dependencies = [
  "log",
  "once_cell",
  "rustls 0.23.40",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.1",
  "rustls-platform-verifier-android",
  "rustls-webpki 0.103.13",
  "security-framework 3.5.0",
@@ -15965,7 +16194,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 [[package]]
 name = "tch"
 version = "0.23.0"
-source = "git+https://github.com/hyprstream/tch-rs?branch=hyprstream#5e16a26f333a3ec73669580a35dea51b349058ac"
+source = "git+https://github.com/hyprstream/tch-rs?branch=hyprstream-libtorch-211#cfe1d9867a7a1f12ca3d40574bde7d084679c3e4"
 dependencies = [
  "half",
  "lazy_static",
@@ -16674,7 +16903,7 @@ dependencies = [
 [[package]]
 name = "torch-sys"
 version = "0.23.0"
-source = "git+https://github.com/hyprstream/tch-rs?branch=hyprstream#5e16a26f333a3ec73669580a35dea51b349058ac"
+source = "git+https://github.com/hyprstream/tch-rs?branch=hyprstream-libtorch-211#cfe1d9867a7a1f12ca3d40574bde7d084679c3e4"
 dependencies = [
  "anyhow",
  "cc",
@@ -17183,6 +17412,16 @@ dependencies = [
  "serde_json",
  "url",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "uriparse"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0200d0fc04d809396c2ad43f3c95da3582a2556eba8d453c1087f4120ee352ff"
+dependencies = [
+ "fnv",
+ "lazy_static",
 ]
 
 [[package]]
@@ -18215,6 +18454,7 @@ dependencies = [
  "libc",
  "ratatui",
  "tokio",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -18263,9 +18503,9 @@ dependencies = [
 
 [[package]]
 name = "web-transport-iroh"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f4ebffba98c30a0ac3560c4d7c595e61a5ad040049d65ff5c91304e5ee5f5ee"
+checksum = "d34a91cf241951b8fe02ff216fdf16fc0a52b910568053652d546ded52399f77"
 dependencies = [
  "bytes",
  "http 1.3.1",
@@ -18302,7 +18542,7 @@ dependencies = [
  "http 1.3.1",
  "quinn",
  "rustls 0.23.40",
- "rustls-native-certs",
+ "rustls-native-certs 0.8.1",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -19241,6 +19481,219 @@ dependencies = [
  "thiserror 2.0.18",
  "windows 0.62.2",
  "windows-core 0.62.2",
+]
+
+[[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "aead",
+ "aes-gcm",
+ "ahash 0.8.12",
+ "aho-corasick",
+ "anyhow",
+ "arrayvec",
+ "axum 0.7.9",
+ "axum-core 0.4.5",
+ "base64ct",
+ "bit-vec",
+ "bitflags 2.11.0",
+ "bumpalo",
+ "bytemuck",
+ "byteorder",
+ "bytes",
+ "bzip2-sys",
+ "capnp",
+ "cc",
+ "chrono",
+ "cipher",
+ "compact_str 0.9.0",
+ "concurrent-queue",
+ "const-oid 0.10.2",
+ "const-oid 0.9.6",
+ "constant_time_eq 0.4.2",
+ "crc32fast",
+ "critical-section",
+ "crossbeam-epoch",
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "crypto-common 0.1.6",
+ "crypto-common 0.2.1",
+ "curve25519-dalek 4.1.3",
+ "data-encoding",
+ "der 0.7.10",
+ "der 0.8.0",
+ "deranged",
+ "derive_more",
+ "derive_more-impl",
+ "digest 0.10.7",
+ "digest 0.11.3",
+ "displaydoc",
+ "ecdsa",
+ "ed25519 2.2.3",
+ "ed25519 3.0.0",
+ "ed25519-dalek 2.2.0",
+ "ed25519-dalek 3.0.0-rc.0",
+ "either",
+ "elliptic-curve",
+ "enumflags2",
+ "event-listener 5.4.1",
+ "event-listener-strategy",
+ "fastrand 2.3.0",
+ "flate2",
+ "fnv",
+ "form_urlencoded",
+ "fuse-backend-rs 0.13.1",
+ "futures",
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-lite 2.6.1",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+ "generic-array",
+ "getrandom 0.2.16",
+ "getrandom 0.3.3",
+ "getrandom 0.4.2",
+ "gimli",
+ "h2 0.4.12",
+ "half",
+ "hashbrown 0.12.3",
+ "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
+ "hmac 0.12.1",
+ "hybrid-array",
+ "hyper 0.14.32",
+ "hyper 1.7.0",
+ "hyper-rustls 0.27.7",
+ "hyper-util",
+ "indexmap 2.14.0",
+ "inout",
+ "ipnet",
+ "iroh",
+ "iroh-base",
+ "iroh-dns",
+ "iroh-metrics",
+ "iroh-relay",
+ "itertools 0.14.0",
+ "k8s-openapi",
+ "kasuari",
+ "kube",
+ "kube-core",
+ "lazy_static",
+ "libc",
+ "libz-sys",
+ "linux-raw-sys 0.12.1",
+ "linux-raw-sys 0.4.15",
+ "log",
+ "lru 0.16.4",
+ "memchr",
+ "minimal-lexical",
+ "miniz_oxide",
+ "mio 1.0.4",
+ "multihash",
+ "nix 0.26.4",
+ "nix 0.27.1",
+ "nom",
+ "noq",
+ "noq-proto",
+ "noq-udp",
+ "num-bigint",
+ "num-integer",
+ "num-iter",
+ "num-traits",
+ "object",
+ "once_cell",
+ "openssl",
+ "openssl-sys",
+ "pem-rfc7468 0.7.0",
+ "percent-encoding",
+ "petgraph 0.6.5",
+ "phf_shared 0.11.3",
+ "pkcs8 0.10.2",
+ "pkcs8 0.11.0",
+ "portable-atomic",
+ "postcard",
+ "postgres-types",
+ "ppv-lite86",
+ "proc-macro2",
+ "prometheus",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "pulley-interpreter",
+ "quinn",
+ "quinn-proto",
+ "quote",
+ "rand 0.10.1",
+ "rand 0.8.5",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "rand_core 0.6.4",
+ "ratatui",
+ "ratatui-core",
+ "ratatui-widgets",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "reqwest 0.11.27",
+ "reqwest 0.12.28",
+ "ring",
+ "rust_decimal",
+ "rustix 0.38.44",
+ "rustix 1.1.4",
+ "rustls 0.23.40",
+ "rustls-webpki 0.103.13",
+ "semver",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "sha2 0.11.0",
+ "signature 2.2.0",
+ "signature 3.0.0",
+ "simd-adler32",
+ "simdutf8",
+ "slab",
+ "smallvec",
+ "spin 0.9.8",
+ "spki 0.8.0",
+ "strum 0.27.2",
+ "subtle",
+ "syn 1.0.109",
+ "syn 2.0.111",
+ "sync_wrapper 1.0.2",
+ "thiserror 2.0.18",
+ "time",
+ "time-macros",
+ "tiny-keccak",
+ "tokio",
+ "tokio-rustls 0.26.2",
+ "tokio-stream",
+ "tokio-util",
+ "toml_datetime 0.6.11",
+ "toml_datetime 0.7.3",
+ "toml_parser",
+ "tower 0.5.2",
+ "tower-http",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
+ "twox-hash",
+ "typenum",
+ "unicode-normalization",
+ "unicode-truncate",
+ "url",
+ "uuid 1.18.1",
+ "vm-memory 0.14.1",
+ "wasm-encoder 0.251.0",
+ "wasmtime-environ",
+ "wasmtime-internal-core",
+ "winnow 0.7.13",
+ "zerocopy",
+ "zeroize",
+ "zstd-sys",
 ]
 
 [[package]]

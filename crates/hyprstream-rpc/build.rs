@@ -21,6 +21,13 @@ fn main() {
         schema_dir,
         Path::new(&out_dir),
         &[],
-        &["common", "streaming", "events", "annotations", "optional", "nine"],
+        &[
+            "common",
+            "streaming",
+            "events",
+            "annotations",
+            "optional",
+            "nine",
+        ],
     );
 }

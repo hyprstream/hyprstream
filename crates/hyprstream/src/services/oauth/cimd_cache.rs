@@ -137,7 +137,9 @@ mod tests {
     #[tokio::test]
     async fn insert_and_get_roundtrip() {
         let cache = CimdCache::new(CimdCacheConfig::default());
-        cache.insert(make_client("https://a.test/c"), Duration::from_secs(60)).await;
+        cache
+            .insert(make_client("https://a.test/c"), Duration::from_secs(60))
+            .await;
         let got = cache.get("https://a.test/c").await;
         assert!(got.is_some());
         assert_eq!(got.unwrap().client_id, "https://a.test/c");
@@ -146,7 +148,9 @@ mod tests {
     #[tokio::test]
     async fn expired_entry_returns_none() {
         let cache = CimdCache::new(CimdCacheConfig::default());
-        cache.insert(make_client("https://a.test/c"), Duration::from_millis(10)).await;
+        cache
+            .insert(make_client("https://a.test/c"), Duration::from_millis(10))
+            .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(cache.get("https://a.test/c").await.is_none());
     }
@@ -161,11 +165,20 @@ mod tests {
         // None → min_ttl
         assert_eq!(cache.clamp_ttl(None), Duration::from_secs(60));
         // Below min → min
-        assert_eq!(cache.clamp_ttl(Some(Duration::from_secs(10))), Duration::from_secs(60));
+        assert_eq!(
+            cache.clamp_ttl(Some(Duration::from_secs(10))),
+            Duration::from_secs(60)
+        );
         // Within range → as-is
-        assert_eq!(cache.clamp_ttl(Some(Duration::from_secs(600))), Duration::from_secs(600));
+        assert_eq!(
+            cache.clamp_ttl(Some(Duration::from_secs(600))),
+            Duration::from_secs(600)
+        );
         // Above max → max
-        assert_eq!(cache.clamp_ttl(Some(Duration::from_secs(99_999))), Duration::from_secs(3600));
+        assert_eq!(
+            cache.clamp_ttl(Some(Duration::from_secs(99_999))),
+            Duration::from_secs(3600)
+        );
     }
 
     #[tokio::test]
@@ -176,13 +189,17 @@ mod tests {
         });
         // Insert 5 versions of the same key, each with a short TTL.
         for _ in 0..5 {
-            cache.insert(make_client("https://a.test/c"), Duration::from_millis(10)).await;
+            cache
+                .insert(make_client("https://a.test/c"), Duration::from_millis(10))
+                .await;
         }
         // After expiry + reap, only one map entry exists (or zero), and
         // the heap should not grow without bound: subsequent inserts
         // should still resolve.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        cache.insert(make_client("https://a.test/c"), Duration::from_secs(60)).await;
+        cache
+            .insert(make_client("https://a.test/c"), Duration::from_secs(60))
+            .await;
         assert_eq!(cache.len().await, 1);
         assert!(cache.get("https://a.test/c").await.is_some());
     }
@@ -202,23 +219,35 @@ mod tests {
 
         // 50 stale heap nodes for client A, all "live" entry version.
         for _ in 0..50 {
-            cache.insert(make_client("https://a.test/c"), Duration::from_secs(120)).await;
+            cache
+                .insert(make_client("https://a.test/c"), Duration::from_secs(120))
+                .await;
         }
         // One entry for client B at capacity.
-        cache.insert(make_client("https://b.test/c"), Duration::from_secs(60)).await;
+        cache
+            .insert(make_client("https://b.test/c"), Duration::from_secs(60))
+            .await;
         assert_eq!(cache.len().await, 2, "A + B at capacity");
 
         // Insert C — triggers evict_one which must walk past stale A
         // heap nodes to find a fresh victim and terminate.
-        cache.insert(make_client("https://c.test/c"), Duration::from_secs(180)).await;
+        cache
+            .insert(make_client("https://c.test/c"), Duration::from_secs(180))
+            .await;
         assert_eq!(cache.len().await, 2, "still 2 after eviction");
         // B had the shortest TTL among current map entries, so should be evicted.
         assert!(
             cache.get("https://b.test/c").await.is_none(),
             "B (shortest TTL) should have been the victim"
         );
-        assert!(cache.get("https://a.test/c").await.is_some(), "A still present");
-        assert!(cache.get("https://c.test/c").await.is_some(), "C just inserted");
+        assert!(
+            cache.get("https://a.test/c").await.is_some(),
+            "A still present"
+        );
+        assert!(
+            cache.get("https://c.test/c").await.is_some(),
+            "C just inserted"
+        );
     }
 
     #[tokio::test]
@@ -227,10 +256,16 @@ mod tests {
             max_entries: 2,
             ..CimdCacheConfig::default()
         });
-        cache.insert(make_client("https://a.test/c1"), Duration::from_secs(10)).await;
-        cache.insert(make_client("https://b.test/c2"), Duration::from_secs(60)).await;
+        cache
+            .insert(make_client("https://a.test/c1"), Duration::from_secs(10))
+            .await;
+        cache
+            .insert(make_client("https://b.test/c2"), Duration::from_secs(60))
+            .await;
         // Capacity reached. Inserting a 3rd evicts the next-to-expire (c1).
-        cache.insert(make_client("https://c.test/c3"), Duration::from_secs(30)).await;
+        cache
+            .insert(make_client("https://c.test/c3"), Duration::from_secs(30))
+            .await;
         assert_eq!(cache.len().await, 2);
         assert!(cache.get("https://a.test/c1").await.is_none());
         assert!(cache.get("https://b.test/c2").await.is_some());

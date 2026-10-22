@@ -70,13 +70,20 @@ impl OidcDiscoveryCache {
         }
 
         // Fetch
-        let discovery_url = format!("{}/.well-known/openid-configuration", issuer_url.trim_end_matches('/'));
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer_url.trim_end_matches('/')
+        );
 
         if !allow_http && !discovery_url.starts_with("https://") {
-            return Err(anyhow!("OIDC discovery requires HTTPS (set allow_http=true for dev): {}", discovery_url));
+            return Err(anyhow!(
+                "OIDC discovery requires HTTPS (set allow_http=true for dev): {}",
+                discovery_url
+            ));
         }
 
-        let response = self.http
+        let response = self
+            .http
             .get(&discovery_url)
             .timeout(Duration::from_secs(10))
             .send()
@@ -84,13 +91,20 @@ impl OidcDiscoveryCache {
             .with_context(|| format!("Failed to fetch OIDC discovery from {}", discovery_url))?;
 
         if !response.status().is_success() {
-            return Err(anyhow!("OIDC discovery returned {}: {}", response.status(), discovery_url));
+            return Err(anyhow!(
+                "OIDC discovery returned {}: {}",
+                response.status(),
+                discovery_url
+            ));
         }
 
         // Size limit: 256KB
         let bytes = response.bytes().await?;
         if bytes.len() > 256 * 1024 {
-            return Err(anyhow!("OIDC discovery response too large: {} bytes", bytes.len()));
+            return Err(anyhow!(
+                "OIDC discovery response too large: {} bytes",
+                bytes.len()
+            ));
         }
 
         let metadata: OidcProviderMetadata = serde_json::from_slice(&bytes)
@@ -100,7 +114,8 @@ impl OidcDiscoveryCache {
         if metadata.issuer != issuer_url {
             return Err(anyhow!(
                 "OIDC discovery issuer mismatch: expected '{}', got '{}'",
-                issuer_url, metadata.issuer
+                issuer_url,
+                metadata.issuer
             ));
         }
 
@@ -113,7 +128,8 @@ impl OidcDiscoveryCache {
                 if !url.starts_with("https://") {
                     return Err(anyhow!(
                         "OIDC discovery {} must be HTTPS: {} (set allow_http=true for dev)",
-                        name, url
+                        name,
+                        url
                     ));
                 }
             }
@@ -122,10 +138,13 @@ impl OidcDiscoveryCache {
         // Cache
         {
             let mut cache = self.cache.write().await;
-            cache.insert(issuer_url.to_owned(), CachedMetadata {
-                metadata: metadata.clone(),
-                fetched_at: Instant::now(),
-            });
+            cache.insert(
+                issuer_url.to_owned(),
+                CachedMetadata {
+                    metadata: metadata.clone(),
+                    fetched_at: Instant::now(),
+                },
+            );
         }
 
         Ok(metadata)

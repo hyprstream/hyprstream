@@ -24,21 +24,20 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use ed25519_dalek::Signer;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use super::state::OAuthState;
 
 /// GET /.well-known/openid-federation — OpenID Federation 1.0 entity configuration
-pub async fn entity_configuration(
-    State(state): State<Arc<OAuthState>>,
-) -> Response {
+pub async fn entity_configuration(State(state): State<Arc<OAuthState>>) -> Response {
     match build_entity_configuration_jwt(&state).await {
         Ok(jwt) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/entity-statement+jwt")],
             jwt,
-        ).into_response(),
+        )
+            .into_response(),
         Err(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason).into_response(),
     }
 }
@@ -84,7 +83,11 @@ pub async fn build_entity_configuration_jwt(state: &OAuthState) -> Result<String
 
     // Entity signing key first — verifies this JWT.
     let signing_jwk = verifying_key_as_okp_jwk(&vk);
-    let signing_x = signing_jwk.get("x").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+    let signing_x = signing_jwk
+        .get("x")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
     jwks_keys.push(signing_jwk);
 
     if let Some(ref store) = state.signing_key_store {
@@ -102,7 +105,10 @@ pub async fn build_entity_configuration_jwt(state: &OAuthState) -> Result<String
     {
         let ca_jwk = verifying_key_bytes_as_okp_jwk(&state.verifying_key_bytes);
         let ca_x = ca_jwk.get("x").and_then(|v| v.as_str()).unwrap_or_default();
-        if !jwks_keys.iter().any(|k| k.get("x").and_then(|v| v.as_str()) == Some(ca_x)) {
+        if !jwks_keys
+            .iter()
+            .any(|k| k.get("x").and_then(|v| v.as_str()) == Some(ca_x))
+        {
             jwks_keys.push(ca_jwk);
         }
     }
@@ -156,7 +162,7 @@ pub async fn publish_entity_statement_to_discovery(state: Arc<OAuthState>) {
         }
     };
 
-    let req = crate::services::generated::discovery_client::RegisterEntityStatementRequest {
+    let req = hyprstream_rpc_std::discovery_client::RegisterEntityStatementRequest {
         issuer: state.issuer_url.clone(),
         jwt,
     };
@@ -223,7 +229,8 @@ pub fn build_entity_configuration(
 /// Serialize a JSON value to base64url-encoded bytes (no padding).
 fn base64url_json(value: serde_json::Value) -> String {
     // serde_json::to_vec on a Value never fails; unwrap_or_else avoids clippy::expect_used
-    let json_bytes = serde_json::to_vec(&value).unwrap_or_else(|_| unreachable!("Value serialization cannot fail"));
+    let json_bytes = serde_json::to_vec(&value)
+        .unwrap_or_else(|_| unreachable!("Value serialization cannot fail"));
     URL_SAFE_NO_PAD.encode(&json_bytes)
 }
 
@@ -299,26 +306,26 @@ mod tests {
         let sk = make_key();
         let vk = sk.verifying_key();
         let as_meta = serde_json::json!({"issuer": "http://localhost:6791"});
-        let jwt = build_entity_configuration(
-            "http://localhost:6791",
-            &sk,
-            &vk,
-            as_meta,
-            &[],
-        );
+        let jwt = build_entity_configuration("http://localhost:6791", &sk, &vk, as_meta, &[]);
 
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have 3 parts");
 
         // Decode header
-        let header_json = URL_SAFE_NO_PAD.decode(parts[0]).expect("header is valid base64url");
-        let header: serde_json::Value = serde_json::from_slice(&header_json).expect("header is valid JSON");
+        let header_json = URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .expect("header is valid base64url");
+        let header: serde_json::Value =
+            serde_json::from_slice(&header_json).expect("header is valid JSON");
         assert_eq!(header["alg"], "EdDSA");
         assert_eq!(header["typ"], "entity-statement+jwt");
 
         // Decode payload
-        let payload_json = URL_SAFE_NO_PAD.decode(parts[1]).expect("payload is valid base64url");
-        let payload: serde_json::Value = serde_json::from_slice(&payload_json).expect("payload is valid JSON");
+        let payload_json = URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .expect("payload is valid base64url");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&payload_json).expect("payload is valid JSON");
         assert_eq!(payload["iss"], "http://localhost:6791");
         assert_eq!(payload["sub"], payload["iss"]);
         assert!(payload["jwks"]["keys"].as_array().unwrap().len() == 1);
@@ -338,7 +345,9 @@ mod tests {
         assert_eq!(parts.len(), 3);
 
         let signing_input = format!("{}.{}", parts[0], parts[1]);
-        let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).expect("signature is valid base64url");
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(parts[2])
+            .expect("signature is valid base64url");
         let sig_array: [u8; 64] = sig_bytes.try_into().expect("signature must be 64 bytes");
         let sig = ed25519_dalek::Signature::from_bytes(&sig_array);
 
@@ -358,13 +367,8 @@ mod tests {
             verifying_key_as_okp_jwk(&key2),
         ];
         let as_meta = serde_json::json!({"issuer": "http://localhost:6791"});
-        let jwt = build_entity_configuration_with_keys(
-            "http://localhost:6791",
-            &sk,
-            keys,
-            as_meta,
-            &[],
-        );
+        let jwt =
+            build_entity_configuration_with_keys("http://localhost:6791", &sk, keys, as_meta, &[]);
 
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);

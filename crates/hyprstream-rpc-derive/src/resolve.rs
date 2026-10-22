@@ -226,9 +226,12 @@ impl<'a> ResolvedSchema<'a> {
 
     /// O(1) cached name lookup. Panics if name was not seen during schema walk.
     pub fn name(&self, raw: &str) -> &ResolvedName {
-        self.names
-            .get(raw)
-            .unwrap_or_else(|| panic!("ResolvedSchema: name '{}' not collected during resolution", raw))
+        self.names.get(raw).unwrap_or_else(|| {
+            panic!(
+                "ResolvedSchema: name '{}' not collected during resolution",
+                raw
+            )
+        })
     }
 
     /// O(1) cached type lookup. Panics if type was not seen during schema walk.

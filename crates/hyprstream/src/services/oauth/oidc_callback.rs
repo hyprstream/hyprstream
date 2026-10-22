@@ -17,11 +17,11 @@ use axum::response::{IntoResponse, Redirect, Response};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use serde::Deserialize;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
+use super::state::{OAuthState, PendingAuthCode, PendingExternalAuth};
 use crate::auth::user_store::UserProfilePatch;
 use crate::config::ProviderKind;
-use super::state::{OAuthState, PendingAuthCode, PendingExternalAuth};
 
 /// Initiate external OAuth/OIDC login by redirecting to the provider.
 ///
@@ -40,7 +40,10 @@ pub async fn external_authorize(
     let provider = match config.oauth.oidc_providers.get(&provider_slug) {
         Some(p) => p.clone(),
         None => {
-            return (axum::http::StatusCode::NOT_FOUND, format!("Unknown provider: {provider_slug}"))
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                format!("Unknown provider: {provider_slug}"),
+            )
                 .into_response();
         }
     };
@@ -55,15 +58,27 @@ pub async fn external_authorize(
         ProviderKind::Oidc => {
             let issuer = match provider.issuer_url.as_deref() {
                 Some(u) => u,
-                None => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "oidc provider missing issuer_url").into_response(),
+                None => {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "oidc provider missing issuer_url",
+                    )
+                        .into_response()
+                }
             };
-            let metadata = match state.oidc_discovery.get_metadata(issuer, provider.allow_http).await {
+            let metadata = match state
+                .oidc_discovery
+                .get_metadata(issuer, provider.allow_http)
+                .await
+            {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(provider = %provider_slug, error = %e, "OIDC discovery failed");
-                    return (axum::http::StatusCode::BAD_GATEWAY,
-                        format!("OIDC discovery failed: {e}")).into_response();
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        format!("OIDC discovery failed: {e}"),
+                    )
+                        .into_response();
                 }
             };
 
@@ -107,20 +122,34 @@ pub async fn external_authorize(
                 created_at: Instant::now(),
                 expires_at: Instant::now() + Duration::from_secs(600),
             };
-            state.pending_external_auths.write().await.insert(external_state.clone(), pending);
+            state
+                .pending_external_auths
+                .write()
+                .await
+                .insert(external_state.clone(), pending);
             Redirect::temporary(&authorize_url).into_response()
         }
 
         ProviderKind::OAuth2 => {
             let auth_endpoint = match provider.effective_authorization_endpoint() {
                 Some(u) => u,
-                None => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "oauth2 provider missing authorization_endpoint").into_response(),
+                None => {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "oauth2 provider missing authorization_endpoint",
+                    )
+                        .into_response()
+                }
             };
             let token_endpoint = match provider.effective_token_endpoint_url() {
                 Some(u) => u.to_owned(),
-                None => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "oauth2 provider missing token_endpoint_url").into_response(),
+                None => {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "oauth2 provider missing token_endpoint_url",
+                    )
+                        .into_response()
+                }
             };
 
             let pkce_supported = provider.effective_pkce_supported();
@@ -169,7 +198,11 @@ pub async fn external_authorize(
                 created_at: Instant::now(),
                 expires_at: Instant::now() + Duration::from_secs(600),
             };
-            state.pending_external_auths.write().await.insert(external_state.clone(), pending);
+            state
+                .pending_external_auths
+                .write()
+                .await
+                .insert(external_state.clone(), pending);
             Redirect::temporary(&authorize_url).into_response()
         }
     }
@@ -179,6 +212,30 @@ pub async fn external_authorize(
 pub struct CallbackParams {
     pub code: String,
     pub state: String,
+}
+
+/// Reject an upstream error using only public response metadata.
+fn check_token_response(
+    response: reqwest::Response,
+    provider_slug: &str,
+) -> Result<reqwest::Response, (axum::http::StatusCode, &'static str)> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    // Never read or log the body, even at DEBUG/TRACE: error fields and provider
+    // diagnostics can contain credentials, and arbitrary providers have no safe
+    // redaction contract. Keep only the configured provider and HTTP status.
+    tracing::error!(
+        provider = %provider_slug,
+        status = status.as_u16(),
+        "External token endpoint returned error"
+    );
+    Err((
+        axum::http::StatusCode::BAD_GATEWAY,
+        "External token exchange rejected",
+    ))
 }
 
 /// Handle callback from external OIDC provider.
@@ -204,7 +261,10 @@ pub async fn external_callback(
     let pending = match pending {
         Some(p) if p.provider_slug == provider_slug && p.expires_at > Instant::now() => p,
         _ => {
-            return (axum::http::StatusCode::BAD_REQUEST, "Invalid or expired external auth state")
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "Invalid or expired external auth state",
+            )
                 .into_response();
         }
     };
@@ -214,7 +274,10 @@ pub async fn external_callback(
     let provider = match config.oauth.oidc_providers.get(&provider_slug) {
         Some(p) => p.clone(),
         None => {
-            return (axum::http::StatusCode::NOT_FOUND, format!("Unknown provider: {provider_slug}"))
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                format!("Unknown provider: {provider_slug}"),
+            )
                 .into_response();
         }
     };
@@ -234,7 +297,8 @@ pub async fn external_callback(
         token_params.push(("client_secret", secret.clone()));
     }
 
-    let mut request = state.http_client
+    let mut request = state
+        .http_client
         .post(&pending.token_endpoint)
         .form(&token_params)
         .timeout(Duration::from_secs(10));
@@ -253,17 +317,20 @@ pub async fn external_callback(
         }
     };
 
-    if !token_response.status().is_success() {
-        let body = token_response.text().await.unwrap_or_default();
-        tracing::error!(provider = %provider_slug, body = %body, "External token endpoint returned error");
-        return (axum::http::StatusCode::BAD_GATEWAY, "External token exchange rejected").into_response();
-    }
+    let token_response = match check_token_response(token_response, &provider_slug) {
+        Ok(response) => response,
+        Err(response) => return response.into_response(),
+    };
 
     let token_json: serde_json::Value = match token_response.json().await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(provider = %provider_slug, error = %e, "Invalid token response JSON");
-            return (axum::http::StatusCode::BAD_GATEWAY, "Invalid token response").into_response();
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "Invalid token response",
+            )
+                .into_response();
         }
     };
 
@@ -276,14 +343,23 @@ pub async fn external_callback(
                 Some(t) => t,
                 None => {
                     tracing::error!(provider = %provider_slug, "No id_token in external token response");
-                    return (axum::http::StatusCode::BAD_GATEWAY, "No id_token from external provider").into_response();
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        "No id_token from external provider",
+                    )
+                        .into_response();
                 }
             };
 
             let issuer = match provider.issuer_url.as_deref() {
                 Some(u) => u,
-                None => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "oidc provider missing issuer_url").into_response(),
+                None => {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "oidc provider missing issuer_url",
+                    )
+                        .into_response()
+                }
             };
 
             // Verify external id_token signature against the provider's JWKS.
@@ -291,11 +367,19 @@ pub async fn external_callback(
             // Fetches the JWKS from the provider's discovery endpoint, selects the
             // appropriate key (by kid or algorithm), and verifies the JWT signature.
             // Supports RS256, ES256, and EdDSA algorithms.
-            let metadata = match state.oidc_discovery.get_metadata(issuer, provider.allow_http).await {
+            let metadata = match state
+                .oidc_discovery
+                .get_metadata(issuer, provider.allow_http)
+                .await
+            {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(provider = %provider_slug, error = %e, "OIDC discovery for JWKS failed");
-                    return (axum::http::StatusCode::BAD_GATEWAY, "OIDC discovery for JWKS verification failed").into_response();
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        "OIDC discovery for JWKS verification failed",
+                    )
+                        .into_response();
                 }
             };
 
@@ -305,11 +389,17 @@ pub async fn external_callback(
                 issuer,
                 &provider.client_id,
                 &state.http_client,
-            ).await {
+            )
+            .await
+            {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(provider = %provider_slug, error = %e, "External id_token JWKS verification failed");
-                    return (axum::http::StatusCode::BAD_GATEWAY, "External id_token verification failed").into_response();
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        "External id_token verification failed",
+                    )
+                        .into_response();
                 }
             };
 
@@ -329,7 +419,9 @@ pub async fn external_callback(
             // Validate audience (OIDC Core Section 3.1.3.6)
             let aud_valid = match &claims["aud"] {
                 serde_json::Value::String(s) => s == &provider.client_id,
-                serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(&provider.client_id)),
+                serde_json::Value::Array(arr) => {
+                    arr.iter().any(|v| v.as_str() == Some(&provider.client_id))
+                }
                 _ => false,
             };
             if !aud_valid {
@@ -373,7 +465,11 @@ pub async fn external_callback(
                 Some(t) => t,
                 None => {
                     tracing::error!(provider = %provider_slug, "No access_token in external token response");
-                    return (axum::http::StatusCode::BAD_GATEWAY, "No access_token from external provider").into_response();
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        "No access_token from external provider",
+                    )
+                        .into_response();
                 }
             };
 
@@ -381,8 +477,11 @@ pub async fn external_callback(
                 Some(u) => u.to_owned(),
                 None => {
                     tracing::error!(provider = %provider_slug, "OAuth2 provider missing userinfo_endpoint");
-                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        "oauth2 provider missing userinfo_endpoint").into_response();
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "oauth2 provider missing userinfo_endpoint",
+                    )
+                        .into_response();
                 }
             };
 
@@ -392,12 +491,17 @@ pub async fn external_callback(
                 &userinfo_url,
                 access_token,
                 &mapping,
-            ).await {
+            )
+            .await
+            {
                 Ok(claims) => claims,
                 Err(e) => {
                     tracing::error!(provider = %provider_slug, error = %e, "OAuth2 userinfo fetch failed");
-                    return (axum::http::StatusCode::BAD_GATEWAY,
-                        format!("Userinfo fetch failed: {e}")).into_response();
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        format!("Userinfo fetch failed: {e}"),
+                    )
+                        .into_response();
                 }
             }
         }
@@ -415,14 +519,20 @@ pub async fn external_callback(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(provider = %provider_slug, error = %e, "Identity mapping failed");
-            return (axum::http::StatusCode::FORBIDDEN, format!("Identity mapping failed: {e}")).into_response();
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                format!("Identity mapping failed: {e}"),
+            )
+                .into_response();
         }
     };
 
     // Resolve the issuer to use for the normalized (issuer, subject) binding.
     // Prefer the provider's configured issuer_url, then the id_token `iss`
     // claim, then the provider slug as a last-resort synthetic issuer.
-    let binding_issuer = provider.issuer_url.as_deref()
+    let binding_issuer = provider
+        .issuer_url
+        .as_deref()
         .or_else(|| external_claims["iss"].as_str())
         .unwrap_or(&provider_slug)
         .to_owned();
@@ -430,7 +540,11 @@ pub async fn external_callback(
         Some(s) if !s.is_empty() => s.to_owned(),
         _ => {
             tracing::error!(provider = %provider_slug, "External token missing required 'sub' claim — rejecting");
-            return (axum::http::StatusCode::BAD_REQUEST, "External token missing required 'sub' claim").into_response();
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "External token missing required 'sub' claim",
+            )
+                .into_response();
         }
     };
 
@@ -453,7 +567,9 @@ pub async fn external_callback(
                 &mapped_subject,
                 &external_claims,
                 &provider.default_scopes,
-            ).await {
+            )
+            .await
+            {
                 Ok(username) => username,
                 Err(response) => return response,
             }
@@ -465,7 +581,10 @@ pub async fn external_callback(
             if let Some(ref user_svc) = state.user_service {
                 let store = user_svc.store();
                 // Try normalized binding first.
-                match store.get_external_identity_user(&binding_issuer, &external_sub).await {
+                match store
+                    .get_external_identity_user(&binding_issuer, &external_sub)
+                    .await
+                {
                     Ok(Some(username)) => username,
                     Ok(None) => {
                         // No normalized binding — try legacy username lookup.
@@ -484,13 +603,21 @@ pub async fn external_callback(
                             }
                             Err(e) => {
                                 tracing::error!(subject = %mapped_subject, error = %e, "User lookup failed");
-                                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "User lookup failed").into_response();
+                                return (
+                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    "User lookup failed",
+                                )
+                                    .into_response();
                             }
                         }
                     }
                     Err(e) => {
                         tracing::error!(issuer = %binding_issuer, subject = %external_sub, error = %e, "External identity lookup failed");
-                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "User lookup failed").into_response();
+                        return (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "User lookup failed",
+                        )
+                            .into_response();
                     }
                 }
             } else {
@@ -499,7 +626,11 @@ pub async fn external_callback(
         }
         Err(e) => {
             tracing::warn!(provider = %provider_slug, subject = %mapped_subject, error = %e, "Provisioning denied");
-            return (axum::http::StatusCode::FORBIDDEN, format!("Access denied: {e}")).into_response();
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                format!("Access denied: {e}"),
+            )
+                .into_response();
         }
     };
 
@@ -516,7 +647,8 @@ pub async fn external_callback(
     rand::rngs::OsRng.fill_bytes(&mut code_bytes);
     let code = URL_SAFE_NO_PAD.encode(code_bytes);
 
-    let scopes: Vec<String> = pending.original_scopes
+    let scopes: Vec<String> = pending
+        .original_scopes
         .split_whitespace()
         .map(String::from)
         .collect();
@@ -533,13 +665,21 @@ pub async fn external_callback(
         expires_at: Instant::now() + Duration::from_secs(60),
         username: authoritative_username,
         verifying_key: None, // external OIDC — no local Ed25519 key binding
-        dpop_jkt: None, // external OIDC flow — no PAR DPoP binding
+        dpop_jkt: None,      // external OIDC flow — no PAR DPoP binding
         client_assertion_jkt: None, // external OIDC flow — no PAR client-auth binding
     };
-    state.pending_codes.write().await.insert(code.clone(), auth_code);
+    state
+        .pending_codes
+        .write()
+        .await
+        .insert(code.clone(), auth_code);
 
     // Redirect to original client with hyprstream auth code
-    let mut redirect_url = format!("{}?code={}", pending.original_redirect_uri, urlencoding::encode(&code));
+    let mut redirect_url = format!(
+        "{}?code={}",
+        pending.original_redirect_uri,
+        urlencoding::encode(&code)
+    );
     if let Some(ref original_state) = pending.original_state {
         redirect_url.push_str(&format!("&state={}", urlencoding::encode(original_state)));
     }
@@ -603,8 +743,14 @@ async fn provision_federated_user(
     // accounts. Existing accounts retain their configured profile.
     if resolution.provisioned {
         let profile = UserProfilePatch {
-            name: external_claims["name"].as_str().map(str::to_owned).map(Some),
-            email: external_claims["email"].as_str().map(str::to_owned).map(Some),
+            name: external_claims["name"]
+                .as_str()
+                .map(str::to_owned)
+                .map(Some),
+            email: external_claims["email"]
+                .as_str()
+                .map(str::to_owned)
+                .map(Some),
             email_verified: external_claims["email_verified"].as_bool().map(Some),
             active: Some(Some(true)),
             external_id: external_claims["sub"].as_str().map(str::to_owned).map(Some),
@@ -633,7 +779,10 @@ async fn provision_federated_user(
         // and settings — regardless of what default_scopes the provider supplies.
         // Addresses the zero-capabilities-on-first-login gap (#182).
         let self_ns = format!("user:{subject}:*");
-        if let Err(e) = pm.add_policy_with_domain(subject, "*", &self_ns, "*", "allow").await {
+        if let Err(e) = pm
+            .add_policy_with_domain(subject, "*", &self_ns, "*", "allow")
+            .await
+        {
             tracing::warn!(subject = %subject, error = %e, "Failed to write self-ownership Casbin rule");
         }
 
@@ -653,7 +802,10 @@ async fn provision_federated_user(
                 [action] => (*action, "*".to_owned()),
                 _ => continue,
             };
-            if let Err(e) = pm.add_policy_with_domain(subject, "*", &resource, action, "allow").await {
+            if let Err(e) = pm
+                .add_policy_with_domain(subject, "*", &resource, action, "allow")
+                .await
+            {
                 tracing::error!(subject = %subject, scope = %scope, error = %e, "Failed to write Casbin rule");
             }
         }
@@ -672,4 +824,140 @@ async fn provision_federated_user(
     }
 
     Ok(resolution.username)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod token_response_tests {
+    use super::check_token_response;
+    use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+    use parking_lot::Mutex;
+    use std::io::Write;
+    use std::sync::Arc;
+    use tracing::Level;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn upstream_response(status: StatusCode, body: String) -> reqwest::Response {
+        let app = Router::new().route("/token", post(move || async move { (status, body) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock token endpoint");
+        let address = listener.local_addr().expect("mock endpoint address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("test client")
+            .post(format!("http://{address}/token"))
+            .send()
+            .await
+            .expect("mock token response");
+        server.abort();
+        response
+    }
+
+    fn capture_check(
+        response: reqwest::Response,
+        level: Level,
+    ) -> (Result<reqwest::Response, axum::response::Response>, String) {
+        let capture = LogCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_max_level(level)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            check_token_response(response, "test-provider")
+        })
+        .map_err(IntoResponse::into_response);
+        let logs = String::from_utf8(capture.0.lock().clone()).expect("UTF-8 structured logs");
+        (result, logs)
+    }
+
+    #[tokio::test]
+    async fn token_response_errors_log_only_public_metadata() {
+        let bodies = [
+            serde_json::json!({
+                "access_token": "access-secret-canary",
+                "refresh_token": "refresh-secret-canary",
+                "id_token": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signature-canary",
+                "code": "authorization-code-canary",
+                "client_secret": "client-secret-canary",
+                "error": "provider-defined-secret-canary",
+                "error_description": "Bearer diagnostic-secret-canary",
+                "diagnostics": { "nested": "nested-secret-canary" }
+            })
+            .to_string(),
+            "Bearer opaque-token-canary\nclient_secret=secret-canary&code=code-canary".repeat(1024),
+            "".to_owned(),
+        ];
+        for status in [
+            StatusCode::FOUND,
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            for body in &bodies {
+                // TRACE additionally proves that diagnostics weren't merely
+                // moved to a lower severity. Each normal threshold is covered.
+                for level in [Level::ERROR, Level::WARN, Level::INFO, Level::TRACE] {
+                    let upstream = upstream_response(status, body.clone()).await;
+                    let (result, logs) = capture_check(upstream, level);
+                    let rejection = result.expect_err("reject non-success response");
+                    assert_eq!(rejection.status(), StatusCode::BAD_GATEWAY);
+                    let rejection_body = axum::body::to_bytes(rejection.into_body(), 1024)
+                        .await
+                        .expect("read rejection body");
+                    assert_eq!(&rejection_body[..], b"External token exchange rejected");
+                    let events: Vec<serde_json::Value> = logs
+                        .lines()
+                        .map(|line| serde_json::from_str(line).expect("JSON log event"))
+                        .collect();
+                    assert_eq!(events.len(), 1, "one safe error event: {logs}");
+                    assert_eq!(events[0]["level"], "ERROR");
+                    // Exact field allowlist catches raw bodies, unknown error
+                    // codes, nested credentials, and future diagnostic fields.
+                    assert_eq!(
+                        events[0]["fields"],
+                        serde_json::json!({
+                            "message": "External token endpoint returned error",
+                            "provider": "test-provider",
+                            "status": status.as_u16(),
+                        })
+                    );
+                    assert!(!logs.contains("canary"), "secret in logs: {logs}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn token_response_success_preserves_body_without_logging() {
+        let body = r#"{"access_token":"success-secret-canary"}"#;
+        let upstream = upstream_response(StatusCode::OK, body.to_owned()).await;
+        let (result, logs) = capture_check(upstream, Level::TRACE);
+        let response = result.expect("successful response passes through");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.expect("untouched token body"), body);
+        assert!(logs.is_empty(), "successful token response logged: {logs}");
+    }
 }

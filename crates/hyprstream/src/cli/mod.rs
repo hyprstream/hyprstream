@@ -13,10 +13,15 @@ pub mod enroll;
 pub mod git_handlers;
 pub mod gpu_detect;
 pub mod handlers;
-pub mod policy_handlers;
 pub mod pds_handlers;
-pub mod quick;
+pub mod policy_handlers;
+// Deployment-roster provisioning/inspection reads the checkpointed PDS
+// store; the concrete type is rocksdb-only today (pure-RDS-without-rocksdb
+// is future work).
 pub mod bootstrap_manager;
+#[cfg(feature = "rocksdb")]
+pub mod deployment_bootstrap;
+pub mod quick;
 pub mod remote_handlers;
 pub mod schema_cli;
 pub mod service_handlers;
@@ -25,57 +30,57 @@ pub mod sign_challenge;
 pub mod systemd_setup;
 pub mod training_handlers;
 pub mod trust;
+pub mod trust_ceremony;
 pub mod tui_handlers;
 pub mod update_handlers;
 pub mod user_handlers;
-pub mod worker_handlers;
 pub mod wizard_handlers;
+pub mod worker_handlers;
 pub mod worktree_handlers;
 
 pub use context::AppContext;
 pub use git_handlers::{
-    apply_policy_template_to_model, handle_branch, handle_checkout, handle_clone,
-    handle_infer, handle_info, handle_list, handle_load, handle_notify_command,
-    parse_filters, parse_status_filter, handle_pull, handle_remove, handle_status, handle_unload,
+    apply_policy_template_to_model, handle_branch, handle_checkout, handle_clone, handle_infer,
+    handle_info, handle_list, handle_load, handle_notify_command, handle_pull, handle_remove,
+    handle_status, handle_unload, parse_filters, parse_status_filter,
 };
 
+pub use crate::auth::policy_templates::{get_template, get_templates, PolicyTemplate};
 #[cfg(feature = "experimental")]
 pub use git_handlers::{handle_commit, handle_merge, handle_promote, handle_push, MergeOptions};
-pub use training_handlers::{
-    handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
-};
 pub use handlers::handle_config;
-pub use worktree_handlers::{
-    handle_worktree_add, handle_worktree_info, handle_worktree_list, handle_worktree_remove,
-};
 pub use policy_handlers::{
     handle_policy_apply, handle_policy_apply_template, handle_policy_check, handle_policy_diff,
-    handle_policy_edit, handle_policy_history, handle_policy_list_templates, handle_policy_rollback,
-    handle_policy_show, handle_token_create,
-    handle_policy_role_add, handle_policy_role_remove, handle_policy_role_list,
-    load_or_generate_signing_key,
+    handle_policy_edit, handle_policy_history, handle_policy_list_templates,
+    handle_policy_role_add, handle_policy_role_list, handle_policy_role_remove,
+    handle_policy_rollback, handle_policy_show, handle_token_create, load_or_generate_signing_key,
 };
-pub use user_handlers::{
-    handle_user_create, handle_user_list, handle_user_register, handle_user_remove,
-    handle_user_keys_list, handle_user_keys_import, handle_user_keys_remove,
-};
-pub use crate::auth::policy_templates::{PolicyTemplate, get_template, get_templates};
 pub use remote_handlers::{
     handle_remote_add, handle_remote_list, handle_remote_remove, handle_remote_rename,
     handle_remote_set_url,
 };
-pub use worker_handlers::{
-    handle_images_df, handle_images_list, handle_images_pull, handle_images_rm,
-    handle_worker_exec, handle_worker_list, handle_worker_restart, handle_worker_rm,
-    handle_worker_run, handle_worker_start, handle_worker_stats, handle_worker_status,
-    handle_worker_stop, handle_worker_terminal,
-};
 pub use service_handlers::{
-    handle_service_install,
-    handle_service_uninstall, handle_service_start, handle_service_stop, handle_service_status,
+    handle_service_install, handle_service_provision_policy_templates, handle_service_start,
+    handle_service_status, handle_service_stop, handle_service_uninstall,
 };
 pub use sign_challenge::handle_sign_challenge;
-pub use wizard_handlers::{handle_wizard, handle_wizard_tui};
+pub use training_handlers::{
+    handle_training_batch, handle_training_checkpoint, handle_training_infer, handle_training_init,
+};
+pub use user_handlers::{
+    handle_user_create, handle_user_keys_import, handle_user_keys_list, handle_user_keys_remove,
+    handle_user_list, handle_user_register, handle_user_remove,
+};
+pub use wizard_handlers::{handle_wizard, handle_wizard_tui, WizardOptions};
+pub use worker_handlers::{
+    handle_images_df, handle_images_list, handle_images_pull, handle_images_rm, handle_worker_exec,
+    handle_worker_list, handle_worker_restart, handle_worker_rm, handle_worker_run,
+    handle_worker_start, handle_worker_stats, handle_worker_status, handle_worker_stop,
+    handle_worker_terminal,
+};
+pub use worktree_handlers::{
+    handle_worktree_add, handle_worktree_info, handle_worktree_list, handle_worktree_remove,
+};
 
 /// Device preference strategy
 #[derive(Debug, Clone, Copy)]

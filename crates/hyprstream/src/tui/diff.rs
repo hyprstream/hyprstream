@@ -59,9 +59,7 @@ pub fn compute_diff(
     let cols = area.width;
     let rows = area.height;
 
-    let is_full = pane.force_full_frame
-        || prev.is_none()
-        || pane.dirty_count() > (rows as u32) / 2;
+    let is_full = pane.force_full_frame || prev.is_none() || pane.dirty_count() > (rows as u32) / 2;
 
     if is_full {
         // Full frame: emit all cells
@@ -273,7 +271,8 @@ pub fn encode_capnp(diff: &FrameDiff, pane_id: u32) -> Vec<u8> {
 
     let mut message = Builder::new_default();
     {
-        let mut frame = message.init_root::<crate::tui_capnp::tui_frame::Builder<'_>>();
+        let mut frame =
+            message.init_root::<hyprstream_rpc_std::tui_capnp::tui_frame::Builder<'_>>();
         frame.set_generation(diff.generation);
         frame.set_timestamp_ms(
             std::time::SystemTime::now()
@@ -409,11 +408,20 @@ mod tests {
     #[test]
     fn test_color_roundtrip() {
         let colors = [
-            Color::Reset, Color::Black, Color::Red, Color::White,
-            Color::Rgb(255, 128, 0), Color::Indexed(42),
+            Color::Reset,
+            Color::Black,
+            Color::Red,
+            Color::White,
+            Color::Rgb(255, 128, 0),
+            Color::Indexed(42),
         ];
         for c in &colors {
-            assert_eq!(unpack_color(pack_color(*c)), *c, "roundtrip failed for {:?}", c);
+            assert_eq!(
+                unpack_color(pack_color(*c)),
+                *c,
+                "roundtrip failed for {:?}",
+                c
+            );
         }
     }
 
@@ -460,8 +468,22 @@ mod tests {
         // The encoded ANSI must position the cursor at x=2 before writing it,
         // not assume the cursor is already there after x=0's write.
         let deltas = vec![
-            CellDelta { x: 0, y: 0, symbol: "A".to_owned(), fg: Color::Reset, bg: Color::Reset, modifiers: Modifier::empty() },
-            CellDelta { x: 2, y: 0, symbol: "B".to_owned(), fg: Color::Reset, bg: Color::Reset, modifiers: Modifier::empty() },
+            CellDelta {
+                x: 0,
+                y: 0,
+                symbol: "A".to_owned(),
+                fg: Color::Reset,
+                bg: Color::Reset,
+                modifiers: Modifier::empty(),
+            },
+            CellDelta {
+                x: 2,
+                y: 0,
+                symbol: "B".to_owned(),
+                fg: Color::Reset,
+                bg: Color::Reset,
+                modifiers: Modifier::empty(),
+            },
         ];
         let diff = FrameDiff {
             is_full: false,

@@ -36,6 +36,14 @@ fn main() {
         "service_events",
         "chat_core",
         "oauth",
+        // Cross-crate service contracts.  These schemas are canonical here;
+        // AGPL implementation crates consume the generated server-only mode
+        // from hyprstream-rpc-derive instead of compiling local copies.
+        "worker",
+        "workflow",
+        "discovery",
+        "tui",
+        "compositor_ipc",
     ];
 
     hyprstream_rpc_build::compile_schemas(schema_dir, out_path, import_paths, &schemas);

@@ -6,15 +6,15 @@
 //! - XET chunk distribution
 //! - Git protocol serving
 
-use crate::service::{GitTorrentService, GitTorrentConfig};
-use crate::{Result, Error};
+use crate::service::{GitTorrentConfig, GitTorrentService};
+use crate::{Error, Result};
 
-use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::net::TcpListener;
-use serde::{Serialize, Deserialize};
+use tokio::sync::RwLock;
 
 /// GitTorrent daemon configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,20 +79,23 @@ impl GitTorrentDaemon {
     /// Create a new GitTorrent daemon
     pub async fn new(config: DaemonConfig) -> Result<Self> {
         // Create repositories directory
-        tokio::fs::create_dir_all(&config.repositories_dir).await
+        tokio::fs::create_dir_all(&config.repositories_dir)
+            .await
             .map_err(Error::from)?;
 
         // Initialize GitTorrent service
         let service = Arc::new(GitTorrentService::new(config.service.clone()).await?);
 
         // Initialize Git protocol listener if enabled
-        let git_listener = if config.enable_git_server {
-            let addr = format!("{}:{}", config.service.bind_address, config.git_port);
-            Some(TcpListener::bind(&addr).await
-                .map_err(|e| Error::other(format!("Failed to bind Git server to {addr}: {e}")))?)
-        } else {
-            None
-        };
+        let git_listener =
+            if config.enable_git_server {
+                let addr = format!("{}:{}", config.service.bind_address, config.git_port);
+                Some(TcpListener::bind(&addr).await.map_err(|e| {
+                    Error::other(format!("Failed to bind Git server to {addr}: {e}"))
+                })?)
+            } else {
+                None
+            };
 
         Ok(Self {
             service,
@@ -105,10 +108,15 @@ impl GitTorrentDaemon {
     /// Run the daemon server
     pub async fn run(&self) -> Result<()> {
         tracing::info!("GitTorrent daemon starting...");
-        tracing::info!("Repositories directory: {}", self.config.repositories_dir.display());
-        tracing::info!("Service bind address: {}:{}",
-                      self.config.service.bind_address,
-                      self.config.service.bind_port);
+        tracing::info!(
+            "Repositories directory: {}",
+            self.config.repositories_dir.display()
+        );
+        tracing::info!(
+            "Service bind address: {}:{}",
+            self.config.service.bind_address,
+            self.config.service.bind_port
+        );
 
         // Scan for existing repositories
         self.scan_repositories().await?;
@@ -123,11 +131,16 @@ impl GitTorrentDaemon {
                 // Note: In a real implementation, we'd need to pass the listener properly
                 // For now, just log that the server would be started
                 tracing::info!("Git protocol server would listen on: {}", listener_addr);
-                tracing::info!("Git server task started with {} repositories",
-                    repositories.read().await.len());
+                tracing::info!(
+                    "Git server task started with {} repositories",
+                    repositories.read().await.len()
+                );
             });
 
-            tracing::info!("Git protocol server listening on port {}", self.config.git_port);
+            tracing::info!(
+                "Git protocol server listening on port {}",
+                self.config.git_port
+            );
         }
 
         // Start periodic announcement of repositories
@@ -150,7 +163,8 @@ impl GitTorrentDaemon {
 
     /// Scan repositories directory for existing repositories
     async fn scan_repositories(&self) -> Result<()> {
-        let mut entries = tokio::fs::read_dir(&self.config.repositories_dir).await
+        let mut entries = tokio::fs::read_dir(&self.config.repositories_dir)
+            .await
             .map_err(Error::from)?;
 
         let mut repositories = self.repositories.write().await;
@@ -161,9 +175,11 @@ impl GitTorrentDaemon {
             if path.is_dir() {
                 // Check if it's a Git repository
                 if path.join(".git").exists() || path.join("objects").exists() {
-                    let name = path.file_name()
+                    let name = path
+                        .file_name()
                         .and_then(|n| n.to_str())
-                        .unwrap_or("unknown").to_owned();
+                        .unwrap_or("unknown")
+                        .to_owned();
 
                     let size = self.calculate_repository_size(&path).await?;
 
@@ -195,8 +211,7 @@ impl GitTorrentDaemon {
     async fn calculate_repository_size(&self, repo_path: &Path) -> Result<u64> {
         let mut total_size = 0;
 
-        let mut entries = tokio::fs::read_dir(repo_path).await
-            .map_err(Error::from)?;
+        let mut entries = tokio::fs::read_dir(repo_path).await.map_err(Error::from)?;
 
         while let Some(entry) = entries.next_entry().await.map_err(Error::from)? {
             let metadata = entry.metadata().await.map_err(Error::from)?;
@@ -207,7 +222,6 @@ impl GitTorrentDaemon {
 
         Ok(total_size)
     }
-
 
     /// Run periodic announcement loop
     async fn run_announcement_loop(
@@ -228,14 +242,20 @@ impl GitTorrentDaemon {
                 }
             }
 
-            tracing::debug!("Completed announcement cycle for {} repositories", repos.len());
+            tracing::debug!(
+                "Completed announcement cycle for {} repositories",
+                repos.len()
+            );
         }
     }
 
     /// Add a new repository to hosting
     pub async fn add_repository(&self, name: String, path: PathBuf) -> Result<()> {
         if !path.exists() {
-            return Err(Error::not_found(format!("Repository path does not exist: {}", path.display())));
+            return Err(Error::not_found(format!(
+                "Repository path does not exist: {}",
+                path.display()
+            )));
         }
 
         let size = self.calculate_repository_size(&path).await?;
@@ -279,7 +299,6 @@ impl GitTorrentDaemon {
     }
 }
 
-
 /// Daemon statistics
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DaemonStats {
@@ -315,7 +334,6 @@ mod tests {
         Ok(())
     }
 
-
     #[tokio::test]
     async fn test_repository_management() -> crate::error::Result<()> {
         let temp_dir = TempDir::new()?;
@@ -334,7 +352,9 @@ mod tests {
         let daemon = GitTorrentDaemon::new(config).await?;
 
         // Add repository
-        daemon.add_repository("test-repo".to_owned(), repo_dir).await?;
+        daemon
+            .add_repository("test-repo".to_owned(), repo_dir)
+            .await?;
 
         // Check it was added
         let repos = daemon.list_repositories().await;

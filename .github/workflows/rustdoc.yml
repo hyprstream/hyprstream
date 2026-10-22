@@ -1,0 +1,151 @@
+name: Rustdoc quality
+
+# Non-blocking documentation-quality lane (policy: docs/rustdoc-quality.md).
+#
+# Scope is deliberately the hyprstream-util PILOT only: `cargo doc` on this one
+# dependency-light leaf crate (parking_lot only) with `--no-deps`. It is NOT a
+# required check and NOT part of the man/protocol/corpus artifact pipeline —
+# the artifacts uploaded here exist solely as review evidence for documentation
+# quality on PRs that touch the pilot. Expanding coverage to further crates is
+# a per-crate, measured, opt-in process documented in docs/rustdoc-quality.md;
+# this workflow must not silently grow into a workspace-wide docs gate.
+#
+# Warning policy: rustdoc GENERATION errors fail the job (a broken build is a
+# failure, not a warning); missing-doc WARNINGS are collected and uploaded as
+# evidence but do not fail the job while the lane is non-blocking. The strict
+# step below runs the same scoped doc with `RUSTDOCFLAGS="-D warnings"` under
+# `continue-on-error` purely to produce machine-checkable evidence of the
+# current warning debt.
+#
+# Use the same self-hosted ARM64 runner and pinned builder as rust.yml.
+# The util-only pilot needs no workspace build, libtorch setup, or S3 cache:
+# disable the image's sccache wrapper and keep target/doc in the checkout for
+# artifact upload. No OIDC/AWS credentials are requested or forwarded.
+#
+# Trigger: merge queue only (long CI runs gate at merge, not on every PR
+# push), plus manual dispatch. merge_group does not support `paths` filters,
+# so the "Decide pilot scope" step below diffs the merge candidate and skips
+# the heavy steps unless a scoped input changed. Scope is deliberately the
+# pilot's own inputs — workspace-manifest-only changes (Cargo.toml /
+# Cargo.lock alone) do NOT fire this lane.
+on:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Merge-group runs must never be cancelled by a new PR push.
+concurrency:
+  group: rustdoc-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+
+jobs:
+  rustdoc-util:
+    name: rustdoc (hyprstream-util pilot)
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    # The workspace-hack (cargo-hakari, Wave D) puts the union dependency
+    # closure behind every leaf crate, so even `cargo doc --no-deps` must
+    # build that closure's metadata — and the evidence step re-runs the doc
+    # a second time with -D warnings. Both passes at CARGO_BUILD_JOBS=2 on
+    # the shared runner exceed the former 20-minute budget (two consecutive
+    # attempts died at exactly 20m), hence 45.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # In-job replacement for the former pull_request `paths` filter. The
+      # scope is the pilot's own inputs only; workspace manifests, the
+      # lockfile, and the toolchain pin alone must not fire this lane.
+      - name: Decide pilot scope
+        id: scope
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="${{ github.event.merge_group.base_sha }}"
+          git fetch --no-tags --depth=1 origin "$base" || git fetch --no-tags origin "$base"
+          run=false
+          while IFS= read -r f; do
+            case "$f" in
+              crates/hyprstream-util/*|crates/hyprstream-util) run=true ;;
+              .github/workflows/rustdoc.yml) run=true ;;
+              .github/scripts/load-builder-image.sh) run=true ;;
+              .github/builder-image.env) run=true ;;
+              docs/rustdoc-quality.md) run=true ;;
+            esac
+          done < <(git diff --no-renames --name-only "$base..${{ github.sha }}")
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          if [ "$run" = "false" ]; then
+            echo "No hyprstream-util pilot inputs changed; skipping rustdoc lane."
+          fi
+
+      - name: Load builder image pin
+        if: steps.scope.outputs.run == 'true'
+        run: bash .github/scripts/load-builder-image.sh
+
+      - name: Pull builder image
+        if: steps.scope.outputs.run == 'true'
+        run: podman pull "$BUILDER_IMAGE"
+
+      - name: Generate rustdoc (generation errors fail; warnings visible in log)
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          podman run --rm \
+            -v "$PWD":/build:Z -w /build \
+            -e RUSTC_WRAPPER= -e CARGO_TARGET_DIR=/build/target \
+            -e CARGO_INCREMENTAL=0 -e CARGO_BUILD_JOBS=2 -e CARGO_TERM_COLOR=always \
+            "$BUILDER_IMAGE" \
+            cargo doc --locked -p hyprstream-util --no-deps
+
+      - name: Collect warning evidence (non-blocking)
+        # Changing RUSTDOCFLAGS invalidates the rustdoc fingerprint, so this
+        # re-runs the scoped doc and re-emits every warning; `-D warnings`
+        # makes their presence observable as a step failure, and
+        # continue-on-error keeps the JOB green while warnings remain.
+        if: steps.scope.outputs.run == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          podman run --rm \
+            -v "$PWD":/build:Z -w /build \
+            -e RUSTC_WRAPPER= -e CARGO_TARGET_DIR=/build/target \
+            -e CARGO_INCREMENTAL=0 -e CARGO_BUILD_JOBS=2 -e CARGO_TERM_COLOR=always \
+            -e 'RUSTDOCFLAGS=-D warnings' \
+            "$BUILDER_IMAGE" \
+            cargo doc --locked -p hyprstream-util --no-deps 2>&1 | tee rustdoc-warnings.log
+
+      - name: Run documented examples (doctests)
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          podman run --rm \
+            -v "$PWD":/build:Z -w /build \
+            -e RUSTC_WRAPPER= -e CARGO_TARGET_DIR=/build/target \
+            -e CARGO_INCREMENTAL=0 -e CARGO_BUILD_JOBS=2 -e CARGO_TERM_COLOR=always \
+            "$BUILDER_IMAGE" \
+            cargo test --locked -p hyprstream-util --doc
+
+      - name: Upload warning evidence
+        if: always() && steps.scope.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdoc-hyprstream-util-warnings
+          path: rustdoc-warnings.log
+          if-no-files-found: warn
+
+      - name: Upload generated API docs
+        if: always() && steps.scope.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdoc-hyprstream-util-html
+          path: target/doc/
+          if-no-files-found: error

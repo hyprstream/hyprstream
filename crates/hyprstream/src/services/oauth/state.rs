@@ -15,7 +15,8 @@ use super::token_store::TokenStore;
 use super::user_service::UserService;
 use crate::auth::user_store::UserStore;
 use crate::config::OAuthConfig;
-use crate::services::{DiscoveryClient, PolicyClient};
+use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 use hyprstream_util::{InsertIfAbsentNoEvictResult, TtlCache};
 
 use super::replay_key::ReplayKey;
@@ -260,6 +261,14 @@ pub struct AuthorizeBinding {
     pub request: super::authorize::AuthorizeParams,
 }
 
+#[cfg(all(test, feature = "postgres"))]
+#[path = "federate_model_tests.rs"]
+mod federate_model_tests;
+
+#[cfg(all(test, feature = "postgres"))]
+#[path = "federate_tui_tests.rs"]
+mod federate_tui_tests;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -268,6 +277,203 @@ mod tests {
     use async_trait::async_trait;
     use hyprstream_rpc::crypto::CryptoPolicy;
     use rand::rngs::OsRng;
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_issuer_is_disabled_at_construction() {
+        assert!(state_for_replay_barrier_tests().federate_issuer.is_none());
+    }
+
+    #[cfg(feature = "postgres")]
+    pub(super) fn composite_signer_fixture(
+        version: u64,
+        pairs: Vec<hyprstream_rpc::auth::CompositeKeyPair>,
+    ) -> (
+        tempfile::TempDir,
+        std::sync::Arc<hyprstream_rpc::auth::CompositeKeySet>,
+    ) {
+        use hyprstream_rpc::auth::CompositeKeySet;
+
+        let dir = tempfile::tempdir().unwrap();
+        let digest = format!("federate-test-generation-{version}");
+        let ledger = dir.path().join("ledger.json");
+        let committed = dir.path().join("committed.json");
+        let prefix = dir.path().join("committed-ledger");
+        let key_set = std::sync::Arc::new(CompositeKeySet::default());
+        key_set.configure_authority(
+            ledger.clone(),
+            committed.clone(),
+            prefix.clone(),
+            dir.path().join("ledger.lock"),
+        );
+        key_set.publish(version, digest.clone(), pairs).unwrap();
+        let generation = prefix.with_file_name(format!(
+            "{}-{version}-{digest}.json",
+            prefix.file_name().unwrap().to_str().unwrap()
+        ));
+        let contents = serde_json::json!({"version": version, "component_digest": digest});
+        std::fs::write(&ledger, serde_json::to_vec(&contents).unwrap()).unwrap();
+        std::fs::write(&generation, serde_json::to_vec(&contents).unwrap()).unwrap();
+        std::fs::write(&committed, serde_json::to_vec(&contents).unwrap()).unwrap();
+        (dir, key_set)
+    }
+
+    #[cfg(feature = "postgres")]
+    pub(super) fn oauth_signing_pair(seed: u8) -> hyprstream_rpc::auth::CompositeKeyPair {
+        use std::sync::Arc;
+        let ed = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]));
+        let (pq, _) = hyprstream_rpc::crypto::pq::ml_dsa_generate_keypair();
+        let pq = Arc::new(pq);
+        let kid = hyprstream_rpc::auth::composite_kid(
+            &ml_dsa::Keypair::verifying_key(&*pq),
+            &ed.verifying_key(),
+        );
+        hyprstream_rpc::auth::CompositeKeyPair::signing(
+            kid,
+            pq,
+            ed,
+            hyprstream_rpc::auth::CompositePairRole::OAuth,
+            hyprstream_rpc::auth::CompositePairState::Active,
+            0,
+            i64::MAX,
+        )
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn federate_signer_uses_authorized_hybrid_oauth_pair() {
+        let pair = oauth_signing_pair(0x43);
+        let (dir, key_set) = composite_signer_fixture(1, vec![pair.clone()]);
+        let signer = super::HybridFederateSigner::new(key_set).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::claims::Claims::new(
+            "did:plc:abcdefghijklmnopqrstuvwx".to_owned(),
+            now,
+            now + 60,
+        )
+        .with_issuer("https://local".to_owned())
+        .with_jti();
+
+        let token = super::super::federate_host::FederateSigner::sign(&signer, &claims)
+            .await
+            .unwrap();
+        let dispatch = hyprstream_rpc::auth::parse_composite_dispatch(&token, &["at+jwt"]).unwrap();
+        assert_eq!(dispatch.kid(), pair.kid());
+        let verified = hyprstream_rpc::auth::jwt::decode_composite(
+            &token,
+            pair.ml_dsa(),
+            pair.ed25519(),
+            None,
+            &dispatch,
+        )
+        .unwrap();
+        assert_eq!(verified.sub, claims.sub);
+        drop(dir);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn federate_signer_uses_new_committed_pair_after_rotation() {
+        use hyprstream_rpc::auth::{CompositePairRole, CompositePairState};
+        let first = oauth_signing_pair(0x44);
+        let second = oauth_signing_pair(0x45);
+        let old_kid = first.kid().to_owned();
+        let (dir, key_set) = composite_signer_fixture(1, vec![first.clone()]);
+        let signer = super::HybridFederateSigner::new(std::sync::Arc::clone(&key_set)).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::claims::Claims::new(
+            "did:plc:abcdefghijklmnopqrstuvwx".to_owned(),
+            now,
+            now + 60,
+        )
+        .with_issuer("https://local".to_owned())
+        .with_jti();
+        let before = super::super::federate_host::FederateSigner::sign(&signer, &claims)
+            .await
+            .unwrap();
+        let before_dispatch =
+            hyprstream_rpc::auth::parse_composite_dispatch(&before, &["at+jwt"]).unwrap();
+        assert_eq!(before_dispatch.kid(), old_kid);
+
+        let (first_pq, first_ed) = first.signing_keys().unwrap();
+        let draining = hyprstream_rpc::auth::CompositeKeyPair::signing(
+            first.kid().to_owned(),
+            first_pq,
+            first_ed,
+            CompositePairRole::OAuth,
+            CompositePairState::Drain,
+            0,
+            i64::MAX,
+        );
+        let (version, digest) = (2, "federate-test-generation-2");
+        key_set
+            .publish(version, digest.to_owned(), vec![draining, second.clone()])
+            .unwrap();
+        let prefix = dir.path().join("committed-ledger");
+        let generation = prefix.with_file_name(format!("committed-ledger-{version}-{digest}.json"));
+        let contents = serde_json::json!({"version": version, "component_digest": digest});
+        std::fs::write(
+            dir.path().join("ledger.json"),
+            serde_json::to_vec(&contents).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(generation, serde_json::to_vec(&contents).unwrap()).unwrap();
+        std::fs::write(
+            dir.path().join("committed.json"),
+            serde_json::to_vec(&contents).unwrap(),
+        )
+        .unwrap();
+
+        let after = super::super::federate_host::FederateSigner::sign(&signer, &claims)
+            .await
+            .unwrap();
+        let after_dispatch =
+            hyprstream_rpc::auth::parse_composite_dispatch(&after, &["at+jwt"]).unwrap();
+        assert_eq!(after_dispatch.kid(), second.kid());
+        assert_ne!(after_dispatch.kid(), old_kid);
+        let verified = hyprstream_rpc::auth::jwt::decode_composite(
+            &after,
+            second.ml_dsa(),
+            second.ed25519(),
+            None,
+            &after_dispatch,
+        )
+        .unwrap();
+        assert_eq!(verified.sub, claims.sub);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn federate_signer_fails_closed_without_oauth_signing_key() {
+        let empty = std::sync::Arc::new(hyprstream_rpc::auth::CompositeKeySet::default());
+        assert!(super::HybridFederateSigner::new(empty).is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn federate_routes_deny_without_policy_adapter() {
+        let state = Arc::new(state_for_replay_barrier_tests());
+        let challenge = super::super::federate_host::challenge(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(
+            challenge.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let exchange = super::super::federate_host::exchange(
+            &state,
+            &axum::http::HeaderMap::new(),
+            b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
+        )
+        .await;
+        assert_eq!(
+            exchange.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 
     fn state_with_user_store(store: Arc<dyn UserStore>) -> OAuthState {
         use hyprstream_rpc::rpc_client::RpcClientImpl;
@@ -369,11 +575,7 @@ mod tests {
         let state = state_for_replay_barrier_tests();
         let now = chrono::Utc::now().timestamp();
         assert!(state.check_and_record_dpop_jti("dpop-future-skew", now + 60));
-        assert!(state.check_and_record_assertion_jti(
-            "client",
-            "assertion-future-skew",
-            now + 360
-        ));
+        assert!(state.check_and_record_assertion_jti("client", "assertion-future-skew", now + 360));
     }
 
     #[test]
@@ -628,6 +830,7 @@ mod tests {
     /// #1113 r5: the default production backend must retain the mapped DID,
     /// and the real account lookup (keys + profile) must reach the success
     /// path after closing and reopening RocksDB.
+    #[cfg(feature = "rocksdb")]
     #[tokio::test]
     async fn atproto_eligibility_succeeds_after_rocksdb_roundtrip() {
         use crate::auth::rocksdb_store::RocksDbUserStore;
@@ -1036,6 +1239,13 @@ pub struct RefreshTokenEntry {
     /// keeps the generic OAuth 2.1 rotation path unchanged.
     #[serde(default)]
     pub ucan_grant: Option<UcanGrantRefresh>,
+    /// OIDC session ID (`sid`) of the interactive session this refresh token
+    /// belongs to. The same session spans every rotation (distinct credential
+    /// IDs, one stable sid — v16 §3.3); the refresh path checks it against
+    /// the session authority before consuming the single-use token, so a
+    /// revoked session cannot refresh. `None` only on pre-session records.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Re-evaluation context persisted alongside a UCAN-grant refresh token so the
@@ -1066,6 +1276,14 @@ impl RefreshTokenEntry {
 
 /// Shared OAuth server state.
 pub struct OAuthState {
+    /// Public HTTPS projection signer. It authenticates the representation,
+    /// not the accepted-current Registry/Model response keys inside it.
+    pub(crate) browser_provisioning_signer: Option<Arc<hyprstream_rpc::crypto::SigningKey>>,
+    pub(crate) browser_provisioning_rate_limiter: Arc<crate::server::middleware::RateLimiter>,
+    /// Exact Federate host exchange remains disabled until an authenticated
+    /// Policy admission adapter and composite signer are installed together.
+    #[cfg(feature = "postgres")]
+    pub(crate) federate_issuer: Option<Arc<super::federate_host::FederateIssuer>>,
     /// Dynamically-registered (RFC 7591) clients keyed by issued UUID
     /// client_id. CIMD clients live in `cimd_cache` instead — DCR
     /// entries have no TTL and outlive cache evictions, so storage is
@@ -1158,6 +1376,16 @@ pub struct OAuthState {
     /// by the write path (#910) and tests; the read endpoints consult it
     /// directly. Default-empty so existing construction sites need no change.
     pub xrpc_repos: Arc<super::xrpc::XrpcRepoStore>,
+    /// Optional native-authorized public repository writer. No public write
+    /// routes are mounted while this is absent.
+    pub public_repo_writer: Option<Arc<crate::services::public_repo::PublicRepoWriter>>,
+    /// Production hosted-account writer. It resolves the requested DID and
+    /// signs through AccountRecordStore without exposing private key bytes.
+    pub hosted_public_repo_writer:
+        Option<Arc<crate::services::public_repo::HostedAccountPublicRepoWriter>>,
+    /// Optional native account resolver for the protected standard
+    /// `com.atproto.server.getSession` route.
+    pub atproto_session_resolver: Option<Arc<dyn super::xrpc::AtprotoSessionResolver>>,
     /// When `true`, the XRPC read-slice routes (`/xrpc/…`) are mounted on the
     /// OAuth router (#1112). Copied from `OAuthConfig::xrpc_read_slice`.
     pub xrpc_read_slice: bool,
@@ -1218,7 +1446,6 @@ pub struct OAuthState {
     /// When present, JWKS serves all slots and issuance uses the active key.
     pub signing_key_store: Option<Arc<crate::auth::SigningKeyStore>>,
     /// Shared JWT ID blocklist for access token revocation (shared with PolicyService).
-    pub jti_blocklist: Option<Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>>,
     /// ES256 (P-256) signing key rotation store for JWKS and DPoP/atproto interop.
     pub es256_key_store: Option<Arc<crate::auth::Es256SigningKeyStore>>,
     /// ML-DSA-65 signing key rotation store for PQ-hybrid JWT issuance.
@@ -1291,7 +1518,74 @@ fn mesh_kem_public_for_policy(
     }
 }
 
+/// Federate session signer using the currently committed hybrid OAuth key pair.
+#[cfg(feature = "postgres")]
+struct HybridFederateSigner {
+    key_set: std::sync::Arc<hyprstream_rpc::auth::CompositeKeySet>,
+}
+
+#[cfg(feature = "postgres")]
+impl HybridFederateSigner {
+    fn new(key_set: std::sync::Arc<hyprstream_rpc::auth::CompositeKeySet>) -> anyhow::Result<Self> {
+        let snapshot = key_set
+            .mint_snapshot()
+            .context("committed OAuth composite signing authority is unavailable")?;
+        anyhow::ensure!(
+            snapshot
+                .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
+                .is_some(),
+            "no authorized active OAuth composite signing pair"
+        );
+        Ok(Self { key_set })
+    }
+}
+
+#[async_trait::async_trait]
+#[cfg(feature = "postgres")]
+impl super::federate_host::FederateSigner for HybridFederateSigner {
+    async fn sign(&self, claims: &hyprstream_rpc::auth::claims::Claims) -> anyhow::Result<String> {
+        let snapshot = self
+            .key_set
+            .mint_snapshot()
+            .context("committed OAuth composite signing authority is unavailable")?;
+        let (pq, ed) = snapshot
+            .active_signing_pair(hyprstream_rpc::auth::CompositePairRole::OAuth)
+            .and_then(hyprstream_rpc::auth::CompositeKeyPair::signing_keys)
+            .ok_or_else(|| anyhow::anyhow!("no authorized active OAuth composite signing pair"))?;
+        Ok(crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(
+            claims, &pq, &ed,
+        ))
+    }
+}
+
 impl OAuthState {
+    /// Install the FederateIssuer for the Federate login path. The optional
+    /// configured TUI client class (W1.3) joins the verifier's accepted
+    /// classes; `None` keeps staging-only behavior (default-deny for the
+    /// TUI class).
+    #[cfg(feature = "postgres")]
+    pub(crate) fn install_federate_issuer(
+        &mut self,
+        admission: std::sync::Arc<dyn super::federate_host::FederateAdmission>,
+        signer: std::sync::Arc<dyn super::federate_host::FederateSigner>,
+        tui_client: Option<super::federate_source::ClientClass>,
+    ) -> anyhow::Result<()> {
+        let host = super::federate_source::FederateHost::new(&self.issuer_url)?;
+        let issuer =
+            super::federate_host::FederateIssuer::new(admission, signer, host, tui_client)?;
+        self.federate_issuer = Some(std::sync::Arc::new(issuer));
+        Ok(())
+    }
+
+    /// Use the currently committed OAuth composite pair for access tokens.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn federate_signer(
+        &self,
+    ) -> anyhow::Result<std::sync::Arc<dyn super::federate_host::FederateSigner>> {
+        Ok(std::sync::Arc::new(HybridFederateSigner::new(
+            hyprstream_rpc::auth::global_composite_key_set(),
+        )?))
+    }
     const MAX_CLIENT_ASSERTION_REPLAY_SECS: i64 = 360;
     const MAX_ATPROTO_SERVICE_ASSERTION_REPLAY_SECS: i64 = 3_600;
     /// DPoP admits iat up to 60 seconds in the future and retains through
@@ -1314,6 +1608,12 @@ impl OAuthState {
         verifying_key_bytes: [u8; 32],
     ) -> Self {
         Self {
+            browser_provisioning_signer: None,
+            browser_provisioning_rate_limiter: Arc::new(
+                crate::server::middleware::RateLimiter::new(60, 60),
+            ),
+            #[cfg(feature = "postgres")]
+            federate_issuer: None,
             clients: RwLock::new(HashMap::new()),
             pending_authorize_bindings: RwLock::new(HashMap::new()),
             cimd_cache: Arc::new(super::cimd_cache::CimdCache::new(
@@ -1352,6 +1652,9 @@ impl OAuthState {
             ),
             sessions: super::session::SessionStore::default(),
             xrpc_repos: Arc::new(super::xrpc::XrpcRepoStore::new()),
+            public_repo_writer: None,
+            hosted_public_repo_writer: None,
+            atproto_session_resolver: None,
             xrpc_read_slice: config.xrpc_read_slice,
             deployment_well_known_dir: config.deployment_well_known_dir.clone(),
             rsa_encoding_key: None,
@@ -1384,7 +1687,6 @@ impl OAuthState {
             jwt_key_nbf: chrono::Utc::now().timestamp(),
             jwt_key_exp: chrono::Utc::now().timestamp() + 14 * 86400,
             signing_key_store: None,
-            jti_blocklist: None,
             es256_key_store: None,
             ml_dsa_key_store: None,
             audit_sink: None,
@@ -1396,6 +1698,14 @@ impl OAuthState {
             iroh_node_id: None,
             iroh_relays: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_browser_provisioning_signer(
+        mut self,
+        signing_key: hyprstream_rpc::crypto::SigningKey,
+    ) -> Self {
+        self.browser_provisioning_signer = Some(Arc::new(signing_key));
+        self
     }
 
     /// Attach the anonymous device store.
@@ -1419,6 +1729,35 @@ impl OAuthState {
         store: Arc<hyprstream_pds_service::AccountRecordStore>,
     ) -> Self {
         self.hosted_account_store = Some(store);
+        self
+    }
+
+    /// Install the explicit native-authorized public repository writer. This
+    /// opt-in is required before standard XRPC repository writes are exposed.
+    pub fn with_public_repo_writer(
+        mut self,
+        writer: Arc<crate::services::public_repo::PublicRepoWriter>,
+    ) -> Self {
+        self.public_repo_writer = Some(writer);
+        self
+    }
+
+    pub fn with_hosted_public_repo_writer(
+        mut self,
+        writer: Arc<crate::services::public_repo::HostedAccountPublicRepoWriter>,
+    ) -> Self {
+        self.hosted_public_repo_writer = Some(writer);
+        self
+    }
+
+    /// Install the explicit native account resolver used by standard
+    /// `com.atproto.server.getSession`. The resolver owns handle, DID-document
+    /// and lifecycle truth; no session route is mounted without it.
+    pub fn with_atproto_session_resolver(
+        mut self,
+        resolver: Arc<dyn super::xrpc::AtprotoSessionResolver>,
+    ) -> Self {
+        self.atproto_session_resolver = Some(resolver);
         self
     }
 
@@ -1532,19 +1871,6 @@ impl OAuthState {
     pub fn with_iroh_transport(mut self, node_id: [u8; 32], relays: Vec<String>) -> Self {
         self.iroh_node_id = Some(node_id);
         self.iroh_relays = relays;
-        self
-    }
-
-    /// Attach the shared JWT ID blocklist (shared with PolicyService).
-    ///
-    /// When set, `POST /oauth/revoke` on access tokens writes the JTI into
-    /// this blocklist so the PolicyService RPC enforcement path also rejects
-    /// revoked tokens — closing the gap between HTTP revocation and RPC auth.
-    pub fn with_jti_blocklist(
-        mut self,
-        bl: Arc<hyprstream_rpc::auth::InMemoryJtiBlocklist>,
-    ) -> Self {
-        self.jti_blocklist = Some(bl);
         self
     }
 
@@ -2247,14 +2573,16 @@ pub fn canonical_issuer_origin(issuer_url: &str) -> Option<String> {
 }
 
 /// Convert the configured OAuth URL to the host-form `did:web` service DID
-/// used by ATProto service-auth audiences.
+/// used by public identity documents, discovery verification, and ATProto
+/// service-auth audiences. This conversion is stateless and does not resolve
+/// or mint hosted account identities.
 ///
 /// For supported DNS/IPv4 origins this mirrors the browser's
 /// `originToDidWeb`: URL parsing normalizes an explicit default port away,
 /// while a non-default port is retained and its domain-segment separator is
 /// encoded as `%3A`. IPv6 is rejected until client and server share one
 /// canonical DID representation for it.
-fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
+pub(crate) fn atproto_service_did_for_origin(issuer_url: &str) -> Option<String> {
     let url = url::Url::parse(issuer_url).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()

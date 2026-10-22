@@ -17,8 +17,8 @@
 //! │  hyprstream/src/services/                                   │
 //! │  ├── core.rs      ← RequestService trait re-exports           │
 //! │  ├── types.rs     ← Shared types (FsDirEntry, ModelInfo, etc.)│
-//! │  ├── registry.rs  ← Registry service + client               │
-//! │  └── inference.rs ← Inference service + client              │
+//! │  ├── registry.rs  ← Registry server                        │
+//! │  └── inference.rs ← Inference server                       │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -61,39 +61,89 @@
 
 mod core;
 mod types;
-mod worktree_helpers;
-pub use worktree_helpers::StatResult;
+use hyprstream_rpc_std::{discovery_client::DiscoveryClient, policy_client::PolicyClient};
+// 9P worktree convenience helpers moved to `hyprstream-inference` with the
+// training checkpoint path (Wave B); re-exported so existing
+// `crate::services::{StatResult, WorktreeClientExt}` paths keep resolving.
+pub use hyprstream_inference::worktree_ext::StatResult;
+pub(crate) use hyprstream_inference::worktree_ext::WorktreeClientExt;
 // contained_root replaced by hyprstream-containedfs crate
+#[cfg(feature = "rocksdb")]
+pub mod at9p_renewal;
 pub mod discovery;
 pub mod editing;
 pub mod factories;
 #[cfg(feature = "metrics")]
 pub mod flight;
+pub mod fs;
 pub mod generated;
 #[cfg(feature = "oci-image")]
 pub mod image_substrate;
 pub mod inference;
+pub mod kata_9p_backend;
 pub mod mcp_service;
 #[cfg(feature = "metrics")]
 pub mod metrics;
-pub mod at9p_verify;
-pub mod ninep_bridge;
 pub mod model;
-pub mod oauth;
-pub mod oai;
-pub mod policy;
-pub mod registry;
-pub mod router;
-pub mod xet;
-pub mod xet_provenance;
-pub mod fs;
 pub mod namespace_builder;
+pub mod native_event_policy;
+pub mod ninep_bridge;
+pub mod oai;
+pub mod oauth;
+pub mod policy;
+pub mod public_repo;
+pub mod registry;
 pub mod remote_mount;
 pub mod remote_registry_mount;
-pub mod kata_9p_backend;
+pub mod revocation;
+pub mod router;
 pub mod rpc_types;
 pub mod typed;
 pub mod worker;
+pub mod xet;
+pub mod xet_provenance;
+
+#[cfg(test)]
+pub(crate) mod restart_diag {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+
+    pub(crate) fn enable() {
+        STARTED.get_or_init(Instant::now);
+        ENABLED.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn phase(label: &'static str) {
+        if !ENABLED.load(Ordering::Acquire) {
+            return;
+        }
+        let elapsed_ms = STARTED
+            .get()
+            .map_or(0, |started| started.elapsed().as_millis());
+        let mut stderr = std::io::stderr().lock();
+        let _ = std::io::Write::write_fmt(
+            &mut stderr,
+            format_args!("RESTART_DIAG_PHASE={label} elapsed_ms={elapsed_ms}\n"),
+        );
+        let _ = std::io::Write::flush(&mut stderr);
+    }
+}
+
+// Postgres-backed PDS record store (#1257) — gated behind `pds-postgres`.
+// When a `[rds]` config section is present, the factory selects this backend;
+// otherwise the RocksDB local backend is used. D2 invariant: signed bytes are
+// the source of truth, SQL is a projection-free KV shell.
+#[cfg(feature = "pds-postgres")]
+pub(crate) mod pds_record_pg;
+// The PDS record store's local RocksDB backend + publisher/resolver/ingest
+// stack (the `rocksdb` feature, valkey precedent). Re-exported through
+// `services::discovery` so callers keep their paths.
+#[cfg(feature = "rocksdb")]
+pub(crate) mod pds_record_rocksdb;
 
 /// Phase-1 cellular-ledger local-enforcer (epic #922, #925). Gated behind the
 /// `ledger` cargo feature, default off — the scheduler quota path is unchanged
@@ -101,55 +151,82 @@ pub mod worker;
 #[cfg(feature = "ledger")]
 pub mod ledger;
 
-pub use core::{
-    Continuation, EnvelopeContext, RequestService,
-};
+/// Settlement/tariff service (#1399). Behind the `pay` cargo feature.
+/// Implements the MIT `hyprstream_pay` traits with AGPL service logic.
+#[cfg(feature = "pay")]
+pub mod pay;
 
-// Generated client types — the public API
-pub use generated::registry_client::{
-    RegistryClient,
-    RepositoryClient, WorktreeClient, CtlClient,
-    TrackedRepository as GenTrackedRepository,
-    WorktreeInfo as GenWorktreeInfo,
-    RepositoryStatus as GenRepositoryStatus,
-    RemoteInfo,
-    RWalk, ROpen, RRead, RWrite, RStat,
-    NpStat as NpStatData, Qid as QidData,
-    FileStatus, LogEntry, ValidationResult, FileInfo,
-    DocFormat,
-};
+pub use core::{Continuation, EnvelopeContext, RequestService};
 
 // Remaining domain types
 pub use types::{
-    MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE,
-    DEFAULT_IOUNIT, MAX_IOUNIT,
-    QTDIR, QTFILE, OREAD, OWRITE, ORDWR, OTRUNC, ORCLOSE, DMDIR,
-    FsDirEntryInfo,
+    FsDirEntryInfo, DEFAULT_IOUNIT, DMDIR, MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT, MAX_FS_IO_SIZE,
+    MAX_IOUNIT, ORCLOSE, ORDWR, OREAD, OTRUNC, OWRITE, QTDIR, QTFILE,
 };
 // Open mode constants also re-exported from hyprstream-vfs::mount for VFS consumers.
 
-pub use inference::{InferenceService, InferenceServiceConfig, INFERENCE_ENDPOINT};
-pub use generated::inference_client::InferenceClient;
-pub use registry::RegistryService;
-pub use policy::PolicyService;
-pub use generated::policy_client::PolicyClient;
-pub use model::{ModelService, ModelServiceConfig, MODEL_ENDPOINT};
-pub use generated::model_client::ModelClient;
-pub use worker::build_authorize_fn;
-pub use namespace_builder::{build_standard_namespace, StandardNamespaceConfig};
-pub use hyprstream_workers::runtime::WorkerClient;
-pub use oauth::OAuthService;
-pub use oai::OAIService;
-pub use xet::{XetService, XetState};
-pub use at9p_verify::{At9pVerifyService, VerifyFaceState, credential_free_router};
+pub use discovery::DiscoveryService;
+#[cfg(feature = "metrics")]
+pub use flight::FlightService;
 #[cfg(feature = "oci-image")]
 pub use image_substrate::{
     create_image_substrate_router, ImageSubstratePolicy, ImageSubstrateState,
 };
-#[cfg(feature = "metrics")]
-pub use flight::FlightService;
-pub use discovery::DiscoveryService;
-pub use generated::discovery_client::DiscoveryClient;
+pub use inference::{InferenceService, InferenceServiceConfig, INFERENCE_ENDPOINT};
+pub use model::{ModelService, ModelServiceConfig, StagingModelPin, MODEL_ENDPOINT};
+pub use namespace_builder::{build_standard_namespace, StandardNamespaceConfig};
+pub use oai::OAIService;
+#[cfg(test)]
+pub(crate) use oai::{
+    await_required_native_dependencies as oai_await_required_native_dependencies,
+    healthy_registry as oai_healthy_registry,
+    prove_model_reachability_denial as oai_prove_model_reachability_denial,
+};
+pub use oauth::OAuthService;
+pub use policy::PolicyService;
+pub use registry::RegistryService;
+pub use worker::build_authorize_fn;
+pub use xet::{XetService, XetState};
+
+/// Construct on the caller's runtime, using the authenticated process profile.
+pub fn policy_client_for_process(
+    signing_key: ed25519_dalek::SigningKey,
+    compatibility_key: ed25519_dalek::VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<PolicyClient> {
+    if hyprstream_discovery::native_network_required() {
+        PolicyClient::from_provider(
+            &hyprstream_discovery::ProductionRpcClientProvider,
+            signing_key,
+            token,
+        )
+    } else {
+        PolicyClient::for_local_bootstrap(signing_key, compatibility_key, token)
+    }
+}
+
+/// Discovery's required reach/evidence comes from the checkpoint-backed resolver.
+pub fn discovery_client_for_process(
+    signing_key: ed25519_dalek::SigningKey,
+    compatibility_key: ed25519_dalek::VerifyingKey,
+    token: Option<String>,
+) -> anyhow::Result<DiscoveryClient> {
+    if hyprstream_discovery::native_network_required() {
+        DiscoveryClient::from_provider(
+            &hyprstream_discovery::ProductionRpcClientProvider,
+            signing_key,
+            token,
+        )
+    } else {
+        DiscoveryClient::for_local_bootstrap(signing_key, compatibility_key, token)
+    }
+}
 pub use mcp_service::{McpConfig, McpService};
 #[cfg(feature = "metrics")]
 pub use metrics::MetricsService;
+
+/// Authenticated Event transport and profile-aware initialization.
+pub mod event_network;
+
+/// Native producer/Streams carrier admission and lifecycle.
+pub mod stream_network;

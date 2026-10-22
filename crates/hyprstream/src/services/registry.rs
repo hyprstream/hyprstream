@@ -3,60 +3,52 @@
 //! This service wraps git2db and provides a ZMQ REQ/REP interface for
 //! repository operations. It uses Cap'n Proto for serialization.
 
-use crate::services::PolicyClient;
 use crate::services::types::{MAX_FDS_GLOBAL, MAX_FDS_PER_CLIENT};
 use crate::services::xet_provenance::XetProvenanceStore;
-use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
 use crate::services::{EnvelopeContext, RequestService};
-use hyprstream_rpc::transport::TransportConfig;
-use hyprstream_rpc::prelude::*;
-use hyprstream_rpc::{StreamChannel, StreamContext};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use git2db::{CloneBuilder, Git2DB, GitRef, RepoId, TrackedRepository};
+use hyprstream_containedfs::{ContainedFs, FsError, FsHandle};
+use hyprstream_rpc::prelude::*;
+use hyprstream_rpc::transport::TransportConfig;
+use hyprstream_rpc::{StreamChannel, StreamContext};
+use hyprstream_rpc_std::policy_client::PolicyClient;
 use parking_lot::Mutex;
 #[cfg_attr(not(feature = "metrics"), allow(unused_imports))]
 use std::collections::HashMap;
-use std::io::{Read as _, Write as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 // Generated client types (RegistryClient is used in test and metrics-impl code)
-#[allow(unused_imports)]
-use crate::services::generated::registry_client::{
-    RegistryClient, RegistryResponseVariant,
-    RegistryHandler, RepoHandler, WorktreeHandler, CtlHandler,
-    dispatch_registry, serialize_response,
-    StreamInfo, ErrorInfo, HealthStatus, DetailedStatusInfo, RemoteInfo,
-    CloneRequest, RegisterRequest,
-    GetBlobRequest, GetBlobRequestContent,
-    PutBlobRequest, PutBlobResult,
-    At9pCandidateRequest, At9pCandidateKind, AcceptedAt9pStateInfo,
-    CreateWorktreeRequest, RemoveWorktreeRequest,
-    BranchRequest, CheckoutRequest, StageFilesRequest,
-    CommitRequest, MergeRequest, ContinueMergeRequest,
-    GetRefRequest, AddRemoteRequest, RemoveRemoteRequest,
-    SetRemoteUrlRequest, RenameRemoteRequest,
-    PushRequest, AmendCommitRequest, CommitWithAuthorRequest,
-    CreateTagRequest, DeleteTagRequest, UpdateRequest,
-    NpWalk, NpOpen, NpCreate, NpRead, NpWrite, NpClunk, NpRemove,
-    NpStatReq, NpWstat, NpFlush,
-    RWalk, ROpen, RRead, RWrite, RStat,
-    NpStat as NpStatData, Qid as QidData,
-    FileStatus, LogEntry, ValidationResult, FileInfo,
-    CtlLogRequest, CtlDiffRequest, CtlCheckoutRequest,
-    EditOpenRequest, EditApplyRequest,
-    DocFormat,
-};
 use crate::services::editing::{self, EditingTable};
-use crate::services::generated::policy_client::PolicyCheck;
+use crate::services::generated::registry_client::{
+    dispatch_registry, serialize_response, CtlHandler, RegistryHandler, RepoHandler,
+    WorktreeHandler,
+};
 use automerge::ReadDoc as _;
+use hyprstream_rpc_std::policy_client::PolicyCheck;
+#[allow(unused_imports)]
+use hyprstream_rpc_std::registry_client::{
+    AcceptedAt9pStateInfo, AddRemoteRequest, AmendCommitRequest, At9pCandidateKind,
+    At9pCandidateRequest, BranchRequest, CheckoutRequest, CloneRequest, CommitRequest,
+    CommitWithAuthorRequest, ContinueMergeRequest, CreateTagRequest, CreateWorktreeRequest,
+    CtlCheckoutRequest, CtlDiffRequest, CtlLogRequest, DeleteTagRequest, DetailedStatusInfo,
+    DocFormat, EditApplyRequest, EditOpenRequest, ErrorInfo, FileInfo, FileStatus, GetBlobRequest,
+    GetBlobRequestContent, GetRefRequest, HealthStatus, LogEntry, MergeRequest, NpClunk, NpCreate,
+    NpFlush, NpOpen, NpRead, NpRemove, NpStat as NpStatData, NpStatReq, NpWalk, NpWrite, NpWstat,
+    PushRequest, PutBlobRequest, PutBlobResult, Qid as QidData, ROpen, RRead, RStat, RWalk, RWrite,
+    RegisterRequest, RegistryClient, RegistryResponseVariant, RemoteInfo, RemoveRemoteRequest,
+    RemoveWorktreeRequest, RenameRemoteRequest, SetRemoteUrlRequest, StageFilesRequest, StreamInfo,
+    UpdateRequest, ValidationResult,
+};
 // Conflicting names — use canonical path at usage sites:
 //   registry_client::TrackedRepository, registry_client::RepositoryStatus, registry_client::WorktreeInfo
 
@@ -77,13 +69,21 @@ fn variant_to_tracked_repository(
 ) -> Result<TrackedRepository> {
     let uuid = Uuid::parse_str(id)?;
     let repo_id = RepoId::from_uuid(uuid);
-    let name_opt = if name.is_empty() { None } else { Some(name.to_owned()) };
+    let name_opt = if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    };
     let tracking = if tracking_ref.is_empty() {
         GitRef::Branch("main".to_owned())
     } else {
         GitRef::Branch(tracking_ref.to_owned())
     };
-    let oid = if current_oid.is_empty() { None } else { Some(current_oid.to_owned()) };
+    let oid = if current_oid.is_empty() {
+        None
+    } else {
+        Some(current_oid.to_owned())
+    };
 
     Ok(TrackedRepository {
         id: repo_id,
@@ -98,7 +98,6 @@ fn variant_to_tracked_repository(
     })
 }
 
-
 // ============================================================================
 // Registry Service (server-side)
 // ============================================================================
@@ -108,7 +107,7 @@ fn variant_to_tracked_repository(
 // ============================================================================
 
 // FsHandle imported from hyprstream_containedfs above
-use crate::services::types::{DEFAULT_IOUNIT, QTDIR, QTFILE, OWRITE, ORDWR, OTRUNC, DMDIR};
+use crate::services::types::{DEFAULT_IOUNIT, DMDIR, ORDWR, OTRUNC, OWRITE, QTDIR, QTFILE};
 
 /// 9P Qid — uniquely identifies a file version.
 #[derive(Clone, Debug)]
@@ -121,10 +120,7 @@ struct Qid {
 /// State of a fid in the 9P table.
 enum FidState {
     /// After walk: handle for metadata/open, not yet opened for I/O.
-    Walked {
-        walk_handle: FsHandle,
-        qid: Qid,
-    },
+    Walked { walk_handle: FsHandle, qid: Qid },
     /// After open: real fd for I/O.
     Opened {
         file: Mutex<std::fs::File>,
@@ -196,7 +192,8 @@ fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
 fn qid_from_metadata(meta: &std::fs::Metadata) -> Qid {
     Qid {
         qtype: if meta.is_dir() { QTDIR } else { QTFILE },
-        version: meta.modified()
+        version: meta
+            .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as u32)
@@ -226,9 +223,7 @@ impl FidTable {
             ));
         }
         if self.fids.len() >= MAX_FDS_GLOBAL as usize {
-            return Err(FsError::ResourceLimit(
-                "too many open fids globally".into(),
-            ));
+            return Err(FsError::ResourceLimit("too many open fids globally".into()));
         }
         for _ in 0..1000 {
             let fid = self.next_fid.fetch_add(1, Relaxed);
@@ -295,9 +290,7 @@ impl FidTable {
             .get(&fid)
             .ok_or_else(|| FsError::NotFound(format!("bad fid: {}", fid)))?;
         if entry.owner_identity != client_id {
-            return Err(FsError::PermissionDenied(
-                "fid not owned by caller".into(),
-            ));
+            return Err(FsError::PermissionDenied("fid not owned by caller".into()));
         }
         entry.last_accessed.store(now_epoch_secs(), Relaxed);
         Ok(entry)
@@ -325,6 +318,9 @@ pub struct RegistryService {
     base_dir: PathBuf,
     /// Policy client for authorization checks (uses ZMQ to PolicyService)
     policy_client: PolicyClient,
+    /// No runtime installer in this slice; reserved Federate JWTs still deny.
+    #[cfg(feature = "postgres")]
+    federate_dispatch: Option<Arc<crate::services::oauth::federate_proof::DispatchAdapter>>,
     // Infrastructure (for Spawnable)
     transport: TransportConfig,
     signing_key: SigningKey,
@@ -350,6 +346,7 @@ pub struct RegistryService {
     /// Publishes/advances a repo's `ai.hyprstream.model` PDS record on
     /// register + commit (#910a). `None` means this node has no PDS
     /// configured — register/commit proceed exactly as before.
+    #[cfg(feature = "rocksdb")]
     pds_publisher: Option<Arc<crate::services::discovery::PdsPublisher>>,
 }
 
@@ -373,12 +370,14 @@ impl git2db::callback_config::ProgressReporter for CloneProgressReporter {
     fn report(&self, stage: &str, current: usize, total: usize) {
         // Use try_send to avoid deadlocking the single-threaded runtime
         // when called from async context (e.g., LFS progress). Progress is best-effort.
-        match self.sender.try_send(hyprstream_rpc::streaming::ProgressUpdate::Progress {
-            stage: stage.to_owned(),
-            current,
-            total,
-        }) {
-            Ok(()) => {},
+        match self
+            .sender
+            .try_send(hyprstream_rpc::streaming::ProgressUpdate::Progress {
+                stage: stage.to_owned(),
+                current,
+                total,
+            }) {
+            Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 tracing::trace!("Progress channel full, dropping update");
             }
@@ -421,6 +420,8 @@ impl RegistryService {
             registry: worker_registry,
             base_dir,
             policy_client,
+            #[cfg(feature = "postgres")]
+            federate_dispatch: None,
             transport,
             signing_key,
             reach_config: Arc::new(parking_lot::RwLock::new(
@@ -434,6 +435,7 @@ impl RegistryService {
             jwt_key_source: None,
             xet_provenance,
             cas_pep: Arc::new(crate::mac::CasPep::fail_closed()),
+            #[cfg(feature = "rocksdb")]
             pds_publisher: None,
         };
 
@@ -449,13 +451,18 @@ impl RegistryService {
     /// Wire in the PDS publisher (#910a). Registration and
     /// `commitWithAuthor` (the RPC promote also drives) will publish/advance
     /// the repo's `ai.hyprstream.model` record through it.
-    pub fn with_pds_publisher(mut self, publisher: crate::services::discovery::PdsPublisher) -> Self {
+    #[cfg(feature = "rocksdb")]
+    pub fn with_pds_publisher(
+        mut self,
+        publisher: crate::services::discovery::PdsPublisher,
+    ) -> Self {
         self.pds_publisher = Some(Arc::new(publisher));
         self
     }
 
     /// Like [`Self::with_pds_publisher`] but takes an already-`Arc`'d publisher,
     /// so the caller can retain a weak clone for the ES256 promotion hook (#918).
+    #[cfg(feature = "rocksdb")]
     pub fn with_pds_publisher_arc(
         mut self,
         publisher: Arc<crate::services::discovery::PdsPublisher>,
@@ -472,8 +479,11 @@ impl RegistryService {
     /// contract `git::promote` documents for the (still-stubbed, cross-node)
     /// pointer-advance path. A missed local publish is caught up by the next
     /// successful register/commit on the same repo.
+    #[cfg(feature = "rocksdb")]
     fn publish_pds_record(&self, repo_id: &RepoId, current_oid: &str) {
-        let Some(publisher) = &self.pds_publisher else { return };
+        let Some(publisher) = &self.pds_publisher else {
+            return;
+        };
         if let Err(e) = publisher.publish(&repo_id.to_string(), current_oid) {
             warn!(
                 repo_id = %repo_id, current_oid, error = %e,
@@ -482,12 +492,25 @@ impl RegistryService {
         }
     }
 
+    /// No-PDS twin: `None` means register/commit proceed exactly as before.
+    #[cfg(not(feature = "rocksdb"))]
+    fn publish_pds_record(&self, _repo_id: &RepoId, _current_oid: &str) {}
+
     /// Set the JWT key source for token verification.
     pub fn with_jwt_key_source(
         mut self,
         src: std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>,
     ) -> Self {
         self.jwt_key_source = Some(src);
+        self
+    }
+
+    #[cfg(feature = "postgres")]
+    pub(crate) fn with_federate_dispatch(
+        mut self,
+        adapter: Arc<crate::services::oauth::federate_proof::DispatchAdapter>,
+    ) -> Self {
+        self.federate_dispatch = Some(adapter);
         self
     }
 
@@ -501,12 +524,19 @@ impl RegistryService {
     fn validate_path_within_base(&self, path: &Path) -> Result<()> {
         // If path exists, use canonical check
         if path.exists() {
-            let canonical_path = path.canonicalize()
+            let canonical_path = path
+                .canonicalize()
                 .map_err(|e| anyhow!("Failed to canonicalize path: {}", e))?;
-            let canonical_base = self.base_dir.canonicalize()
+            let canonical_base = self
+                .base_dir
+                .canonicalize()
                 .map_err(|e| anyhow!("Failed to canonicalize base dir: {}", e))?;
             if !canonical_path.starts_with(&canonical_base) {
-                return Err(anyhow!("Path {:?} is outside base directory {:?}", canonical_path, canonical_base));
+                return Err(anyhow!(
+                    "Path {:?} is outside base directory {:?}",
+                    canonical_path,
+                    canonical_base
+                ));
             }
         } else {
             // Path doesn't exist yet — use contained_join for validation
@@ -575,52 +605,62 @@ impl RegistryService {
             .with_progress(git2db::callback_config::ProgressConfig::Channel(reporter));
 
         // Execute clone and stream progress concurrently
-        let result = stream_channel.run_stream(&stream_ctx, |mut publisher| async move {
-            // Spawn clone task - runs concurrently with progress streaming
-            let registry_clone = Arc::clone(&registry);
+        let result = stream_channel
+            .run_stream(&stream_ctx, |mut publisher| async move {
+                // Spawn clone task - runs concurrently with progress streaming
+                let registry_clone = Arc::clone(&registry);
 
-            let clone_handle = tokio::spawn(async move {
-                // CloneBuilder manages locks internally for optimal performance
-                // (read lock for config, no lock during network I/O, write lock for registration)
-                Self::clone_repo_inner(
-                    registry_clone,
-                    &url,
-                    name.as_deref(),
-                    shallow,
-                    depth,
-                    branch.as_deref(),
-                    Some(callback_config),
-                ).await
-            });
+                let clone_handle = tokio::spawn(async move {
+                    // CloneBuilder manages locks internally for optimal performance
+                    // (read lock for config, no lock during network I/O, write lock for registration)
+                    Self::clone_repo_inner(
+                        registry_clone,
+                        &url,
+                        name.as_deref(),
+                        shallow,
+                        depth,
+                        branch.as_deref(),
+                        Some(callback_config),
+                    )
+                    .await
+                });
 
-            // Drop sender after spawning so receiver knows when clone finishes
-            drop(progress_tx);
+                // Drop sender after spawning so receiver knows when clone finishes
+                drop(progress_tx);
 
-            // Stream progress updates in real-time as they arrive
-            // (Ignore Complete/Error from channel - we'll send our own based on clone_result)
-            while let Some(update) = progress_rx.recv().await {
-                if let ProgressUpdate::Progress { stage, current, total } = update {
-                    if let Err(e) = publisher.publish_progress(&stage, current, total).await {
-                        return (publisher, Err(e));
+                // Stream progress updates in real-time as they arrive
+                // (Ignore Complete/Error from channel - we'll send our own based on clone_result)
+                while let Some(update) = progress_rx.recv().await {
+                    if let ProgressUpdate::Progress {
+                        stage,
+                        current,
+                        total,
+                    } = update
+                    {
+                        if let Err(e) = publisher.publish_progress(&stage, current, total).await {
+                            return (publisher, Err(e));
+                        }
                     }
                 }
-            }
 
-            // Wait for clone to complete and send final status
-            let result = match clone_handle.await {
-                Ok(Ok(repo)) => {
-                    let metadata = serde_json::json!({
-                        "repo_id": repo.id.to_string(),
-                        "name": repo.name,
-                        "url": repo.url,
-                    });
-                    publisher.complete_ref(metadata.to_string().as_bytes()).await
-                }
-                Ok(Err(e)) => Err(e),  // framework sends Error frame automatically
-                Err(e) => Err(anyhow!("Clone task panicked: {}", e)),  // framework sends Error frame
-            };
-            (publisher, result)
-        }).await;
+                // Wait for clone to complete and send final status
+                let result = match clone_handle.await {
+                    Ok(Ok(repo)) => {
+                        let metadata = serde_json::json!({
+                            "repo_id": repo.id.to_string(),
+                            "name": repo.name,
+                            "url": repo.url,
+                        });
+                        publisher
+                            .complete_ref(metadata.to_string().as_bytes())
+                            .await
+                    }
+                    Ok(Err(e)) => Err(e), // framework sends Error frame automatically
+                    Err(e) => Err(anyhow!("Clone task panicked: {}", e)), // framework sends Error frame
+                };
+                (publisher, result)
+            })
+            .await;
 
         if let Err(e) = result {
             error!(
@@ -631,12 +671,10 @@ impl RegistryService {
         }
     }
 
-
-
     /// Parse a RepoId from string
     fn parse_repo_id(id_str: &str) -> Result<RepoId> {
-        let uuid = Uuid::parse_str(id_str)
-            .map_err(|e| anyhow!("invalid repo id '{}': {}", id_str, e))?;
+        let uuid =
+            Uuid::parse_str(id_str).map_err(|e| anyhow!("invalid repo id '{}': {}", id_str, e))?;
         Ok(RepoId::from_uuid(uuid))
     }
 
@@ -749,7 +787,8 @@ impl RegistryService {
             let branch = head.as_ref().and_then(|h| h.shorthand().map(String::from));
             let head_oid = head.as_ref().and_then(git2::Reference::target);
 
-            let statuses = repo.statuses(None)
+            let statuses = repo
+                .statuses(None)
                 .map_err(|e| anyhow!("Failed to get statuses: {}", e))?;
             let is_clean = statuses.is_empty();
             let modified_files: Vec<std::path::PathBuf> = statuses
@@ -762,16 +801,23 @@ impl RegistryService {
                 if let Some(branch_name) = head_ref.shorthand() {
                     let upstream_name = format!("origin/{}", branch_name);
                     if let Ok(upstream) = repo.revparse_single(&upstream_name) {
-                        if let (Ok(local), Ok(remote)) = (
-                            head_ref.peel_to_commit(),
-                            upstream.peel_to_commit(),
-                        ) {
+                        if let (Ok(local), Ok(remote)) =
+                            (head_ref.peel_to_commit(), upstream.peel_to_commit())
+                        {
                             repo.graph_ahead_behind(local.id(), remote.id())
                                 .unwrap_or((0, 0))
-                        } else { (0, 0) }
-                    } else { (0, 0) }
-                } else { (0, 0) }
-            } else { (0, 0) };
+                        } else {
+                            (0, 0)
+                        }
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            };
 
             Ok(git2db::RepositoryStatus {
                 branch,
@@ -781,7 +827,8 @@ impl RegistryService {
                 is_clean,
                 modified_files,
             })
-        }).await
+        })
+        .await
     }
 
     /// Handle clone operation
@@ -801,7 +848,8 @@ impl RegistryService {
             depth,
             branch,
             None,
-        ).await
+        )
+        .await
     }
 
     // ========================================================================
@@ -822,8 +870,9 @@ impl RegistryService {
         client_ephemeral_pubkey: Option<&[u8]>,
     ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
         // DH key derivation is required
-        let client_pub_bytes = client_ephemeral_pubkey
-            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let client_pub_bytes = client_ephemeral_pubkey.ok_or_else(|| {
+            anyhow!("Streaming requires client ephemeral pubkey for E2E authentication")
+        })?;
 
         // Create StreamChannel for DH key exchange and publishing
         let stream_channel = StreamChannel::new(self.signing_key.clone())
@@ -850,6 +899,7 @@ impl RegistryService {
             dh_public: *stream_ctx.server_pubkey(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             ..Default::default()
         };
 
@@ -869,7 +919,8 @@ impl RegistryService {
                 shallow,
                 depth,
                 branch,
-            ).await;
+            )
+            .await;
         });
 
         Ok((stream_info, continuation))
@@ -1067,8 +1118,9 @@ impl RegistryService {
         subject_id: String,
         verified_tenant: Option<String>,
     ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
-        let client_pub_bytes = client_ephemeral_pubkey
-            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let client_pub_bytes = client_ephemeral_pubkey.ok_or_else(|| {
+            anyhow!("Streaming requires client ephemeral pubkey for E2E authentication")
+        })?;
 
         let stream_channel = StreamChannel::new(self.signing_key.clone())
             .with_reach_config(hyprstream_rpc::moq_stream::ProducerReachConfig::default())
@@ -1093,6 +1145,7 @@ impl RegistryService {
             dh_public: *stream_ctx.server_pubkey(),
             broadcast_path,
             announced_at: stream_ctx.reach(),
+            moql_server_identity: stream_ctx.moql_server_identity(),
             ..Default::default()
         };
         let cas_pep = Arc::clone(&self.cas_pep);
@@ -1143,8 +1196,9 @@ impl RegistryService {
                 // clearance BEFORE reading any bytes. Fail-closed: a deny
                 // produces zero bytes of output.
                 let resolver = crate::mac::CasObjectLabelResolver::from_domain(&domain);
-                let decision =
-                    cas_pep.check_read(&subject_id, verified_tenant.as_deref(), &resolver);
+                let decision = cas_pep
+                    .check_read(&subject_id, verified_tenant.as_deref(), &resolver)
+                    .await;
                 if !decision.is_permit() {
                     tracing::warn!(
                         target: "hyprstream.mac.cas_pep",
@@ -1154,15 +1208,23 @@ impl RegistryService {
                         ?decision,
                         "getBlob MAC PEP denied at continuation; no bytes streamed (#1270)"
                     );
-                    return (publisher, Err(anyhow!(
-                        "getBlob denied: MAC clearance check failed at point of use: \
+                    return (
+                        publisher,
+                        Err(anyhow!(
+                            "getBlob denied: MAC clearance check failed at point of use: \
                          {decision:?} (#1270)"
-                    )));
+                        )),
+                    );
                 }
 
                 let bytes = match substrate.get(&domain, &address).await {
                     Ok(b) => b,
-                    Err(e) => return (publisher, Err(anyhow!("getBlob reconstruction failed: {}", e))),
+                    Err(e) => {
+                        return (
+                            publisher,
+                            Err(anyhow!("getBlob reconstruction failed: {}", e)),
+                        )
+                    }
                 };
                 for frame in bytes.chunks(CHUNK) {
                     if let Err(e) = publisher.publish_data(frame).await {
@@ -1184,7 +1246,10 @@ impl RegistryService {
     }
 
     /// Handle list worktrees
-    async fn handle_list_worktrees(&self, repo_id: &str) -> Result<Vec<crate::services::generated::registry_client::WorktreeInfo>> {
+    async fn handle_list_worktrees(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<hyprstream_rpc_std::registry_client::WorktreeInfo>> {
         let id = Self::parse_repo_id(repo_id)?;
         let registry = self.registry.read().await;
         let handle = registry.repo(&id)?;
@@ -1218,7 +1283,7 @@ impl RegistryService {
                 .map(std::borrow::ToOwned::to_owned)
                 .collect();
 
-            result.push(crate::services::generated::registry_client::WorktreeInfo {
+            result.push(hyprstream_rpc_std::registry_client::WorktreeInfo {
                 path_removed: (), // field removed from schema
                 branch_name,
                 head_oid,
@@ -1231,11 +1296,7 @@ impl RegistryService {
     }
 
     /// Handle create worktree (idempotent — no-op if worktree already exists)
-    async fn handle_create_worktree(
-        &self,
-        repo_id: &str,
-        branch: &str,
-    ) -> Result<()> {
+    async fn handle_create_worktree(&self, repo_id: &str, branch: &str) -> Result<()> {
         // Validate branch name (rejects .., control chars, path traversal)
         hyprstream_containedfs::validate_ref_name(branch)
             .map_err(|e| anyhow!("Invalid branch name: {}", e))?;
@@ -1249,9 +1310,7 @@ impl RegistryService {
         // branch names like "feature/my-branch" correctly.
         let mut worktrees = handle.get_worktrees().await?;
         for wt in &mut worktrees {
-            let wt_branch = wt.status().await
-                .ok()
-                .and_then(|s| s.branch);
+            let wt_branch = wt.status().await.ok().and_then(|s| s.branch);
             if wt_branch.as_deref() == Some(branch) {
                 return Ok(());
             }
@@ -1345,8 +1404,7 @@ impl RegistryService {
                 break;
             }
         }
-        let matched_wt = found
-            .ok_or_else(|| anyhow!("No worktree for branch '{}'", branch))?;
+        let matched_wt = found.ok_or_else(|| anyhow!("No worktree for branch '{}'", branch))?;
 
         let worktree_name = matched_wt
             .file_name()
@@ -1390,7 +1448,9 @@ impl RegistryService {
     /// repo path (e.g. `models/name/name.git`), which can't be used for operations
     /// that require a working tree (status, staging, etc.). This method finds the
     /// actual worktree for the tracking ref.
-    async fn resolve_worktree_path(handle: &git2db::RepositoryHandle<'_>) -> Result<std::path::PathBuf> {
+    async fn resolve_worktree_path(
+        handle: &git2db::RepositoryHandle<'_>,
+    ) -> Result<std::path::PathBuf> {
         let base_path = handle.worktree()?.to_path_buf();
 
         // Detect bare repository: path ends in .git or has HEAD but no .git subdir
@@ -1421,7 +1481,10 @@ impl RegistryService {
             }
         }
 
-        Err(anyhow!("No worktrees found for bare repository: {:?}", base_path))
+        Err(anyhow!(
+            "No worktrees found for bare repository: {:?}",
+            base_path
+        ))
     }
 
     /// Execute a blocking git2 operation on a repository.
@@ -1449,14 +1512,21 @@ impl RegistryService {
     ///
     /// Unlike `with_repo_blocking` which guesses the worktree via `resolve_worktree_path`,
     /// this takes an explicit branch/worktree name.
-    async fn with_worktree_blocking<F, T>(&self, id: &git2db::RepoId, branch: &str, f: F) -> Result<T>
+    async fn with_worktree_blocking<F, T>(
+        &self,
+        id: &git2db::RepoId,
+        branch: &str,
+        f: F,
+    ) -> Result<T>
     where
         F: FnOnce(git2::Repository) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let registry = self.registry.read().await;
         let handle = registry.repo(id)?;
-        let wt = handle.get_worktree(branch).await
+        let wt = handle
+            .get_worktree(branch)
+            .await
             .map_err(|e| anyhow!("Worktree '{}' not found: {}", branch, e))?
             .ok_or_else(|| anyhow!("Worktree '{}' not found", branch))?;
         let wt_path = wt.path().to_path_buf();
@@ -1475,7 +1545,8 @@ impl RegistryService {
         let refspec = refspec.map(std::borrow::ToOwned::to_owned);
         self.with_repo_blocking(&id, move |repo| {
             crate::git::ops::fetch(&repo, "origin", refspec.as_deref())
-        }).await
+        })
+        .await
     }
 
     /// Handle health check
@@ -1542,7 +1613,12 @@ impl RegistryService {
     }
 
     /// Handle rename remote operation
-    async fn handle_rename_remote(&self, repo_id: &str, old_name: &str, new_name: &str) -> Result<()> {
+    async fn handle_rename_remote(
+        &self,
+        repo_id: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let old_name = old_name.to_owned();
         let new_name = new_name.to_owned();
@@ -1557,13 +1633,20 @@ impl RegistryService {
     // ========================================================================
 
     /// Handle push operation
-    async fn handle_push(&self, repo_id: &str, remote: &str, refspec: &str, force: bool) -> Result<()> {
+    async fn handle_push(
+        &self,
+        repo_id: &str,
+        remote: &str,
+        refspec: &str,
+        force: bool,
+    ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let remote = remote.to_owned();
         let refspec = refspec.to_owned();
         self.with_repo_blocking(&id, move |repo| {
             crate::git::ops::push(&repo, &remote, &refspec, force)
-        }).await
+        })
+        .await
     }
 
     // ========================================================================
@@ -1573,28 +1656,32 @@ impl RegistryService {
     /// Handle list tags operation
     async fn handle_list_tags(&self, repo_id: &str) -> Result<Vec<String>> {
         let id = Self::parse_repo_id(repo_id)?;
-        self.with_repo_blocking(&id, |repo| {
-            crate::git::ops::list_tags(&repo)
-        }).await
+        self.with_repo_blocking(&id, |repo| crate::git::ops::list_tags(&repo))
+            .await
     }
 
     /// Handle create tag operation
-    async fn handle_create_tag(&self, repo_id: &str, name: &str, target: Option<&str>) -> Result<()> {
+    async fn handle_create_tag(
+        &self,
+        repo_id: &str,
+        name: &str,
+        target: Option<&str>,
+    ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let name = name.to_owned();
         let target = target.map(std::borrow::ToOwned::to_owned);
         self.with_repo_blocking(&id, move |repo| {
             crate::git::ops::create_tag(&repo, &name, target.as_deref(), false)
-        }).await
+        })
+        .await
     }
 
     /// Handle delete tag operation
     async fn handle_delete_tag(&self, repo_id: &str, name: &str) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let name = name.to_owned();
-        self.with_repo_blocking(&id, move |repo| {
-            crate::git::ops::delete_tag(&repo, &name)
-        }).await
+        self.with_repo_blocking(&id, move |repo| crate::git::ops::delete_tag(&repo, &name))
+            .await
     }
 
     // ========================================================================
@@ -1604,9 +1691,8 @@ impl RegistryService {
     /// Handle detailed status operation
     async fn handle_detailed_status(&self, repo_id: &str) -> Result<DetailedStatusInfo> {
         let id = Self::parse_repo_id(repo_id)?;
-        self.with_repo_blocking(&id, |repo| {
-            crate::git::ops::detailed_status(&repo)
-        }).await
+        self.with_repo_blocking(&id, |repo| crate::git::ops::detailed_status(&repo))
+            .await
     }
 
     // ========================================================================
@@ -1625,22 +1711,21 @@ impl RegistryService {
         }
 
         // Resolve worktree path from repo
-        let id = Self::parse_repo_id(repo_id)
-            .map_err(|e| FsError::NotFound(e.to_string()))?;
+        let id = Self::parse_repo_id(repo_id).map_err(|e| FsError::NotFound(e.to_string()))?;
 
         let registry = self.registry.read().await;
-        let handle = registry.repo(&id)
+        let handle = registry
+            .repo(&id)
             .map_err(|e| FsError::NotFound(e.to_string()))?;
-        let worktrees = handle.get_worktrees().await
+        let worktrees = handle
+            .get_worktrees()
+            .await
             .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
 
         // Find the worktree matching the requested name
         let mut worktree_path = None;
         for wt in &worktrees {
-            let wt_name = wt.path()
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let wt_name = wt.path().file_name().and_then(|s| s.to_str()).unwrap_or("");
             if wt_name == worktree {
                 worktree_path = Some(wt.path().to_path_buf());
                 break;
@@ -1651,12 +1736,15 @@ impl RegistryService {
         let worktree_path = if let Some(p) = worktree_path {
             p
         } else if worktree == "." || worktree.is_empty() {
-            handle.resolve_worktree_path().await
+            handle
+                .resolve_worktree_path()
+                .await
                 .map_err(|e| FsError::NotFound(e.to_string()))?
         } else {
-            return Err(FsError::NotFound(
-                format!("worktree '{}' not found for repo '{}'", worktree, repo_id),
-            ));
+            return Err(FsError::NotFound(format!(
+                "worktree '{}' not found for repo '{}'",
+                worktree, repo_id
+            )));
         };
 
         let root = hyprstream_containedfs::open(&worktree_path)?;
@@ -1704,12 +1792,19 @@ impl RegistryService {
         };
         #[cfg(not(unix))]
         let (mode, atime, mtime, uid, gid) = {
-            let mtime_val = meta.modified()
+            let mtime_val = meta
+                .modified()
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as u32)
                 .unwrap_or(0);
-            (if meta.is_dir() { 0o40755 } else { 0o100644 }, mtime_val, mtime_val, String::new(), String::new())
+            (
+                if meta.is_dir() { 0o40755 } else { 0o100644 },
+                mtime_val,
+                mtime_val,
+                String::new(),
+                String::new(),
+            )
         };
         NpStatData {
             qid: Self::qid_to_data(&qid),
@@ -1723,22 +1818,23 @@ impl RegistryService {
             muid: String::new(),
         }
     }
-
 }
 
 // ============================================================================
 // Generated Handler Helpers
 // ============================================================================
 
-fn tracked_repo_to_data(repo: &TrackedRepository) -> crate::services::generated::registry_client::TrackedRepository {
+fn tracked_repo_to_data(
+    repo: &TrackedRepository,
+) -> hyprstream_rpc_std::registry_client::TrackedRepository {
     tracked_repo_to_data_with_worktrees(repo, vec![])
 }
 
 fn tracked_repo_to_data_with_worktrees(
     repo: &TrackedRepository,
-    worktrees: Vec<crate::services::generated::registry_client::WorktreeInfo>,
-) -> crate::services::generated::registry_client::TrackedRepository {
-    crate::services::generated::registry_client::TrackedRepository {
+    worktrees: Vec<hyprstream_rpc_std::registry_client::WorktreeInfo>,
+) -> hyprstream_rpc_std::registry_client::TrackedRepository {
+    hyprstream_rpc_std::registry_client::TrackedRepository {
         id: repo.id.to_string(),
         name: repo.name.clone().unwrap_or_default(),
         url: repo.url.clone(),
@@ -1774,7 +1870,12 @@ fn reg_error(msg: &str) -> RegistryResponseVariant {
 
 #[async_trait::async_trait(?Send)]
 impl RegistryHandler for RegistryService {
-    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+    async fn authorize(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> Result<()> {
         // Pass the operation string as-is to the policy check rather than
         // round-tripping through Operation enum (which maps "query" → "query.status").
         let subject = ctx.subject();
@@ -1784,41 +1885,91 @@ impl RegistryHandler for RegistryService {
         // the registry does not provide.
         let request = PolicyCheck {
             subject: subject.to_string(),
-            domain: "*".to_owned(),
+            domain: if ctx.is_federate_admitted() {
+                ctx.domain()?
+            } else {
+                "*".to_owned()
+            },
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let allowed = crate::services::policy::check_with_verified_bearer(
+        if ctx.is_federate_admitted() {
+            anyhow::ensure!(
+                ctx.admitted_federate_operation(resource, operation),
+                "Federate request-local operation mismatch"
+            );
+            // H2 already performed a fresh Policy check for the original
+            // holder's exact Registry.list action. Generic Policy.check would
+            // instead check this service's own identity.
+            return Ok(());
+        }
+        let allowed = crate::services::policy::check_with_holder_evidence(
             &self.policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
+            ctx.original_holder_evidence(),
         )
         .await
         .unwrap_or_else(|e| {
-            warn!("Policy check RPC error: sub={} obj={} act={} err={} - denying access", subject, resource, operation, e);
+            warn!(
+                "Policy check RPC error: sub={} obj={} act={} err={} - denying access",
+                subject, resource, operation, e
+            );
             false
         });
         if allowed {
             Ok(())
         } else {
-            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+            anyhow::bail!(
+                "Unauthorized: {} cannot {} on {}",
+                subject,
+                operation,
+                resource
+            )
         }
     }
 
-    async fn handle_list(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
+    async fn handle_list(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<RegistryResponseVariant> {
+        if ctx.is_federate_admitted() {
+            // H2 admits Registry.list but cannot check each entry under the
+            // original holder. Keep catalog browsing empty until Policy has
+            // an authenticated per-entry query. The staging acceptance path
+            // uses exact-pin getByName with its own fresh request admission.
+            return Ok(RegistryResponseVariant::ListResult(Vec::new()));
+        }
         let repos = match self.handle_list().await {
             Ok(r) => r,
             Err(e) => return Ok(reg_error(&e.to_string())),
         };
 
         let subject = ctx.subject().to_string();
-        let domain = ctx.domain()?;
+        // Registry is node-global (as in authorize above). A verified local
+        // service WIT is not a hosted-account tenant. Tenant-bound callers
+        // still require their verified tenant; never widen a user to '*'.
+        let caller = ctx.subject();
+        let domain = if ctx.verified_tenant().is_none()
+            && ctx.claims().is_some()
+            && !caller.is_federated()
+            && caller
+                .name()
+                .is_some_and(|name| name.starts_with("service:"))
+        {
+            "*".to_owned()
+        } else {
+            ctx.domain()?
+        };
         let mut result = Vec::with_capacity(repos.len());
 
         for repo in &repos {
             let name = repo.name.clone().unwrap_or_default();
-            if name.is_empty() { continue; }
+            if name.is_empty() {
+                continue;
+            }
 
             // Policy gate: only include repos the caller has at least query access to
             let resource = format!("model:{}", name);
@@ -1828,18 +1979,24 @@ impl RegistryHandler for RegistryService {
                 resource: resource.clone(),
                 operation: "query".to_owned(),
             };
-            let permitted = crate::services::policy::check_with_verified_bearer(
+            let permitted = crate::services::policy::check_with_holder_evidence(
                 &self.policy_client,
                 &request,
                 ctx.jwt_token(),
                 &ctx.subject(),
+                ctx.original_holder_evidence(),
             )
             .await
             .unwrap_or_else(|e| {
-                warn!("Policy check RPC error while filtering {}: {} - denying access", resource, e);
+                warn!(
+                    "Policy check RPC error while filtering {}: {} - denying access",
+                    resource, e
+                );
                 false
             });
-            if !permitted { continue; }
+            if !permitted {
+                continue;
+            }
 
             // Collect worktrees with capabilities (holds registry read lock internally)
             let worktrees = match self.handle_list_worktrees(&repo.id.to_string()).await {
@@ -1856,7 +2013,12 @@ impl RegistryHandler for RegistryService {
         Ok(RegistryResponseVariant::ListResult(result))
     }
 
-    async fn handle_get(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<RegistryResponseVariant> {
+    async fn handle_get(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> Result<RegistryResponseVariant> {
         match self.handle_get(value).await {
             Ok(Some(repo)) => Ok(tracked_variant!(GetResult, &repo)),
             Ok(None) => Ok(reg_error("Repository not found")),
@@ -1864,7 +2026,12 @@ impl RegistryHandler for RegistryService {
         }
     }
 
-    async fn handle_get_by_name(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<RegistryResponseVariant> {
+    async fn handle_get_by_name(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> Result<RegistryResponseVariant> {
         match self.handle_get_by_name(value).await {
             Ok(Some(repo)) => Ok(tracked_variant!(GetByNameResult, &repo)),
             Ok(None) => Ok(reg_error("Repository not found")),
@@ -1872,27 +2039,69 @@ impl RegistryHandler for RegistryService {
         }
     }
 
-    async fn handle_clone(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_clone(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &CloneRequest,
     ) -> Result<RegistryResponseVariant> {
-        let name_opt = if data.name.is_empty() { None } else { Some(data.name.as_str()) };
-        let branch_opt = if data.branch.is_empty() { None } else { Some(data.branch.as_str()) };
-        match self.handle_clone(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt).await {
+        let name_opt = if data.name.is_empty() {
+            None
+        } else {
+            Some(data.name.as_str())
+        };
+        let branch_opt = if data.branch.is_empty() {
+            None
+        } else {
+            Some(data.branch.as_str())
+        };
+        match self
+            .handle_clone(
+                &data.url,
+                name_opt,
+                data.shallow,
+                Some(data.depth),
+                branch_opt,
+            )
+            .await
+        {
             Ok(repo) => Ok(tracked_variant!(CloneResult, &repo)),
             Err(e) => Ok(reg_error(&e.to_string())),
         }
     }
 
-    async fn handle_clone_stream(&self, ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_clone_stream(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &CloneRequest,
     ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
-        let name_opt = if data.name.is_empty() { None } else { Some(data.name.as_str()) };
-        let branch_opt = if data.branch.is_empty() { None } else { Some(data.branch.as_str()) };
+        let name_opt = if data.name.is_empty() {
+            None
+        } else {
+            Some(data.name.as_str())
+        };
+        let branch_opt = if data.branch.is_empty() {
+            None
+        } else {
+            Some(data.branch.as_str())
+        };
         let client_ephemeral_pubkey = ctx.ephemeral_pubkey();
-        self.prepare_clone_stream(&data.url, name_opt, data.shallow, Some(data.depth), branch_opt, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice)).await
+        self.prepare_clone_stream(
+            &data.url,
+            name_opt,
+            data.shallow,
+            Some(data.depth),
+            branch_opt,
+            client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice),
+        )
+        .await
     }
 
-    async fn handle_get_blob(&self, ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_get_blob(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &GetBlobRequest,
     ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
         // SECURITY: enforce BOTH conditions (caller-may-access-grantRepo AND
@@ -1916,25 +2125,48 @@ impl RegistryHandler for RegistryService {
         .await
     }
 
-    async fn handle_register(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_register(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &RegisterRequest,
     ) -> Result<RegistryResponseVariant> {
-        let name_opt = if data.name.is_empty() { None } else { Some(data.name.as_str()) };
-        let tracking_ref_opt = if data.tracking_ref.is_empty() { None } else { Some(data.tracking_ref.as_str()) };
-        match self.handle_register(&data.path, name_opt, tracking_ref_opt).await {
+        let name_opt = if data.name.is_empty() {
+            None
+        } else {
+            Some(data.name.as_str())
+        };
+        let tracking_ref_opt = if data.tracking_ref.is_empty() {
+            None
+        } else {
+            Some(data.tracking_ref.as_str())
+        };
+        match self
+            .handle_register(&data.path, name_opt, tracking_ref_opt)
+            .await
+        {
             Ok(repo) => Ok(tracked_variant!(RegisterResult, &repo)),
             Err(e) => Ok(reg_error(&e.to_string())),
         }
     }
 
-    async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<RegistryResponseVariant> {
+    async fn handle_remove(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> Result<RegistryResponseVariant> {
         match self.handle_remove(value).await {
             Ok(()) => Ok(RegistryResponseVariant::RemoveResult),
             Err(e) => Ok(reg_error(&e.to_string())),
         }
     }
 
-    async fn handle_health_check(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<RegistryResponseVariant> {
+    async fn handle_health_check(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<RegistryResponseVariant> {
         match self.handle_health_check().await {
             Ok(status) => Ok(RegistryResponseVariant::HealthCheckResult(status)),
             Err(e) => Ok(reg_error(&e.to_string())),
@@ -1952,7 +2184,10 @@ impl RegistryHandler for RegistryService {
     /// `$scope(query)` does for `handle_get_blob`; neither carries `#[authorize]`).
     /// A failure returns a fail-closed error response — no bytes are persisted and
     /// no provenance is recorded unless the caller is authorized.
-    async fn handle_put_blob(&self, ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_put_blob(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &PutBlobRequest,
     ) -> Result<RegistryResponseVariant> {
         match self.put_blob_inner(ctx, data).await {
@@ -1962,37 +2197,65 @@ impl RegistryHandler for RegistryService {
         }
     }
 
-    async fn handle_ingest_at9p_candidate(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_ingest_at9p_candidate(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &At9pCandidateRequest,
     ) -> Result<RegistryResponseVariant> {
-        let result = async {
-            anyhow::ensure!(!data.did.is_empty(), "did is required");
-            anyhow::ensure!(!data.record_bytes.is_empty(), "candidate bytes are required");
-            anyhow::ensure!(data.record_bytes.len() <= MAX_AT9P_CANDIDATE_BYTES, "candidate exceeds ingest cap");
-            let publisher = self.pds_publisher.as_ref()
-                .ok_or_else(|| anyhow!("accepted did:at9p ingest is not configured"))?;
-            let publisher = Arc::clone(publisher);
-            let did = data.did.clone();
-            let record_bytes = data.record_bytes.clone();
-            let kind = data.kind;
-            let now = chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            let state = tokio::task::spawn_blocking(move || match kind {
-                At9pCandidateKind::Genesis => publisher.ingest_at9p_genesis(&did, &record_bytes),
-                At9pCandidateKind::Successor => {
-                    publisher.ingest_at9p_successor(&did, &record_bytes, &now)
-                }
+        // Fail closed: accepted-state ingest requires the concrete publisher.
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            let _ = (_ctx, _request_id, data);
+            return Ok(reg_error(
+                "accepted did:at9p ingest requires the `rocksdb` feature",
+            ));
+        }
+        #[cfg(feature = "rocksdb")]
+        {
+            let result = async {
+                anyhow::ensure!(!data.did.is_empty(), "did is required");
+                anyhow::ensure!(
+                    !data.record_bytes.is_empty(),
+                    "candidate bytes are required"
+                );
+                anyhow::ensure!(
+                    data.record_bytes.len() <= MAX_AT9P_CANDIDATE_BYTES,
+                    "candidate exceeds ingest cap"
+                );
+                let publisher = self
+                    .pds_publisher
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("accepted did:at9p ingest is not configured"))?;
+                let publisher = Arc::clone(publisher);
+                let did = data.did.clone();
+                let record_bytes = data.record_bytes.clone();
+                let kind = data.kind;
+                let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let state = tokio::task::spawn_blocking(move || match kind {
+                    At9pCandidateKind::Genesis => {
+                        publisher.ingest_at9p_genesis(&did, &record_bytes)
+                    }
+                    At9pCandidateKind::Successor => {
+                        publisher.ingest_at9p_successor(&did, &record_bytes, &now)
+                    }
+                })
+                .await
+                .map_err(|error| anyhow!("at9p candidate worker failed: {error}"))??;
+                Ok::<_, anyhow::Error>(AcceptedAt9pStateInfo {
+                    did: state.did,
+                    epoch: state.epoch,
+                    head_digest: state.head_digest.to_vec(),
+                    terminal: state.terminal,
+                })
+            }
+            .await;
+            Ok(match result {
+                Ok(info) => RegistryResponseVariant::IngestAt9pCandidateResult(info),
+                Err(error) => reg_error(&format!("at9p candidate rejected: {error}")),
             })
-            .await
-            .map_err(|error| anyhow!("at9p candidate worker failed: {error}"))??;
-            Ok::<_, anyhow::Error>(AcceptedAt9pStateInfo { did: state.did, epoch: state.epoch, head_digest: state.head_digest.to_vec(), terminal: state.terminal })
-        }.await;
-        Ok(match result {
-            Ok(info) => RegistryResponseVariant::IngestAt9pCandidateResult(info),
-            Err(error) => reg_error(&format!("at9p candidate rejected: {error}")),
-        })
+        }
     }
-
 }
 
 impl RegistryService {
@@ -2083,32 +2346,55 @@ impl RegistryService {
 
 #[async_trait::async_trait(?Send)]
 impl RepoHandler for RegistryService {
-    async fn handle_create_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &CreateWorktreeRequest,
+    async fn handle_create_worktree(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &CreateWorktreeRequest,
     ) -> Result<()> {
         self.handle_create_worktree(repo_id, &data.branch).await
     }
 
-    async fn handle_list_worktrees(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_list_worktrees(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         repo_id: &str,
-    ) -> Result<Vec<crate::services::generated::registry_client::WorktreeInfo>> {
+    ) -> Result<Vec<hyprstream_rpc_std::registry_client::WorktreeInfo>> {
         self.handle_list_worktrees(repo_id).await
     }
 
-    async fn handle_remove_worktree(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &RemoveWorktreeRequest,
+    async fn handle_remove_worktree(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &RemoveWorktreeRequest,
     ) -> Result<()> {
         self.handle_remove_worktree(repo_id, &data.branch).await
     }
 
-    async fn handle_create_branch(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &BranchRequest,
+    async fn handle_create_branch(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &BranchRequest,
     ) -> Result<()> {
-        let sp = if data.start_point.is_empty() { None } else { Some(data.start_point.as_str()) };
-        self.handle_create_branch(repo_id, &data.branch_name, sp).await
+        let sp = if data.start_point.is_empty() {
+            None
+        } else {
+            Some(data.start_point.as_str())
+        };
+        self.handle_create_branch(repo_id, &data.branch_name, sp)
+            .await
     }
 
-    async fn handle_list_branches(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_list_branches(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         repo_id: &str,
     ) -> Result<Vec<String>> {
         self.handle_list_branches(repo_id).await
@@ -2116,169 +2402,292 @@ impl RepoHandler for RegistryService {
 
     // DEPRECATED — these operations moved to WorktreeRequest scope.
     // Kept for wire compatibility; return errors directing callers to the new API.
-    async fn handle_checkout(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _data: &CheckoutRequest,
+    async fn handle_checkout(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _data: &CheckoutRequest,
     ) -> Result<()> {
-        Err(anyhow!("checkout moved to worktree scope — use worktree(branch).checkout()"))
+        Err(anyhow!(
+            "checkout moved to worktree scope — use worktree(branch).checkout()"
+        ))
     }
 
-    async fn handle_stage_all(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_stage_all(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         _repo_id: &str,
     ) -> Result<()> {
-        Err(anyhow!("stageAll moved to worktree scope — use worktree(branch).stageAll()"))
+        Err(anyhow!(
+            "stageAll moved to worktree scope — use worktree(branch).stageAll()"
+        ))
     }
 
-    async fn handle_stage_files(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _data: &StageFilesRequest,
+    async fn handle_stage_files(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _data: &StageFilesRequest,
     ) -> Result<()> {
-        Err(anyhow!("stageFiles moved to worktree scope — use worktree(branch).stageFiles()"))
+        Err(anyhow!(
+            "stageFiles moved to worktree scope — use worktree(branch).stageFiles()"
+        ))
     }
 
-    async fn handle_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _data: &CommitRequest,
+    async fn handle_commit(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _data: &CommitRequest,
     ) -> Result<String> {
-        Err(anyhow!("commit moved to worktree scope — use worktree(branch).commit()"))
+        Err(anyhow!(
+            "commit moved to worktree scope — use worktree(branch).commit()"
+        ))
     }
 
-    async fn handle_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _data: &MergeRequest,
+    async fn handle_merge(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _data: &MergeRequest,
     ) -> Result<()> {
-        Err(anyhow!("merge moved to worktree scope — use worktree(branch).merge()"))
+        Err(anyhow!(
+            "merge moved to worktree scope — use worktree(branch).merge()"
+        ))
     }
 
-    async fn handle_abort_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_abort_merge(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         _repo_id: &str,
     ) -> Result<()> {
-        Err(anyhow!("abortMerge moved to worktree scope — use worktree(branch).abortMerge()"))
+        Err(anyhow!(
+            "abortMerge moved to worktree scope — use worktree(branch).abortMerge()"
+        ))
     }
 
-    async fn handle_continue_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _data: &ContinueMergeRequest,
+    async fn handle_continue_merge(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _data: &ContinueMergeRequest,
     ) -> Result<()> {
-        Err(anyhow!("continueMerge moved to worktree scope — use worktree(branch).continueMerge()"))
+        Err(anyhow!(
+            "continueMerge moved to worktree scope — use worktree(branch).continueMerge()"
+        ))
     }
 
-    async fn handle_quit_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_quit_merge(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         _repo_id: &str,
     ) -> Result<()> {
-        Err(anyhow!("quitMerge moved to worktree scope — use worktree(branch).quitMerge()"))
+        Err(anyhow!(
+            "quitMerge moved to worktree scope — use worktree(branch).quitMerge()"
+        ))
     }
 
-    async fn handle_get_head(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_get_head(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         repo_id: &str,
     ) -> Result<String> {
         self.handle_get_head(repo_id).await
     }
 
-    async fn handle_get_ref(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &GetRefRequest,
+    async fn handle_get_ref(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &GetRefRequest,
     ) -> Result<String> {
         self.handle_get_ref(repo_id, &data.ref_name).await
     }
 
-    async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_status(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         repo_id: &str,
-    ) -> Result<crate::services::generated::registry_client::RepositoryStatus> {
+    ) -> Result<hyprstream_rpc_std::registry_client::RepositoryStatus> {
         let status = self.handle_status(repo_id).await?;
-        Ok(crate::services::generated::registry_client::RepositoryStatus {
+        Ok(hyprstream_rpc_std::registry_client::RepositoryStatus {
             branch: status.branch.unwrap_or_default(),
             head_oid: status.head.map(|h| h.to_string()).unwrap_or_default(),
             ahead: status.ahead as u32,
             behind: status.behind as u32,
             is_clean: status.is_clean,
-            modified_files: status.modified_files.iter()
+            modified_files: status
+                .modified_files
+                .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect(),
         })
     }
 
-    async fn handle_detailed_status(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_detailed_status(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         repo_id: &str,
     ) -> Result<DetailedStatusInfo> {
         self.handle_detailed_status(repo_id).await
     }
 
-    async fn handle_list_remotes(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_list_remotes(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         repo_id: &str,
     ) -> Result<Vec<RemoteInfo>> {
         self.handle_list_remotes(repo_id).await
     }
 
-    async fn handle_add_remote(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &AddRemoteRequest,
+    async fn handle_add_remote(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &AddRemoteRequest,
     ) -> Result<()> {
         self.handle_add_remote(repo_id, &data.name, &data.url).await
     }
 
-    async fn handle_remove_remote(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &RemoveRemoteRequest,
+    async fn handle_remove_remote(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &RemoveRemoteRequest,
     ) -> Result<()> {
         self.handle_remove_remote(repo_id, &data.name).await
     }
 
-    async fn handle_set_remote_url(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &SetRemoteUrlRequest,
+    async fn handle_set_remote_url(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &SetRemoteUrlRequest,
     ) -> Result<()> {
-        self.handle_set_remote_url(repo_id, &data.name, &data.url).await
+        self.handle_set_remote_url(repo_id, &data.name, &data.url)
+            .await
     }
 
-    async fn handle_rename_remote(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &RenameRemoteRequest,
+    async fn handle_rename_remote(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &RenameRemoteRequest,
     ) -> Result<()> {
-        self.handle_rename_remote(repo_id, &data.old_name, &data.new_name).await
+        self.handle_rename_remote(repo_id, &data.old_name, &data.new_name)
+            .await
     }
 
-    async fn handle_push(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &PushRequest,
+    async fn handle_push(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &PushRequest,
     ) -> Result<()> {
-        self.handle_push(repo_id, &data.remote, &data.refspec, data.force).await
+        self.handle_push(repo_id, &data.remote, &data.refspec, data.force)
+            .await
     }
 
     // DEPRECATED — moved to WorktreeRequest scope.
-    async fn handle_amend_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _data: &AmendCommitRequest,
+    async fn handle_amend_commit(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _data: &AmendCommitRequest,
     ) -> Result<String> {
-        Err(anyhow!("amendCommit moved to worktree scope — use worktree(branch).amendCommit()"))
+        Err(anyhow!(
+            "amendCommit moved to worktree scope — use worktree(branch).amendCommit()"
+        ))
     }
 
-    async fn handle_commit_with_author(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _data: &CommitWithAuthorRequest,
+    async fn handle_commit_with_author(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _data: &CommitWithAuthorRequest,
     ) -> Result<String> {
-        Err(anyhow!("commitWithAuthor moved to worktree scope — use worktree(branch).commitWithAuthor()"))
+        Err(anyhow!(
+            "commitWithAuthor moved to worktree scope — use worktree(branch).commitWithAuthor()"
+        ))
     }
 
-    async fn handle_stage_all_including_untracked(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_stage_all_including_untracked(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         _repo_id: &str,
     ) -> Result<()> {
         Err(anyhow!("stageAllIncludingUntracked moved to worktree scope — use worktree(branch).stageAllIncludingUntracked()"))
     }
 
-    async fn handle_list_tags(&self, _ctx: &EnvelopeContext, _request_id: u64,
+    async fn handle_list_tags(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         repo_id: &str,
     ) -> Result<Vec<String>> {
         self.handle_list_tags(repo_id).await
     }
 
-    async fn handle_create_tag(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &CreateTagRequest,
+    async fn handle_create_tag(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &CreateTagRequest,
     ) -> Result<()> {
-        let t = if data.target.is_empty() { None } else { Some(data.target.as_str()) };
+        let t = if data.target.is_empty() {
+            None
+        } else {
+            Some(data.target.as_str())
+        };
         self.handle_create_tag(repo_id, &data.name, t).await
     }
 
-    async fn handle_delete_tag(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &DeleteTagRequest,
+    async fn handle_delete_tag(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &DeleteTagRequest,
     ) -> Result<()> {
         self.handle_delete_tag(repo_id, &data.name).await
     }
 
-    async fn handle_update(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, data: &UpdateRequest,
+    async fn handle_update(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        data: &UpdateRequest,
     ) -> Result<()> {
-        let r = if data.refspec.is_empty() { None } else { Some(data.refspec.as_str()) };
+        let r = if data.refspec.is_empty() {
+            None
+        } else {
+            Some(data.refspec.as_str())
+        };
         self.handle_update(repo_id, r).await
     }
-
 }
 
 // ============================================================================
@@ -2288,59 +2697,89 @@ impl RepoHandler for RegistryService {
 impl RegistryService {
     /// Resolve a fid to its relative path within the worktree.
     fn fid_rel_path(&self, fid: u32, client_id: &str) -> Result<String> {
-        let entry = self.fid_table.get_verified(fid, client_id)
+        let entry = self
+            .fid_table
+            .get_verified(fid, client_id)
             .map_err(|e| anyhow!("{}", e))?;
         match &entry.state {
             FidState::Walked { walk_handle, .. } => Ok(walk_handle.rel_path().to_owned()),
             FidState::Opened { .. } => {
                 // Opened fids don't carry the path — walk_handle was consumed.
                 // For ctl operations, the fid should be in Walked state.
-                anyhow::bail!("fid {} is opened for I/O; ctl operations require a walked (not opened) fid", fid)
+                anyhow::bail!(
+                    "fid {} is opened for I/O; ctl operations require a walked (not opened) fid",
+                    fid
+                )
             }
         }
     }
 
     /// Read file content via contained root for a given fid's path.
-    async fn read_fid_content(&self, repo_id: &str, worktree: &str, fid: u32, client_id: &str) -> Result<String> {
+    async fn read_fid_content(
+        &self,
+        repo_id: &str,
+        worktree: &str,
+        fid: u32,
+        client_id: &str,
+    ) -> Result<String> {
         let rel_path = self.fid_rel_path(fid, client_id)?;
-        let root = self.get_contained_root(repo_id, worktree).await
+        let root = self
+            .get_contained_root(repo_id, worktree)
+            .await
             .map_err(|e| anyhow!("{}", e))?;
-        let file = root.open(&rel_path, hyprstream_containedfs::OpenMode::OREAD)
+        let file = root
+            .open(&rel_path, hyprstream_containedfs::OpenMode::OREAD)
             .map_err(|e| anyhow!("{}", e))?;
         let mut content = String::new();
         std::io::BufReader::new(file).read_to_string(&mut content)?;
         Ok(content)
     }
-
 }
 
 #[async_trait::async_trait(?Send)]
 impl CtlHandler for RegistryService {
     /// Git status of this file.
-    async fn handle_status(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, _name: &str, fid: u32,
+    async fn handle_status(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        _name: &str,
+        fid: u32,
     ) -> Result<FileStatus> {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let state = self.with_repo_blocking(&id, move |repo| {
-            let status = repo.status_file(std::path::Path::new(&rel_path))?;
-            Ok(format!("{:?}", status))
-        }).await?;
+        let state = self
+            .with_repo_blocking(&id, move |repo| {
+                let status = repo.status_file(std::path::Path::new(&rel_path))?;
+                Ok(format!("{:?}", status))
+            })
+            .await?;
         Ok(FileStatus { state })
     }
 
     /// Commits touching this file.
-    async fn handle_log(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, _name: &str, fid: u32, data: &CtlLogRequest,
+    async fn handle_log(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        _name: &str,
+        fid: u32,
+        data: &CtlLogRequest,
     ) -> Result<Vec<LogEntry>> {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
         let ref_name = data.ref_name.clone();
-        let max_count = if data.max_count == 0 { 20 } else { data.max_count as usize };
+        let max_count = if data.max_count == 0 {
+            20
+        } else {
+            data.max_count as usize
+        };
 
         self.with_repo_blocking(&id, move |repo| {
             let mut revwalk = repo.revwalk()?;
@@ -2361,17 +2800,21 @@ impl CtlHandler for RegistryService {
                 let commit = repo.find_commit(oid)?;
 
                 let dominated = if commit.parent_count() == 0 {
-                    commit.tree()?.get_path(std::path::Path::new(&rel_path)).is_ok()
+                    commit
+                        .tree()?
+                        .get_path(std::path::Path::new(&rel_path))
+                        .is_ok()
                 } else {
                     let parent = commit.parent(0)?;
-                    let diff = repo.diff_tree_to_tree(
-                        Some(&parent.tree()?),
-                        Some(&commit.tree()?),
-                        None,
-                    )?;
+                    let diff =
+                        repo.diff_tree_to_tree(Some(&parent.tree()?), Some(&commit.tree()?), None)?;
                     diff.deltas().any(|d| {
-                        d.new_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
-                        || d.old_file().path().is_some_and(|p| p == std::path::Path::new(&rel_path))
+                        d.new_file()
+                            .path()
+                            .is_some_and(|p| p == std::path::Path::new(&rel_path))
+                            || d.old_file()
+                                .path()
+                                .is_some_and(|p| p == std::path::Path::new(&rel_path))
                     })
                 };
 
@@ -2386,18 +2829,29 @@ impl CtlHandler for RegistryService {
                 }
             }
             Ok(entries)
-        }).await
+        })
+        .await
     }
 
     /// Diff this file against a ref.
-    async fn handle_diff(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, _name: &str, fid: u32, data: &CtlDiffRequest,
+    async fn handle_diff(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        _name: &str,
+        fid: u32,
+        data: &CtlDiffRequest,
     ) -> Result<String> {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let ref_name = if data.ref_name.is_empty() { "HEAD".to_owned() } else { data.ref_name.clone() };
+        let ref_name = if data.ref_name.is_empty() {
+            "HEAD".to_owned()
+        } else {
+            data.ref_name.clone()
+        };
 
         self.with_repo_blocking(&id, move |repo| {
             let obj = repo.revparse_single(&ref_name)?;
@@ -2407,10 +2861,7 @@ impl CtlHandler for RegistryService {
             let mut diff_opts = git2::DiffOptions::new();
             diff_opts.pathspec(&rel_path);
 
-            let diff = repo.diff_tree_to_workdir_with_index(
-                Some(&tree),
-                Some(&mut diff_opts),
-            )?;
+            let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut diff_opts))?;
 
             let mut output = String::new();
             diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
@@ -2425,12 +2876,18 @@ impl CtlHandler for RegistryService {
             })?;
 
             Ok(output)
-        }).await
+        })
+        .await
     }
 
     /// Git blame for this file.
-    async fn handle_blame(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, _name: &str, fid: u32,
+    async fn handle_blame(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        _name: &str,
+        fid: u32,
     ) -> Result<String> {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
@@ -2449,38 +2906,63 @@ impl CtlHandler for RegistryService {
                     let line_start = hunk.final_start_line();
                     let line_count = hunk.lines_in_hunk();
                     use std::fmt::Write;
-                    writeln!(output, "{:.8} ({} L{}-{}) ",
-                        oid, name, line_start, line_start + line_count - 1)?;
+                    writeln!(
+                        output,
+                        "{:.8} ({} L{}-{}) ",
+                        oid,
+                        name,
+                        line_start,
+                        line_start + line_count - 1
+                    )?;
                 }
             }
             Ok(output)
-        }).await
+        })
+        .await
     }
 
     /// Restore file content from a ref.
-    async fn handle_checkout(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, fid: u32, data: &CtlCheckoutRequest,
+    async fn handle_checkout(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        fid: u32,
+        data: &CtlCheckoutRequest,
     ) -> Result<()> {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
         let id = Self::parse_repo_id(repo_id)?;
-        let ref_name = if data.ref_name.is_empty() { "HEAD".to_owned() } else { data.ref_name.clone() };
+        let ref_name = if data.ref_name.is_empty() {
+            "HEAD".to_owned()
+        } else {
+            data.ref_name.clone()
+        };
         let rel_path_clone = rel_path.clone();
 
-        let blob_content = self.with_repo_blocking(&id, move |repo| {
-            let obj = repo.revparse_single(&ref_name)?;
-            let commit = obj.peel_to_commit()?;
-            let tree = commit.tree()?;
-            let entry = tree.get_path(std::path::Path::new(&rel_path_clone))?;
-            let blob = repo.find_blob(entry.id())?;
-            Ok(blob.content().to_vec())
-        }).await?;
+        let blob_content = self
+            .with_repo_blocking(&id, move |repo| {
+                let obj = repo.revparse_single(&ref_name)?;
+                let commit = obj.peel_to_commit()?;
+                let tree = commit.tree()?;
+                let entry = tree.get_path(std::path::Path::new(&rel_path_clone))?;
+                let blob = repo.find_blob(entry.id())?;
+                Ok(blob.content().to_vec())
+            })
+            .await?;
 
         // Write blob content to the worktree file (no registry lock held)
-        let root = self.get_contained_root(repo_id, name).await
+        let root = self
+            .get_contained_root(repo_id, name)
+            .await
             .map_err(|e| anyhow!("{}", e))?;
-        let mut file = root.open(&rel_path, hyprstream_containedfs::OpenMode::OWRITE | hyprstream_containedfs::OpenMode::OTRUNC)
+        let mut file = root
+            .open(
+                &rel_path,
+                hyprstream_containedfs::OpenMode::OWRITE | hyprstream_containedfs::OpenMode::OTRUNC,
+            )
             .map_err(|e| anyhow!("{}", e))?;
         use std::io::Write as _;
         file.write_all(&blob_content)?;
@@ -2490,8 +2972,13 @@ impl CtlHandler for RegistryService {
     }
 
     /// Validate file format.
-    async fn handle_validate(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, fid: u32,
+    async fn handle_validate(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        fid: u32,
     ) -> Result<ValidationResult> {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
@@ -2534,13 +3021,20 @@ impl CtlHandler for RegistryService {
     }
 
     /// File metadata and git state.
-    async fn handle_info(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, fid: u32,
+    async fn handle_info(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _name: &str,
+        fid: u32,
     ) -> Result<FileInfo> {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
 
-        let entry = self.fid_table.get_verified(fid, &subject)
+        let entry = self
+            .fid_table
+            .get_verified(fid, &subject)
             .map_err(|e| anyhow!("{}", e))?;
         let meta = match &entry.state {
             FidState::Walked { walk_handle, .. } => {
@@ -2582,32 +3076,47 @@ impl CtlHandler for RegistryService {
     }
 
     /// Open file for CRDT editing.
-    async fn handle_edit_open(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, fid: u32, data: &EditOpenRequest,
+    async fn handle_edit_open(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        fid: u32,
+        data: &EditOpenRequest,
     ) -> Result<()> {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
         let content = self.read_fid_content(repo_id, name, fid, &subject).await?;
         let format = data.format;
 
-        self.editing_table.open(
-            &subject, fid, repo_id, name, &rel_path, format, &content,
-        ).map_err(|e| anyhow!("{}", e))?;
+        self.editing_table
+            .open(&subject, fid, repo_id, name, &rel_path, format, &content)
+            .map_err(|e| anyhow!("{}", e))?;
 
         Ok(())
     }
 
     /// Get current CRDT document state.
-    async fn handle_edit_state(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, fid: u32,
+    async fn handle_edit_state(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _name: &str,
+        fid: u32,
     ) -> Result<String> {
         let subject = ctx.subject().to_string();
-        let shared = self.editing_table.get_session(&subject, fid)
+        let shared = self
+            .editing_table
+            .get_session(&subject, fid)
             .ok_or_else(|| anyhow!("no active editing session for fid {}", fid))?;
 
         let sd = shared.lock();
         // Get the content value from the automerge document
-        let content = sd.doc.get(automerge::ROOT, "content")
+        let content = sd
+            .doc
+            .get(automerge::ROOT, "content")
             .ok()
             .flatten()
             .map(|(val, _)| match val {
@@ -2623,11 +3132,19 @@ impl CtlHandler for RegistryService {
     }
 
     /// Apply automerge CRDT change.
-    async fn handle_edit_apply(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, fid: u32, data: &EditApplyRequest,
+    async fn handle_edit_apply(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _name: &str,
+        fid: u32,
+        data: &EditApplyRequest,
     ) -> Result<()> {
         let subject = ctx.subject().to_string();
-        let shared = self.editing_table.get_session(&subject, fid)
+        let shared = self
+            .editing_table
+            .get_session(&subject, fid)
             .ok_or_else(|| anyhow!("no active editing session for fid {}", fid))?;
 
         let mut sd = shared.lock();
@@ -2638,8 +3155,13 @@ impl CtlHandler for RegistryService {
     }
 
     /// Close CRDT editing session.
-    async fn handle_edit_close(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, fid: u32,
+    async fn handle_edit_close(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _name: &str,
+        fid: u32,
     ) -> Result<()> {
         let subject = ctx.subject().to_string();
         if !self.editing_table.close(&subject, fid) {
@@ -2649,19 +3171,29 @@ impl CtlHandler for RegistryService {
     }
 
     /// Write CRDT state to disk file.
-    async fn handle_ctl_flush(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, fid: u32,
+    async fn handle_ctl_flush(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        fid: u32,
     ) -> Result<()> {
         let subject = ctx.subject().to_string();
         let rel_path = self.fid_rel_path(fid, &subject)?;
-        let shared = self.editing_table.get_session(&subject, fid)
+        let shared = self
+            .editing_table
+            .get_session(&subject, fid)
             .ok_or_else(|| anyhow!("no active editing session for fid {}", fid))?;
 
         // Read current file hash and compare with stored hash
-        let root = self.get_contained_root(repo_id, name).await
+        let root = self
+            .get_contained_root(repo_id, name)
+            .await
             .map_err(|e| anyhow!("{}", e))?;
         let current_hash = {
-            let file = root.open(&rel_path, hyprstream_containedfs::OpenMode::OREAD)
+            let file = root
+                .open(&rel_path, hyprstream_containedfs::OpenMode::OREAD)
                 .map_err(|e| anyhow!("{}", e))?;
             let mut data = Vec::new();
             std::io::BufReader::new(file).read_to_end(&mut data)?;
@@ -2676,7 +3208,9 @@ impl CtlHandler for RegistryService {
         }
 
         // Get content from CRDT doc
-        let content = sd.doc.get(automerge::ROOT, "content")
+        let content = sd
+            .doc
+            .get(automerge::ROOT, "content")
             .ok()
             .flatten()
             .map(|(val, _)| match val {
@@ -2689,7 +3223,11 @@ impl CtlHandler for RegistryService {
             .unwrap_or_default();
 
         // Write to disk (write=true, truncate=true)
-        let mut file = root.open(&rel_path, hyprstream_containedfs::OpenMode::OWRITE | hyprstream_containedfs::OpenMode::OTRUNC)
+        let mut file = root
+            .open(
+                &rel_path,
+                hyprstream_containedfs::OpenMode::OWRITE | hyprstream_containedfs::OpenMode::OTRUNC,
+            )
             .map_err(|e| anyhow!("{}", e))?;
         use std::io::Write as _;
         file.write_all(content.as_bytes())?;
@@ -2709,10 +3247,17 @@ impl CtlHandler for RegistryService {
 #[async_trait::async_trait(?Send)]
 impl WorktreeHandler for RegistryService {
     /// Walk: resolve path components to get a fid.
-    async fn handle_walk(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &NpWalk,
+    async fn handle_walk(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &NpWalk,
     ) -> Result<RWalk> {
-        let root = self.get_contained_root(repo_id, name).await
+        let root = self
+            .get_contained_root(repo_id, name)
+            .await
             .map_err(|e| anyhow!("{}", e))?;
 
         // Validate each wname is a single safe path component (defense-in-depth;
@@ -2725,7 +3270,10 @@ impl WorktreeHandler for RegistryService {
                 anyhow::bail!("path traversal via '..' rejected");
             }
             if wname.contains('/') {
-                anyhow::bail!("wname {:?} contains slash (must be a single component)", wname);
+                anyhow::bail!(
+                    "wname {:?} contains slash (must be a single component)",
+                    wname
+                );
             }
             if wname.as_bytes().contains(&0) {
                 anyhow::bail!("wname contains NUL byte");
@@ -2739,10 +3287,8 @@ impl WorktreeHandler for RegistryService {
             data.wnames.join("/")
         };
 
-        let walk_handle = root.walk(&path)
-            .map_err(|e| anyhow!("{}", e))?;
-        let meta = walk_handle.metadata()
-            .map_err(|e| anyhow!("{}", e))?;
+        let walk_handle = root.walk(&path).map_err(|e| anyhow!("{}", e))?;
+        let meta = walk_handle.metadata().map_err(|e| anyhow!("{}", e))?;
         let qid = qid_from_metadata(&meta);
 
         let subject = ctx.subject().to_string();
@@ -2754,12 +3300,16 @@ impl WorktreeHandler for RegistryService {
             }
             data.newfid
         } else {
-            self.fid_table.alloc_fid(&subject)
+            self.fid_table
+                .alloc_fid(&subject)
                 .map_err(|e| anyhow!("{}", e))?
         };
 
         let entry = FidEntry {
-            state: FidState::Walked { walk_handle, qid: qid.clone() },
+            state: FidState::Walked {
+                walk_handle,
+                qid: qid.clone(),
+            },
             owner_identity: subject.clone(),
             last_accessed: AtomicU64::new(now_epoch_secs()),
         };
@@ -2777,13 +3327,20 @@ impl WorktreeHandler for RegistryService {
     }
 
     /// Open: open a walked fid for I/O, returns iounit.
-    async fn handle_open(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, data: &NpOpen,
+    async fn handle_open(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _name: &str,
+        data: &NpOpen,
     ) -> Result<ROpen> {
         let subject = ctx.subject().to_string();
 
         // Take the fid to transition Walked → Opened (no count change)
-        let entry = self.fid_table.take(data.fid)
+        let entry = self
+            .fid_table
+            .take(data.fid)
             .ok_or_else(|| anyhow!("fid {} not found", data.fid))?;
         if entry.owner_identity != subject {
             // Put it back and bail
@@ -2795,11 +3352,14 @@ impl WorktreeHandler for RegistryService {
             FidState::Walked { walk_handle, qid } => (walk_handle, qid),
             other => {
                 // Put it back and bail
-                self.fid_table.replace(data.fid, FidEntry {
-                    state: other,
-                    owner_identity: entry.owner_identity,
-                    last_accessed: entry.last_accessed,
-                });
+                self.fid_table.replace(
+                    data.fid,
+                    FidEntry {
+                        state: other,
+                        owner_identity: entry.owner_identity,
+                        last_accessed: entry.last_accessed,
+                    },
+                );
                 anyhow::bail!("fid {} is already opened", data.fid);
             }
         };
@@ -2808,8 +3368,7 @@ impl WorktreeHandler for RegistryService {
         let rel_path = walk_handle.rel_path().to_owned();
 
         let write = (data.mode & OWRITE) != 0 || (data.mode & ORDWR) != 0;
-        let file = walk_handle.open_file(write)
-            .map_err(|e| anyhow!("{}", e))?;
+        let file = walk_handle.open_file(write).map_err(|e| anyhow!("{}", e))?;
 
         // If OTRUNC, truncate the file
         if (data.mode & OTRUNC) != 0 && write {
@@ -2819,17 +3378,20 @@ impl WorktreeHandler for RegistryService {
         let iounit = DEFAULT_IOUNIT;
 
         // Re-insert as Opened (no count change — take didn't decrement)
-        self.fid_table.replace(data.fid, FidEntry {
-            state: FidState::Opened {
-                file: Mutex::new(file),
-                qid: qid.clone(),
-                iounit,
-                mode: data.mode,
-                rel_path,
+        self.fid_table.replace(
+            data.fid,
+            FidEntry {
+                state: FidState::Opened {
+                    file: Mutex::new(file),
+                    qid: qid.clone(),
+                    iounit,
+                    mode: data.mode,
+                    rel_path,
+                },
+                owner_identity: subject,
+                last_accessed: AtomicU64::new(now_epoch_secs()),
             },
-            owner_identity: subject,
-            last_accessed: AtomicU64::new(now_epoch_secs()),
-        });
+        );
 
         Ok(ROpen {
             qid: Self::qid_to_data(&qid),
@@ -2838,8 +3400,13 @@ impl WorktreeHandler for RegistryService {
     }
 
     /// Create: create a file/dir under a walked directory fid.
-    async fn handle_create(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &NpCreate,
+    async fn handle_create(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &NpCreate,
     ) -> Result<ROpen> {
         let subject = ctx.subject().to_string();
 
@@ -2851,14 +3418,19 @@ impl WorktreeHandler for RegistryService {
             anyhow::bail!("create name {:?} is not a valid file name", data.name);
         }
         if data.name.contains('/') {
-            anyhow::bail!("create name {:?} must be a single component (no slashes)", data.name);
+            anyhow::bail!(
+                "create name {:?} must be a single component (no slashes)",
+                data.name
+            );
         }
         if data.name.as_bytes().contains(&0) {
             anyhow::bail!("create name contains NUL byte");
         }
 
         // Take the fid to get ownership of the WalkHandle (directory we're creating in)
-        let entry = self.fid_table.take(data.fid)
+        let entry = self
+            .fid_table
+            .take(data.fid)
             .ok_or_else(|| anyhow!("fid {} not found", data.fid))?;
         if entry.owner_identity != subject {
             self.fid_table.replace(data.fid, entry);
@@ -2869,21 +3441,27 @@ impl WorktreeHandler for RegistryService {
             FidState::Walked { walk_handle, qid } => {
                 if qid.qtype & QTDIR == 0 {
                     // Put it back and bail
-                    self.fid_table.replace(data.fid, FidEntry {
-                        state: FidState::Walked { walk_handle, qid },
-                        owner_identity: entry.owner_identity,
-                        last_accessed: entry.last_accessed,
-                    });
+                    self.fid_table.replace(
+                        data.fid,
+                        FidEntry {
+                            state: FidState::Walked { walk_handle, qid },
+                            owner_identity: entry.owner_identity,
+                            last_accessed: entry.last_accessed,
+                        },
+                    );
                     anyhow::bail!("fid {} is not a directory", data.fid);
                 }
                 (walk_handle, qid)
             }
             other => {
-                self.fid_table.replace(data.fid, FidEntry {
-                    state: other,
-                    owner_identity: entry.owner_identity,
-                    last_accessed: entry.last_accessed,
-                });
+                self.fid_table.replace(
+                    data.fid,
+                    FidEntry {
+                        state: other,
+                        owner_identity: entry.owner_identity,
+                        last_accessed: entry.last_accessed,
+                    },
+                );
                 anyhow::bail!("fid {} must be a walked (not opened) directory", data.fid);
             }
         };
@@ -2892,27 +3470,32 @@ impl WorktreeHandler for RegistryService {
 
         // Compute the child's path relative to the contained root
         let child_path = dir_handle.child_rel_path(&data.name);
-        let root = self.get_contained_root(repo_id, name).await
+        let root = self
+            .get_contained_root(repo_id, name)
+            .await
             .map_err(|e| anyhow!("{}", e))?;
 
         if is_dir {
             // Create child directory via ContainedFs (kernel-enforced containment)
-            root.mkdir(&child_path)
-                .map_err(|e| anyhow!("{}", e))?;
+            root.mkdir(&child_path).map_err(|e| anyhow!("{}", e))?;
 
             // Resolve a handle to the new child directory
-            let child_handle = root.walk(&child_path)
-                .map_err(|e| anyhow!("{}", e))?;
-            let meta = child_handle.metadata()
-                .map_err(|e| anyhow!("{}", e))?;
+            let child_handle = root.walk(&child_path).map_err(|e| anyhow!("{}", e))?;
+            let meta = child_handle.metadata().map_err(|e| anyhow!("{}", e))?;
             let qid = qid_from_metadata(&meta);
 
             // Replace the fid with the new directory as Walked (no count change)
-            self.fid_table.replace(data.fid, FidEntry {
-                state: FidState::Walked { walk_handle: child_handle, qid: qid.clone() },
-                owner_identity: subject,
-                last_accessed: AtomicU64::new(now_epoch_secs()),
-            });
+            self.fid_table.replace(
+                data.fid,
+                FidEntry {
+                    state: FidState::Walked {
+                        walk_handle: child_handle,
+                        qid: qid.clone(),
+                    },
+                    owner_identity: subject,
+                    last_accessed: AtomicU64::new(now_epoch_secs()),
+                },
+            );
 
             Ok(ROpen {
                 qid: Self::qid_to_data(&qid),
@@ -2920,7 +3503,12 @@ impl WorktreeHandler for RegistryService {
             })
         } else {
             // Create file via ContainedFs (kernel-enforced containment)
-            let file = root.create(&child_path, hyprstream_containedfs::OpenMode::OWRITE | hyprstream_containedfs::OpenMode::OTRUNC)
+            let file = root
+                .create(
+                    &child_path,
+                    hyprstream_containedfs::OpenMode::OWRITE
+                        | hyprstream_containedfs::OpenMode::OTRUNC,
+                )
                 .map_err(|e| anyhow!("{}", e))?;
 
             let meta = file.metadata()?;
@@ -2931,17 +3519,20 @@ impl WorktreeHandler for RegistryService {
             let mode = data.mode | ORDWR;
 
             // Replace the fid with the opened file (no count change)
-            self.fid_table.replace(data.fid, FidEntry {
-                state: FidState::Opened {
-                    file: Mutex::new(file),
-                    qid: qid.clone(),
-                    iounit,
-                    mode,
-                    rel_path: child_path,
+            self.fid_table.replace(
+                data.fid,
+                FidEntry {
+                    state: FidState::Opened {
+                        file: Mutex::new(file),
+                        qid: qid.clone(),
+                        iounit,
+                        mode,
+                        rel_path: child_path,
+                    },
+                    owner_identity: subject,
+                    last_accessed: AtomicU64::new(now_epoch_secs()),
                 },
-                owner_identity: subject,
-                last_accessed: AtomicU64::new(now_epoch_secs()),
-            });
+            );
 
             Ok(ROpen {
                 qid: Self::qid_to_data(&qid),
@@ -2953,21 +3544,35 @@ impl WorktreeHandler for RegistryService {
     /// Read: offset+count read, bounded by iounit. This is THE fix for the
     /// readFile bug — no unbounded allocation possible.
     /// For directories, returns entries in wire format: name_len(u32le) + name(utf8) + is_dir(u8) + size(u64le).
-    async fn handle_read(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &NpRead,
+    async fn handle_read(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &NpRead,
     ) -> Result<RRead> {
         let subject = ctx.subject().to_string();
-        let entry = self.fid_table.get_verified(data.fid, &subject)
+        let entry = self
+            .fid_table
+            .get_verified(data.fid, &subject)
             .map_err(|e| anyhow!("{}", e))?;
 
         match &entry.state {
-            FidState::Opened { file, qid, iounit, rel_path, .. } => {
+            FidState::Opened {
+                file,
+                qid,
+                iounit,
+                rel_path,
+                ..
+            } => {
                 if qid.qtype & QTDIR != 0 {
                     // Directory read: encode entries as wire format
-                    let root = self.get_contained_root(repo_id, name).await
+                    let root = self
+                        .get_contained_root(repo_id, name)
+                        .await
                         .map_err(|e| anyhow!("{}", e))?;
-                    let entries = root.readdir(rel_path)
-                        .map_err(|e| anyhow!("{}", e))?;
+                    let entries = root.readdir(rel_path).map_err(|e| anyhow!("{}", e))?;
 
                     // Serialize all entries into wire format:
                     // name_len(u32le) + name(utf8) + is_dir(u8) + size(u64le)
@@ -2990,7 +3595,9 @@ impl WorktreeHandler for RegistryService {
 
                     let count = std::cmp::min(data.count, *iounit) as usize;
                     let end = std::cmp::min(count, wire.len());
-                    Ok(RRead { data: wire[..end].to_vec() })
+                    Ok(RRead {
+                        data: wire[..end].to_vec(),
+                    })
                 } else {
                     // Regular file read
                     let count = std::cmp::min(data.count, *iounit) as usize;
@@ -3007,26 +3614,39 @@ impl WorktreeHandler for RegistryService {
     }
 
     /// Write: offset+data write, rejects if data > iounit.
-    async fn handle_write(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, data: &NpWrite,
+    async fn handle_write(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _name: &str,
+        data: &NpWrite,
     ) -> Result<RWrite> {
         let subject = ctx.subject().to_string();
         // Guard: reject direct writes to files with active CRDT editing sessions
         if self.editing_table.fid_has_session(&subject, data.fid) {
-            anyhow::bail!("fid {} is open for CRDT editing, use ctl edit-apply instead", data.fid);
+            anyhow::bail!(
+                "fid {} is open for CRDT editing, use ctl edit-apply instead",
+                data.fid
+            );
         }
-        let entry = self.fid_table.get_verified(data.fid, &subject)
+        let entry = self
+            .fid_table
+            .get_verified(data.fid, &subject)
             .map_err(|e| anyhow!("{}", e))?;
 
         match &entry.state {
-            FidState::Opened { file, iounit, mode, .. } => {
+            FidState::Opened {
+                file, iounit, mode, ..
+            } => {
                 if (*mode & OWRITE) == 0 && (*mode & ORDWR) == 0 {
                     anyhow::bail!("fid {} not opened for writing", data.fid);
                 }
                 if data.data.len() as u32 > *iounit {
                     anyhow::bail!(
                         "write data ({} bytes) exceeds iounit ({})",
-                        data.data.len(), iounit
+                        data.data.len(),
+                        iounit
                     );
                 }
                 let mut f = file.lock();
@@ -3039,24 +3659,38 @@ impl WorktreeHandler for RegistryService {
     }
 
     /// Clunk: release a fid, close any open file.
-    async fn handle_clunk(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, data: &NpClunk,
+    async fn handle_clunk(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _name: &str,
+        data: &NpClunk,
     ) -> Result<()> {
         let subject = ctx.subject().to_string();
         // Clean up any CRDT editing session for this fid
         self.editing_table.on_clunk(&subject, data.fid);
-        let _entry = self.fid_table.remove(data.fid, &subject)
+        let _entry = self
+            .fid_table
+            .remove(data.fid, &subject)
             .ok_or_else(|| anyhow!("fid {} not found or not owned", data.fid))?;
         // File is dropped here, closing the fd
         Ok(())
     }
 
     /// Remove: clunk + delete the file/directory.
-    async fn handle_remove(&self, ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &NpRemove,
+    async fn handle_remove(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &NpRemove,
     ) -> Result<()> {
         let subject = ctx.subject().to_string();
-        let entry = self.fid_table.remove(data.fid, &subject)
+        let entry = self
+            .fid_table
+            .remove(data.fid, &subject)
             .ok_or_else(|| anyhow!("fid {} not found or not owned", data.fid))?;
 
         // Determine what to remove based on the qid type
@@ -3070,17 +3704,27 @@ impl WorktreeHandler for RegistryService {
         // the WalkHandle, we use the metadata to identify what we're removing.
         // For a proper implementation, we'd need to track the path in the fid.
         let _ = (repo_id, name, qid);
-        warn!("9P remove: fid {} clunked but path-based removal requires path tracking", data.fid);
+        warn!(
+            "9P remove: fid {} clunked but path-based removal requires path tracking",
+            data.fid
+        );
         // The fid is already removed (clunked) — file handle dropped
         Ok(())
     }
 
     /// Stat: get file metadata for a fid.
-    async fn handle_np_stat(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, data: &NpStatReq,
+    async fn handle_np_stat(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _name: &str,
+        data: &NpStatReq,
     ) -> Result<RStat> {
         let subject = ctx.subject().to_string();
-        let entry = self.fid_table.get_verified(data.fid, &subject)
+        let entry = self
+            .fid_table
+            .get_verified(data.fid, &subject)
             .map_err(|e| anyhow!("{}", e))?;
 
         let (meta, rel_path) = match &entry.state {
@@ -3088,9 +3732,7 @@ impl WorktreeHandler for RegistryService {
                 walk_handle.metadata().map_err(|e| anyhow!("{}", e))?,
                 walk_handle.rel_path().to_owned(),
             ),
-            FidState::Opened { file, rel_path, .. } => {
-                (file.lock().metadata()?, rel_path.clone())
-            }
+            FidState::Opened { file, rel_path, .. } => (file.lock().metadata()?, rel_path.clone()),
         };
 
         let stat = Self::metadata_to_np_stat(Self::rel_path_file_name(&rel_path), &meta);
@@ -3098,11 +3740,18 @@ impl WorktreeHandler for RegistryService {
     }
 
     /// Wstat: modify file metadata (rename, truncate, etc).
-    async fn handle_wstat(&self, ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, data: &NpWstat,
+    async fn handle_wstat(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _name: &str,
+        data: &NpWstat,
     ) -> Result<()> {
         let subject = ctx.subject().to_string();
-        let entry = self.fid_table.get_verified(data.fid, &subject)
+        let entry = self
+            .fid_table
+            .get_verified(data.fid, &subject)
             .map_err(|e| anyhow!("{}", e))?;
 
         // Handle length change (truncate)
@@ -3124,8 +3773,13 @@ impl WorktreeHandler for RegistryService {
     }
 
     /// Flush: cancel a pending operation (no-op for synchronous ops).
-    async fn handle_flush(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        _repo_id: &str, _name: &str, _data: &NpFlush,
+    async fn handle_flush(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        _repo_id: &str,
+        _name: &str,
+        _data: &NpFlush,
     ) -> Result<()> {
         // No-op for synchronous operations
         Ok(())
@@ -3136,40 +3790,59 @@ impl WorktreeHandler for RegistryService {
     // ========================================================================
 
     /// Stage all tracked modified files in this worktree (git add -u).
-    async fn handle_stage_all(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str,
+    async fn handle_stage_all(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
     ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-        self.with_worktree_blocking(&id, name, |repo| {
-            crate::git::ops::stage_all(&repo)
-        }).await
+        self.with_worktree_blocking(&id, name, |repo| crate::git::ops::stage_all(&repo))
+            .await
     }
 
     /// Stage specific files in this worktree.
-    async fn handle_stage_files(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &StageFilesRequest,
+    async fn handle_stage_files(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &StageFilesRequest,
     ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let files = data.files.clone();
         self.with_worktree_blocking(&id, name, move |repo| {
             let file_refs: Vec<&str> = files.iter().map(std::string::String::as_str).collect();
             crate::git::ops::stage_files(&repo, &file_refs)
-        }).await
+        })
+        .await
     }
 
     /// Stage all files including untracked in this worktree (git add -A).
-    async fn handle_stage_all_including_untracked(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str,
+    async fn handle_stage_all_including_untracked(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
     ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         self.with_worktree_blocking(&id, name, |repo| {
             crate::git::ops::stage_all_with_untracked(&repo)
-        }).await
+        })
+        .await
     }
 
     /// Commit staged changes in this worktree.
-    async fn handle_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &CommitRequest,
+    async fn handle_commit(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &CommitRequest,
     ) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
         let message = data.message.clone();
@@ -3182,7 +3855,8 @@ impl WorktreeHandler for RegistryService {
                 crate::git::ops::commit_index(&repo, &message)?
             };
             Ok(oid.to_string())
-        }).await
+        })
+        .await
     }
 
     /// Commit staged changes with specified author.
@@ -3192,91 +3866,267 @@ impl WorktreeHandler for RegistryService {
     /// layer, so publishing the PDS record here — rather than in the
     /// client-side `advance_pointer` stub — is what makes "promote" actually
     /// advance the atproto pointer for a local/single-node deployment.
-    async fn handle_commit_with_author(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &CommitWithAuthorRequest,
+    async fn handle_commit_with_author(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &CommitWithAuthorRequest,
     ) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
         let message = data.message.clone();
         let author_name = data.author_name.clone();
         let author_email = data.author_email.clone();
-        let oid = self.with_worktree_blocking(&id, name, move |repo| {
-            Ok(crate::git::ops::commit_with_author(&repo, &message, &author_name, &author_email)?.to_string())
-        }).await?;
+        let oid = self
+            .with_worktree_blocking(&id, name, move |repo| {
+                Ok(crate::git::ops::commit_with_author(
+                    &repo,
+                    &message,
+                    &author_name,
+                    &author_email,
+                )?
+                .to_string())
+            })
+            .await?;
         self.publish_pds_record(&id, &oid);
         Ok(oid)
     }
 
     /// Amend the last commit in this worktree.
-    async fn handle_amend_commit(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &AmendCommitRequest,
+    async fn handle_amend_commit(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &AmendCommitRequest,
     ) -> Result<String> {
         let id = Self::parse_repo_id(repo_id)?;
         let message = data.message.clone();
         self.with_worktree_blocking(&id, name, move |repo| {
             Ok(crate::git::ops::amend_head(&repo, &message)?.to_string())
-        }).await
+        })
+        .await
     }
 
     /// Checkout a ref in this worktree.
-    async fn handle_checkout(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &CheckoutRequest,
+    async fn handle_checkout(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &CheckoutRequest,
     ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let ref_name = data.ref_name.clone();
         self.with_worktree_blocking(&id, name, move |repo| {
             crate::git::ops::ensure_branch(&repo, &ref_name)
-        }).await
+        })
+        .await
     }
 
     /// Merge a branch into this worktree.
-    async fn handle_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &MergeRequest,
+    async fn handle_merge(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &MergeRequest,
     ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
         let source = data.source.clone();
-        let message = if data.message.is_empty() { None } else { Some(data.message.clone()) };
+        let message = if data.message.is_empty() {
+            None
+        } else {
+            Some(data.message.clone())
+        };
         self.with_worktree_blocking(&id, name, move |repo| {
             crate::git::ops::merge(&repo, &source, message.as_deref())?;
             Ok(())
-        }).await
+        })
+        .await
     }
 
     /// Abort an in-progress merge in this worktree.
-    async fn handle_abort_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str,
+    async fn handle_abort_merge(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
     ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-        self.with_worktree_blocking(&id, name, |repo| {
-            crate::git::ops::abort_merge(&repo)
-        }).await
+        self.with_worktree_blocking(&id, name, |repo| crate::git::ops::abort_merge(&repo))
+            .await
     }
 
     /// Continue a merge after resolving conflicts.
-    async fn handle_continue_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str, data: &ContinueMergeRequest,
+    async fn handle_continue_merge(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
+        data: &ContinueMergeRequest,
     ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-        let message = if data.message.is_empty() { None } else { Some(data.message.clone()) };
+        let message = if data.message.is_empty() {
+            None
+        } else {
+            Some(data.message.clone())
+        };
         self.with_worktree_blocking(&id, name, move |repo| {
             crate::git::ops::continue_merge(&repo, message.as_deref())?;
             Ok(())
-        }).await
+        })
+        .await
     }
 
     /// Exit merge state without committing.
-    async fn handle_quit_merge(&self, _ctx: &EnvelopeContext, _request_id: u64,
-        repo_id: &str, name: &str,
+    async fn handle_quit_merge(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        repo_id: &str,
+        name: &str,
     ) -> Result<()> {
         let id = Self::parse_repo_id(repo_id)?;
-        self.with_worktree_blocking(&id, name, |repo| {
-            crate::git::ops::quit_merge(&repo)
-        }).await
+        self.with_worktree_blocking(&id, name, |repo| crate::git::ops::quit_merge(&repo))
+            .await
+    }
+}
+
+#[cfg(feature = "postgres")]
+pub(crate) const FEDERATE_REGISTRY_REQUEST_ROOT_TYPE_ID: u64 =
+    <hyprstream_rpc_std::registry_capnp::registry_request::Reader<'static> as capnp::traits::HasTypeId>::TYPE_ID;
+
+#[cfg(feature = "postgres")]
+fn federate_registry_operation(
+    body: &hyprstream_rpc::service::DecodedRequestBody,
+    pin: &crate::services::model::StagingModelPin,
+) -> Result<(String, String)> {
+    use hyprstream_rpc_std::registry_capnp::registry_request;
+    anyhow::ensure!(
+        pin == &crate::services::model::StagingModelPin::reviewed()?,
+        "Federate Registry requires the reviewed staging model pin"
+    );
+    let request = body.root::<registry_request::Reader>()?;
+    match request.which()? {
+        registry_request::Which::List(()) => Ok(("registry:List".to_owned(), "query".to_owned())),
+        registry_request::Which::GetByName(name) => {
+            let name = name?.to_str()?;
+            anyhow::ensure!(
+                name == crate::services::model::StagingModelPin::reviewed_repo_name(),
+                "Federate Registry lookup is not the reviewed model repository"
+            );
+            Ok((format!("registry:{name}"), "query".to_owned()))
+        }
+        _ => anyhow::bail!("unsupported Federate Registry method"),
     }
 }
 
 #[async_trait(?Send)]
 impl RequestService for RegistryService {
-    fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
+    fn accept_deferred_federate_credential(&self) -> bool {
+        #[cfg(feature = "postgres")]
+        {
+            self.federate_dispatch.is_some()
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            false
+        }
+    }
+
+    async fn admit_deferred_federate_request(
+        &self,
+        ctx: &EnvelopeContext,
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+        proof: &hyprstream_rpc::proof::parser::ParsedProof,
+    ) -> anyhow::Result<(
+        hyprstream_rpc::proof::verify::VerifiedProof,
+        [u8; 32],
+        String,
+        String,
+        hyprstream_rpc::proof::admission::ProofReplayKey,
+        u64,
+    )> {
+        #[cfg(feature = "postgres")]
+        {
+            let adapter = self
+                .federate_dispatch
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Federate dispatch is disabled"))?;
+            let pin = crate::services::model::StagingModelPin::from_env()?
+                .ok_or_else(|| anyhow::anyhow!("Federate Registry requires a staging model pin"))?;
+            let (resource, operation) = federate_registry_operation(body, &pin)?;
+            let (verified, holder, replay_key, replay_expiry) = adapter
+                .admit(
+                    ctx,
+                    proof,
+                    "registry",
+                    FEDERATE_REGISTRY_REQUEST_ROOT_TYPE_ID,
+                    body.bytes(),
+                )
+                .await?;
+            Ok((
+                verified,
+                holder,
+                resource,
+                operation,
+                replay_key,
+                replay_expiry,
+            ))
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            let _ = (ctx, body, proof);
+            anyhow::bail!("Federate dispatch is disabled")
+        }
+    }
+
+    async fn commit_deferred_federate_request(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+        replay_key: &hyprstream_rpc::proof::admission::ProofReplayKey,
+        replay_expiry: u64,
+    ) -> anyhow::Result<()> {
+        #[cfg(feature = "postgres")]
+        {
+            let adapter = self
+                .federate_dispatch
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Federate dispatch is disabled"))?;
+            adapter
+                .commit_request_use(ctx, resource, operation, replay_key, replay_expiry)
+                .await
+                .map_err(anyhow::Error::new)
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            let _ = (ctx, resource, operation, replay_key, replay_expiry);
+            anyhow::bail!("Federate dispatch is disabled")
+        }
+    }
+
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, and dispatch below all consume.
+        crate::services::generated::registry_client::decode_registry_request_body(signed_body)
+    }
+
+    fn producer_reach_config_handle(
+        &self,
+    ) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
         Some(self.reach_config.clone())
     }
 
@@ -3284,8 +4134,12 @@ impl RequestService for RegistryService {
         Some(self.moq_origin.clone())
     }
 
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
-        dispatch_registry(self, ctx, payload).await
+    async fn handle_request(
+        &self,
+        ctx: &EnvelopeContext,
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+    ) -> Result<(Vec<u8>, Option<crate::services::Continuation>)> {
+        dispatch_registry(self, ctx, body).await
     }
 
     fn name(&self) -> &str {
@@ -3319,7 +4173,7 @@ impl RequestService for RegistryService {
 }
 
 // ============================================================================
-// MetricsRegistryClient Implementation (on generated RegistryClient)
+// Metrics checkpoint adapter for the canonical generated RegistryClient
 // ============================================================================
 
 #[cfg(feature = "metrics")]
@@ -3328,18 +4182,32 @@ use hyprstream_metrics::checkpoint::manager::{
 };
 
 #[cfg(feature = "metrics")]
+pub(crate) struct MetricsRegistryAdapter(pub(crate) RegistryClient);
+
+#[cfg(feature = "metrics")]
 #[async_trait]
-impl MetricsRegistryClient for RegistryClient {
+impl MetricsRegistryClient for MetricsRegistryAdapter {
     async fn get_by_name(
         &self,
         name: &str,
     ) -> Result<Option<TrackedRepository>, MetricsRegistryError> {
-        let r = self.get_by_name(name)
+        let r = self
+            .0
+            .get_by_name(name)
             .await
             .map_err(|e| MetricsRegistryError::Operation(e.to_string()))?;
-        Ok(Some(variant_to_tracked_repository(
-            &r.id, &r.name, &r.url, "", &r.tracking_ref, &r.current_oid, r.registered_at,
-        ).map_err(|e| MetricsRegistryError::Operation(e.to_string()))?))
+        Ok(Some(
+            variant_to_tracked_repository(
+                &r.id,
+                &r.name,
+                &r.url,
+                "",
+                &r.tracking_ref,
+                &r.current_oid,
+                r.registered_at,
+            )
+            .map_err(|e| MetricsRegistryError::Operation(e.to_string()))?,
+        ))
     }
 
     async fn register(
@@ -3351,22 +4219,17 @@ impl MetricsRegistryClient for RegistryClient {
         let path_str = path
             .to_str()
             .ok_or_else(|| MetricsRegistryError::Operation("Invalid path encoding".to_owned()))?;
-        self.register(&RegisterRequest {
-            path: path_str.to_owned(),
-            name: name.unwrap_or("").to_owned(),
-            tracking_ref: String::new(),
-        })
+        self.0
+            .register(&RegisterRequest {
+                path: path_str.to_owned(),
+                name: name.unwrap_or("").to_owned(),
+                tracking_ref: String::new(),
+            })
             .await
             .map(|_| ())
             .map_err(|e| MetricsRegistryError::Operation(e.to_string()))
     }
 }
-
-
-
-
-
-
 
 /// Parse a git-xet / git-lfs pointer file and report whether `merkle_hex` is the
 /// pointer's **content-hash / OID field** — i.e. the address this tracked file
@@ -3434,9 +4297,8 @@ mod xet_pointer_tests {
 
     #[test]
     fn matches_lfs_pointer_exact_oid() {
-        let ptr = format!(
-            "version https://git-lfs.github.com/spec/v1\noid sha256:{HEX}\nsize 1234\n"
-        );
+        let ptr =
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{HEX}\nsize 1234\n");
         assert!(xet_pointer_references_merkle(&ptr, HEX));
     }
 
@@ -3534,9 +4396,83 @@ mod xet_pointer_tests {
 )]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_registry_route_admits_only_list_and_exact_pinned_get_by_name() -> Result<()> {
+        let pin = crate::services::model::StagingModelPin::reviewed()?;
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message
+                .init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+            request.set_id(1);
+            request.set_list(());
+        })?;
+        let body =
+            crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        assert_eq!(
+            federate_registry_operation(&body, &pin)?,
+            ("registry:List".into(), "query".into())
+        );
+
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message
+                .init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+            request.set_id(2);
+            request.set_get_by_name(crate::services::model::StagingModelPin::reviewed_repo_name());
+        })?;
+        let body =
+            crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        assert_eq!(
+            federate_registry_operation(&body, &pin)?,
+            ("registry:qwen2.5-0.5b-instruct".into(), "query".into())
+        );
+
+        for rejected in ["", "attacker", "qwen2.5-0.5b-instruct:main"] {
+            let bytes = hyprstream_rpc::serialize_message(|message| {
+                let mut request = message
+                    .init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>(
+                );
+                request.set_id(3);
+                request.set_get_by_name(rejected);
+            })?;
+            let body =
+                crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+            assert!(
+                federate_registry_operation(&body, &pin).is_err(),
+                "accepted {rejected:?}"
+            );
+        }
+
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message
+                .init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+            request.set_id(4);
+            request.set_get("repo-id");
+        })?;
+        let body =
+            crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        assert!(federate_registry_operation(&body, &pin).is_err());
+        let other = crate::services::model::StagingModelPin::new("other:main", pin.commit)?;
+        let bytes = hyprstream_rpc::serialize_message(|message| {
+            let mut request = message
+                .init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>();
+            request.set_id(5);
+            request.set_list(());
+        })?;
+        let body =
+            crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        assert!(federate_registry_operation(&body, &other).is_err());
+        let wrong_oid = crate::services::model::StagingModelPin::new(
+            pin.model_ref.clone(),
+            git2::Oid::from_str("0000000000000000000000000000000000000001")?,
+        )?;
+        assert!(federate_registry_operation(&body, &wrong_oid).is_err());
+        Ok(())
+    }
     use crate::auth::PolicyManager;
-    use crate::services::{PolicyService, PolicyClient};
+    use crate::services::PolicyService;
     use hyprstream_rpc::crypto::generate_signing_keypair;
+    use hyprstream_rpc_std::policy_client::PolicyClient;
     use hyprstream_service::ServiceManager;
     use tempfile::TempDir;
 
@@ -3547,17 +4483,31 @@ mod tests {
     }
     fn at9p_test_signer(tag: u8) -> At9pTestSigner {
         use hyprstream_rpc::crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes};
-        let mut seed = [0u8; 32]; seed[0] = tag;
+        let mut seed = [0u8; 32];
+        seed[0] = tag;
         let ed = ed25519_dalek::SigningKey::from_bytes(&seed);
         let (pq, vk) = ml_dsa_generate_keypair();
         let pair = hyprstream_pds::at9p::HybridKeyPair::new(
-            ed.verifying_key().to_bytes().to_vec(), ml_dsa_vk_bytes(&vk)).unwrap();
+            ed.verifying_key().to_bytes().to_vec(),
+            ml_dsa_vk_bytes(&vk),
+        )
+        .unwrap();
         At9pTestSigner { ed, pq, pair }
     }
-    fn at9p_test_body(current: &At9pTestSigner, next: &[&At9pTestSigner], tag: &str) -> hyprstream_pds::at9p::CapsuleBody {
-        use hyprstream_pds::at9p::{CapsuleBody, ServiceEndpoint, ServiceEntry, ServiceType, Transport};
-        let service = ServiceEntry::new("#ns", ServiceType::NinePExport,
-            ServiceEndpoint::new(Transport::Iroh, format!("iroh://{tag}")).unwrap()).unwrap();
+    fn at9p_test_body(
+        current: &At9pTestSigner,
+        next: &[&At9pTestSigner],
+        tag: &str,
+    ) -> hyprstream_pds::at9p::CapsuleBody {
+        use hyprstream_pds::at9p::{
+            CapsuleBody, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
+        };
+        let service = ServiceEntry::new(
+            "#ns",
+            ServiceType::NinePExport,
+            ServiceEndpoint::new(Transport::Iroh, format!("iroh://{tag}")).unwrap(),
+        )
+        .unwrap();
         let mut body = CapsuleBody::new(vec![current.pair.clone()], vec![service]).unwrap();
         body.next_key_commitments = next.iter().map(|s| s.pair.commitment_digest()).collect();
         body
@@ -3566,8 +4516,8 @@ mod tests {
     #[tokio::test]
     async fn test_registry_service_health_check() {
         crate::mac::install_explicit_test_dispatch_pep();
-        use hyprstream_service::InprocManager;
         use hyprstream_rpc::transport::TransportConfig;
+        use hyprstream_service::InprocManager;
 
         // Tests use Classical (EdDSA-only) keys — install Classical verify
         // policy on both the request and response arms so the global
@@ -3601,10 +4551,16 @@ mod tests {
         );
 
         // Create a permissive policy manager and start PolicyService first
-        let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: create policy manager"));
+        let policy_manager = Arc::new(
+            PolicyManager::permissive()
+                .await
+                .expect("test: create policy manager"),
+        );
         let policy_transport = TransportConfig::inproc("test-policy-health");
         let git2db = Arc::new(tokio::sync::RwLock::new(
-            git2db::Git2DB::open(temp_dir.path()).await.expect("test: open git2db"),
+            git2db::Git2DB::open(temp_dir.path())
+                .await
+                .expect("test: open git2db"),
         ));
         let policy_service = PolicyService::new(
             policy_manager,
@@ -3614,7 +4570,10 @@ mod tests {
             policy_transport,
         );
         let manager = InprocManager::new();
-        let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy service");
+        let _policy_handle = manager
+            .spawn(Box::new(policy_service))
+            .await
+            .expect("test: start policy service");
 
         // Create policy client for RegistryService
         let policy_client: PolicyClient = PolicyClient::for_local_endpoint_bootstrap(
@@ -3622,7 +4581,8 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        ).expect("test: create policy client");
+        )
+        .expect("test: create policy client");
 
         // Start the registry service with policy client
         let registry_transport = TransportConfig::inproc("test-registry-health");
@@ -3631,8 +4591,13 @@ mod tests {
             policy_client,
             registry_transport,
             signing_key.clone(),
-        ).await.expect("test: create registry service");
-        let mut handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry service");
+        )
+        .await
+        .expect("test: create registry service");
+        let mut handle = manager
+            .spawn(Box::new(registry_service))
+            .await
+            .expect("test: start registry service");
 
         // Create signed client with matching key and local identity
         let client: RegistryClient = RegistryClient::for_local_endpoint_bootstrap(
@@ -3640,27 +4605,37 @@ mod tests {
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        ).expect("test: create registry client");
+        )
+        .expect("test: create registry client");
         // health_check returns () on success
         let result = client.health_check().await;
-        assert!(result.is_ok(), "health_check should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "health_check should succeed: {:?}",
+            result.err()
+        );
 
         // Stop the service
         let _ = handle.stop().await;
     }
 
+    #[cfg(feature = "rocksdb")]
     #[tokio::test]
     async fn registry_rpc_is_live_at9p_candidate_boundary() {
         crate::mac::install_explicit_test_dispatch_pep();
         use hyprstream_pds::at9p_sign::{sign_capsule, sign_update_record};
         use hyprstream_service::InprocManager;
         const NOW: &str = "2026-07-16T12:00:00Z";
-        let _ = hyprstream_rpc::envelope::install_verify_config(hyprstream_rpc::envelope::EnvelopeVerifyConfig {
-            policy: hyprstream_rpc::crypto::CryptoPolicy::Classical, pq_store: None,
-        });
+        let _ = hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
+            },
+        );
         let _ = hyprstream_rpc::envelope::install_response_verify_config(
             hyprstream_rpc::envelope::ResponseVerifyConfig {
-                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical, pq_store: None,
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Classical,
+                pq_store: None,
             },
         );
         let root = TempDir::new().unwrap();
@@ -3679,86 +4654,202 @@ mod tests {
         );
         let policy_manager = Arc::new(PolicyManager::permissive().await.unwrap());
         let policy_git = Arc::new(RwLock::new(Git2DB::open(&models).await.unwrap()));
-        let policy = PolicyService::new(policy_manager, Arc::new(key.clone()),
-            crate::config::TokenConfig::default(), policy_git,
-            TransportConfig::inproc("at9p-policy"));
+        let policy = PolicyService::new(
+            policy_manager,
+            Arc::new(key.clone()),
+            crate::config::TokenConfig::default(),
+            policy_git,
+            TransportConfig::inproc("at9p-policy"),
+        );
         let manager = InprocManager::new();
-        let policy_handle = manager.spawn(Box::new(policy)).await.unwrap();
-        let policy_client = PolicyClient::for_local_endpoint_bootstrap("inproc://at9p-policy", key.clone(), key.verifying_key(), None).unwrap();
-        let store = Arc::new(crate::services::discovery::PdsRecordStore::open(&pds).unwrap()
-            .with_at9p_acceptance_identity(key.verifying_key()));
+        let mut policy_handle = manager.spawn(Box::new(policy)).await.unwrap();
+        let policy_client = PolicyClient::for_local_endpoint_bootstrap(
+            "inproc://at9p-policy",
+            key.clone(),
+            key.verifying_key(),
+            None,
+        )
+        .unwrap();
+        let store = Arc::new(
+            crate::services::discovery::PdsRecordStore::open(&pds)
+                .unwrap()
+                .with_at9p_acceptance_identity(key.verifying_key()),
+        );
         let ingest = crate::services::discovery::At9pStateIngest::open(
-            Arc::clone(&store), &root.path().join("alarm"), key.clone(),
+            Arc::clone(&store),
+            &root.path().join("alarm"),
+            key.clone(),
             ed25519_dalek::SigningKey::from_bytes(&[81u8; 32]),
-            hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[82u8; 32])).unwrap();
+            hyprstream_rpc::crypto::pq::ml_dsa_sk_from_seed(&[82u8; 32]),
+        )
+        .unwrap();
         let publisher = {
             use crate::auth::key_rotation::{Es256KeySlot, Es256KeySlots, Es256SigningKeyStore};
             let store_for_pub = Arc::new(Es256SigningKeyStore::new(Es256KeySlots {
                 drain: None,
                 active: Some(Es256KeySlot::new(
                     p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
-                    0, i64::MAX,
+                    0,
+                    i64::MAX,
                 )),
                 lead: None,
             }));
-            crate::services::discovery::PdsPublisher::new(Arc::clone(&store),
-                "did:key:test".to_owned(), store_for_pub)
-                .with_at9p_state_ingest(ingest)
+            crate::services::discovery::PdsPublisher::new(
+                Arc::clone(&store),
+                "did:key:test".to_owned(),
+                store_for_pub,
+            )
+            .with_at9p_state_ingest(ingest)
         };
-        let registry = RegistryService::new(&models, policy_client,
-            TransportConfig::inproc("at9p-registry"), key.clone()).await.unwrap()
-            .with_pds_publisher(publisher);
+        let registry = RegistryService::new(
+            &models,
+            policy_client,
+            TransportConfig::inproc("at9p-registry"),
+            key.clone(),
+        )
+        .await
+        .unwrap()
+        .with_pds_publisher(publisher);
         let mut handle = manager.spawn(Box::new(registry)).await.unwrap();
-        let client = RegistryClient::for_local_endpoint_bootstrap("inproc://at9p-registry", key.clone(), key.verifying_key(), None).unwrap();
+        let client = RegistryClient::for_local_endpoint_bootstrap(
+            "inproc://at9p-registry",
+            key.clone(),
+            key.verifying_key(),
+            None,
+        )
+        .unwrap();
         let (g, n1, n2, n3) = (
-            at9p_test_signer(1), at9p_test_signer(2),
-            at9p_test_signer(3), at9p_test_signer(4),
+            at9p_test_signer(1),
+            at9p_test_signer(2),
+            at9p_test_signer(3),
+            at9p_test_signer(4),
         );
         let genesis = sign_capsule(at9p_test_body(&g, &[&n1], "genesis"), &g.ed, &g.pq).unwrap();
         let genesis_bytes = genesis.to_dag_cbor().unwrap();
         let cid = genesis.cid512().unwrap();
         let did = format!("{}{}", hyprstream_pds::at9p_gate::DID_AT9P_PREFIX, cid);
-        assert_eq!(client.ingest_at9p_candidate(&At9pCandidateRequest {
-            did: did.clone(), kind: At9pCandidateKind::Genesis,
-            record_bytes: genesis_bytes.clone(),
-        }).await.unwrap().epoch, 0);
-        let update = sign_update_record(cid.clone(), 1, hyprstream_pds::at9p::h512(&genesis_bytes),
-            at9p_test_body(&n1, &[&n2], "rotated"), "2099-01-01T00:00:00Z".to_owned(), &n1.ed, &n1.pq).unwrap();
-        let accepted = client.ingest_at9p_candidate(&At9pCandidateRequest {
-            did: did.clone(), kind: At9pCandidateKind::Successor,
-            record_bytes: update.to_dag_cbor().unwrap(),
-        }).await.unwrap();
+        assert_eq!(
+            client
+                .ingest_at9p_candidate(&At9pCandidateRequest {
+                    did: did.clone(),
+                    kind: At9pCandidateKind::Genesis,
+                    record_bytes: genesis_bytes.clone(),
+                })
+                .await
+                .unwrap()
+                .epoch,
+            0
+        );
+        let update = sign_update_record(
+            cid.clone(),
+            1,
+            hyprstream_pds::at9p::h512(&genesis_bytes),
+            at9p_test_body(&n1, &[&n2], "rotated"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &n1.ed,
+            &n1.pq,
+        )
+        .unwrap();
+        let accepted = client
+            .ingest_at9p_candidate(&At9pCandidateRequest {
+                did: did.clone(),
+                kind: At9pCandidateKind::Successor,
+                record_bytes: update.to_dag_cbor().unwrap(),
+            })
+            .await
+            .unwrap();
         assert_eq!(accepted.epoch, 1);
         let resolver = crate::services::discovery::PdsRecordResolver::new(Arc::clone(&store));
         let state = resolver.accepted_at9p_state(&did, NOW).unwrap().unwrap();
         assert_eq!(state.current.subject_keys[0], n1.pair);
-        let fork = sign_update_record(cid.clone(), 1, hyprstream_pds::at9p::h512(&genesis_bytes),
-            at9p_test_body(&n1, &[&n2], "fork"), "2099-01-01T00:00:00Z".to_owned(), &n1.ed, &n1.pq).unwrap();
-        assert!(client.ingest_at9p_candidate(&At9pCandidateRequest {
-            did: did.clone(), kind: At9pCandidateKind::Successor,
-            record_bytes: fork.to_dag_cbor().unwrap(),
-        }).await.is_err());
-        let expired = sign_update_record(cid.clone(), 2, state.head_digest,
-            at9p_test_body(&n2, &[], "expired"), "2026-01-01T00:00:00Z".to_owned(), &n2.ed, &n2.pq).unwrap();
-        assert!(client.ingest_at9p_candidate(&At9pCandidateRequest {
-            did: did.clone(), kind: At9pCandidateKind::Successor,
-            record_bytes: expired.to_dag_cbor().unwrap(),
-        }).await.is_err());
-        let terminal = sign_update_record(cid.clone(), 2, state.head_digest,
-            at9p_test_body(&n2, &[], "terminal"), "2099-01-01T00:00:00Z".to_owned(), &n2.ed, &n2.pq).unwrap();
-        let terminal_state = client.ingest_at9p_candidate(&At9pCandidateRequest {
-            did: did.clone(), kind: At9pCandidateKind::Successor,
-            record_bytes: terminal.to_dag_cbor().unwrap(),
-        }).await.unwrap();
+        let fork = sign_update_record(
+            cid.clone(),
+            1,
+            hyprstream_pds::at9p::h512(&genesis_bytes),
+            at9p_test_body(&n1, &[&n2], "fork"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &n1.ed,
+            &n1.pq,
+        )
+        .unwrap();
+        assert!(client
+            .ingest_at9p_candidate(&At9pCandidateRequest {
+                did: did.clone(),
+                kind: At9pCandidateKind::Successor,
+                record_bytes: fork.to_dag_cbor().unwrap(),
+            })
+            .await
+            .is_err());
+        let expired = sign_update_record(
+            cid.clone(),
+            2,
+            state.head_digest,
+            at9p_test_body(&n2, &[], "expired"),
+            "2026-01-01T00:00:00Z".to_owned(),
+            &n2.ed,
+            &n2.pq,
+        )
+        .unwrap();
+        assert!(client
+            .ingest_at9p_candidate(&At9pCandidateRequest {
+                did: did.clone(),
+                kind: At9pCandidateKind::Successor,
+                record_bytes: expired.to_dag_cbor().unwrap(),
+            })
+            .await
+            .is_err());
+        let terminal = sign_update_record(
+            cid.clone(),
+            2,
+            state.head_digest,
+            at9p_test_body(&n2, &[], "terminal"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &n2.ed,
+            &n2.pq,
+        )
+        .unwrap();
+        let terminal_state = client
+            .ingest_at9p_candidate(&At9pCandidateRequest {
+                did: did.clone(),
+                kind: At9pCandidateKind::Successor,
+                record_bytes: terminal.to_dag_cbor().unwrap(),
+            })
+            .await
+            .unwrap();
         assert!(terminal_state.terminal);
-        let after_terminal = sign_update_record(cid, 3, terminal_state.head_digest.try_into().unwrap(),
-            at9p_test_body(&n3, &[&n3], "forbidden"), "2099-01-01T00:00:00Z".to_owned(), &n3.ed, &n3.pq).unwrap();
-        assert!(client.ingest_at9p_candidate(&At9pCandidateRequest {
-            did, kind: At9pCandidateKind::Successor,
-            record_bytes: after_terminal.to_dag_cbor().unwrap(),
-        }).await.is_err());
-        let _ = handle.stop().await;
-        drop(policy_handle);
+        let after_terminal = sign_update_record(
+            cid,
+            3,
+            terminal_state.head_digest.try_into().unwrap(),
+            at9p_test_body(&n3, &[&n3], "forbidden"),
+            "2099-01-01T00:00:00Z".to_owned(),
+            &n3.ed,
+            &n3.pq,
+        )
+        .unwrap();
+        assert!(client
+            .ingest_at9p_candidate(&At9pCandidateRequest {
+                did,
+                kind: At9pCandidateKind::Successor,
+                record_bytes: after_terminal.to_dag_cbor().unwrap(),
+            })
+            .await
+            .is_err());
+        handle.stop().await.unwrap();
+        assert!(!handle.is_running());
+        drop(resolver);
+        // The client may retain the processor; stop must still destroy the
+        // service's publisher/ingest and release its RocksDB ownership first.
+        assert_eq!(
+            Arc::strong_count(&store),
+            1,
+            "stopped Registry retained its DB"
+        );
+        drop(store);
+        let reopened = crate::services::discovery::PdsRecordStore::open(&pds).unwrap();
+        drop(reopened);
+        policy_handle.stop().await.unwrap();
+        assert!(!policy_handle.is_running());
     }
 
     // ── #432 getBlob authz: the hash is NOT a capability ──────────────────────
@@ -3771,9 +4862,13 @@ mod tests {
     async fn spawn_registry_for_authz_test(
         temp_dir: &TempDir,
         suffix: &str,
-    ) -> (RegistryClient, hyprstream_service::InprocManager, hyprstream_service::SpawnedService) {
-        use hyprstream_service::InprocManager;
+    ) -> (
+        RegistryClient,
+        hyprstream_service::InprocManager,
+        hyprstream_service::SpawnedService,
+    ) {
         use hyprstream_rpc::transport::TransportConfig;
+        use hyprstream_service::InprocManager;
 
         let _ = hyprstream_rpc::envelope::install_verify_config(
             hyprstream_rpc::envelope::EnvelopeVerifyConfig {
@@ -3782,10 +4877,16 @@ mod tests {
             },
         );
         let (signing_key, _vk) = generate_signing_keypair();
-        let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let policy_manager = Arc::new(
+            PolicyManager::permissive()
+                .await
+                .expect("test: policy manager"),
+        );
         let policy_transport = TransportConfig::inproc(format!("test-policy-{suffix}"));
         let git2db = Arc::new(tokio::sync::RwLock::new(
-            git2db::Git2DB::open(temp_dir.path()).await.expect("test: open git2db"),
+            git2db::Git2DB::open(temp_dir.path())
+                .await
+                .expect("test: open git2db"),
         ));
         let policy_service = PolicyService::new(
             policy_manager,
@@ -3795,27 +4896,37 @@ mod tests {
             policy_transport,
         );
         let manager = InprocManager::new();
-        let _policy_handle = manager.spawn(Box::new(policy_service)).await.expect("test: start policy");
+        let _policy_handle = manager
+            .spawn(Box::new(policy_service))
+            .await
+            .expect("test: start policy");
         let policy_client: PolicyClient = PolicyClient::for_local_endpoint_bootstrap(
             &format!("inproc://test-policy-{suffix}"),
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        ).expect("test: policy client");
+        )
+        .expect("test: policy client");
         let registry_transport = TransportConfig::inproc(format!("test-registry-{suffix}"));
         let registry_service = RegistryService::new(
             temp_dir.path(),
             policy_client,
             registry_transport,
             signing_key.clone(),
-        ).await.expect("test: create registry service");
-        let handle = manager.spawn(Box::new(registry_service)).await.expect("test: start registry");
+        )
+        .await
+        .expect("test: create registry service");
+        let handle = manager
+            .spawn(Box::new(registry_service))
+            .await
+            .expect("test: start registry");
         let client: RegistryClient = RegistryClient::for_local_endpoint_bootstrap(
             &format!("inproc://test-registry-{suffix}"),
             signing_key.clone(),
             signing_key.verifying_key(),
             None,
-        ).expect("test: registry client");
+        )
+        .expect("test: registry client");
         // Leak the policy handle for the test's lifetime (dropped at process exit).
         std::mem::forget(_policy_handle);
         (client, manager, handle)
@@ -3856,8 +4967,8 @@ mod tests {
         commit_files: &[(&str, &str)],
     ) -> (RegistryService, RepoId) {
         use git2::{Repository, Signature};
-        use hyprstream_service::InprocManager;
         use hyprstream_rpc::transport::TransportConfig;
+        use hyprstream_service::InprocManager;
 
         let _ = hyprstream_rpc::envelope::install_verify_config(
             hyprstream_rpc::envelope::EnvelopeVerifyConfig {
@@ -3874,7 +4985,9 @@ mod tests {
             let mut index = repo.index().expect("test: index");
             for (rel, contents) in commit_files {
                 std::fs::write(repo_path.join(rel), contents).expect("test: write file");
-                index.add_path(std::path::Path::new(rel)).expect("test: index add");
+                index
+                    .add_path(std::path::Path::new(rel))
+                    .expect("test: index add");
             }
             index.write().expect("test: index write");
             let tree_oid = index.write_tree().expect("test: write tree");
@@ -3903,10 +5016,15 @@ mod tests {
         // resolves; repo_contains_xet_merkle never touches it.
         let (signing_key, _vk) = generate_signing_keypair();
         let policy_ep = format!("test-policy-436-{repo_name}");
-        let policy_manager =
-            Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let policy_manager = Arc::new(
+            PolicyManager::permissive()
+                .await
+                .expect("test: policy manager"),
+        );
         let policy_git2db = Arc::new(tokio::sync::RwLock::new(
-            Git2DB::open(base_dir).await.expect("test: open git2db for policy"),
+            Git2DB::open(base_dir)
+                .await
+                .expect("test: open git2db for policy"),
         ));
         let policy_service = PolicyService::new(
             policy_manager,
@@ -3929,9 +5047,10 @@ mod tests {
         )
         .expect("test: policy client");
         let registry_transport = TransportConfig::inproc(format!("test-registry-436-{repo_name}"));
-        let service = RegistryService::new(base_dir, policy_client, registry_transport, signing_key)
-            .await
-            .expect("test: create registry service");
+        let service =
+            RegistryService::new(base_dir, policy_client, registry_transport, signing_key)
+                .await
+                .expect("test: create registry service");
         (service, repo_id)
     }
 
@@ -3997,7 +5116,10 @@ mod tests {
         let (service, repo_id) = registry_with_committed_repo(
             temp_dir.path(),
             "model-planted",
-            &[("model.safetensors", &legit_pointer), ("planted.txt", &planted)],
+            &[
+                ("model.safetensors", &legit_pointer),
+                ("planted.txt", &planted),
+            ],
         )
         .await;
 
@@ -4025,7 +5147,10 @@ mod tests {
             .repo_contains_xet_merkle(&repo_id, MERKLE_A)
             .await
             .expect("test: containment check");
-        assert!(still_permitted, "the genuine content-OID must remain entitled");
+        assert!(
+            still_permitted,
+            "the genuine content-OID must remain entitled"
+        );
     }
 
     #[tokio::test]
@@ -4080,7 +5205,11 @@ mod tests {
             )
             .await
             .expect("test: walk to config.json");
-        assert_eq!(walk.qid.qtype & 0x80, 0, "config.json must not be a directory");
+        assert_eq!(
+            walk.qid.qtype & 0x80,
+            0,
+            "config.json must not be a directory"
+        );
 
         let stat = service
             .handle_np_stat(&ctx, 2, &repo_id_str, ".", &NpStatReq { fid: 42 })
@@ -4101,8 +5230,8 @@ mod tests {
         // now route through the `Git2DB::register(repo_id)` builder and honor
         // the real, caller-chosen path.
         use git2::{Repository, Signature};
-        use hyprstream_service::InprocManager;
         use hyprstream_rpc::transport::TransportConfig;
+        use hyprstream_service::InprocManager;
 
         let _ = hyprstream_rpc::envelope::install_verify_config(
             hyprstream_rpc::envelope::EnvelopeVerifyConfig {
@@ -4124,7 +5253,9 @@ mod tests {
         {
             let mut index = repo.index().expect("test: index");
             std::fs::write(repo_path.join("README.md"), "hello").expect("test: write file");
-            index.add_path(Path::new("README.md")).expect("test: index add");
+            index
+                .add_path(Path::new("README.md"))
+                .expect("test: index add");
             index.write().expect("test: index write");
             let tree_oid = index.write_tree().expect("test: write tree");
             let tree = repo.find_tree(tree_oid).expect("test: find tree");
@@ -4134,7 +5265,11 @@ mod tests {
         }
 
         let (signing_key, _vk) = generate_signing_keypair();
-        let policy_manager = Arc::new(PolicyManager::permissive().await.expect("test: policy manager"));
+        let policy_manager = Arc::new(
+            PolicyManager::permissive()
+                .await
+                .expect("test: policy manager"),
+        );
         let policy_git2db = Arc::new(tokio::sync::RwLock::new(
             Git2DB::open(base_dir).await.expect("test: open git2db"),
         ));

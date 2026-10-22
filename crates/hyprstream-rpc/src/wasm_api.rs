@@ -115,8 +115,8 @@ pub fn derive_stream_keys(
 
     let mut result = Vec::with_capacity(128);
     // topic is a hex string (64 chars = 32 bytes decoded)
-    let topic_bytes = hex::decode(&keys.topic)
-        .map_err(|e| JsError::new(&format!("invalid topic hex: {}", e)))?;
+    let topic_bytes =
+        hex::decode(&keys.topic).map_err(|e| JsError::new(&format!("invalid topic hex: {}", e)))?;
     result.extend_from_slice(&topic_bytes);
     result.extend_from_slice(&*keys.mac_key);
     let ctrl_topic_bytes = hex::decode(&keys.ctrl_topic)
@@ -156,7 +156,8 @@ pub fn init_stream_hmac(mac_key: &[u8], topic: &str) -> Result<u32, JsError> {
         id
     });
     STREAM_HMAC_TABLE.with(|t| {
-        t.borrow_mut().insert(handle, StreamHmacState::new(key, topic.to_owned()));
+        t.borrow_mut()
+            .insert(handle, StreamHmacState::new(key, topic.to_owned()));
     });
     Ok(handle)
 }
@@ -176,12 +177,19 @@ pub fn init_stream_hmac(mac_key: &[u8], topic: &str) -> Result<u32, JsError> {
 ///
 /// true if MAC verification passes; false if MAC is wrong (stream integrity violation)
 #[wasm_bindgen]
-pub fn verify_stream_block_step(handle: u32, capnp_data: &[u8], mac: &[u8]) -> Result<bool, JsError> {
+pub fn verify_stream_block_step(
+    handle: u32,
+    capnp_data: &[u8],
+    mac: &[u8],
+) -> Result<bool, JsError> {
     STREAM_HMAC_TABLE.with(|t| {
         let mut table = t.borrow_mut();
-        let hmac = table
-            .get_mut(&handle)
-            .ok_or_else(|| JsError::new(&format!("stream HMAC handle {} not found; call init_stream_hmac first", handle)))?;
+        let hmac = table.get_mut(&handle).ok_or_else(|| {
+            JsError::new(&format!(
+                "stream HMAC handle {} not found; call init_stream_hmac first",
+                handle
+            ))
+        })?;
         Ok(hmac.verify_next(capnp_data, mac))
     })
 }
@@ -212,10 +220,7 @@ pub fn close_stream_hmac(handle: u32) {
 ///
 /// 32 bytes shared secret
 #[wasm_bindgen]
-pub fn ecdh_ristretto(
-    client_privkey: &[u8],
-    server_pubkey: &[u8],
-) -> Result<Vec<u8>, JsError> {
+pub fn ecdh_ristretto(client_privkey: &[u8], server_pubkey: &[u8]) -> Result<Vec<u8>, JsError> {
     use crate::crypto::key_exchange::DefaultKeyExchange;
     use crate::crypto::KeyExchange;
 
@@ -227,9 +232,8 @@ pub fn ecdh_ristretto(
     }
 
     // Reconstruct secret from scalar bytes
-    let scalar = curve25519_dalek::scalar::Scalar::from_canonical_bytes(
-        client_privkey.try_into().unwrap()
-    );
+    let scalar =
+        curve25519_dalek::scalar::Scalar::from_canonical_bytes(client_privkey.try_into().unwrap());
     if scalar.is_none().into() {
         return Err(JsError::new("invalid Ristretto255 scalar"));
     }
@@ -364,8 +368,7 @@ pub fn verify_signed_envelope(
             "expected signer has no anchored ML-DSA-65 verification key",
         ));
     }
-    let opts = UnwrapOptions::fixed_signer(&verifying_key, &*nonce_cache)
-        .with_pq_store(&pq_store);
+    let opts = UnwrapOptions::fixed_signer(&verifying_key, &*nonce_cache).with_pq_store(&pq_store);
 
     let (_signed, payload) = unwrap_and_verify(envelope_bytes, &opts)
         .map_err(|e| JsError::new(&format!("envelope verification failed: {}", e)))?;
@@ -384,9 +387,19 @@ pub fn current_timestamp_ms() -> i64 {
 }
 
 /// Generate a random 16-byte nonce.
+///
+/// Backed by `OsRng` — the same cryptographic source this module already uses
+/// for the AES-GCM nonce below and that `envelope::generate_nonce` uses
+/// natively (`getrandom` is configured with the browser backend for wasm32).
+/// A previous revision returned all-zeros here on the assumption `OsRng` was
+/// wasm-hostile; that was a footgun — any browser caller populating a replay
+/// nonce from it would silently defeat replay protection. It returns real
+/// entropy.
 #[wasm_bindgen]
 pub fn generate_nonce() -> Vec<u8> {
-    crate::envelope::generate_nonce().to_vec()
+    let mut nonce = vec![0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    nonce
 }
 
 // ============================================================================
@@ -402,8 +415,7 @@ pub fn zmtp_greeting() -> Vec<u8> {
 /// Validate a 64-byte ZMTP 3.1 greeting from the peer.
 #[wasm_bindgen]
 pub fn zmtp_validate_greeting(greeting: &[u8]) -> Result<(), JsError> {
-    crate::zmtp_framing::validate_greeting(greeting)
-        .map_err(|e| JsError::new(&format!("{}", e)))
+    crate::zmtp_framing::validate_greeting(greeting).map_err(|e| JsError::new(&format!("{}", e)))
 }
 
 /// Build a ZMTP READY command frame for the given socket type.
@@ -428,7 +440,12 @@ pub fn zmtp_ready_command(socket_type: &str) -> Result<Vec<u8>, JsError> {
         "XSUB" => ZmqSocketType::XSub,
         "PUSH" => ZmqSocketType::Push,
         "PULL" => ZmqSocketType::Pull,
-        _ => return Err(JsError::new(&format!("unknown socket type: {}", socket_type))),
+        _ => {
+            return Err(JsError::new(&format!(
+                "unknown socket type: {}",
+                socket_type
+            )))
+        }
     };
 
     let metadata = crate::zmtp_framing::build_ready_metadata(st);
@@ -472,8 +489,7 @@ pub fn zmtp_encode_multipart(parts_flat: &[u8]) -> Result<Vec<u8>, JsError> {
 /// Only data frames are returned (command frames are skipped).
 #[wasm_bindgen]
 pub fn zmtp_decode_frames(buf: &[u8]) -> Result<Vec<u8>, JsError> {
-    crate::zmtp_framing::decode_frames_to_flat(buf)
-        .map_err(|e| JsError::new(&format!("{}", e)))
+    crate::zmtp_framing::decode_frames_to_flat(buf).map_err(|e| JsError::new(&format!("{}", e)))
 }
 
 /// Decode a ZMTP command frame.
@@ -571,7 +587,10 @@ pub fn aes_gcm_encrypt(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, JsError> {
-    use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes256Gcm, Nonce};
+    use aes_gcm::{
+        aead::{Aead, KeyInit, Payload},
+        Aes256Gcm, Nonce,
+    };
 
     if key.len() != 32 {
         return Err(JsError::new("key must be 32 bytes"));
@@ -581,7 +600,10 @@ pub fn aes_gcm_encrypt(
     }
 
     let cipher = Aes256Gcm::new(key.into());
-    let payload = Payload { msg: plaintext, aad };
+    let payload = Payload {
+        msg: plaintext,
+        aad,
+    };
     cipher
         .encrypt(Nonce::from_slice(nonce), payload)
         .map_err(|_| JsError::new("AES-GCM encrypt failed"))
@@ -606,7 +628,10 @@ pub fn aes_gcm_decrypt(
     ciphertext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, JsError> {
-    use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes256Gcm, Nonce};
+    use aes_gcm::{
+        aead::{Aead, KeyInit, Payload},
+        Aes256Gcm, Nonce,
+    };
 
     if key.len() != 32 {
         return Err(JsError::new("key must be 32 bytes"));
@@ -616,7 +641,10 @@ pub fn aes_gcm_decrypt(
     }
 
     let cipher = Aes256Gcm::new(key.into());
-    let payload = Payload { msg: ciphertext, aad };
+    let payload = Payload {
+        msg: ciphertext,
+        aad,
+    };
     cipher
         .decrypt(Nonce::from_slice(nonce), payload)
         .map_err(|_| JsError::new("AES-GCM decrypt failed (wrong key, nonce, or AAD)"))
@@ -873,11 +901,7 @@ pub fn ed25519_sign(privkey_seed: &[u8], message: &[u8]) -> Result<Vec<u8>, JsEr
 ///
 /// `true` if signature is valid
 #[wasm_bindgen]
-pub fn ed25519_verify(
-    pubkey: &[u8],
-    message: &[u8],
-    signature: &[u8],
-) -> Result<bool, JsError> {
+pub fn ed25519_verify(pubkey: &[u8], message: &[u8], signature: &[u8]) -> Result<bool, JsError> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
     if pubkey.len() != 32 {

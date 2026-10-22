@@ -28,8 +28,8 @@ use ed25519_dalek::SigningKey;
 use rand::RngCore;
 
 use hyprstream_rpc::moq_stream::{
-    connect_moq_reach_for_qos, run_relay_announce_link, MoqStreamOrigin, ProducerReachConfig,
-    RelayChoice, NodeStreamReach, STREAM_TRACK,
+    connect_moq_reach_for_qos, run_relay_announce_link, MoqStreamOrigin, NodeStreamReach,
+    ProducerReachConfig, RelayChoice, RelayTarget, STREAM_TRACK,
 };
 use hyprstream_rpc::stream_info::{
     Destination, QuicReach, Role, StreamOpt, TransportConfig as ReachTransport,
@@ -51,8 +51,9 @@ fn build_server() -> Result<(web_transport_quinn::Server, std::net::SocketAddr, 
     let key_der = cert_key.key_pair.serialize_der();
 
     let chain = vec![rustls::pki_types::CertificateDer::from(cert_der.clone())];
-    let key =
-        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der));
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        key_der,
+    ));
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse()?;
     let server = web_transport_quinn::ServerBuilder::new()
@@ -123,7 +124,7 @@ async fn moq_relay_rendezvous() -> Result<()> {
     let link_relay = relay_reach.clone();
     let link_producer = producer_origin.producer().clone();
     let link_task = tokio::spawn(async move {
-        let _ = run_relay_announce_link(&link_producer, &link_relay).await;
+        let _ = run_relay_announce_link(&link_producer, &link_relay, None, None).await;
     });
 
     // No fixed sleep: the `timeout(announced_broadcast)` below is the deterministic
@@ -135,7 +136,14 @@ async fn moq_relay_rendezvous() -> Result<()> {
     // The reach list carries the relay ONLY (no direct producer reach) — a
     // relay-only / anonymized advertisement. The subscriber cannot dial the
     // producer because it was never told where the producer is.
-    let reach = vec![Destination { role: Role::Relay, transport: relay_reach.clone() }];
+    let reach = vec![Destination {
+        role: Role::Relay,
+        transport: relay_reach.clone(),
+        // A production pinned-QUIC relay has transport authentication but no
+        // MoQL accepted-state witness. It must remain dialable; only Iroh
+        // selects and verifies a MoQL witness.
+        moql_server_identity: Default::default(),
+    }];
 
     // Default qos = Retention::Live; with a relay-only reach there is nothing to
     // promote — the relay is the only dialable option, exercising rendezvous.
@@ -161,15 +169,14 @@ async fn moq_relay_rendezvous() -> Result<()> {
     // so the verifier must open it with the SAME key — otherwise `Tagged` frames pass
     // through undecrypted and never become `Data`/`Complete`. Mirrors the production
     // consumers (stream_consumer.rs + moq_stream.rs all call `.with_enc_key`).
-    let mut verifier = StreamVerifier::new(mac_key, topic.clone())
-        .with_enc_key(*ctx.enc_key().expect("interop DH ctx derives the AEAD enc_key (#321)"));
+    let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(
+        *ctx.enc_key()
+            .expect("interop DH ctx derives the AEAD enc_key (#321)"),
+    );
     let mut got: Vec<StreamPayload> = Vec::new();
 
     // Publish one group at a time and drain it so the ordered chain is observed.
-    async fn next_frame(
-        track: &mut moq_net::TrackConsumer,
-        seq: u64,
-    ) -> Result<bytes::Bytes> {
+    async fn next_frame(track: &mut moq_net::TrackConsumer, seq: u64) -> Result<bytes::Bytes> {
         let mut group = tokio::time::timeout(Duration::from_secs(10), track.get_group(seq))
             .await
             .map_err(|_| anyhow!("timed out waiting for relayed group {seq}"))??
@@ -183,19 +190,43 @@ async fn moq_relay_rendezvous() -> Result<()> {
     publisher.publish_data(b"alpha").await?;
     let f0 = next_frame(&mut track, 0).await?;
     let raw_relayed: Vec<u8> = f0.to_vec(); // capture a relayed frame for the blind-relay assertion.
-    got.extend(hyprstream_rpc::moq_stream::verify_moq_frame(&mut verifier, &topic, &f0)?);
+    got.extend(hyprstream_rpc::moq_stream::verify_moq_frame(
+        &mut verifier,
+        &topic,
+        &f0,
+    )?);
 
     publisher.publish_data(b"beta").await?;
     let f1 = next_frame(&mut track, 1).await?;
-    got.extend(hyprstream_rpc::moq_stream::verify_moq_frame(&mut verifier, &topic, &f1)?);
+    got.extend(hyprstream_rpc::moq_stream::verify_moq_frame(
+        &mut verifier,
+        &topic,
+        &f1,
+    )?);
 
     publisher.complete_ref(b"{}").await?;
     let f2 = next_frame(&mut track, 2).await?;
-    got.extend(hyprstream_rpc::moq_stream::verify_moq_frame(&mut verifier, &topic, &f2)?);
+    got.extend(hyprstream_rpc::moq_stream::verify_moq_frame(
+        &mut verifier,
+        &topic,
+        &f2,
+    )?);
 
-    assert!(matches!(&got[0], StreamPayload::Data(d) if d == b"alpha"), "got {:?}", got[0]);
-    assert!(matches!(&got[1], StreamPayload::Data(d) if d == b"beta"), "got {:?}", got[1]);
-    assert!(matches!(&got[2], StreamPayload::Complete(_)), "got {:?}", got[2]);
+    assert!(
+        matches!(&got[0], StreamPayload::Data(d) if d == b"alpha"),
+        "got {:?}",
+        got[0]
+    );
+    assert!(
+        matches!(&got[1], StreamPayload::Data(d) if d == b"beta"),
+        "got {:?}",
+        got[1]
+    );
+    assert!(
+        matches!(&got[2], StreamPayload::Complete(_)),
+        "got {:?}",
+        got[2]
+    );
 
     // ── Relay-blind: the relay-forwarded bytes do NOT verify without the key ───
     // The relay holds no `mac_key` (and no `enc_key`); content integrity is keyed
@@ -203,10 +234,14 @@ async fn moq_relay_rendezvous() -> Result<()> {
     // bytes the relay forwarded — proving the relay cannot read or forge content,
     // only carry opaque frames. (The AEAD `enc_key` seal is the same posture: the
     // relay never derives or holds it.)
-    assert!(!raw_relayed.is_empty(), "expected to capture a relayed frame");
+    assert!(
+        !raw_relayed.is_empty(),
+        "expected to capture a relayed frame"
+    );
     let wrong_key = [0xFFu8; 32];
     let mut blind_verifier = StreamVerifier::new(wrong_key, topic.clone());
-    let blind = hyprstream_rpc::moq_stream::verify_moq_frame(&mut blind_verifier, &topic, &raw_relayed);
+    let blind =
+        hyprstream_rpc::moq_stream::verify_moq_frame(&mut blind_verifier, &topic, &raw_relayed);
     assert!(
         blind.is_err(),
         "relay-forwarded bytes must NOT verify without the source key (relay-blind); \
@@ -264,6 +299,8 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     let iroh_node_id = [0x11u8; 32];
     let direct_addr: std::net::SocketAddr = "203.0.113.7:443".parse()?; // TEST-NET-3, unreachable
     let server_cfg = ProducerReachConfig {
+        moql_server_identity: None,
+        relay_moql_server_identity: None,
         iroh_node_id: Some(iroh_node_id),
         quic_reach: Some(NodeStreamReach {
             addr: direct_addr,
@@ -291,12 +328,26 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
         )),
         "the iroh-direct reach must be built from ProducerReachConfig.iroh_node_id: {default_reach:?}"
     );
-    let only_reach = server_cfg.reach_with_relay(RelayChoice::Only(relay_reach.clone()));
+    let only_reach = server_cfg.reach_with_relay(RelayChoice::Only(RelayTarget::new(
+        relay_reach.clone(),
+        hyprstream_rpc::stream_info::MoqlServerIdentity {
+            did: "did:at9p:test-relay".to_owned(),
+            epoch: 1,
+            head_digest: vec![0x42; 64],
+            expires_at_unix_ms: hyprstream_rpc::envelope::current_timestamp() + 60_000,
+            ed25519: [0x42; 32],
+            ml_dsa65: vec![0x42; 1952],
+        },
+    )));
     assert!(
         only_reach.iter().all(|d| d.role == Role::Relay),
         "RelayChoice::Only must omit ALL direct reaches (anonymized): {only_reach:?}"
     );
-    assert_eq!(only_reach.len(), 1, "Only advertises exactly the one relay reach");
+    assert_eq!(
+        only_reach.len(),
+        1,
+        "Only advertises exactly the one relay reach"
+    );
     assert!(
         only_reach[0].transport == relay_reach,
         "the sole advertised reach is the relay"
@@ -329,7 +380,7 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     let link_relay = relay_reach.clone();
     let link_producer = producer_origin.producer().clone();
     let link_task = tokio::spawn(async move {
-        let _ = run_relay_announce_link(&link_producer, &link_relay).await;
+        let _ = run_relay_announce_link(&link_producer, &link_relay, None, None).await;
     });
     // Wait for the announce link to propagate the producer's broadcast UP to the
     // relay before the subscriber dials, instead of a fixed sleep that can flake
@@ -364,8 +415,10 @@ async fn relay_choice_only_anonymizes_stream_end_to_end() -> Result<()> {
     // so the verifier must open it with the SAME key — otherwise `Tagged` frames pass
     // through undecrypted and never become `Data`/`Complete`. Mirrors the production
     // consumers (stream_consumer.rs + moq_stream.rs all call `.with_enc_key`).
-    let mut verifier = StreamVerifier::new(mac_key, topic.clone())
-        .with_enc_key(*ctx.enc_key().expect("interop DH ctx derives the AEAD enc_key (#321)"));
+    let mut verifier = StreamVerifier::new(mac_key, topic.clone()).with_enc_key(
+        *ctx.enc_key()
+            .expect("interop DH ctx derives the AEAD enc_key (#321)"),
+    );
     // Publish FIRST, then read the group (the moq group exists once published) —
     // matches the `next_frame` ordering in `moq_relay_rendezvous`.
     publisher.publish_data(b"anon").await?;

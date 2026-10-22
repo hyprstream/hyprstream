@@ -735,7 +735,10 @@ fn parse_metadata(path: &Path) -> Option<(String, usize, BTreeMap<String, usize>
                 .into_iter()
                 .flatten()
             {
-                if matches!(ann.get("name").and_then(|n| n.as_str()), Some("scope") | Some("capability")) {
+                if matches!(
+                    ann.get("name").and_then(|n| n.as_str()),
+                    Some("scope") | Some("capability")
+                ) {
                     methods += 1;
                     let scope = ann
                         .get("value")

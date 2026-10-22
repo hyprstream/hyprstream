@@ -24,34 +24,23 @@
 //!           └── Executes steps via VFS `/bin/` ctl calls + TclShell
 //! ```
 
-mod service;
-mod client;
-mod parser;
-mod triggers;
-mod subscription;
-mod runner;
-pub mod scheduler;
 pub mod adapter;
 pub mod gh_adapter;
+mod parser;
+mod runner;
+pub mod scheduler;
+mod service;
+mod subscription;
+mod triggers;
 
-pub use service::WorkflowService;
-pub use parser::{Workflow, Job, JobResources, Step};
-pub use triggers::{EventTrigger, EventHandler, HandlerResult};
-pub use subscription::WorkflowSubscription;
-pub use runner::WorkflowRunner;
-pub use scheduler::{JobScheduler, Placement};
 pub use adapter::SubscriberAdapter;
 pub use gh_adapter::GitHubActionsAdapter;
-
-// Re-export generated wire-format types for external consumers
-pub use client::{
-    GenWorkflowClient,
-    WorkflowDef, WorkflowInfo, WorkflowRun,
-    JobRun, StepRun, RunStatus,
-    KeyValue as WorkflowKeyValue,
-    EventTrigger as EventTriggerWire,
-    WorkflowResponseVariant,
-};
+pub use parser::{Job, JobResources, ParseMode, Step, Workflow};
+pub use runner::WorkflowRunner;
+pub use scheduler::{JobScheduler, Placement};
+pub use service::WorkflowService;
+pub use subscription::WorkflowSubscription;
+pub use triggers::{EventHandler, EventTrigger, HandlerResult};
 
 /// Workflow ID
 pub type WorkflowId = String;

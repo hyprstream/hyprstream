@@ -294,6 +294,11 @@ services:
   # --- Control plane -------------------------------------------------------
   policy:
     enabled: true
+    # replicas MUST stay 1 (the chart-wide default): the policy pod is the
+    # single-writer credential-revocation authority over one canonical durable
+    # store. Two policy pods on a shared PVC would hold divergent in-memory
+    # indexes over one append file. Only raise this once the shared
+    # Valkey/Redis revocation substrate lands.
     kind: rpc              # QUIC/RPC (informational)
     ports:
       - name: quic

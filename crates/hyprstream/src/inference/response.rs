@@ -126,8 +126,14 @@ mod tests {
         let mut handle = StreamHandle::new(chunk_rx, stats_rx);
 
         // Send some chunks
-        chunk_tx.send(Ok("Hello".to_owned())).await.expect("test: send chunk");
-        chunk_tx.send(Ok(" World".to_owned())).await.expect("test: send chunk");
+        chunk_tx
+            .send(Ok("Hello".to_owned()))
+            .await
+            .expect("test: send chunk");
+        chunk_tx
+            .send(Ok(" World".to_owned()))
+            .await
+            .expect("test: send chunk");
         drop(chunk_tx); // Close channel
 
         // Receive chunks

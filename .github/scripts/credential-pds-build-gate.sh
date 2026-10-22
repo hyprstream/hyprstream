@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prove that the former production release command fails closed when the
-# credential-pds feature is absent. At PR #1414's reviewed head (670715389),
+# encrypted-account-admission marker is absent. At PR #1414's reviewed head (670715389),
 # this command exited zero after silently skipping the hyprstream binary.
 set -euo pipefail
 
@@ -35,12 +35,12 @@ build_status=${PIPESTATUS[0]}
 set -e
 
 if [[ "${build_status}" -eq 0 ]]; then
-  echo "credential-pds gate: feature-less release build unexpectedly succeeded" >&2
+  echo "credential-pds gate: admission-policy-less release build unexpectedly succeeded" >&2
   exit 1
 fi
 
-if ! grep -Fq 'every Hyprstream build requires the `credential-pds` feature' "${gate_log}"; then
-  echo "credential-pds gate: build failed without the provenance diagnostic" >&2
+if ! grep -Fq 'every Hyprstream build requires the `encrypted-account-admission`' "${gate_log}"; then
+  echo "credential-pds gate: build failed without the admission-policy diagnostic" >&2
   exit 1
 fi
 

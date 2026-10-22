@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use super::{
-    ProcessBackend, ProcessConfig, SpawnedProcess, SpawnerBackend, StandaloneBackend, SystemdBackend,
+    ProcessBackend, ProcessConfig, SpawnedProcess, SpawnerBackend, StandaloneBackend,
+    SystemdBackend,
 };
 use hyprstream_rpc::error::Result;
 
@@ -75,7 +76,9 @@ impl ProcessSpawner {
                         backend_type: ProcessBackend::Systemd { user_mode },
                     }
                 } else {
-                    tracing::warn!("Systemd requested but not available, falling back to standalone");
+                    tracing::warn!(
+                        "Systemd requested but not available, falling back to standalone"
+                    );
                     Self {
                         backend: Arc::new(StandaloneBackend::new()),
                         backend_type: ProcessBackend::Standalone,
@@ -142,6 +145,15 @@ impl ProcessSpawner {
     /// `true` if the process is still running.
     pub async fn is_running(&self, process: &SpawnedProcess) -> Result<bool> {
         self.backend.is_running(process).await
+    }
+
+    /// Synchronous bounded stop of a TRACKED direct child, used only by the
+    /// launch-transaction guard's `Drop` for cancellation cleanup where no
+    /// async runtime work is guaranteed (#1585). Delegates to the backend,
+    /// which stops through its retained child handle — never a blind by-PID
+    /// signal; unsupported backends fail honestly.
+    pub fn stop_tracked_child_sync(&self, process: &SpawnedProcess) -> Result<()> {
+        self.backend.stop_tracked_child_sync(process)
     }
 }
 

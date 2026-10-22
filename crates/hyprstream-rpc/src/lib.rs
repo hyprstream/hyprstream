@@ -44,49 +44,127 @@
 // Cap'n Proto generated modules
 pub mod common_capnp {
     #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::all,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::match_same_arms
+    )]
+    #![allow(
+        clippy::semicolon_if_nothing_returned,
+        clippy::doc_markdown,
+        clippy::indexing_slicing
+    )]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/common_capnp.rs"));
 }
 
 pub mod events_capnp {
     #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::all,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::match_same_arms
+    )]
+    #![allow(
+        clippy::semicolon_if_nothing_returned,
+        clippy::doc_markdown,
+        clippy::indexing_slicing
+    )]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/events_capnp.rs"));
 }
 
 pub mod nine_capnp {
     #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::all,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::match_same_arms
+    )]
+    #![allow(
+        clippy::semicolon_if_nothing_returned,
+        clippy::doc_markdown,
+        clippy::indexing_slicing
+    )]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/nine_capnp.rs"));
 }
 
 pub mod streaming_capnp {
     #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::all,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::match_same_arms
+    )]
+    #![allow(
+        clippy::semicolon_if_nothing_returned,
+        clippy::doc_markdown,
+        clippy::indexing_slicing
+    )]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/streaming_capnp.rs"));
 }
 
 pub mod annotations_capnp {
     #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::all,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::match_same_arms
+    )]
+    #![allow(
+        clippy::semicolon_if_nothing_returned,
+        clippy::doc_markdown,
+        clippy::indexing_slicing
+    )]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/annotations_capnp.rs"));
 }
 
 pub mod optional_capnp {
     #![allow(dead_code, unused_imports)]
-    #![allow(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::match_same_arms)]
-    #![allow(clippy::semicolon_if_nothing_returned, clippy::doc_markdown, clippy::indexing_slicing)]
-    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #![allow(
+        clippy::all,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::match_same_arms
+    )]
+    #![allow(
+        clippy::semicolon_if_nothing_returned,
+        clippy::doc_markdown,
+        clippy::indexing_slicing
+    )]
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     include!(concat!(env!("OUT_DIR"), "/optional_capnp.rs"));
 }
 
@@ -113,16 +191,23 @@ pub mod streaming_types {
     hyprstream_rpc_derive::generate_rpc_service!("streaming");
 }
 
+pub mod authorization_witness;
 pub mod capnp;
 pub mod cid;
 pub mod crypto;
 pub mod envelope;
 pub mod error;
 pub mod platform;
+pub mod proof;
 pub mod rpc_client;
-pub mod stream_info;
+pub mod sensitive;
 pub mod stream_epoch;
+pub mod stream_info;
 pub mod zmtp_framing;
+// #324/N1 intentionally stops at a crate-internal data contract. The allow is
+// removed when the first reassembly/transport consumer lands.
+#[allow(dead_code)]
+pub(crate) mod activation_envelope;
 
 // ============================================================================
 // Cross-platform modules (available on all targets including wasm32)
@@ -151,13 +236,27 @@ mod _metadata;
 
 // ============================================================================
 // Transport traits (available on ALL targets)
-pub mod transport_traits;
 pub mod stream_consumer;
+pub mod transport_traits;
 
 // Native-only modules (not compiled for wasm32)
 // ============================================================================
 
 pub mod auth;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dial;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod event_subject;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod events;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod latch;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod moq_authz;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod moq_event;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod moq_stream;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod registry;
 #[cfg(not(target_arch = "wasm32"))]
@@ -165,27 +264,13 @@ pub mod resolver;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod service;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod streaming;
+pub mod service_entry;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stream_provenance;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod moq_stream;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod moq_authz;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod moq_event;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod events;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod latch;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod event_subject;
+pub mod streaming;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod dial;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod service_entry;
 // Shared `did:key` (Ed25519) codec — now the single canonical home in the light
 // `hyprstream-crypto` crate (#916). Re-exported so existing `crate::did_key::…`
 // and external `hyprstream_rpc::did_key::…` paths keep compiling unchanged; the
@@ -201,9 +286,15 @@ pub mod did_plc;
 // Pure DID URL parser + inert dereference plan (#906, at9p epic #880 G1).
 // Available on every target and intentionally independent of DID resolution,
 // transport decoding, dial targets, admission, and carrier possession.
-pub mod did_url;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admission;
+pub mod did_url;
+// Additive, session-scoped PQ binding overlay: trust-on-first-use continuity
+// for dynamically-identified clients, with out-of-band promotion. Consulted by
+// the envelope verify path after the admin-anchored store misses; never mutates
+// that store.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod session_pq_overlay;
 // The real, method-dispatched `IdentityResolver` (#579). Native-only: the
 // did:web arm depends on `did_web`'s DID-document helpers.
 #[cfg(not(target_arch = "wasm32"))]
@@ -226,9 +317,9 @@ pub mod web_transport;
 // #409 Path A: browser counterpart to native `dial`. Compiles only on wasm32;
 // see `dial_wasm.rs` for why this is a separate module rather than an arm in
 // native `dial()` (which is itself `#[cfg(not(target_arch = "wasm32"))]`).
+pub mod browser_provisioning;
 #[cfg(target_arch = "wasm32")]
 pub mod dial_wasm;
-pub mod browser_provisioning;
 /// Browser-side RFC 8693 token-exchange (#1314) for the wasm client. Pure
 /// parsing helpers compile on all targets (unit-tested on native); the browser
 /// `fetch` glue is `wasm32`-only.
@@ -243,30 +334,31 @@ pub mod iroh_peer;
 // ============================================================================
 
 pub use capnp::{serialize_message, FromCapnp, ToCapnp};
-pub use rpc_client::{CallOptions, PreSealGuard, RequestBuilder, RpcClient, RpcClientImpl};
+pub use rpc_client::{
+    CallOptions, PreSealGuard, RequestBuilder, RpcClient, RpcClientImpl, RpcClientProvider,
+};
 pub use transport_traits::{PublishSink, Signer, Transport};
-pub mod identity;
-pub mod node_identity;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod federated_identity;
+pub mod identity;
+pub mod node_identity;
 pub mod signer;
-pub use stream_info::StreamInfo;
 pub use crypto::{
-    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
-    DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
+    generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes, DefaultKeyExchange,
+    KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
 };
+pub use stream_info::StreamInfo;
 
 #[cfg(not(feature = "fips"))]
 pub use crypto::{generate_ephemeral_keypair, ristretto_dh, RistrettoPublic, RistrettoSecret};
 
-pub use envelope::{
-    unwrap_and_verify,
-    Authorization, EnvelopeVerification, FederatedToken, InMemoryNonceCache, KeyedPqTrustStore,
-    NonceCache, PqTrustStore, RequestEnvelope, ResponseEnvelope, SignedEnvelope, Subject,
-    TokenClaims, UnwrapOptions, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
-};
 #[cfg(not(target_arch = "wasm32"))]
 pub use envelope::unwrap_envelope;
+pub use envelope::{
+    unwrap_and_verify, Authorization, EnvelopeVerification, FederatedToken, InMemoryNonceCache,
+    KeyedPqTrustStore, NonceCache, PqTrustStore, RequestEnvelope, ResponseEnvelope, SignedEnvelope,
+    Subject, TokenClaims, UnwrapOptions, MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
+};
 pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 
 // ============================================================================
@@ -277,9 +369,7 @@ pub use error::{EnvelopeError, EnvelopeResult, Result, RpcError};
 pub use hyprstream_rpc_derive::{authorize, service_factory, FromCapnp, ToCapnp};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use resolver::{
-    NetworkDiscoveryResolver, Resolver, ResolverProfile, ServiceQuery,
-};
+pub use resolver::{NetworkDiscoveryResolver, Resolver, ResolverProfile, ServiceQuery};
 
 #[cfg(all(not(target_arch = "wasm32"), test))]
 pub use resolver::{
@@ -292,13 +382,12 @@ pub use resolver::{
 pub use registry::SocketKind;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use service::{Continuation, EnvelopeContext, Spawnable, ServiceHandle, RequestService};
+pub use service::{Continuation, EnvelopeContext, RequestService, ServiceHandle, Spawnable};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use streaming::{
-    ChannelProgressReporter, derive_client_stream_keys,
-    progress_channel, ProgressUpdate, ResponseStream, StreamChannel, StreamContext,
-    StreamPayload, StreamPayloadData, StreamVerifier,
+    derive_client_stream_keys, progress_channel, ChannelProgressReporter, ProgressUpdate,
+    ResponseStream, StreamChannel, StreamContext, StreamPayload, StreamPayloadData, StreamVerifier,
 };
 
 // ============================================================================
@@ -308,22 +397,45 @@ pub use streaming::{
 #[cfg(not(target_arch = "wasm32"))]
 pub mod prelude {
     pub use crate::{
-        // Serialization
-        serialize_message, FromCapnp, ToCapnp,
         // Crypto
-        generate_signing_keypair, signing_key_from_bytes, verifying_key_from_bytes,
-        DefaultKeyExchange, KeyExchange, SharedSecret, SigningKey, StreamHmacState, VerifyingKey,
+        generate_signing_keypair,
+        // Serialization
+        serialize_message,
+        signing_key_from_bytes,
+        unwrap_and_verify,
         // Envelope
-        unwrap_envelope, unwrap_and_verify, Authorization, EnvelopeVerification,
-        InMemoryNonceCache, NonceCache, RequestEnvelope, ResponseEnvelope,
-        SignedEnvelope, Subject, UnwrapOptions,
-        MAX_CLOCK_SKEW_MS, MAX_TIMESTAMP_AGE_MS,
-        // Error
-        EnvelopeError, EnvelopeResult, Result, RpcError,
+        unwrap_envelope,
+        verifying_key_from_bytes,
+        Authorization,
+        DefaultKeyExchange,
         // Service (transport)
-        EnvelopeContext, ServiceHandle, RequestService,
+        EnvelopeContext,
+        // Error
+        EnvelopeError,
+        EnvelopeResult,
+        EnvelopeVerification,
+        FromCapnp,
+        InMemoryNonceCache,
+        KeyExchange,
+        NonceCache,
+        RequestEnvelope,
+        RequestService,
+        ResponseEnvelope,
+        Result,
+        RpcError,
+        ServiceHandle,
+        SharedSecret,
+        SignedEnvelope,
+        SigningKey,
         // Streaming
         StreamContext,
+        StreamHmacState,
+        Subject,
+        ToCapnp,
+        UnwrapOptions,
+        VerifyingKey,
+        MAX_CLOCK_SKEW_MS,
+        MAX_TIMESTAMP_AGE_MS,
     };
 
     #[cfg(not(feature = "fips"))]

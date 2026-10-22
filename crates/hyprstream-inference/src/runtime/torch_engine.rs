@@ -1,0 +1,5318 @@
+//! PyTorch-based inference engine using tch-rs
+
+use crate::config::{FinishReason, GenerationConfig, GenerationResult, RuntimeConfig};
+use crate::runtime::architectures::ModelOperations;
+use crate::runtime::template_engine::{ChatMessage, TemplateEngine};
+use crate::runtime::tensor_sampling::TensorSampler;
+use crate::runtime::RuntimeEngine;
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
+use json_threat_protection as jtp;
+use parking_lot::Mutex;
+use serde_json;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::{
+    atomic::{AtomicU32, AtomicUsize, Ordering},
+    Arc,
+};
+use tch::{nn::VarStore, Device, Tensor};
+use tokenizers::Tokenizer;
+use tracing::{info, instrument, warn};
+
+/// Resolve the compute dtype independently from checkpoint weight storage.
+/// This pure policy accepts the documented case-insensitive precision aliases;
+/// it performs no device allocation. `fp8` retains legacy BF16 compute except
+/// for qualified channel-FP8 CPU checkpoints, whose activation QDQ/matmuls run
+/// in Float32. It never requests hardware Float8 activations on CPU.
+/// Serving adapters must still enforce their own qualified-device/dtype gate.
+pub fn resolve_inference_compute_kind(
+    precision_mode: Option<&str>,
+    device: Device,
+    channel_fp8: bool,
+) -> Result<tch::Kind> {
+    match precision_mode
+        .unwrap_or("auto")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "fp32" | "float32" => Ok(tch::Kind::Float),
+        "fp16" | "float16" => Ok(tch::Kind::Half),
+        "auto" | "fp8" if device == Device::Cpu && channel_fp8 => Ok(tch::Kind::Float),
+        "bf16" | "bfloat16" | "auto" | "fp8" => Ok(tch::Kind::BFloat16),
+        mode => anyhow::bail!("unsupported inference precision mode: {mode}"),
+    }
+}
+
+/// Build a self-explaining diagnostic for why CUDA/ROCm is unavailable.
+///
+/// `tch::Cuda::is_available()` returns a bare `false` with no cause, which made
+/// the GPU→CPU fallback nearly impossible to diagnose in the field (e.g. an RTX
+/// 5090 node with a CUDA libtorch bundled that still logged a one-line "not
+/// available"). This collects the underlying signals so the operator can tell
+/// *why*:
+///
+/// - `has_cuda` / `has_cudart`: was this libtorch even compiled with CUDA? If
+///   `false`, an install/active-backend mismatch bundled a CPU build.
+/// - `device_count`: 0 with a CUDA build almost always means the driver lib
+///   (`libcuda.so.1`, shipped by the host NVIDIA driver — *never* by the
+///   AppImage) could not be loaded, i.e. `LD_LIBRARY_PATH` does not reach the
+///   host driver path. A negative count is a CUDA-internal error.
+/// - The current `LD_LIBRARY_PATH` is echoed so the operator can immediately
+///   see whether the host driver path is missing.
+fn cuda_unavailable_diagnostics() -> String {
+    let has_cuda = tch::utils::has_cuda();
+    let has_cudart = tch::utils::has_cudart();
+    let has_hip = tch::utils::has_hip();
+    let device_count = tch::Cuda::device_count();
+    let ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "<unset>".to_owned());
+
+    // Best-effort, actionable interpretation of the signals above.
+    let hint = if !has_cuda && !has_hip {
+        "this libtorch was NOT built with CUDA/ROCm support (CPU-only build). \
+         Check the installed/active backend — an install likely selected a 'cpu' \
+         variant (verify ~/.local/share/hyprstream/active-backend / active-version)."
+    } else if device_count <= 0 {
+        "libtorch has CUDA/ROCm support but reports 0 devices. This is almost \
+         always the host driver library (libcuda.so.1) failing to load: it ships \
+         with the NVIDIA driver and is never bundled in the AppImage. Ensure the \
+         host driver lib dir is on LD_LIBRARY_PATH (e.g. /usr/lib64, \
+         /usr/lib/x86_64-linux-gnu, or the libcuda.so.1 location from \
+         `ldconfig -p | grep libcuda`), or that ldconfig has it cached."
+    } else {
+        "CUDA/ROCm reports devices but is_available() is false — possible \
+         driver/runtime version mismatch or a CUDA-internal init error."
+    };
+
+    format!(
+        "is_available()=false; has_cuda={has_cuda}, has_cudart={has_cudart}, \
+         has_hip={has_hip}, device_count={device_count}, \
+         LD_LIBRARY_PATH={ld_path}. Likely cause: {hint}"
+    )
+}
+
+/// Basic context state for tracking generation state
+#[derive(Debug, Clone)]
+pub struct ContextState {
+    /// Current sequence length
+    pub sequence_length: usize,
+    /// Context window size
+    pub context_window: usize,
+    /// Whether model is initialized
+    pub initialized: bool,
+}
+
+/// PyTorch inference engine using tch-rs
+///
+/// Thread-safe implementation using proper synchronization primitives.
+/// All mutable state is protected by mutexes with poisoning recovery.
+#[derive(Clone)]
+pub struct TorchEngine {
+    /// VarStore for native PyTorch weight management - not thread safe, requires external sync
+    var_store: Arc<Mutex<Option<VarStore>>>,
+    /// SafeTensors raw data for on-demand tensor creation - thread safe after initialization
+    /// Detected model architecture - thread safe after initialization
+    model_architecture: Arc<Mutex<Option<String>>>,
+    /// Persistent model instance to avoid recreation on every forward pass
+    /// Using Arc<Mutex<>> for interior mutability since ModelOperations has mutable methods
+    persistent_model: Option<Arc<Mutex<Box<dyn ModelOperations>>>>,
+    /// Basic KV cache storage for context tracking - thread safe with mutex
+    context_state: Arc<Mutex<Option<ContextState>>>,
+    /// Tokenizer for text processing - thread safe after initialization
+    tokenizer: Arc<Mutex<Option<Tokenizer>>>,
+    /// Template engine for chat formatting
+    template_engine: Arc<Mutex<Option<TemplateEngine>>>,
+    /// Device for computation (CPU/CUDA/ROCm) - immutable after construction.
+    ///
+    /// For a multi-device engine this is the pool's **primary** (first) device —
+    /// the home of non-layer weights (embeddings, final norm, lm_head) and the
+    /// device inputs are placed on before the first decoder layer. Per-layer
+    /// placement is driven by the model's own `LayerDeviceMap` (`forward_layers`).
+    device: Device,
+    /// Resolved multi-device pool, when the engine was built from >1 device
+    /// (#314 wiring). `None` for single-device engines (the common case). When
+    /// `Some` and non-single, the loaded model is built as a single pipeline
+    /// stage spanning `[0..num_hidden_layers)` with a layer→device map derived
+    /// from this pool. Held as `Option<Arc<...>>` because `TorchEngine` is
+    /// `Clone` and the pool is `Send + Sync` (it holds only `Device` values).
+    device_pool: Option<Arc<crate::runtime::DevicePool>>,
+    /// Runtime configuration - immutable after construction
+    config: RuntimeConfig,
+    /// Generation configuration with defaults
+    generation_config: GenerationConfig,
+    /// Loaded model information - protected by mutex
+    model_info: Arc<Mutex<ModelInfo>>,
+    /// Active LoRA adapter name - thread safe with mutex
+    pub active_lora: Arc<Mutex<Option<String>>>,
+    /// GPU sampler for efficient token sampling - thread safe after initialization
+    sampler: TensorSampler, // Renamed from gpu_sampler - works on both CPU and GPU
+    /// Cached tokenizer vocabulary size for lock-free access
+    /// 0 means not yet initialized
+    tokenizer_vocab_size: Arc<AtomicUsize>,
+    /// Cached EOS token ID for lock-free access
+    /// 0 means not yet initialized (actual EOS tokens are typically > 0)
+    eos_token_id: Arc<AtomicU32>,
+    /// KV cache registry for session-based cache isolation
+    /// Enables concurrent inference across multiple sessions
+    kv_cache_registry: Option<Arc<crate::runtime::kv_cache::KVCacheRegistry>>,
+    /// Current active session owner for KV cache selection
+    /// If set, generation uses the corresponding cache from the registry
+    active_cache_owner: Arc<Mutex<Option<crate::runtime::kv_cache::CacheOwner>>>,
+    /// KV-cache compatibility descriptor for the loaded model (#1277). The
+    /// authoritative identity every reusable/durable KV lookup is checked
+    /// against; `None` until a model is loaded. Built from the model config +
+    /// runtime config at load time, finalized with the tokenizer identity.
+    kv_compat: Arc<Mutex<Option<crate::runtime::kv_compat::KvCompatDescriptor>>>,
+    // Note: XET/LFS handled by git-xet-filter + ModelFactory::load_file_with_pointer_detection()
+    // Note: Pre-training not supported (persistent_model doesn't expose VarStore), LoRA only
+}
+
+/// Tokenize `text` with `tokenizer`, writing no caller content to the process
+/// log.
+///
+/// Token-burn counts (prompt token count) are now emitted as OTel metrics at the
+/// call site (`TextStream::new_with_delta`), not as log lines (#1261) — the log
+/// is no longer the metering source. This helper logs only on the two
+/// content-free diagnostic outcomes: an empty token sequence (failure) and a
+/// tokenize/decode roundtrip mismatch (a real tokenizer-bug signal), in both
+/// cases carrying only bounded lengths, never the text.
+///
+/// #1253: the prompt and its decoded token text are tenant-private and must
+/// never reach process-wide logs — a shared inference process exposes them
+/// outside the caller's request boundary. This helper is split out from
+/// [`TorchEngine::tokenize`] so its no-leak behavior is unit-testable without
+/// a full engine/model.
+fn tokenize_redacted(tokenizer: &Tokenizer, text: &str) -> Result<Vec<i64>> {
+    let bytes = text.len();
+    let chars = text.chars().count();
+
+    let encoding = tokenizer
+        .encode(text, false)
+        .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+    let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+
+    if token_ids.is_empty() {
+        tracing::warn!(bytes, chars, "Tokenization produced empty token sequence");
+        return Err(anyhow!(
+            "Tokenization produced empty token sequence ({} bytes, {} chars)",
+            bytes,
+            chars
+        ));
+    }
+
+    // Surface roundtrip mismatches for diagnosis, but never the original or
+    // decoded text — only that they diverged and the bounded lengths.
+    if let Ok(decoded) = tokenizer.decode(
+        &token_ids.iter().map(|&id| id as u32).collect::<Vec<_>>(),
+        false,
+    ) {
+        if decoded != text {
+            tracing::warn!(
+                bytes,
+                chars,
+                tokens = token_ids.len(),
+                decoded_bytes = decoded.len(),
+                "Tokenization roundtrip mismatch (content redacted)"
+            );
+        }
+    }
+
+    Ok(token_ids)
+}
+
+/// Helper functions for tensor operations
+impl TorchEngine {
+    /// Set the random seed for deterministic generation
+    /// Useful for debugging - enables reproducible token sequences
+    pub fn set_seed(&self, seed: u64) {
+        TensorSampler::set_seed(seed);
+    }
+
+    /// Get cached vocabulary size without locking
+    pub fn get_vocab_size(&self) -> usize {
+        let size = self.tokenizer_vocab_size.load(Ordering::Relaxed);
+        if size > 0 {
+            size
+        } else {
+            // Fallback: try to get from tokenizer (shouldn't happen after load_tokenizer)
+            self.tokenizer
+                .lock()
+                .as_ref()
+                .map(|t| t.get_vocab_size(true))
+                .unwrap_or(0) // Return 0 if tokenizer not loaded (caller should error)
+        }
+    }
+
+    /// Get the device this engine is using for computation
+    pub fn device(&self) -> Device {
+        self.device
+    }
+
+    /// The resolved multi-device pool, if this engine was built with >1 device.
+    ///
+    /// Returns `None` for single-device engines (the common case, including the
+    /// legacy single-`gpu_device_id` path and CPU). When `Some` and non-single,
+    /// the loaded model is built as a single pipeline stage with a layer→device
+    /// map derived from this pool (#314 wiring). The pool's primary equals
+    /// [`Self::device`].
+    #[must_use]
+    pub fn device_pool(&self) -> Option<&crate::runtime::DevicePool> {
+        self.device_pool.as_deref()
+    }
+
+    /// Whether this engine is configured to build a multi-device pipeline.
+    ///
+    /// True exactly when [`Self::device_pool`] is `Some` and holds >1 device.
+    /// The model is constructed with `LayerDeviceMap::even_split` across the
+    /// pool; single-device engines return `false` and build the whole model on
+    /// [`Self::device`].
+    #[must_use]
+    pub fn is_multi_device(&self) -> bool {
+        self.device_pool.as_deref().is_some_and(|p| !p.is_single())
+    }
+
+    // ============================================================================
+    // Session-Based KV Cache Management
+    // ============================================================================
+
+    /// Initialize the KV cache registry for session-based cache isolation.
+    ///
+    /// This should be called after loading a model when the configuration is known.
+    /// The registry will manage separate KV caches for different sessions/requests.
+    pub fn initialize_kv_registry(
+        &mut self,
+        num_layers: usize,
+        max_seq_len: usize,
+        quant_type: hyprstream_rpc_std::model_client::KVQuantType,
+        memory_budget: Option<usize>,
+    ) {
+        let config = crate::runtime::kv_cache::CacheConfig::new(num_layers, max_seq_len)
+            .with_quant_type(quant_type);
+
+        let registry = crate::runtime::kv_cache::KVCacheRegistry::new(config, memory_budget);
+        self.kv_cache_registry = Some(Arc::new(registry));
+
+        tracing::info!(
+            "[TorchEngine] Initialized KV cache registry: {} layers, max_seq_len={}, budget={:?}",
+            num_layers,
+            max_seq_len,
+            memory_budget
+        );
+    }
+
+    /// Expected KV-cache compatibility fingerprint for the loaded model under the
+    /// given adapter/delta generation, or `None` when no authoritative identity is
+    /// available.
+    ///
+    /// The effective identity folds in the base-weight content digest, the full
+    /// effective architecture/runtime config, and the live `adapter_generation`
+    /// actually applied to the request. Returns `None` when no descriptor was
+    /// built (the base-weight digest could not be computed) or when the descriptor
+    /// is not yet authoritatively complete (tokenizer identity not yet folded in,
+    /// or tokenizer hashing failed). The session-reuse path treats `None` as
+    /// **fail-closed**: it discards a cache rather than reusing it under a
+    /// missing or uncertain identity — it never treats absence as "no gating".
+    pub fn kv_compat_fingerprint_for(
+        &self,
+        adapter_generation: u64,
+    ) -> Option<crate::runtime::kv_compat::KvCompatFingerprint> {
+        let guard = self.kv_compat.lock();
+        let desc = guard.as_ref()?;
+        if !desc.is_authoritatively_complete() {
+            return None;
+        }
+        let mut effective = desc.clone();
+        effective.weights.adapter_generation = adapter_generation;
+        Some(crate::runtime::kv_compat::KvCompatFingerprint::of(
+            &effective,
+        ))
+    }
+
+    /// Compute a KV cache memory budget based on model size and available GPU memory.
+    ///
+    /// Uses `HYPRSTREAM_KV_BUDGET_MB` env var if set, otherwise estimates:
+    /// GPU total (from common card sizes) minus model weights, times 0.7.
+    /// Returns None on CPU (no budget needed).
+    pub fn compute_kv_budget(&self) -> Option<usize> {
+        if self.device == Device::Cpu {
+            return None;
+        }
+
+        // Check for explicit override
+        if let Ok(mb_str) = std::env::var("HYPRSTREAM_KV_BUDGET_MB") {
+            if let Ok(mb) = mb_str.parse::<usize>() {
+                tracing::info!("KV cache budget from HYPRSTREAM_KV_BUDGET_MB: {} MB", mb);
+                return Some(mb * 1024 * 1024);
+            }
+        }
+
+        let model_bytes = self.model_memory_usage();
+
+        // Estimate total GPU memory from common card sizes.
+        // Without cudaMemGetInfo FFI, we use a conservative heuristic:
+        // assume the GPU has enough memory to hold the model + some headroom.
+        // We estimate total VRAM as model_bytes * 1.75 (model is typically ~55-60% of VRAM).
+        // This is conservative — on larger GPUs it underestimates, leaving more headroom.
+        let estimated_total = model_bytes * 7 / 4; // 1.75x model size
+        let remaining = estimated_total.saturating_sub(model_bytes);
+        let budget = remaining * 7 / 10; // 70% of remaining
+
+        tracing::info!(
+            "KV cache budget: {} MB (estimated from {} MB model weights, ~{} MB total VRAM)",
+            budget / (1024 * 1024),
+            model_bytes / (1024 * 1024),
+            estimated_total / (1024 * 1024),
+        );
+
+        Some(budget)
+    }
+
+    /// Get the KV cache registry (for external access)
+    pub fn kv_registry(&self) -> Option<Arc<crate::runtime::kv_cache::KVCacheRegistry>> {
+        self.kv_cache_registry.clone()
+    }
+
+    /// Set the active session for generation.
+    ///
+    /// This sets which KV cache will be used for the next generation call.
+    /// Use `CacheOwner::Session(session_id)` for conversational sessions that
+    /// should preserve context across multiple requests.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // For a conversational session (preserves context)
+    /// engine.set_session(CacheOwner::Session("conversation-123".into()));
+    ///
+    /// // For a stateless request (cache discarded after)
+    /// engine.set_session(CacheOwner::new_stateless());
+    /// ```
+    pub fn set_session(&self, owner: crate::runtime::kv_cache::CacheOwner) -> Result<()> {
+        if self.kv_cache_registry.is_none() {
+            return Err(anyhow!(
+                "KV cache registry not initialized. Call initialize_kv_registry first."
+            ));
+        }
+
+        let mut active_owner = self.active_cache_owner.lock();
+
+        tracing::debug!("Setting active session to: {:?}", owner);
+        *active_owner = Some(owner);
+
+        Ok(())
+    }
+
+    /// Get the current active session owner
+    pub fn get_session(&self) -> Option<crate::runtime::kv_cache::CacheOwner> {
+        self.active_cache_owner.lock().clone()
+    }
+
+    /// Clear the active session (subsequent generations will use the model's internal cache)
+    pub fn clear_session(&self) -> Result<()> {
+        let mut active_owner = self.active_cache_owner.lock();
+        *active_owner = None;
+        Ok(())
+    }
+
+    /// Release a session's KV cache (for cleanup after conversation ends)
+    pub fn release_session(&self, owner: &crate::runtime::kv_cache::CacheOwner) -> Result<()> {
+        if let Some(registry) = &self.kv_cache_registry {
+            registry.release(owner);
+            tracing::debug!("Released session cache: {:?}", owner);
+        }
+        Ok(())
+    }
+
+    /// Get total memory usage across all session caches
+    pub fn session_cache_memory_usage(&self) -> usize {
+        self.kv_cache_registry
+            .as_ref()
+            .map(|r| r.total_memory_usage())
+            .unwrap_or(0)
+    }
+
+    /// Get number of active session caches
+    pub fn active_session_count(&self) -> usize {
+        self.kv_cache_registry
+            .as_ref()
+            .map(|r| r.cache_count())
+            .unwrap_or(0)
+    }
+
+    /// Evict LRU session caches to stay within memory budget
+    pub fn evict_session_caches(&self) {
+        if let Some(registry) = &self.kv_cache_registry {
+            registry.evict_to_budget();
+        }
+    }
+
+    /// Swap the active session's KV cache into the model.
+    ///
+    /// If an active session owner is set and the registry is initialized,
+    /// retrieves (or creates) the session's cache from the registry and
+    /// installs it in the model via `set_kv_cache()`. Returns true if
+    /// a session cache was swapped in.
+    ///
+    /// `tenant_id` is the effective tenant whose delta contributed to this
+    /// request's weights (`None` when no tenant delta contributes), and
+    /// `weight_epoch` is that delta's current weight epoch (ignored when
+    /// `tenant_id` is `None`). The pair is registered against the owner cache
+    /// *before* the cache is installed in the model, so the cache is tracked
+    /// for invalidation (and cleared if its previously-computed KV is stale
+    /// w.r.t. a different tenant or an older weight epoch) before generation
+    /// can read a single token from it.
+    ///
+    /// **Atomicity invariant (F2):** the register→install sequence below is
+    /// *not* guarded by a lock spanning both operations. It is race-free today
+    /// because `InferenceService` runs on a single-threaded `current_thread`
+    /// Tokio runtime inside a `LocalSet`, and this function is await-free — no
+    /// other request task can interleave between `register_delta_dependency`
+    /// and `set_kv_cache`, so the pair executes atomically with respect to
+    /// other requests. If `InferenceService` ever moves to a multi-threaded
+    /// runtime (or an `.await` is introduced here), this invariant breaks and a
+    /// spanning lock or an epoch handshake would be required.
+    pub fn swap_session_cache(&self, tenant_id: Option<String>, weight_epoch: u64) -> bool {
+        let owner = match self.active_cache_owner.lock().clone() {
+            Some(o) => o,
+            None => return false,
+        };
+        let registry = match &self.kv_cache_registry {
+            Some(r) => r,
+            None => return false,
+        };
+        let model_arc = match &self.persistent_model {
+            Some(m) => m,
+            None => return false,
+        };
+
+        let session_cache = registry.get_or_create(owner.clone());
+        // Register the delta dependency BEFORE installing the cache. This both
+        // records the owner for tenant-delta invalidation and, if the effective
+        // tenant changed since this cache was last computed, clears the stale KV
+        // in place. Ordering matters: registration/staleness-clear precede
+        // set_kv_cache, so the model can never publish output from an untracked
+        // or weight-stale cache.
+        let cleared_stale = registry.register_delta_dependency(&owner, tenant_id, weight_epoch);
+        let mut model = model_arc.lock();
+        model.set_kv_cache(session_cache);
+        tracing::debug!(
+            "Swapped session KV cache into model (stale_cleared={})",
+            cleared_stale
+        );
+        true
+    }
+
+    /// Estimate model memory usage in bytes.
+    ///
+    /// Sums the byte sizes of all parameters in the VarStore.
+    pub fn model_memory_usage(&self) -> usize {
+        let vs_guard = self.var_store.lock();
+        {
+            if let Some(vs) = vs_guard.as_ref() {
+                return vs
+                    .variables()
+                    .values()
+                    .map(|t| {
+                        let numel = t.numel();
+                        let elem_size = match t.kind() {
+                            tch::Kind::Half | tch::Kind::BFloat16 => 2,
+                            tch::Kind::Double => 8,
+                            tch::Kind::Int8 | tch::Kind::Uint8 => 1,
+                            _ => 4, // Float and others
+                        };
+                        numel * elem_size
+                    })
+                    .sum();
+            }
+        }
+        0
+    }
+
+    /// Create new PyTorch engine
+    pub fn new(config: RuntimeConfig) -> Result<Self> {
+        Self::new_sync(config)
+    }
+
+    /// Create new PyTorch engine (async version)
+    pub async fn new_async(config: RuntimeConfig) -> Result<Self> {
+        Self::new_sync(config)
+    }
+
+    /// Internal sync constructor
+    fn new_sync(config: RuntimeConfig) -> Result<Self> {
+        // Multi-GPU foundation (#313/#314, epic #310): when devices are
+        // *explicitly* requested via `RuntimeConfig.devices` /
+        // `HYPRSTREAM_GPU_DEVICES`, resolve them through `DevicePool`, which
+        // validates them fail-fast (no silent CPU downgrade). When the pool
+        // holds >1 device the engine keeps the whole pool and threads it into
+        // model construction so the model is built as a single multi-device
+        // pipeline stage (layers spread via `LayerDeviceMap::even_split`,
+        // `forward_layers` performs the stage-boundary copies). Single-pool and
+        // legacy single-`gpu_device_id` paths are unchanged.
+        if config.use_gpu {
+            if let Some(indices) = config.resolve_explicit_multi_device_indices()? {
+                let pool = crate::runtime::DevicePool::from_cuda_indices(&indices)?;
+                let device = pool.primary();
+                if pool.is_single() {
+                    info!(
+                        "🚀 DevicePool resolved a single device {:?}; building single-device engine",
+                        device
+                    );
+                    return Self::with_device(config, device, None);
+                }
+                info!(
+                    "🚀 Multi-GPU DevicePool resolved {} device(s) {:?}; building a multi-device \
+                     pipeline (primary {:?} hosts embeddings/lm_head)",
+                    pool.len(),
+                    pool.devices(),
+                    device
+                );
+                return Self::with_device(config, device, Some(Arc::new(pool)));
+            }
+        }
+
+        // Determine device based on configuration
+        let device = if config.use_gpu {
+            // Use specified GPU device ID, or auto-detect
+            let gpu_device = if let Some(device_id) = config.gpu_device_id {
+                // A GPU was *explicitly* requested. Check if CUDA/ROCm is available.
+                if Device::cuda_if_available() != Device::Cpu {
+                    Device::Cuda(device_id)
+                } else if config.strict_device {
+                    // No-fragile-fallbacks (#315): a process told to use GPU N that
+                    // silently lands on CPU tanks the pipeline. Fail fast instead,
+                    // and surface the *actual* reason CUDA was unavailable so the
+                    // operator can fix it (driver lib / wrong backend / mismatch).
+                    let diag = cuda_unavailable_diagnostics();
+                    return Err(anyhow!(
+                        "GPU {device_id} explicitly requested but CUDA/ROCm is not available; \
+                         refusing to silently fall back to CPU (strict_device). \
+                         Set HYPRSTREAM_STRICT_DEVICE=0 to allow CPU fallback. \
+                         Diagnostics: {diag}"
+                    ));
+                } else {
+                    warn!(
+                        "⚠️  GPU {} requested but CUDA/ROCm not available, falling back to CPU. {}",
+                        device_id,
+                        cuda_unavailable_diagnostics()
+                    );
+                    Device::Cpu
+                }
+            } else {
+                // Pure auto-detect ("use a GPU if there is one"): CPU fallback is
+                // the intended behavior here even under strict_device, since no
+                // specific device was requested.
+                Device::cuda_if_available()
+            };
+
+            if gpu_device != Device::Cpu {
+                // Check if this is actually ROCm/HIP
+                let device_id = match gpu_device {
+                    Device::Cuda(id) => id,
+                    _ => 0,
+                };
+                if tch::utils::has_hip() {
+                    info!("🚀 Using ROCm/HIP GPU {} acceleration", device_id);
+                } else {
+                    info!("🚀 Using CUDA GPU {} acceleration", device_id);
+                }
+                gpu_device
+            } else {
+                // The live RTX 5090 / cuda130 node hit exactly this branch: a
+                // bare "not available" with no cause. Always surface *why* now
+                // (most commonly libcuda.so.1 missing from LD_LIBRARY_PATH).
+                warn!(
+                    "⚠️  GPU requested but not available, falling back to CPU. {}",
+                    cuda_unavailable_diagnostics()
+                );
+                Device::Cpu
+            }
+        } else {
+            info!("💻 Using CPU inference");
+            Device::Cpu
+        };
+
+        Self::with_device(config, device, None)
+    }
+
+    /// Construct an engine pinned to an already-resolved primary [`Device`].
+    ///
+    /// Pass `device_pool = Some(pool)` with a multi-device pool to build the
+    /// model as a single pipeline stage spanning the whole decoder stack with a
+    /// layer→device map (the #314 multi-device path). The engine's `device`
+    /// remains the pool's primary (first) device — the home of embeddings, final
+    /// norm, and lm_head, and where inputs land before the first layer.
+    /// `device_pool = None` (or a single-device pool) preserves the original
+    /// whole-model-on-one-device behavior.
+    fn with_device(
+        config: RuntimeConfig,
+        device: Device,
+        device_pool: Option<Arc<crate::runtime::DevicePool>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            var_store: Arc::new(Mutex::new(None)),
+            model_architecture: Arc::new(Mutex::new(None)),
+            persistent_model: None,
+            context_state: Arc::new(Mutex::new(None)),
+            tokenizer: Arc::new(Mutex::new(None)),
+            template_engine: Arc::new(Mutex::new(None)),
+            device,
+            device_pool,
+            config: config.clone(),
+            generation_config: GenerationConfig {
+                max_tokens: 2048,
+                temperature: 0.7,
+                top_p: 0.9,
+                top_k: Some(40),
+                repeat_penalty: 1.1,
+                stop_tokens: vec!["</s>".to_owned()],
+                seed: None,
+                stream: false,
+            },
+            model_info: Arc::new(Mutex::new(ModelInfo {
+                name: "unloaded".to_owned(),
+                architecture: "unknown".to_owned(),
+                parameters: Some(0),
+                context_length: 2048,
+                vocab_size: 32000,
+                hidden_size: 768,
+                ..Default::default()
+            })),
+            active_lora: Arc::new(Mutex::new(None)),
+            sampler: TensorSampler::new(device),
+            tokenizer_vocab_size: Arc::new(AtomicUsize::new(0)),
+            eos_token_id: Arc::new(AtomicU32::new(0)),
+            kv_cache_registry: None, // Initialized after model load when config is known
+            active_cache_owner: Arc::new(Mutex::new(None)),
+            kv_compat: Arc::new(Mutex::new(None)), // Built from model config at load time (#1277)
+        })
+    }
+
+    /// Load model from safetensors or torchscript
+    async fn load_model_file(&mut self, path: &Path) -> Result<()> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .ok_or_else(|| anyhow!("Invalid file extension"))?;
+
+        match ext {
+            "pt" | "pth" => {
+                return Err(anyhow!("TorchScript models (.pt/.pth) are no longer supported. Please use SafeTensors format (.safetensors) instead."));
+            }
+            "safetensors" => {
+                // Load SafeTensors model directly
+                info!("Loading weights: {}", path.display());
+                self.load_safetensors(path).await?;
+            }
+            _ => {
+                return Err(anyhow!("Unsupported model format: {}", ext));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load SafeTensors model using ModelFactory for unified weight loading
+    async fn load_safetensors(&mut self, path: &Path) -> Result<()> {
+        info!("Loading weights: {}", path.display());
+
+        // Get the model directory (parent of the safetensors file)
+        let model_dir = path.parent().unwrap_or(path);
+
+        // Use ModelFactory to load the model (handles all weight loading internally)
+        self.initialize_persistent_model(model_dir).await?;
+
+        // Extract model info from the loaded model
+        if let Some(model) = &self.persistent_model {
+            let _model_guard = model.lock();
+
+            // Get architecture info from the model
+            // For now, use a default since we don't have a method to query this
+            let architecture = "auto".to_owned();
+
+            // Update model info
+            {
+                let mut model_info_guard = self.model_info.lock();
+                model_info_guard.architecture = architecture.clone();
+            }
+
+            // Set architecture
+            {
+                let mut arch_guard = self.model_architecture.lock();
+                *arch_guard = Some(architecture.clone());
+            }
+        }
+
+        // Get context window from model info that was populated from config
+        let context_window = self.effective_context_limit()?;
+
+        // Initialize context state
+        {
+            let mut context_guard = self.context_state.lock();
+            *context_guard = Some(ContextState {
+                sequence_length: 0,
+                context_window,
+                initialized: true,
+            });
+        }
+
+        // Create dummy VarStore for backward compatibility
+        {
+            let vs = VarStore::new(self.device);
+            let mut var_store_guard = self.var_store.lock();
+            *var_store_guard = Some(vs);
+        }
+
+        info!("✅ SafeTensors model loaded via ModelFactory");
+        info!("🚀 Model initialized and ready for inference");
+        Ok(())
+    }
+
+    /// Get tensor from VarStore by name (for inference) - thread safe
+    pub fn get_tensor(&self, name: &str) -> Option<Tensor> {
+        let var_store_guard = self.var_store.lock();
+        let vs = var_store_guard.as_ref()?;
+        vs.variables().get(name).map(tch::Tensor::shallow_clone)
+    }
+
+    /// List all available tensor names in VarStore - thread safe
+    pub fn list_tensor_names(&self) -> Vec<String> {
+        let var_store_guard = self.var_store.lock();
+        if let Some(vs) = var_store_guard.as_ref() {
+            vs.variables().keys().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Check if model is loaded via VarStore - thread safe
+    pub fn has_varstore(&self) -> bool {
+        self.var_store.lock().is_some()
+    }
+
+    /// Authoritative content digest of the base weights actually loaded from
+    /// `model_path` — a canonical SHA-256 over the **loader-selected**
+    /// `.safetensors` shards' **resolved** bytes (shard count + length-prefixed
+    /// name + per-shard content digest), in sorted name order. This is the
+    /// base-weight identity for the KV-compat fingerprint (#1277): two snapshots
+    /// sharing a basename but differing in content diverge here, unlike a
+    /// path/label.
+    ///
+    /// The shard set comes from the **same selector the loader uses**
+    /// (`ModelFactory::find_shard_files_for_digest`, the digest-authoritative
+    /// variant of the loader's selector: `model.safetensors.index.json` →
+    /// `model.safetensors` → shard-name glob), so the digest covers EXACTLY the
+    /// shards the loader reads — an extra/unreferenced `.safetensors` in the
+    /// directory (stale shard, alt-precision copy) cannot shift the fingerprint
+    /// while the loaded weights are identical. Unlike the loader, the digest
+    /// REJECTS an ambiguous manifest-less multi-shard glob set regardless of
+    /// `HYPRSTREAM_STRICT_LOADER` — fingerprint authority is stricter than
+    /// loader permissiveness.
+    ///
+    /// The digest hashes the **resolved** bytes — the identical resolution path
+    /// the loader walks (`ModelFactory::resolve_weight_for_digest` transparently
+    /// resolves an un-smudged LFS/XET pointer to its object content), so it never
+    /// hashes a pointer stub in place of the real tensors. It is **fail-closed**:
+    /// any selection/read/resolve error, an empty selection, an
+    /// index-referenced shard that is missing, or an ambiguous manifest-less
+    /// multi-shard set propagates, so the caller declines to mint a descriptor
+    /// and KV reuse fails closed rather than hashing a partial shard set.
+    async fn weights_content_digest(model_path: &Path) -> Result<String> {
+        use crate::runtime::kv_compat;
+        use crate::runtime::model_factory::{ModelFactory, ResolvedWeight};
+
+        // Resolve the loader-selected shard set (the digest-authoritative
+        // variant of the loader's own selector).
+        let shards = ModelFactory::find_shard_files_for_digest(model_path)?;
+
+        // Fail closed on an empty or inconsistent selection: the loader would
+        // have nothing authoritative to load (or the index disagrees with the
+        // directory), so reuse must be declined rather than minted over a
+        // partial/ambiguous set.
+        if shards.is_empty() {
+            anyhow::bail!(
+                "no loader-selected .safetensors weight shards in {}",
+                model_path.display()
+            );
+        }
+        for shard in &shards {
+            if !shard.is_file() {
+                anyhow::bail!(
+                    "loader-selected shard {} is missing or not a regular file",
+                    shard.display()
+                );
+            }
+        }
+
+        let mut digested: Vec<(String, [u8; 32])> = Vec::with_capacity(shards.len());
+        for shard in &shards {
+            let name = shard
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_owned();
+            // Resolve transparently (LFS/XET pointer → object content), then
+            // hash the resolved bytes. Large ordinary shards stream; resolved
+            // pointers and small files hash their owned bytes.
+            let shard_digest = match ModelFactory::resolve_weight_for_digest(shard).await? {
+                ResolvedWeight::Owned(bytes) => kv_compat::shard_content_digest(&bytes),
+                ResolvedWeight::File(file) => Self::stream_file_digest(file)?,
+            };
+            digested.push((name, shard_digest));
+        }
+        Ok(kv_compat::base_weight_digest_from_shards(&digested))
+    }
+
+    /// SHA-256 of a file's bytes, streamed in 64 KiB chunks so a multi-GB shard
+    /// is never fully buffered into memory just to hash it. Returns the resolved
+    /// read error (fail-closed) rather than a partial digest.
+    fn stream_file_digest(file: std::fs::File) -> std::result::Result<[u8; 32], std::io::Error> {
+        use sha2::Digest;
+        use std::io::Read;
+        let mut hasher = sha2::Sha256::new();
+        let mut f = file;
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(hasher.finalize().as_slice());
+        Ok(out)
+    }
+
+    /// Initialize XET storage with default configuration
+    /// Initialize the persistent model instance using ModelFactory
+    async fn initialize_persistent_model(&mut self, model_path: &Path) -> Result<()> {
+        use crate::runtime::model_config::ModelConfig;
+        use crate::runtime::model_factory::ModelFactory;
+        use crate::runtime::torch_utils::preflight_gpu_check;
+
+        info!("Initializing model");
+
+        // XET/LFS handled automatically by git-xet-filter + ModelFactory fallback
+        // Load model config first to get model parameters
+        let empty_weights = HashMap::new();
+        let config = ModelConfig::load(model_path, &empty_weights)?;
+
+        // Effective context length (CLI override or model default)
+        let effective_max_context = self
+            .config
+            .max_context
+            .map(|v| v as usize)
+            .unwrap_or(config.max_position_embeddings);
+        if self.config.max_context.is_some() {
+            info!(
+                "Using max_context override: {} tokens (model default: {})",
+                effective_max_context, config.max_position_embeddings
+            );
+        }
+
+        // Estimate model memory requirements
+        let estimated_weights_mb = {
+            // Rough estimate: vocab_size * hidden_size (embeddings)
+            //                 + num_layers * hidden_size * intermediate_size * 3 (MLP)
+            //                 + num_layers * hidden_size * hidden_size * 4 (attention)
+            let embedding_params = config.vocab_size * config.hidden_size;
+            let mlp_params_per_layer = config.hidden_size * config.intermediate_size * 3;
+            let attn_params_per_layer = config.hidden_size * config.hidden_size * 4;
+            let params_per_layer = mlp_params_per_layer + attn_params_per_layer;
+            let total_params = embedding_params + (config.num_hidden_layers * params_per_layer);
+
+            // BF16 = 2 bytes per parameter
+            (total_params * 2) as f64 / (1024.0 * 1024.0)
+        };
+
+        let kv_cache_mb = {
+            // KV cache: 2 (keys+values) * num_layers * batch_size * max_seq_len * num_heads * head_dim * 2 (BF16)
+            let batch_size = 1;
+            let kv_per_layer = 2
+                * batch_size
+                * effective_max_context
+                * config.num_attention_heads
+                * config.head_dim
+                * 2;
+            let total_kv = config.num_hidden_layers * kv_per_layer;
+            total_kv as f64 / (1024.0 * 1024.0)
+        };
+
+        let total_estimated_mb = estimated_weights_mb + kv_cache_mb;
+
+        info!(
+            "Model memory estimate:\n\
+             - Weights: {:.2} MB\n\
+             - KV cache: {:.2} MB (max_seq_len={})\n\
+             - Total: {:.2} MB",
+            estimated_weights_mb, kv_cache_mb, effective_max_context, total_estimated_mb
+        );
+
+        // Pre-flight GPU memory check (best-effort)
+        if let Err(e) = preflight_gpu_check(self.device, total_estimated_mb) {
+            warn!("GPU memory pre-flight check failed: {}", e);
+            // Continue anyway - the check might not be accurate
+        }
+
+        // Update ModelInfo with actual values from config
+        {
+            let mut model_info = self.model_info.lock();
+            model_info.hidden_size = config.hidden_size as u32;
+            model_info.intermediate_size = Some(config.intermediate_size as u32);
+            model_info.num_attention_heads = Some(config.num_attention_heads as u32);
+            model_info.num_key_value_heads = Some(config.num_key_value_heads as u32);
+            model_info.head_dim = Some(config.head_dim as u32);
+            model_info.num_hidden_layers = Some(config.num_hidden_layers as u32);
+            model_info.vocab_size = config.vocab_size as u32;
+            model_info.context_length = effective_max_context as u32;
+            model_info.architecture = config.model_type.clone();
+        }
+
+        // Build the KV-cache compatibility descriptor (#1277): the authoritative
+        // identity of the model + runtime config that produces this engine's KV.
+        // Every reusable/durable KV lookup is checked against its fingerprint.
+        // Built here (where the full `ModelConfig` is in scope) from authoritative
+        // inputs only — never a human label. The base-weight identity is a content
+        // digest of the resolved shards; the tokenizer identity is folded in later
+        // by `load_tokenizer`, before any generation reads the fingerprint. If no
+        // authoritative base digest can be computed, the descriptor is left unset
+        // and the cache boundary fails closed (KV recomputed, not reused).
+        match Self::weights_content_digest(model_path).await {
+            Ok(base_revision) => {
+                use crate::runtime::kv_compat::{
+                    KvCompatDescriptor, KvDtype, KvQuantMode, MoeRouting, RopeScalingFp,
+                    WeightIdentity, KV_COMPAT_FORMAT_VERSION,
+                };
+                let kv_quant = match self.config.kv_quant_type {
+                    hyprstream_rpc_std::model_client::KVQuantType::None => KvQuantMode::None,
+                    hyprstream_rpc_std::model_client::KVQuantType::Int8 => KvQuantMode::Int8,
+                    hyprstream_rpc_std::model_client::KVQuantType::Nf4 => KvQuantMode::Nf4,
+                    hyprstream_rpc_std::model_client::KVQuantType::Fp4 => KvQuantMode::Fp4,
+                };
+                // `model_name` is a display label for mismatch messages; the
+                // authoritative weight identity is the content digest above.
+                let model_name = model_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let descriptor = KvCompatDescriptor {
+                    format_version: KV_COMPAT_FORMAT_VERSION,
+                    weights: WeightIdentity::base_only(base_revision),
+                    model_name,
+                    architecture: config.model_type.clone(),
+                    model_version: config.version,
+                    num_hidden_layers: config.num_hidden_layers,
+                    num_attention_heads: config.num_attention_heads,
+                    num_key_value_heads: config.num_key_value_heads,
+                    head_dim: config.head_dim,
+                    hidden_size: config.hidden_size,
+                    // Effective attention behavior — every field below can change
+                    // KV *values* without changing coarse geometry (#1277 review).
+                    use_qk_norm: config.use_qk_norm,
+                    partial_rotary_factor_bits: config.partial_rotary_factor.map(f32::to_bits),
+                    layer_types: config.layer_types.clone(),
+                    linear_key_head_dim: config.linear_key_head_dim,
+                    linear_value_head_dim: config.linear_value_head_dim,
+                    linear_num_key_heads: config.linear_num_key_heads,
+                    linear_num_value_heads: config.linear_num_value_heads,
+                    linear_conv_kernel_dim: config.linear_conv_kernel_dim,
+                    // Effective model config — each demonstrably changes hidden
+                    // states / downstream K/V without changing coarse geometry
+                    // (#1277 review finding F3): normalization epsilon, activation,
+                    // embedding/attention scaling, MoE routing, and local-RoPE /
+                    // sliding-window. Taken verbatim from the resolved ModelConfig
+                    // that constructs the model.
+                    rms_norm_eps_bits: config.rms_norm_eps.to_bits(),
+                    layer_norm_eps_bits: config.layer_norm_eps.map(f32::to_bits),
+                    hidden_activation: config.hidden_activation.clone(),
+                    scale_embeddings: config.scale_embeddings,
+                    query_pre_attn_scalar_bits: config.query_pre_attn_scalar.map(f32::to_bits),
+                    moe: MoeRouting {
+                        is_moe: config.is_moe,
+                        num_experts: config.num_experts,
+                        num_experts_per_tok: config.num_experts_per_tok,
+                        moe_intermediate_size: config.moe_intermediate_size,
+                        shared_expert_intermediate_size: config.shared_expert_intermediate_size,
+                    },
+                    sliding_window: config.sliding_window,
+                    rope_local_base_freq_bits: config.rope_local_base_freq.map(f32::to_bits),
+                    rope_theta_bits: config.rope_theta.to_bits(),
+                    rope_scaling: config
+                        .rope_scaling
+                        .as_ref()
+                        .map(|rs| RopeScalingFp::new(&rs.rope_type, rs.factor)),
+                    max_position_embeddings: config.max_position_embeddings,
+                    dtype: KvDtype::from_name(&config.dtype),
+                    kv_quant,
+                    block_size: crate::runtime::kv_cache::BLOCK_SIZE,
+                    max_context: effective_max_context,
+                    vocab_size: config.vocab_size,
+                    // Folded in by `load_tokenizer`; descriptor is non-authoritative
+                    // (fingerprint = None) until then, so reuse fails closed.
+                    tokenizer_hash: None,
+                };
+                *self.kv_compat.lock() = Some(descriptor);
+            }
+            Err(e) => {
+                warn!(
+                    "Cannot compute authoritative base-weight digest for {}: {} \
+                     — KV-cache reuse disabled (fail-closed)",
+                    model_path.display(),
+                    e
+                );
+                // Leave kv_compat unset (None): the reuse boundary will discard
+                // rather than adopt any cache, since there is no authoritative
+                // identity to compare against.
+                *self.kv_compat.lock() = None;
+            }
+        }
+
+        // Use the factory to create the model. When `device_pool` is set and
+        // multi-device, the factory builds the model as a single pipeline stage
+        // spanning all decoder layers with a layer→device map (#314 wiring).
+        let factory_start = std::time::Instant::now();
+        let model = ModelFactory::create(
+            model_path,
+            &self.device,
+            resolve_inference_compute_kind(
+                self.config.precision_mode.as_deref(),
+                self.device,
+                super::channel_fp8::ChannelFp8Profile::read(model_path)?.is_some(),
+            )?,
+            self.config.max_context.map(|v| v as usize),
+            self.config.kv_quant_type,
+            self.device_pool.as_deref(),
+            self.config.fp8_dequant_load,
+            self.config.speculative_decoding,
+        )
+        .await?;
+        let factory_time = factory_start.elapsed();
+        info!(
+            "✅ Model weights loaded in {:.2}s",
+            factory_time.as_secs_f64()
+        );
+
+        self.persistent_model = Some(Arc::new(Mutex::new(model)));
+
+        // Load generation_config.json if present (model-specific sampling defaults)
+        let gen_config_path = model_path.join("generation_config.json");
+        if gen_config_path.exists() {
+            match std::fs::read_to_string(&gen_config_path) {
+                Ok(contents) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                        if let Some(t) = json["temperature"].as_f64() {
+                            self.generation_config.temperature = t as f32;
+                        }
+                        if let Some(p) = json["top_p"].as_f64() {
+                            self.generation_config.top_p = p as f32;
+                        }
+                        if let Some(k) = json["top_k"].as_u64() {
+                            self.generation_config.top_k = Some(k as usize);
+                        }
+                        if let Some(rp) = json["repetition_penalty"].as_f64() {
+                            self.generation_config.repeat_penalty = rp as f32;
+                        }
+                        if let Some(mt) = json["max_new_tokens"].as_u64() {
+                            self.generation_config.max_tokens = mt as usize;
+                        } else if let Some(ml) = json["max_length"].as_u64() {
+                            self.generation_config.max_tokens = ml as usize;
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to read generation_config.json: {}", e),
+            }
+        }
+
+        if !gen_config_path.exists() && config.model_type.contains("qwen3_5") {
+            // Qwen3.5 recommended defaults (non-thinking mode) when no
+            // generation_config.json is present. Qwen3 models ship their own
+            // generation_config.json so this only applies to Qwen3.5.
+            self.generation_config.temperature = 0.7;
+            self.generation_config.top_p = 0.8;
+            self.generation_config.top_k = Some(20);
+            self.generation_config.repeat_penalty = 1.5;
+        }
+
+        info!("Generation config: temperature={}, top_p={}, top_k={:?}, repeat_penalty={} (model_type={})",
+            self.generation_config.temperature, self.generation_config.top_p,
+            self.generation_config.top_k, self.generation_config.repeat_penalty,
+            config.model_type);
+
+        Ok(())
+    }
+
+    /// Load tokenizer and template configuration - thread safe
+    #[instrument(name = "torch_engine.load_tokenizer", skip(self), fields(model_path = %model_path.display()))]
+    async fn load_tokenizer(&mut self, model_path: &Path) -> Result<()> {
+        // Try to find tokenizer.json - if model_path is a directory, look inside it
+        // If it's a file, look in the parent directory
+        let search_dir = if model_path.is_dir() {
+            model_path
+        } else {
+            model_path.parent().unwrap_or(model_path)
+        };
+
+        let tokenizer_path = search_dir.join("tokenizer.json");
+        let tokenizer_config_path = search_dir.join("tokenizer_config.json");
+
+        if tokenizer_path.exists() {
+            info!("Loading tokenizer: {}", tokenizer_path.display());
+            let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
+
+            // Log initial vocabulary size
+            let initial_vocab_size = tokenizer.get_vocab_size(true);
+            info!("Initial tokenizer vocabulary size: {}", initial_vocab_size);
+
+            // Get model's configured vocab size
+            let model_vocab_size = {
+                let model_info = self.model_info.lock();
+                model_info.vocab_size as usize
+            };
+
+            // Apply model-specific tokenizer configuration if model is loaded
+            if let Some(model) = &self.persistent_model {
+                let model_guard = model.lock();
+                let tokenizer_config = model_guard.get_tokenizer_config();
+
+                // Configure the tokenizer based on the model architecture
+                tokenizer_config.configure_tokenizer(&mut tokenizer, model_vocab_size)?;
+
+                tracing::debug!("Applied model-specific tokenizer configuration");
+            } else {
+                // Model not loaded yet - log vocab mismatch if any
+                if model_vocab_size != initial_vocab_size {
+                    tracing::debug!(
+                        "Vocabulary size mismatch detected (model: {}, tokenizer: {}), but model not loaded yet to apply configuration",
+                        model_vocab_size, initial_vocab_size
+                    );
+                }
+            }
+
+            // Cache the final vocabulary size for lock-free access
+            let final_vocab_size = tokenizer.get_vocab_size(true);
+            self.tokenizer_vocab_size
+                .store(final_vocab_size, Ordering::Relaxed);
+
+            info!("Final tokenizer vocabulary size: {}", final_vocab_size);
+
+            // Fold the tokenizer identity into the KV-compat descriptor (#1277).
+            // Cached token ids are only meaningful relative to one tokenizer, so
+            // a different tokenizer (even with the same vocab size) must reject.
+            // The on-disk `tokenizer.json` bytes are the authoritative identity;
+            // deterministic model-driven mutation (e.g. Qwen vocab padding) is
+            // already captured by `vocab_size`. FAIL-CLOSED: if the bytes cannot
+            // be hashed, the tokenizer identity is left unset, the descriptor is
+            // non-authoritative (fingerprint = None), and the cache boundary
+            // discards rather than adopts any cache — we never silently degrade
+            // to a weaker vocab-only identity.
+            {
+                let mut guard = self.kv_compat.lock();
+                let tokenizer_hash = match std::fs::read(&tokenizer_path) {
+                    Ok(bytes) => {
+                        use sha2::{Digest, Sha256};
+                        let mut hasher = Sha256::new();
+                        hasher.update(&bytes);
+                        Some(hex::encode(hasher.finalize()))
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Could not read {} for KV-compat tokenizer identity ({}): \
+                             KV-cache reuse disabled (fail-closed)",
+                            tokenizer_path.display(),
+                            e
+                        );
+                        None
+                    }
+                };
+                if let Some(desc) = guard.as_mut() {
+                    desc.set_tokenizer(final_vocab_size, tokenizer_hash);
+                }
+            }
+
+            // Thread safe assignment
+            let mut tokenizer_guard = self.tokenizer.lock();
+            *tokenizer_guard = Some(tokenizer);
+        } else {
+            return Err(anyhow!(
+                "Tokenizer not found at {}. A proper tokenizer.json file is required for inference.",
+                tokenizer_path.display()
+            ));
+        }
+
+        // Load template configuration if available
+        if tokenizer_config_path.exists() {
+            info!(
+                "Loading tokenizer config: {}",
+                tokenizer_config_path.display()
+            );
+            let config_content = tokio::fs::read_to_string(&tokenizer_config_path).await?;
+
+            // Validate before parsing
+            jtp::from_str(&config_content)
+                .with_max_depth(10)
+                .with_max_string_length(50000)
+                .validate()
+                .map_err(|e| anyhow!("Invalid tokenizer config: {:?}", e))?;
+
+            let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
+
+            // Parse template configuration
+            let template_config = TemplateEngine::from_tokenizer_config(&config_json)?;
+
+            // Cache EOS token ID for lock-free access during generation
+            if let Some(ref eos_str) = template_config.eos_token {
+                let tokenizer_guard = self.tokenizer.lock();
+                if let Some(ref tokenizer) = *tokenizer_guard {
+                    if let Some(eos_id) = tokenizer.token_to_id(eos_str) {
+                        self.eos_token_id.store(eos_id, Ordering::Relaxed);
+                        info!("Cached EOS token: '{}' -> ID {}", eos_str, eos_id);
+                    } else {
+                        warn!("EOS token '{}' not found in tokenizer vocabulary", eos_str);
+                    }
+                }
+            }
+
+            // Create template engine
+            let template_engine = TemplateEngine::new(template_config)?;
+
+            // Store template engine
+            let mut template_guard = self.template_engine.lock();
+            *template_guard = Some(template_engine);
+
+            info!("✅ Template engine initialized");
+        } else {
+            info!("⚠️ No tokenizer_config.json found, using fallback templates");
+        }
+
+        Ok(())
+    }
+
+    /// Tokenize text to input IDs - thread safe
+    ///
+    /// Only bounded, content-redacted metadata (byte/char length, token count)
+    /// is written to the process log. The prompt itself and its token text are
+    /// tenant-private and never logged (#1253).
+    fn tokenize(&self, text: &str) -> Result<Vec<i64>> {
+        let tokenizer_guard = self.tokenizer.lock();
+        let tokenizer = tokenizer_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
+
+        tokenize_redacted(tokenizer, text)
+    }
+
+    /// Format text with dynamic chat template
+    fn format_chat_message(&self, system: Option<&str>, user: &str) -> String {
+        // Try to use template engine if available
+        {
+            let template_guard = self.template_engine.lock();
+            if let Some(ref engine) = *template_guard {
+                let mut messages = Vec::new();
+
+                // Add system message if provided
+                if let Some(system_msg) = system {
+                    messages.push(ChatMessage {
+                        role: "system".into(),
+                        content: Some(system_msg.into()),
+                        ..Default::default()
+                    });
+                }
+
+                // Add user message
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: Some(user.into()),
+                    ..Default::default()
+                });
+
+                // Apply template (no tools in this code path)
+                if let Ok(formatted) = engine.apply_chat_template(&messages, Some(true), None) {
+                    return formatted;
+                }
+            }
+        }
+
+        // Generic fallback template (model-agnostic)
+        let mut formatted = String::new();
+
+        // Add system message if provided
+        if let Some(system_msg) = system {
+            formatted.push_str("System: ");
+            formatted.push_str(system_msg);
+            formatted.push_str("\n\n");
+        }
+
+        // Add user message
+        formatted.push_str("User: ");
+        formatted.push_str(user);
+        formatted.push_str("\n\nAssistant: ");
+
+        formatted
+    }
+
+    /// Check if a token ID is the EOS token (lock-free using cached ID)
+    pub fn is_eos_token(&self, token_id: usize) -> bool {
+        let cached_eos = self.eos_token_id.load(Ordering::Relaxed);
+        // cached_eos == 0 means not initialized; actual EOS tokens are > 0
+        cached_eos > 0 && token_id as u32 == cached_eos
+    }
+
+    /// Get the tokenizer for streaming decoding - CoW makes this cheap!
+    ///
+    /// Returns a cloned tokenizer (cheap due to copy-on-write)
+    pub fn get_tokenizer(&self) -> Result<Tokenizer> {
+        let tokenizer_guard = self.tokenizer.lock();
+        tokenizer_guard
+            .as_ref()
+            .cloned() // Cheap clone due to CoW
+            .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))
+    }
+
+    /// Run inference on the model (supports both TorchScript and VarStore models) - thread safe
+    pub fn forward(&self, input_ids: &[i64]) -> Result<Tensor> {
+        // Try VarStore-based inference first (preferred for SafeTensors models)
+        if self.has_varstore() {
+            return self.forward_varstore(input_ids);
+        }
+
+        Err(anyhow!("No model loaded - call load_model() first"))
+    }
+
+    /// Run inference using VarStore (SafeTensors models) with persistent model - thread safe
+    fn forward_varstore(&self, input_ids: &[i64]) -> Result<Tensor> {
+        // Use the persistent model instance - NO recreation!
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized - call load_model() first"))?;
+
+        // Verify context state with thread safety
+        {
+            let context_guard = self.context_state.lock();
+            let _context_state = context_guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("Context state not initialized"))?;
+        }
+
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        // Convert input IDs to tensor (keep as int64 for embeddings)
+        let input_tensor = Tensor::from_slice(input_ids)
+            .to_kind(tch::Kind::Int64) // Ensure int64 for embedding lookup
+            .to_device(self.device)
+            .unsqueeze(0); // Add batch dimension: [1, seq_len]
+
+        // Lock the model and run forward pass (efficient!) with poison recovery
+        let model = model_arc.lock();
+        // RAII guard: panic-safe — Drop restores GradMode during unwinding
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward(&input_tensor, None)?
+        };
+
+        // Extract logits for the last token
+        let logits_shape = logits.size();
+        let seq_len = logits_shape[1];
+        let _vocab_size = logits_shape[2] as usize;
+
+        // Get logits for last token: [batch=1, last_seq_pos, vocab_size]
+        let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1); // [1, vocab_size]
+
+        Ok(last_token_logits)
+    }
+
+    /// Run optimized inference with KV caching - only process new tokens
+    pub fn forward_cached(&self, input_ids: &[i64], start_pos: usize) -> Result<Tensor> {
+        // Use the persistent model instance
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        // Process all provided tokens. The caller is responsible for passing
+        // only the tokens that need processing:
+        // - Decode mode: caller passes &[last_token] (single token)
+        // - Partial prefill: caller passes &prompt_tokens[prefix_len..] (new suffix)
+        // - Full prefill: caller passes &prompt_tokens (all tokens)
+        let tokens_to_process = input_ids;
+
+        // Convert to tensor
+        let input_tensor = Tensor::from_slice(tokens_to_process)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0); // [1, seq_len]
+
+        // Run forward pass with position info for proper KV cache usage
+        let model = model_arc.lock();
+
+        // RAII guard: panic-safe — Drop restores GradMode during unwinding
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward_with_cache(&input_tensor, start_pos)?
+        };
+
+        // Extract logits for the last token
+        let logits_shape = logits.size();
+        let seq_len = logits_shape[1];
+        let _vocab_size = logits_shape[2] as usize;
+
+        // Get logits for last token
+        let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
+
+        Ok(last_token_logits)
+    }
+
+    /// Run inference with KV caching and optional delta injection
+    ///
+    /// Same as `forward_cached()` but calls `forward_with_cache_and_delta()` on the model,
+    /// injecting per-tenant LoRA corrections at each attention layer.
+    pub fn forward_with_delta_cached(
+        &self,
+        input_ids: &[i64],
+        start_pos: usize,
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        // Process all provided tokens — caller passes the appropriate slice
+        let input_tensor = Tensor::from_slice(input_ids)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0);
+
+        let model = model_arc.lock();
+
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward_with_cache_and_delta(&input_tensor, start_pos, delta)?
+        };
+
+        let logits_shape = logits.size();
+        let seq_len = logits_shape[1];
+
+        let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
+
+        Ok(last_token_logits)
+    }
+
+    /// Batched ragged decode step over several same-delta sequences (#329).
+    ///
+    /// Each entry is `(new_token_ids, start_pos, per-sequence KVCacheManager)`.
+    /// Returns last-token logits per row `[B, vocab]`. Delegates to the model's
+    /// `forward_batched` (Llama-only; other architectures return an error so the
+    /// caller falls back to per-stream `forward_with_delta_cached`). Tensors stay
+    /// on this (bridge) thread; only the Send token/logits metadata crosses.
+    pub fn forward_batched_step(
+        &self,
+        sequences: &mut [(
+            Vec<i64>,
+            usize,
+            std::sync::Arc<parking_lot::Mutex<crate::runtime::kv_cache::KVCacheManager>>,
+        )],
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let model = model_arc.lock();
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward_batched(sequences, delta)?
+        };
+
+        // logits: [B, q, vocab] -> last-token logits [B, vocab].
+        let seq_len = logits.size()[1];
+        Ok(logits.narrow(1, seq_len - 1, 1).squeeze_dim(1))
+    }
+
+    /// Run full forward pass with optional delta injection (no KV cache)
+    pub fn forward_with_delta_full(
+        &self,
+        input_ids: &[i64],
+        delta: Option<&crate::training::TenantDelta>,
+    ) -> Result<Tensor> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let input_tensor = Tensor::from_slice(input_ids)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0);
+
+        let model = model_arc.lock();
+
+        let logits = {
+            let _no_grad = tch::no_grad_guard();
+            model.forward_with_cache_and_delta(&input_tensor, 0, delta)?
+        };
+
+        let logits_shape = logits.size();
+        let seq_len = logits_shape[1];
+
+        let last_token_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1);
+
+        Ok(last_token_logits)
+    }
+
+    /// Clear KV cache before new generation to prevent context pollution
+    pub fn clear_kv_cache(&self) {
+        if let Some(model_arc) = &self.persistent_model {
+            let model = model_arc.lock();
+            let model_any = model.as_any();
+            if let Some(llama_model) =
+                model_any.downcast_ref::<crate::runtime::architectures::llama::LlamaModel>()
+            {
+                llama_model.clear_kv_cache();
+                tracing::debug!("Cleared KV cache before generation");
+            } else if let Some(q35_model) =
+                model_any.downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+            {
+                q35_model.clear_kv_cache();
+                tracing::debug!("Cleared Qwen3.5 KV cache + SSM states before generation");
+            }
+        }
+    }
+
+    /// Snapshot Qwen3.5 SSM (conv/rec) states for TTT adaptation.
+    ///
+    /// Returns `Some((conv, rec))` if the loaded model is Qwen3.5; `None` otherwise.
+    /// Each `Tensor` is deep-copied via `.copy()` (C4 fix) so the snapshot is
+    /// independent of subsequent forward-pass mutations during the TTT loop.
+    pub fn snapshot_ssm_states(&self) -> Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)> {
+        let model_arc = self.persistent_model.as_ref()?;
+        let model = model_arc.lock();
+        let q35 = model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()?;
+        Some(q35.snapshot_ssm_states())
+    }
+
+    /// Restore Qwen3.5 SSM states from a snapshot produced by `snapshot_ssm_states`.
+    ///
+    /// No-op if the loaded model is not Qwen3.5 or snapshot is `None`.
+    pub fn restore_ssm_states(&self, snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>) {
+        let Some((conv_snap, rec_snap)) = snapshot else {
+            return;
+        };
+        let Some(model_arc) = &self.persistent_model else {
+            return;
+        };
+        let model = model_arc.lock();
+        if let Some(q35) = model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+        {
+            q35.restore_ssm_states(conv_snap, rec_snap);
+            tracing::debug!("Restored Qwen3.5 SSM states after TTT adaptation");
+        }
+    }
+
+    // ========================================================================
+    // MTP self-speculative decoding (Qwen3.5, v1: dense + greedy + batch=1)
+    // ========================================================================
+
+    /// Whether the loaded model can self-speculate: a Qwen3.5 with a loaded
+    /// (dense) MTP draft head. Pipeline/multi-device stage loads never own the
+    /// MTP head, so this is false there too.
+    pub fn speculative_supported(&self) -> bool {
+        let Some(model_arc) = &self.persistent_model else {
+            return false;
+        };
+        let model = model_arc.lock();
+        model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+            .is_some_and(crate::runtime::architectures::qwen3_5::Qwen3_5Model::has_mtp)
+    }
+
+    /// Speculative prefill/verify forward: returns per-position logits plus the
+    /// pre-final-norm hidden states the MTP head consumes.
+    ///
+    /// Never delta-adapted: speculation is disabled for tenant-delta streams at
+    /// stream construction, so this always runs the base model.
+    ///
+    /// Returns `(logits [1, seq|1, vocab], hidden [1, seq, hidden_size])`.
+    pub fn forward_speculative(
+        &self,
+        input_ids: &[i64],
+        start_pos: usize,
+        last_logits_only: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let input_tensor = Tensor::from_slice(input_ids)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0);
+
+        let model = model_arc.lock();
+        let q35 = model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+            .ok_or_else(|| anyhow!("Speculative decoding requires a Qwen3.5 model"))?;
+        let _no_grad = tch::no_grad_guard();
+        q35.forward_with_cache_hidden(&input_tensor, start_pos, last_logits_only)
+    }
+
+    /// MTP draft forward over `token_ids.len()` consecutive slots. Slot `i`
+    /// pairs `hiddens[.., i, ..]` with `embed(token_ids[i])` at absolute
+    /// position `base + i`. Returns the last slot's logits `[1, 1, vocab]`.
+    pub fn forward_mtp_draft(
+        &self,
+        token_ids: &[i64],
+        hiddens: &Tensor,
+        base: usize,
+    ) -> Result<Tensor> {
+        let model_arc = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not initialized"))?;
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not properly initialized"));
+        }
+
+        let ids_tensor = Tensor::from_slice(token_ids)
+            .to_kind(tch::Kind::Int64)
+            .to_device(self.device)
+            .unsqueeze(0);
+
+        let model = model_arc.lock();
+        let q35 = model
+            .as_any()
+            .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+            .ok_or_else(|| anyhow!("Speculative decoding requires a Qwen3.5 model"))?;
+        let _no_grad = tch::no_grad_guard();
+        q35.mtp_forward(&ids_tensor, hiddens, base)
+    }
+
+    /// Sample next token using bundled parameters with tiered repeat penalty.
+    fn sample_token_with_params(
+        &self,
+        logits_tensor: &Tensor,
+        params: &SamplingParams,
+        previous_tokens: &[i64],
+        penalty_exempt_tokens: &HashSet<i64>,
+    ) -> Result<usize> {
+        self.sampler.sample_token_with_penalty_exemptions(
+            logits_tensor,
+            params.temperature,
+            params.top_p,
+            params.top_k,
+            params.repeat_penalty,
+            previous_tokens,
+            penalty_exempt_tokens,
+        )
+    }
+}
+
+/// Rewind the model's installed session cache to a matched prefix.
+///
+/// Pure-attention models: truncating the KV cache to `prefix_len` is exact, so
+/// any prefix length is reusable (unchanged behavior).
+///
+/// Hybrid recurrent models (Qwen3.5): the GDN conv/rec state is Markovian and
+/// cannot be truncated to an arbitrary position — it can only be restored to
+/// the end-of-prefill snapshot stored with the cached tokens (see
+/// [`KVCacheManager::set_cached_tokens_with_ssm`]). A prefix hit is therefore
+/// reusable only when the FULL cached sequence matched
+/// (`prefix_len == cached_token_count()`) and a snapshot is present; anything
+/// else discards KV + SSM state and forces a full recompute, because decoding
+/// from a truncated KV with stale recurrent state silently produces tokens
+/// conditioned on the wrong context.
+///
+/// Returns the number of reusable prefix tokens (0 = cache cleared, full
+/// prefill required). The caller must guarantee a strict partial hit
+/// (`prefix_len < prompt_len`); the exact-prompt-repeat decision lives in
+/// [`resolve_session_prefill_start`].
+pub(crate) fn rewind_session_state(model: &dyn ModelOperations, prefix_len: usize) -> usize {
+    let Some(cache) = model.get_kv_cache() else {
+        return 0;
+    };
+    let q35 = model
+        .as_any()
+        .downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>();
+    let Some(q35) = q35 else {
+        cache.lock().truncate_to(prefix_len);
+        return prefix_len;
+    };
+
+    let snapshot = {
+        let cache_guard = cache.lock();
+        if prefix_len == cache_guard.cached_token_count() {
+            cache_guard.ssm_snapshot()
+        } else {
+            None
+        }
+    };
+    match snapshot {
+        Some((conv_snap, rec_snap)) => {
+            cache.lock().truncate_to(prefix_len);
+            q35.restore_ssm_states(conv_snap, rec_snap);
+            prefix_len
+        }
+        None => {
+            // Partial prefix match (or no snapshot): recurrent state cannot be
+            // rewound to an intermediate position — recompute from scratch.
+            model.clear_kv_cache();
+            0
+        }
+    }
+}
+
+/// Decide the prefill start position for a session-cache prefix match.
+///
+/// A strict partial hit (`0 < prefix_len < prompt_len`) is reusable: there is
+/// a nonempty suffix left to prefill, and [`rewind_session_state`] puts the
+/// cache and model into the exact end-of-prefix state.
+///
+/// An exact-prompt repeat (`prefix_len == prompt_len` — the session resending
+/// its previous prompt verbatim, `prefix_len == cached_token_count()`) is NOT
+/// reusable even though the full cached sequence matched: no tokens remain to
+/// prefill, and sampling the first new token needs logits for the last prompt
+/// position, which the cache does not retain. The engine must re-run the whole
+/// prompt, and that re-run must start from CLEARED state — prefilling onto the
+/// restored KV plus end-of-prefill GDN snapshot would advance the recurrent
+/// state over the prompt a second time, producing wrong logits (and a wrong
+/// end-of-prefill snapshot for the next turn). A miss (`prefix_len == 0`)
+/// clears and starts fresh as before.
+///
+/// Returns the prefill start position (0 = cache cleared, full prefill).
+pub(crate) fn resolve_session_prefill_start(
+    model: &dyn ModelOperations,
+    prefix_len: usize,
+    prompt_len: usize,
+) -> usize {
+    if prefix_len > 0 && prefix_len < prompt_len {
+        rewind_session_state(model, prefix_len)
+    } else {
+        model.clear_kv_cache();
+        0
+    }
+}
+
+impl TorchEngine {
+    /// Stable, content-free label identifying the loaded model for OTel metric
+    /// attributes (#1261). Prefers the model name (set on load); falls back to
+    /// architecture, then "unknown". Never the prompt or generated text.
+    fn model_label(&self) -> String {
+        let info = self.model_info.lock().clone();
+        if !info.name.is_empty() && info.name != "unloaded" {
+            info.name
+        } else if !info.architecture.is_empty() && info.architecture != "unknown" {
+            info.architecture
+        } else {
+            "unknown".to_owned()
+        }
+    }
+}
+
+#[async_trait]
+impl RuntimeEngine for TorchEngine {
+    #[instrument(name = "torch_engine.load_model", skip(self), fields(path = %path.display()))]
+    async fn load_model(&mut self, path: &Path) -> Result<()> {
+        // Store the original path for model naming
+        let original_path = path.to_path_buf();
+
+        // If path is a directory, find the model file inside it
+        let model_file_path = if path.is_dir() {
+            // First check for single file patterns
+            let single_files = [
+                "model.safetensors",
+                "pytorch_model.bin",
+                "model.bin",
+                "model.pt",
+                "model.pth",
+            ];
+
+            let mut found_file = None;
+            for filename in &single_files {
+                let candidate = path.join(filename);
+                if candidate.exists() {
+                    found_file = Some(candidate);
+                    break;
+                }
+            }
+
+            // If no single file found, check for sharded SafeTensors
+            if found_file.is_none() {
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        let filename = entry.file_name();
+                        if let Some(name) = filename.to_str() {
+                            // Match standard shard pattern: model-00001-of-NNNNN.safetensors
+                            // Also match Qwen3.5 pattern: model.safetensors-00001-of-NNNNN.safetensors
+                            let is_first_shard = (name.starts_with("model-00001-of-")
+                                || name.starts_with("model.safetensors-00001-of-"))
+                                && name.ends_with(".safetensors");
+                            if is_first_shard {
+                                info!(
+                                    "🔍 Detected sharded SafeTensors model starting with: {}",
+                                    name
+                                );
+                                found_file = Some(entry.path());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            found_file.ok_or_else(|| {
+                anyhow!(
+                    "No supported model file found in directory: {}",
+                    path.display()
+                )
+            })?
+        } else {
+            path.to_path_buf()
+        };
+
+        info!("Loading model: {}", model_file_path.display());
+        self.load_model_file(&model_file_path).await?;
+
+        // Set the model name based on the canonical path
+        // Use directory name if loading from directory, otherwise use filename
+        let model_name = if original_path.is_dir() {
+            // Get the last component of the directory path as the model name
+            original_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_owned()
+        } else {
+            // Use the file stem for single files
+            original_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_owned()
+        };
+
+        // Update model info with the correct name
+        {
+            let mut model_info_guard = self.model_info.lock();
+            model_info_guard.name = model_name;
+        }
+
+        self.load_tokenizer(path).await?;
+        Ok(())
+    }
+
+    async fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+        // Format prompt with model-agnostic chat template
+        let formatted_prompt =
+            self.format_chat_message(Some("You are a helpful assistant."), prompt);
+
+        let request = GenerationRequest {
+            prompt: formatted_prompt,
+            max_tokens: Some(max_tokens as u32),
+            temperature: Some(self.generation_config.temperature),
+            top_p: Some(self.generation_config.top_p),
+            top_k: self.generation_config.top_k.map(|v| v as u32),
+            repeat_penalty: Some(self.generation_config.repeat_penalty),
+            stop_tokens: Some(self.generation_config.stop_tokens.clone()),
+            ..Default::default()
+        };
+
+        let result = self.generate_with_params(request).await?;
+        Ok(result.text)
+    }
+
+    async fn generate_with_params(&self, request: GenerationRequest) -> Result<GenerationResult> {
+        use futures::StreamExt;
+
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!(
+                "Model not properly initialized - persistent model not ready"
+            ));
+        }
+
+        let mut stream = self.generate(request)?;
+        let mut accumulated_text = String::new();
+
+        while let Some(text_chunk) = stream.next().await {
+            accumulated_text.push_str(&text_chunk?);
+        }
+
+        let stats = stream.stats();
+        Ok(GenerationResult {
+            text: accumulated_text,
+            tokens_generated: stats.tokens_generated,
+            finish_reason: stats.finish_reason.unwrap_or(FinishReason::Stop),
+            generation_time_ms: stats.generation_time_ms,
+            tokens_per_second: stats.tokens_per_second,
+            quality_metrics: stats.quality_metrics,
+            prefill_tokens: stats.prefill_tokens,
+            prefill_time_ms: stats.prefill_time_ms,
+            prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+            inference_tokens: stats.inference_tokens,
+            inference_time_ms: stats.inference_time_ms,
+            inference_tokens_per_sec: stats.inference_tokens_per_sec,
+            ttt_metrics: None, // TTT metrics attached by InferenceService
+        })
+    }
+
+    fn model_info(&self) -> ModelInfo {
+        self.model_info.lock().clone()
+    }
+
+    fn is_loaded(&self) -> bool {
+        let varstore_loaded = self.has_varstore();
+        let persistent_loaded = self.persistent_model.is_some();
+
+        varstore_loaded || persistent_loaded
+    }
+
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        self.apply_chat_template_with_vars(messages, add_generation_prompt, tools, None, None)
+    }
+
+    fn apply_chat_template_with_vars(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
+        enable_thinking: Option<bool>,
+        template_vars_json: Option<&str>,
+    ) -> Result<String> {
+        // Use our template engine if available
+        let template_guard = self.template_engine.lock();
+
+        if let Some(ref engine) = *template_guard {
+            engine.apply_chat_template_with_vars(
+                messages,
+                Some(add_generation_prompt),
+                tools,
+                enable_thinking,
+                template_vars_json,
+            )
+        } else {
+            // Fallback to simple formatting
+            let mut formatted = String::new();
+            for msg in messages {
+                formatted.push_str(&format!(
+                    "{}: {}\n",
+                    msg.role,
+                    msg.content.as_deref().unwrap_or("")
+                ));
+            }
+            if add_generation_prompt {
+                formatted.push_str("assistant: ");
+            }
+            Ok(formatted)
+        }
+    }
+}
+
+// Training-specific methods
+impl TorchEngine {
+    /// Enable training mode for pre-training
+    pub fn enable_training(&mut self, _learning_rate: f64) -> Result<()> {
+        // Ensure model is loaded
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!(
+                "Model not loaded - persistent model not initialized"
+            ));
+        }
+
+        // For pre-training without VarStore:
+        // 1. Set requires_grad on model tensors
+        // 2. Use manual SGD or implement custom optimizer
+        //
+        // The challenge: tch-rs optimizers require VarStore
+        // Solutions:
+        // - Create a temporary VarStore and register model weights
+        // - Implement manual gradient descent
+        // - Use LoRA for all training (recommended)
+
+        tracing::warn!("Pre-training without VarStore requires manual optimizer implementation");
+        tracing::info!("For now, use LoRA training which has proper VarStore support");
+
+        Ok(())
+    }
+
+    /// Perform a manual SGD step without optimizer
+    pub fn manual_sgd_step(&mut self, _learning_rate: f32) -> Result<()> {
+        // This would manually update weights:
+        // weight = weight - learning_rate * weight.grad()
+        // But we don't have direct access to the model's tensors
+
+        tracing::warn!("Manual SGD not implemented - model tensors not accessible");
+        Ok(())
+    }
+
+    /// Forward pass for training (with gradient tracking)
+    pub fn forward_training(&self, input_ids: &Tensor, track_gradients: bool) -> Result<Tensor> {
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!("Model not initialized"));
+        }
+
+        let model = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Persistent model not available"))?;
+        let model_guard = model.lock();
+
+        // Forward pass - gradients tracked if tensors have requires_grad
+        if track_gradients {
+            // Gradients are tracked by default when tensors have requires_grad
+            model_guard.forward(input_ids, None)
+        } else {
+            {
+                let _no_grad = tch::no_grad_guard();
+                model_guard.forward(input_ids, None)
+            }
+        }
+    }
+
+    /// Compute loss and backward (without optimizer step)
+    pub fn compute_loss_and_backward(&self, input_ids: &Tensor, labels: &Tensor) -> Result<f64> {
+        // Forward pass with gradients
+        let logits = self.forward_training(input_ids, true)?;
+
+        // Compute cross-entropy loss
+        let batch_size = logits.size()[0];
+        let seq_len = logits.size()[1];
+        let vocab_size = logits.size()[2];
+
+        let logits_flat = logits.view([batch_size * seq_len, vocab_size]);
+        let labels_flat = labels.view([batch_size * seq_len]);
+
+        let loss = logits_flat.cross_entropy_loss::<Tensor>(
+            &labels_flat,
+            None,
+            tch::Reduction::Mean,
+            -100, // ignore_index for padding
+            0.0,  // label_smoothing
+        );
+
+        let loss_value = loss.double_value(&[]);
+
+        // Backward pass computes gradients
+        loss.backward();
+
+        Ok(loss_value)
+    }
+
+    /// Disable training mode
+    pub fn disable_training(&mut self) -> Result<()> {
+        // Gradient tracking is controlled per tensor, not globally
+        tracing::info!("Training mode disabled");
+        Ok(())
+    }
+
+    /// Check if training is enabled
+    pub fn is_training_enabled(&self) -> bool {
+        false // Pre-training not fully supported without VarStore
+    }
+}
+
+// Additional methods needed by inference layer
+impl TorchEngine {
+    // Old callback-based streaming APIs removed - use generate() for all streaming use cases
+
+    /// Check if persistent model is initialized - thread safe
+    pub fn is_persistent_model_ready(&self) -> bool {
+        let persistent_ready = self.persistent_model.is_some();
+        let context_ready = self
+            .context_state
+            .lock()
+            .as_ref()
+            .is_some_and(|c| c.initialized);
+
+        persistent_ready && context_ready
+    }
+
+    /// Generate text as a stream of decoded UTF-8 text chunks
+    ///
+    /// Returns a Stream that yields `Result<String>` with properly decoded text.
+    /// The stream automatically handles:
+    /// - Multi-byte UTF-8 sequences (emojis, CJK characters, etc.)
+    /// - EOS and stop token detection
+    /// - Max tokens limit
+    /// - Special token filtering
+    ///
+    /// Dropping the stream stops generation automatically (no manual cancellation needed).
+    ///
+    /// # Example
+    /// ```no_run
+    /// use futures::StreamExt;
+    /// use hyprstream_rpc_std::inference_client::GenerationRequest;
+    ///
+    /// # async fn example(engine: &hyprstream_inference::runtime::torch_engine::TorchEngine) -> anyhow::Result<()> {
+    /// let request = GenerationRequest::default();
+    /// let mut stream = engine.generate(request)?;
+    ///
+    /// while let Some(text_chunk) = stream.next().await {
+    ///     print!("{}", text_chunk?);
+    /// }
+    ///
+    /// let stats = stream.stats();
+    /// println!("Generated {} tokens", stats.tokens_generated);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn generate(&self, mut request: GenerationRequest) -> Result<TextStream<'_>> {
+        // Set random seed if provided for deterministic generation
+        if let Some(seed) = request.seed {
+            self.set_seed(seed as u64);
+        }
+
+        // Apply server defaults if not specified in request
+        if request.timeout_ms.is_none() {
+            request.timeout_ms = Some(self.config.default_generation_timeout_ms);
+        }
+
+        TextStream::new(self, request)
+    }
+
+    /// Generate with optional per-tenant delta for delta-aware inference
+    ///
+    /// When `delta` is Some, LoRA corrections are injected at each attention layer
+    /// during generation. The delta is locked per-token (not held across the entire
+    /// generation) to allow concurrent training updates.
+    ///
+    /// `adapter_generation` is the live LoRA/delta generation actually applied to
+    /// this request; it is folded into the KV-compat expected identity so a
+    /// re-adapted model is detected as incompatible and its stale KV rejected.
+    ///
+    /// `tenant_id` is the effective tenant whose delta contributed to the weights
+    /// (`Some` only when a per-tenant delta is in play, `None` otherwise), and
+    /// `weight_epoch` is that delta's current weight epoch. The pair is threaded
+    /// to the session-cache swap so the resulting KV is registered for
+    /// tenant-delta invalidation and cleared if the weights changed under a
+    /// different tenant or an older weight epoch (same-tenant in-place
+    /// re-adaptation). The caller must derive the tenant id from the verified
+    /// request subject, not invent a new identity source.
+    pub fn generate_with_delta(
+        &self,
+        mut request: GenerationRequest,
+        delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+        tenant_id: Option<String>,
+        weight_epoch: u64,
+        adapter_generation: u64,
+    ) -> Result<TextStream<'_>> {
+        if let Some(seed) = request.seed {
+            self.set_seed(seed as u64);
+        }
+
+        if request.timeout_ms.is_none() {
+            request.timeout_ms = Some(self.config.default_generation_timeout_ms);
+        }
+
+        TextStream::new_with_delta(
+            self,
+            request,
+            delta,
+            tenant_id,
+            weight_epoch,
+            adapter_generation,
+        )
+    }
+
+    /// Non-streaming generation with optional delta (convenience wrapper)
+    pub async fn generate_with_delta_params(
+        &self,
+        request: GenerationRequest,
+        delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+        tenant_id: Option<String>,
+        weight_epoch: u64,
+        adapter_generation: u64,
+    ) -> Result<crate::config::GenerationResult> {
+        use futures::StreamExt;
+
+        if !self.is_persistent_model_ready() {
+            return Err(anyhow!(
+                "Model not properly initialized - persistent model not ready"
+            ));
+        }
+
+        let mut stream =
+            self.generate_with_delta(request, delta, tenant_id, weight_epoch, adapter_generation)?;
+        let mut accumulated_text = String::new();
+
+        while let Some(text_chunk) = stream.next().await {
+            accumulated_text.push_str(&text_chunk?);
+        }
+
+        let stats = stream.stats();
+        Ok(crate::config::GenerationResult {
+            text: accumulated_text,
+            tokens_generated: stats.tokens_generated,
+            finish_reason: stats
+                .finish_reason
+                .unwrap_or(crate::config::FinishReason::Stop),
+            generation_time_ms: stats.generation_time_ms,
+            tokens_per_second: stats.tokens_per_second,
+            quality_metrics: stats.quality_metrics,
+            prefill_tokens: stats.prefill_tokens,
+            prefill_time_ms: stats.prefill_time_ms,
+            prefill_tokens_per_sec: stats.prefill_tokens_per_sec,
+            inference_tokens: stats.inference_tokens,
+            inference_time_ms: stats.inference_time_ms,
+            inference_tokens_per_sec: stats.inference_tokens_per_sec,
+            ttt_metrics: None,
+        })
+    }
+
+    /// Forward pass with per-layer delta injection for TTT training.
+    ///
+    /// Uses `decode_layer_with_delta()` to inject the tenant delta's A/B matrices
+    /// after q_proj/v_proj projections inside each attention layer. This creates a
+    /// differentiable path from the loss back to the delta parameters, enabling
+    /// gradient-based training via `loss.backward()`.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [1, seq_len]
+    /// * `delta` - Tenant's LoRA delta with trainable A/B matrices
+    ///
+    /// # Returns
+    /// Logits tensor [1, seq_len, vocab_size] with gradient path to delta parameters
+    pub fn forward_with_delta(
+        &self,
+        input_ids: &Tensor,
+        delta: &crate::training::TenantDelta,
+    ) -> Result<Tensor> {
+        let model = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Model not loaded"))?;
+        let model_guard = model.lock();
+
+        // Get embeddings from the base model
+        let input = input_ids.to(self.device);
+        let mut hidden_states = model_guard.embed_tokens(&input)?;
+
+        // NOTE: f32 upcast is NOT done here because model weights are bf16 and
+        // ROCm/HIP matmul requires matching dtypes. Gradient precision is handled
+        // by the delta injection path (LoRA A/B matrices) operating in the model's
+        // native dtype with the with_grad() wrapper ensuring autograd is active.
+
+        // Generate position IDs
+        let seq_len = hidden_states.size()[1];
+        let position_ids = Tensor::arange(seq_len, (tch::Kind::Int64, hidden_states.device()));
+
+        let num_layers = model_guard.num_layers();
+
+        // Process each layer with delta injection
+        for layer_idx in 0..num_layers {
+            let (new_hidden, _kv) = model_guard.decode_layer_with_delta(
+                layer_idx,
+                &hidden_states,
+                None,                // attention_mask
+                Some(&position_ids), // position_ids
+                None,                // past_kv (no cache during training)
+                delta,
+            )?;
+            hidden_states = new_hidden;
+        }
+
+        // Apply final norm + LM head
+        hidden_states = model_guard.apply_final_norm(&hidden_states)?;
+        let logits = model_guard.lm_head(&hidden_states)?;
+
+        Ok(logits)
+    }
+
+    /// Authoritative context capacity of the loaded model. ModelInfo is populated
+    /// from the checkpoint configuration and optional max_context override during
+    /// loading; RuntimeConfig.context_length is only a constructor default.
+    /// Serving encoders and native decision admission must use this same limit.
+    pub fn effective_context_limit(&self) -> Result<usize> {
+        anyhow::ensure!(self.persistent_model.is_some(), "Model not loaded");
+        let limit = self.model_info.lock().context_length as usize;
+        anyhow::ensure!(limit > 0, "loaded model has an invalid context limit");
+        Ok(limit)
+    }
+
+    /// Execute a decision head against fresh full-sequence hidden states while
+    /// holding the backbone lock. The supplied gather reads original LM-head
+    /// rows without allocating token-by-vocabulary logits. No cache is reused.
+    pub fn with_decision_backbone<T>(
+        &self,
+        token_ids: &[i64],
+        head: impl FnOnce(&Tensor, &dyn Fn(&[i64]) -> Result<Tensor>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_decision_backbone_checked(token_ids, &|| Ok(()), head)
+    }
+
+    /// Cooperative cancellation/deadline variant. The checker runs before
+    /// admission, between decoder layers, and around head evaluation. An active
+    /// libtorch kernel completes before the next check; dropping a future alone
+    /// is not a compute-cancellation mechanism.
+    pub fn with_decision_backbone_checked<T>(
+        &self,
+        token_ids: &[i64],
+        check: &dyn Fn() -> Result<()>,
+        head: impl FnOnce(&Tensor, &dyn Fn(&[i64]) -> Result<Tensor>) -> Result<T>,
+    ) -> Result<T> {
+        check()?;
+        anyhow::ensure!(!token_ids.is_empty(), "decision token sequence is empty");
+        let limit = self.effective_context_limit()?;
+        anyhow::ensure!(
+            token_ids.len() <= limit,
+            "decision input exceeds context limit"
+        );
+        anyhow::ensure!(
+            self.device == tch::Device::Cpu,
+            "decision backbone is CPU-only pending CPU acceptance"
+        );
+        let model = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Model not loaded"))?;
+        let model = model.lock();
+        let _guard = tch::no_grad_guard();
+        let input = Tensor::from_slice(token_ids)
+            .reshape([1, token_ids.len() as i64])
+            .to_device(self.device);
+        let hidden = model.decision_hidden_states_checked(&input, check)?;
+        check()?;
+        let gather = |ids: &[i64]| model.decision_output_embedding_rows(ids);
+        let output = head(&hidden, &gather)?;
+        check()?;
+        Ok(output)
+    }
+
+    /// Get the number of layers in the loaded model.
+    pub fn get_num_layers(&self) -> Result<usize> {
+        let model = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Model not loaded"))?;
+        Ok(model.lock().num_layers())
+    }
+
+    /// Get module dimensions for LoRA target modules from the loaded model.
+    ///
+    /// Returns a map of module_name -> (in_features, out_features) for all
+    /// supported LoRA target modules. Used by DeltaPool to initialize
+    /// per-tenant LoRA deltas with correct dimensions.
+    ///
+    /// Supported modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+    pub fn get_lora_module_dims(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (usize, usize)>> {
+        let model_info = self.model_info.lock();
+        let hidden_size = model_info.hidden_size as usize;
+
+        let num_heads = model_info
+            .num_attention_heads
+            .ok_or_else(|| anyhow!("num_attention_heads not set in ModelInfo"))?
+            as usize;
+        let num_kv_heads = model_info.num_key_value_heads.unwrap_or(num_heads as u32) as usize;
+        let head_dim = model_info
+            .head_dim
+            .map(|d| d as usize)
+            .unwrap_or(hidden_size / num_heads);
+
+        let q_out = num_heads * head_dim;
+        let kv_out = num_kv_heads * head_dim;
+
+        let intermediate_size = if let Some(intermediate) = model_info.intermediate_size {
+            intermediate as usize
+        } else {
+            match model_info.architecture.as_str() {
+                "Qwen2ForCausalLM" => (hidden_size as f32 * 2.6667) as usize,
+                "LlamaForCausalLM" => (hidden_size as f32 * 2.75) as usize,
+                _ => hidden_size * 4,
+            }
+        };
+
+        let mut dims = std::collections::HashMap::new();
+        // Self-attention projections with correct dimensions
+        // q_proj: in=hidden_size, out=num_heads * head_dim
+        dims.insert("q_proj".to_owned(), (hidden_size, q_out));
+        // k_proj/v_proj: in=hidden_size, out=num_kv_heads * head_dim (GQA support)
+        dims.insert("k_proj".to_owned(), (hidden_size, kv_out));
+        dims.insert("v_proj".to_owned(), (hidden_size, kv_out));
+        // o_proj: in=num_heads * head_dim, out=hidden_size
+        dims.insert("o_proj".to_owned(), (q_out, hidden_size));
+        // MLP projections (expand)
+        for name in &["gate_proj", "up_proj"] {
+            dims.insert((*name).to_owned(), (hidden_size, intermediate_size));
+        }
+        // MLP projection (contract)
+        dims.insert("down_proj".to_owned(), (intermediate_size, hidden_size));
+
+        Ok(dims)
+    }
+
+    /// Get per-layer LoRA module dimensions for hybrid architectures (e.g., Qwen3.5).
+    ///
+    /// Returns `None` for uniform architectures (Llama, Gemma, etc.) where all layers
+    /// have identical module dims. Returns per-layer overrides for Qwen3.5 where GDN
+    /// layers have different `o_proj` input dims than full-attention layers.
+    pub fn get_per_layer_lora_dims(
+        &self,
+    ) -> Option<std::collections::HashMap<usize, std::collections::HashMap<String, (usize, usize)>>>
+    {
+        let model_arc = self.persistent_model.as_ref()?;
+        let model = model_arc.lock();
+        let model_any = model.as_any();
+
+        if let Some(q35) =
+            model_any.downcast_ref::<crate::runtime::architectures::qwen3_5::Qwen3_5Model>()
+        {
+            let qcfg = q35.text_config();
+            let hidden = qcfg.hidden_size as usize;
+            let nh = qcfg.num_attention_heads as usize;
+            let hd = qcfg.head_dim as usize;
+            // q_proj outputs num_heads * head_dim * 2 (first half = Q, second half = gate).
+            // The LoRA delta targets only the Q half, so lora_b out_features = nh*hd (the half-dim).
+            // o_proj in_features is also nh*hd (attention output after gate application).
+            let q_half_dim = nh * hd;
+
+            let gdn_out_proj_in = qcfg.linear_num_value_heads * qcfg.linear_value_head_dim;
+            let num_layers = qcfg.num_hidden_layers as usize;
+
+            let mut per_layer: std::collections::HashMap<
+                usize,
+                std::collections::HashMap<String, (usize, usize)>,
+            > = std::collections::HashMap::new();
+
+            let nkv_out = (qcfg.num_key_value_heads as usize) * hd;
+            for (layer_idx, lt) in qcfg.layer_types.iter().enumerate() {
+                let mut layer_dims: std::collections::HashMap<String, (usize, usize)> =
+                    std::collections::HashMap::new();
+                if lt == "full_attention" {
+                    // Full-attention: q correction targets the Q half (not the doubled projection)
+                    layer_dims.insert("q_proj".to_owned(), (hidden, q_half_dim));
+                    layer_dims.insert("v_proj".to_owned(), (hidden, nkv_out));
+                    layer_dims.insert("o_proj".to_owned(), (q_half_dim, hidden));
+                } else {
+                    // GDN (linear_attention): only o_proj; maps to struct field out_proj.
+                    // in_features = val_dim (input to out_proj), out_features = hidden_size.
+                    layer_dims.insert("o_proj".to_owned(), (gdn_out_proj_in, hidden));
+                }
+                per_layer.insert(layer_idx, layer_dims);
+            }
+
+            // Fill any layers not covered by layer_types (every 4th is full_attn)
+            for layer_idx in 0..num_layers {
+                per_layer.entry(layer_idx).or_insert_with(|| {
+                    let is_full_attn = (layer_idx + 1) % 4 == 0;
+                    let mut layer_dims: std::collections::HashMap<String, (usize, usize)> =
+                        std::collections::HashMap::new();
+                    if is_full_attn {
+                        layer_dims.insert("q_proj".to_owned(), (hidden, q_half_dim));
+                        layer_dims.insert("v_proj".to_owned(), (hidden, nkv_out));
+                        layer_dims.insert("o_proj".to_owned(), (q_half_dim, hidden));
+                    } else {
+                        layer_dims.insert("o_proj".to_owned(), (gdn_out_proj_in, hidden));
+                    }
+                    layer_dims
+                });
+            }
+
+            Some(per_layer)
+        } else {
+            None
+        }
+    }
+
+    /// Validate LoRA configuration against model dimensions.
+    ///
+    /// Checks that the requested target modules are valid for this model.
+    /// The actual LoRA delta creation is handled by DeltaPool/TenantDelta.
+    pub fn create_lora(&mut self, config: crate::training::TenantDeltaConfig) -> Result<()> {
+        let all_dims = self.get_lora_module_dims()?;
+
+        for module_name in &config.target_modules {
+            if !all_dims.contains_key(module_name.as_str()) {
+                return Err(anyhow!(
+                    "Unknown module '{}'. Supported modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj",
+                    module_name
+                ));
+            }
+        }
+
+        tracing::info!(
+            rank = config.rank,
+            alpha = config.alpha,
+            target_modules = ?config.target_modules,
+            "LoRA configuration validated - delta creation handled by DeltaPool"
+        );
+        Ok(())
+    }
+
+    // ============================================================================
+    // Embedding Extraction for RAG/CAG
+    // ============================================================================
+
+    /// Extract embedding from text using the model's hidden states.
+    ///
+    /// This method tokenizes the input text, runs a forward pass through the model,
+    /// and extracts the final hidden states. The embedding is computed by mean-pooling
+    /// the hidden states over the sequence dimension.
+    ///
+    /// # Arguments
+    /// - `text` - Input text to embed
+    ///
+    /// # Returns
+    /// - Vec<f32> - The embedding vector (dimension = model's hidden_size)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let embedding = engine.extract_embedding("What is machine learning?")?;
+    /// println!("Embedding dimension: {}", embedding.len());
+    /// ```
+    pub fn extract_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        // Tokenize input
+        let tokenizer_guard = self.tokenizer.lock();
+        let tokenizer = tokenizer_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("No tokenizer loaded"))?;
+
+        let encoding = tokenizer
+            .encode(text, false)
+            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+
+        let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        drop(tokenizer_guard);
+
+        self.extract_embedding_from_tokens(&token_ids)
+    }
+
+    /// Extract embedding from pre-tokenized input.
+    ///
+    /// This is a lower-level method for when tokens are already available
+    /// (e.g., from a previous generation). Uses mean pooling over the hidden states.
+    ///
+    /// # Arguments
+    /// - `token_ids` - Pre-tokenized input IDs
+    ///
+    /// # Returns
+    /// - Vec<f32> - The embedding vector (dimension = model's hidden_size)
+    pub fn extract_embedding_from_tokens(&self, token_ids: &[i64]) -> Result<Vec<f32>> {
+        if token_ids.is_empty() {
+            return Err(anyhow!("Empty token list"));
+        }
+
+        let input_tensor = Tensor::from_slice(token_ids)
+            .to_device(self.device)
+            .unsqueeze(0); // [1, seq_len]
+
+        let model_guard = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("No model loaded"))?
+            .lock();
+
+        {
+            let _no_grad = tch::no_grad_guard();
+
+            // Get token embeddings
+            let embeddings = model_guard.embed_tokens(&input_tensor)?;
+
+            // Process through layers to get hidden states
+            let hidden_states = self
+                .process_through_layers_for_embedding(&**model_guard, &embeddings)
+                .unwrap_or_else(|_| embeddings.shallow_clone());
+
+            // Apply final normalization
+            let normalized = model_guard
+                .apply_final_norm(&hidden_states)
+                .unwrap_or(hidden_states);
+
+            // Mean pool over sequence dimension: [1, seq_len, hidden_size] -> [1, hidden_size]
+            let pooled = normalized.mean_dim(1, false, tch::Kind::Float);
+
+            // Squeeze batch dimension
+            let pooled_1d = pooled.squeeze_dim(0); // [hidden_size]
+
+            // L2 normalize for cosine similarity
+            let norm = pooled_1d.norm();
+            let normalized_embedding = if norm.double_value(&[]) > 1e-12 {
+                &pooled_1d / norm
+            } else {
+                pooled_1d
+            };
+
+            // Convert to CPU and extract values
+            let cpu_tensor = normalized_embedding.to_device(tch::Device::Cpu);
+            let numel = cpu_tensor.numel();
+            let mut embedding_vec = vec![0.0f32; numel];
+            cpu_tensor.copy_data(&mut embedding_vec, numel);
+
+            Ok(embedding_vec)
+        }
+    }
+
+    /// Compute vision embeddings for one or more images.
+    ///
+    /// Preprocesses raw image bytes and runs them through the model's vision
+    /// encoder (e.g. SigLIP). Returns one embedding vector per image.
+    ///
+    /// # Arguments
+    /// * `images` - Raw image bytes (PNG/JPEG/RGB) per image
+    ///
+    /// # Returns
+    /// * Vec<Vec<f32>> - Embedding vectors, one per input image
+    pub fn embed_images(&self, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>> {
+        use crate::runtime::image_utils::{load_image_from_bytes, ImagePreprocessConfig};
+
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let model_guard = self
+            .persistent_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("No model loaded"))?
+            .lock();
+
+        // Preprocess images to tensors
+        let config = ImagePreprocessConfig::siglip();
+        let mut image_tensors = Vec::with_capacity(images.len());
+        for img_bytes in images {
+            let tensor = load_image_from_bytes(img_bytes, &config, self.device)?;
+            image_tensors.push(tensor);
+        }
+        let batch = Tensor::cat(&image_tensors, 0); // [B, 3, H, W]
+
+        let _no_grad = tch::no_grad_guard();
+
+        // Run through vision encoder
+        let embeddings_tensor = model_guard.encode_vision(&batch)?;
+        // embeddings_tensor shape: [B, hidden_size]
+
+        let batch_size = embeddings_tensor.size()[0] as usize;
+        let dim = embeddings_tensor.size()[1] as usize;
+        let cpu_tensor = embeddings_tensor
+            .to_device(tch::Device::Cpu)
+            .to_kind(tch::Kind::Float);
+
+        let mut results = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let mut vec = vec![0.0f32; dim];
+            let row = cpu_tensor.get(i as i64);
+            row.copy_data(&mut vec, dim);
+            results.push(vec);
+        }
+
+        Ok(results)
+    }
+
+    /// Process embeddings through all model layers for embedding extraction
+    fn process_through_layers_for_embedding(
+        &self,
+        model: &dyn crate::runtime::architectures::ModelOperations,
+        embeddings: &Tensor,
+    ) -> Result<Tensor> {
+        let num_layers = model.num_layers();
+        let mut hidden_states = embeddings.shallow_clone();
+
+        for layer_idx in 0..num_layers {
+            let (new_hidden, _kv) = model.decode_layer(
+                layer_idx,
+                &hidden_states,
+                None, // attention_mask
+                None, // position_ids
+                None, // past_kv
+            )?;
+            hidden_states = new_hidden;
+        }
+
+        Ok(hidden_states)
+    }
+
+    /// Explicitly drop every CUDA/device tensor the engine owns or has cached
+    /// on this thread, **now** — while the CUDA context is still alive.
+    ///
+    /// # Why this exists (#429)
+    ///
+    /// `tch`/libtorch defers CUDA context teardown to an `atexit` handler that
+    /// runs during *process* exit. But two classes of device tensor outlive the
+    /// engine struct and only drop later:
+    ///
+    /// 1. **Thread-local RoPE caches** (`llama::ROPE_CACHE`, `qwen3_5::ROPE_CACHE`)
+    ///    — sin/cos tables cached on the compute device. They are TLS, so they
+    ///    are not touched by `Drop` and survive until the owning thread exits.
+    /// 2. **The inference service thread itself** — it is spawned detached in
+    ///    `LocalInferenceService::start`, so its TLS destructors (and thus the
+    ///    RoPE cache drop) can fire during process-exit cleanup, *after* the
+    ///    CUDA context is gone → `c10::Error: invalid device pointer` (SIGABRT).
+    ///
+    /// The engine-only GPU smoke (`e6_gpu_engine_is_single_device_on_one_gpu_host`)
+    /// never loads weights nor runs a forward pass, so it populates no RoPE
+    /// cache and exits cleanly; the streaming test does, which is why only it
+    /// aborts.
+    ///
+    /// Calling this on the service thread at `Shutdown` receipt — *before*
+    /// replying to the client — drops the RoPE tables and the model weights
+    /// synchronously while the caller is still blocked on the reply (process
+    /// indubitably alive, context valid). After it returns only empty shells
+    /// remain for any late TLS/static destruction, so there is nothing left to
+    /// free against a dead context.
+    ///
+    /// # Contract
+    ///
+    /// This is a **terminal** teardown: the engine is unusable afterward
+    /// (`model_info` reports unloaded, generation will error). It must only be
+    /// called once, at shutdown. Unlike [`Drop`], it deliberately *does* clear
+    /// shared `Arc<Mutex<Option<T>>>` contents — that is safe precisely because
+    /// the engine is being retired, not because the contents are unused. (The
+    /// production inference path holds a single engine instance per service; a
+    /// cached clone would see `None` and fail closed with "No model loaded",
+    /// which is the correct behavior for a retired engine.)
+    pub fn release_device_resources(&mut self) {
+        // 1. Clear the model's own KV cache while the model still exists (the
+        //    cache tensors live inside the architecture model's KVCacheManager).
+        self.clear_kv_cache();
+
+        // 2. Drop the architecture model (all decoder-layer weights, embeddings,
+        //    lm_head) — the bulk of the device memory.
+        self.persistent_model = None;
+
+        // 3. Drop the (dummy) VarStore and clear the session KV registry so any
+        //    device tensors held there release before context teardown too.
+        {
+            let mut vs_guard = self.var_store.lock();
+            *vs_guard = None;
+        }
+        if let Some(registry) = self.kv_cache_registry.clone() {
+            registry.clear_all();
+        }
+
+        // 4. Drop the thread-local RoPE sin/cos tables on *this* thread. This is
+        //    the load-bearing step for #429: without it these CUDA tensors would
+        //    only free in the detached service thread's TLS destructor.
+        crate::runtime::architectures::llama::clear_rope_cache();
+        crate::runtime::architectures::qwen3_5::clear_rope_cache();
+
+        // 5. Drain any in-flight CUDA kernels (frees completed, makes the above
+        //    drops effective on the device) before we hand control back. CPU is
+        //    a no-op. Best-effort: a failure to synchronize is logged, not fatal
+        //    — the tensors are already dropped on the Rust side.
+        if let Device::Cuda(idx) = self.device {
+            // atc_synchronize panics on internal error; never propagate.
+            let res = std::panic::catch_unwind(|| tch::Cuda::synchronize(idx as i64));
+            if res.is_err() {
+                warn!("CUDA synchronize during teardown returned an error (ignored)");
+            }
+        }
+    }
+}
+
+impl Drop for TorchEngine {
+    fn drop(&mut self) {
+        // Drop our Arc references to shared resources.
+        // The actual cleanup happens when the LAST Arc reference drops.
+        //
+        // IMPORTANT: Do NOT clear the contents of Arc<Mutex<Option<T>>> fields!
+        // All TorchEngine clones share the same Arc instances. Clearing the contents
+        // would break other clones (especially the cached engine in model_cache).
+        //
+        // Previous implementation cleared shared Arc contents, causing:
+        // - First request: clone for spawn_blocking drops, clears var_store
+        // - Second request: cached engine has var_store = None, fails with "No model loaded"
+
+        // Drop our Arc references (NOT the contents)
+        self.persistent_model = None; // Drops our Option<Arc<...>> reference
+
+        // Arc<Mutex<...>> fields are automatically cleaned up via Arc reference counting
+        // when the last TorchEngine clone drops. No manual intervention needed.
+    }
+}
+
+#[cfg(test)]
+#[path = "torch_engine_mtp_session_tests.rs"]
+mod mtp_session_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    #[test]
+    fn precision_policy_preserves_aliases_and_non_cpu_modes_without_gpu_execution() {
+        for device in [Device::Cpu, Device::Cuda(0), Device::Mps] {
+            for channel in [false, true] {
+                for (aliases, expected) in [
+                    (
+                        &["fp32", "float32", "FP32", "Float32"][..],
+                        tch::Kind::Float,
+                    ),
+                    (&["fp16", "float16", "FP16", "Float16"][..], tch::Kind::Half),
+                    (
+                        &["bf16", "bfloat16", "BF16", "BFloat16"][..],
+                        tch::Kind::BFloat16,
+                    ),
+                ] {
+                    for alias in aliases {
+                        assert_eq!(
+                            resolve_inference_compute_kind(Some(alias), device, channel).unwrap(),
+                            expected
+                        );
+                    }
+                }
+                let automatic = if device == Device::Cpu && channel {
+                    tch::Kind::Float
+                } else {
+                    tch::Kind::BFloat16
+                };
+                for alias in [None, Some("auto"), Some("AUTO"), Some("fp8"), Some("FP8")] {
+                    assert_eq!(
+                        resolve_inference_compute_kind(alias, device, channel).unwrap(),
+                        automatic
+                    );
+                }
+                for invalid in ["", "fp64", "float8", "surprise"] {
+                    assert!(
+                        resolve_inference_compute_kind(Some(invalid), device, channel).is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decision_context_uses_actual_loaded_config_and_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.safetensors");
+        let shapes = [
+            ("model.embed_tokens.weight", vec![8, 4]),
+            ("model.norm.weight", vec![4]),
+            ("model.layers.0.input_layernorm.weight", vec![4]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![4]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![4, 4]),
+            ("model.layers.0.mlp.gate_proj.weight", vec![8, 4]),
+            ("model.layers.0.mlp.up_proj.weight", vec![8, 4]),
+            ("model.layers.0.mlp.down_proj.weight", vec![4, 8]),
+        ];
+        let weights: Vec<_> = shapes
+            .into_iter()
+            .map(|(key, shape)| {
+                (
+                    key.to_owned(),
+                    Tensor::ones(shape.as_slice(), (tch::Kind::Float, Device::Cpu)),
+                )
+            })
+            .collect();
+        Tensor::write_safetensors(&weights, &path).unwrap();
+        for (model_limit, override_limit, expected_limit, admitted_tokens) in [
+            (64usize, None, 64usize, 64usize),
+            (8192, None, 8192, 4097),
+            (8192, Some(32), 32, 32),
+        ] {
+            let config = serde_json::json!({
+                "model_type":"llama","architectures":["LlamaForCausalLM"],
+                "hidden_size":4,"intermediate_size":8,"num_hidden_layers":1,
+                "num_attention_heads":2,"num_key_value_heads":2,"head_dim":2,
+                "vocab_size":8,"max_position_embeddings":model_limit,
+                "rms_norm_eps":1e-5,"rope_theta":10000.0,"tie_word_embeddings":true
+            });
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let mut engine = TorchEngine::new(RuntimeConfig {
+                use_gpu: false,
+                context_length: 4096,
+                max_context: override_limit,
+                precision_mode: Some("fp32".to_owned()),
+                speculative_decoding: false,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(engine.effective_context_limit().is_err());
+            engine.load_model_file(&path).await.unwrap();
+            assert_eq!(engine.effective_context_limit().unwrap(), expected_limit);
+            assert_eq!(
+                engine.context_state.lock().as_ref().unwrap().context_window,
+                expected_limit
+            );
+            let overflow = vec![0i64; expected_limit + 1];
+            let rejected = engine
+                .with_decision_backbone_checked(&overflow, &|| Ok(()), |_, _| Ok(()))
+                .unwrap_err();
+            assert!(rejected.to_string().contains("exceeds context limit"));
+            // Llama deliberately lacks decision hidden states. Reaching that
+            // downstream error proves valid context was admitted without doing
+            // a long forward. The8192case causally admits4097tokens, which the
+            // previous RuntimeConfig default4096 incorrectly rejected.
+            let admitted = vec![0i64; admitted_tokens];
+            let downstream = engine
+                .with_decision_backbone_checked(&admitted, &|| Ok(()), |_, _| Ok(()))
+                .unwrap_err();
+            assert!(downstream
+                .to_string()
+                .contains("decision hidden states unsupported"));
+        }
+    }
+
+    #[test]
+    fn mtp_bonus_sampling_matches_serial_repetition_window() {
+        let engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false,
+            speculative_decoding: false,
+            ..Default::default()
+        })
+        .unwrap();
+        const TOKENIZER: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"oldest":0,"recent":1,"accepted":2,"[UNK]":3},"unk_token":"[UNK]"}}"#;
+        *engine.tokenizer.lock() = Some(Tokenizer::from_bytes(TOKENIZER.as_bytes()).unwrap());
+        let request = GenerationRequest {
+            prompt: "recent".into(),
+            temperature: Some(0.0),
+            repeat_penalty: Some(2.0),
+            repeat_last_n: Some(2),
+            ..Default::default()
+        };
+        let mut stream = TextStream::new(&engine, request).unwrap();
+        stream.recent_tokens = VecDeque::from([0, 1]);
+        // The accepted first token makes serial evict token 0. Penalizing that
+        // stale token changes the bonus argmax from 0 to 3 in this fixture.
+        let logits = Tensor::from_slice(&[10.0_f32, 0.0, 0.0, 7.0]);
+        let serial = engine
+            .sample_token_with_params(
+                &logits.copy(),
+                &stream.sampling_params,
+                &[1, 2],
+                &stream.penalty_exempt_tokens,
+            )
+            .unwrap();
+        let stale = engine
+            .sample_token_with_params(
+                &logits.copy(),
+                &stream.sampling_params,
+                &[0, 1, 2],
+                &stream.penalty_exempt_tokens,
+            )
+            .unwrap();
+        assert_ne!(stale, serial, "fixture must detect the pre-fix history");
+        let bonus = stream.sample_spec_position(&logits.copy(), &[2]).unwrap();
+        assert_eq!(bonus as usize, serial);
+        assert_eq!(stream.recent_tokens_buffer, vec![1, 2]);
+        assert_eq!(stream.recent_tokens, VecDeque::from([0, 1]));
+        // More round-local tokens than the configured window still stay bounded.
+        stream
+            .sample_spec_position(&logits.copy(), &[2, 3, 1])
+            .unwrap();
+        assert_eq!(stream.recent_tokens_buffer, vec![3, 1]);
+    }
+
+    // ===== #1253: prompt/token text must never reach process logs =====
+
+    /// Distinctive canary planted in prompt inputs; the assertions below prove
+    /// it never appears in captured process logs.
+    const LEAK_CANARY: &str = "PROMPTLEAKCANARY7q3z";
+
+    /// Minimal in-memory WordLevel tokenizer (no model files needed). The canary
+    /// is a known vocab entry so it tokenizes cleanly on the success path; any
+    /// other word maps to `[UNK]`, exercising the roundtrip-mismatch path.
+    fn redact_test_tokenizer() -> Tokenizer {
+        const TOK_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1,"[UNK]":3,"PROMPTLEAKCANARY7q3z":7},"unk_token":"[UNK]"}}"#;
+        Tokenizer::from_bytes(TOK_JSON.as_bytes()).expect("valid in-memory tokenizer")
+    }
+
+    /// `tracing_subscriber` writer that buffers all output into a shared Vec.
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for CapturingWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Newtype wrapper so we can implement the foreign `MakeWriter` trait for a
+    /// local type (orphan rule).
+    #[derive(Clone)]
+    struct CaptureSink(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureSink {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturingWriter(self.0.clone())
+        }
+    }
+
+    // ===== Session-cache recording vs cancellation-before-first-poll =====
+
+    /// Minimal `ArchitectureConfig` for the recording stub below: no model
+    /// math is exercised, only the configuration surface the trait requires.
+    struct StubArchConfig;
+    impl crate::runtime::architectures::ArchitectureConfig for StubArchConfig {
+        fn num_attention_heads(&self) -> usize {
+            4
+        }
+        fn num_key_value_heads(&self) -> usize {
+            4
+        }
+        fn hidden_size(&self) -> usize {
+            16
+        }
+        fn intermediate_size(&self) -> usize {
+            32
+        }
+        fn vocab_size(&self) -> usize {
+            16
+        }
+        fn max_position_embeddings(&self) -> usize {
+            64
+        }
+        fn rope_theta(&self) -> Option<f32> {
+            None
+        }
+        fn rope_dim(&self) -> Option<usize> {
+            None
+        }
+        fn layer_norm_eps(&self) -> f32 {
+            1e-5
+        }
+        fn use_rms_norm(&self) -> bool {
+            true
+        }
+    }
+
+    /// Model stub for cache-recording tests: holds a real (empty)
+    /// `KVCacheManager` and serves it to the engine's save path via
+    /// `get_kv_cache`. No forward is ever called — these tests exercise stream
+    /// construction, drop, and cache recording only, so every compute method
+    /// stays on the trait's `Err`/no-op defaults.
+    struct RecordingStubModel {
+        cache: Option<Arc<Mutex<crate::runtime::KVCacheManager>>>,
+    }
+    impl ModelOperations for RecordingStubModel {
+        fn architecture(&self) -> crate::runtime::architectures::ModelArchitecture {
+            crate::runtime::architectures::ModelArchitecture::Llama { version: 3 }
+        }
+        fn config(&self) -> &dyn crate::runtime::architectures::ArchitectureConfig {
+            &StubArchConfig
+        }
+        fn forward(&self, _input: &Tensor, _past_kv: Option<&Tensor>) -> Result<Tensor> {
+            Err(anyhow!("recording tests never poll the stream"))
+        }
+        fn reshape_for_attention(&self, tensor: &Tensor, _is_key_value: bool) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn apply_rope(&self, tensor: &Tensor, _position_ids: &Tensor) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn normalize(&self, tensor: &Tensor) -> Result<Tensor> {
+            Ok(tensor.shallow_clone())
+        }
+        fn get_attention_mask(&self, _seq_len: usize, _past_kv_len: usize) -> Result<Tensor> {
+            Err(anyhow!("recording tests never poll the stream"))
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn get_kv_cache(&self) -> Option<Arc<Mutex<crate::runtime::KVCacheManager>>> {
+            self.cache.clone()
+        }
+        fn set_kv_cache(&mut self, cache: Arc<Mutex<crate::runtime::KVCacheManager>>) {
+            self.cache = Some(cache);
+        }
+        fn clear_kv_cache(&self) {
+            // Same shape as the real architectures: route the clear through
+            // the installed KVCacheManager so the metadata contract under
+            // test is the production `clear_all` path.
+            if let Some(cache) = &self.cache {
+                let mut guard = cache.lock();
+                guard.clear_all();
+            }
+        }
+    }
+
+    /// Regression (cancellation before first poll): dropping a stream that was
+    /// never polled must NOT record its prompt IDs into the session cache.
+    /// Exact-hit/miss resolution in `TextStream::new` clears the cache at
+    /// generation setup, before any forward — recording IDs over that empty
+    /// state would let a later extending prompt claim a prefix_len against KV
+    /// that does not exist (the pure-attention hit path would partial-prefill
+    /// from mid-prompt with no history behind it). `prefill_time_ms` is Some
+    /// exactly when the first prefill forward completed, so it gates recording.
+    #[test]
+    fn drop_before_first_poll_does_not_record_session_cache() {
+        let mut engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("CPU engine should construct without a model");
+
+        // In-memory tokenizer (same pattern as the log-redaction tests);
+        // "hello world" → [0, 1].
+        *engine.tokenizer.lock() = Some(redact_test_tokenizer());
+
+        // A real empty KV cache served by the stub model — the recording target.
+        let cache: Arc<Mutex<crate::runtime::KVCacheManager>> = Arc::new(Mutex::new(
+            crate::runtime::KVCacheManager::new(2, 64, crate::runtime::KVQuantType::None),
+        ));
+        engine.persistent_model = Some(Arc::new(Mutex::new(Box::new(RecordingStubModel {
+            cache: Some(cache.clone()),
+        }))));
+
+        let request = GenerationRequest {
+            prompt: "hello world".to_owned(),
+            ..Default::default()
+        };
+        let stream = TextStream::new(&engine, request).expect("stream should construct");
+        // Cancellation: dropped before the first poll — no prefill ever ran.
+        drop(stream);
+
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            0,
+            "a drop before the first poll must not record prompt IDs over the cleared cache"
+        );
+
+        // The downstream hazard: a later extending prompt must not claim a
+        // reusable prefix over state that was never prefilled.
+        let extended = vec![0i64, 1, 5, 9];
+        assert_eq!(
+            cache.lock().prefix_match_len(&extended),
+            0,
+            "no prefix may be claimed over cache state that was never computed"
+        );
+    }
+
+    /// Regression (prior-session metadata vs cancellation): a cache populated
+    /// by an earlier turn (prompt IDs + end-of-prefill SSM snapshot) must not
+    /// retain that metadata after the set-up clear that a later turn's exact
+    /// hit or miss performs at generation setup. That clear runs before any
+    /// forward; if the turn is then cancelled before its first poll, nothing
+    /// new is recorded — so a subsequent extending prompt would otherwise
+    /// claim a prefix (and, for hybrid models, restore a stale snapshot)
+    /// against KV that no longer exists.
+    #[test]
+    fn setup_clear_drops_prior_session_metadata_on_cancelled_turn() {
+        let mut engine = TorchEngine::new(RuntimeConfig {
+            use_gpu: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("CPU engine should construct without a model");
+        *engine.tokenizer.lock() = Some(redact_test_tokenizer());
+
+        // Registry + session owner so the swap path engages: the set-up clear
+        // then runs through resolve_session_prefill_start exactly as the
+        // production prefix-detection branch drives it.
+        let registry = Arc::new(crate::runtime::kv_cache::KVCacheRegistry::new(
+            crate::runtime::kv_cache::CacheConfig {
+                num_layers: 2,
+                max_seq_len: 64,
+                quant_type: crate::runtime::KVQuantType::None,
+                paged: false,
+            },
+            None,
+        ));
+        let owner = crate::runtime::kv_cache::CacheOwner::Session("s1".to_owned());
+        let prior = registry.get_or_create(owner.clone());
+        // Stamp the cache compatibly so the #1277 reuse policy keeps it and
+        // prefix detection actually sees the prior metadata.
+        let mut desc = crate::runtime::kv_compat::KvCompatDescriptor::default();
+        desc.weights.base_revision = "test-base".to_owned();
+        desc.set_tokenizer(16, Some("test-tok-hash".to_owned()));
+        *engine.kv_compat.lock() = Some(desc);
+        {
+            let mut prior_guard = prior.lock();
+            prior_guard.set_compat_fingerprint(engine.kv_compat_fingerprint_for(0).unwrap());
+            let opt = (tch::Kind::Float, Device::Cpu);
+            let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+            let rec = vec![Some(Tensor::zeros([4], opt)), None];
+            // Prior turn's prompt [0, 1, 7] strictly extends this turn's
+            // ("hello world" → [0, 1]): the request is an exact hit, whose
+            // set-up clear routes through resolve_session_prefill_start →
+            // model.clear_kv_cache() — the production boundary under test.
+            prior_guard.set_cached_tokens_with_ssm(vec![0, 1, 7], Some((conv, rec)));
+        }
+        engine.kv_cache_registry = Some(registry);
+        *engine.active_cache_owner.lock() = Some(owner);
+        engine.persistent_model = Some(Arc::new(Mutex::new(Box::new(RecordingStubModel {
+            cache: None,
+        }))));
+
+        let request = GenerationRequest {
+            prompt: "hello world".to_owned(),
+            ..Default::default()
+        };
+        let stream = TextStream::new(&engine, request).expect("stream should construct");
+        // Cancelled before the first poll: the set-up clear has run, and no
+        // new recording can happen.
+        drop(stream);
+
+        // `prior` is the same Arc the swap installed into the model.
+        let guard = prior.lock();
+        assert_eq!(
+            guard.cached_token_count(),
+            0,
+            "prior prompt IDs must not survive the set-up clear"
+        );
+        assert!(
+            guard.ssm_snapshot().is_none(),
+            "prior end-of-prefill SSM snapshot must not survive the set-up clear"
+        );
+        assert_eq!(
+            guard.prefix_match_len(&[0, 1, 7, 4]),
+            0,
+            "an extending prompt must not claim a prefix over cleared KV"
+        );
+    }
+
+    /// Run `f` under a thread-local TRACE subscriber whose output is captured.
+    /// TRACE is deliberate: #1253 forbids relocating prompt text to DEBUG, so
+    /// the canary must be absent even at the lowest log level.
+    fn capture_logs<F: FnOnce()>(f: F) -> String {
+        let sink = CaptureSink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f();
+        // Drain the captured bytes into a local so the MutexGuard drops before
+        // `sink` itself (block-end drop order).
+        let cells = std::mem::take(&mut *sink.0.lock());
+        String::from_utf8(cells).unwrap()
+    }
+
+    /// #1253: a distinctive prompt secret must never appear in process logs,
+    /// regardless of tokenization outcome — success, empty-token failure, or
+    /// roundtrip mismatch.
+    ///
+    /// (Generation, stop, cancellation, and stream-error paths were audited:
+    /// after the #1261 redaction they log only positions/counts and error
+    /// objects — never prompt text, generated text, or token IDs, which are
+    /// reversible to text via the loaded tokenizer. Those paths require a full
+    /// model to drive, so the content-bearing tokenization outcomes — which are
+    /// exactly where the prompt is handled — are covered hermetically here.)
+    #[test]
+    fn tokenize_redacted_never_logs_prompt_content() {
+        let tokenizer = redact_test_tokenizer();
+
+        // --- success: every word is a known token ---
+        let logs = capture_logs(|| {
+            let ids = tokenize_redacted(&tokenizer, &format!("hello {LEAK_CANARY} world"));
+            assert_eq!(ids.unwrap().len(), 3);
+        });
+        assert!(
+            !logs.contains("Tokenized prompt"),
+            "success path must no longer emit a metering log line (token counts are OTel metrics now, #1261): {logs}"
+        );
+        assert!(
+            !logs.contains(LEAK_CANARY),
+            "prompt secret leaked into logs on success: {logs}"
+        );
+
+        // --- roundtrip mismatch: unknown word decodes to [UNK] ---
+        let logs = capture_logs(|| {
+            let ids = tokenize_redacted(&tokenizer, &format!("{LEAK_CANARY} zzz_unknown"));
+            // non-empty -> Ok, but the decode diverges -> mismatch warning
+            assert_eq!(ids.unwrap().len(), 2);
+        });
+        assert!(
+            logs.contains("roundtrip mismatch"),
+            "mismatch path must still emit bounded metadata: {logs}"
+        );
+        assert!(
+            !logs.contains(LEAK_CANARY),
+            "prompt secret leaked into logs on mismatch: {logs}"
+        );
+        assert!(
+            !logs.contains("zzz_unknown"),
+            "decoded token text leaked into logs on mismatch: {logs}"
+        );
+
+        // --- empty-token failure: 0 tokens (pure whitespace input) ---
+        // An input that carries the canary always yields >=1 token with this
+        // tokenizer, so the failure path is exercised with whitespace; we still
+        // assert it logs only bounded metadata ("empty token sequence") and no
+        // prompt content.
+        let logs = capture_logs(|| {
+            let res = tokenize_redacted(&tokenizer, "   ");
+            assert!(res.is_err(), "whitespace-only input must fail");
+        });
+        assert!(
+            logs.contains("empty token sequence"),
+            "failure path must still emit bounded metadata: {logs}"
+        );
+    }
+
+    // ---- base-weight content digest (#1277, finding F1) ----
+    //
+    // The pure framing/digest helpers live in `kv_compat`; these cover the engine
+    // seam: loader-selected shard-set resolution (extra/unreferenced `.safetensors`
+    // files are never hashed), fail-closed selection, resolved-byte hashing
+    // (incl. LFS/XET pointer handling), determinism, and parity with the pure
+    // helpers.
+
+    use crate::runtime::kv_compat;
+
+    /// Write `bytes` to `dir/shard_name`.
+    fn write_shard(dir: &std::path::Path, shard_name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        use std::io::Write;
+        let p = dir.join(shard_name);
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(bytes).unwrap();
+        p
+    }
+
+    /// Write a minimal `model.safetensors.index.json` whose `weight_map`
+    /// references exactly `shard_names`.
+    fn write_index(dir: &std::path::Path, shard_names: &[&str]) {
+        let weight_map: serde_json::Map<String, serde_json::Value> = shard_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                (
+                    format!("tensor.{i}"),
+                    serde_json::Value::String((*name).to_owned()),
+                )
+            })
+            .collect();
+        let index = serde_json::json!({ "weight_map": weight_map });
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_string_pretty(&index).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn weights_content_digest_is_deterministic_and_matches_pure() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            b"AAAA-content",
+        );
+        write_shard(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            b"BBBB-content",
+        );
+        write_index(
+            dir.path(),
+            &[
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+        );
+        let a = TorchEngine::weights_content_digest(dir.path())
+            .await
+            .unwrap();
+        let b = TorchEngine::weights_content_digest(dir.path())
+            .await
+            .unwrap();
+        assert_eq!(a, b, "digest must be deterministic across runs");
+        // Parity with the pure framing helper (engine resolves+hashes, pure fn frames).
+        let expected = kv_compat::base_weight_digest_from_shards(&[
+            (
+                "model-00001-of-00002.safetensors".into(),
+                kv_compat::shard_content_digest(b"AAAA-content"),
+            ),
+            (
+                "model-00002-of-00002.safetensors".into(),
+                kv_compat::shard_content_digest(b"BBBB-content"),
+            ),
+        ]);
+        assert_eq!(
+            a, expected,
+            "engine digest must equal the pure framing over resolved bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn weight_digest_reads_sealed_tree_after_checkout_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2db::Repository::init(dir.path()).unwrap();
+        repo.config().unwrap().set_str("user.name", "test").unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.email", "test@example.invalid")
+            .unwrap();
+        write_shard(dir.path(), "model.safetensors", b"reviewed weights");
+        let mut index = repo.index().unwrap();
+        index
+            .add_path(std::path::Path::new("model.safetensors"))
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        let commit = repo
+            .commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])
+            .unwrap();
+        drop(tree);
+        drop(repo);
+
+        let artifact = git2db::pinned_tree::PinnedTree::acquire(dir.path(), commit)
+            .await
+            .unwrap()
+            .into_sealed_projection()
+            .unwrap();
+        let baseline = TorchEngine::weights_content_digest(artifact.root())
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), b"replacement weights").unwrap();
+        let after = TorchEngine::weights_content_digest(artifact.root())
+            .await
+            .unwrap();
+        assert_eq!(baseline, after);
+        assert_ne!(
+            baseline,
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn weights_content_digest_same_basename_different_bytes_diverge() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        write_shard(d1.path(), "model-00001-of-00002.safetensors", b"content-A");
+        write_shard(d1.path(), "model-00002-of-00002.safetensors", b"content-B");
+        write_index(
+            d1.path(),
+            &[
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+        );
+        write_shard(d2.path(), "model-00001-of-00002.safetensors", b"content-A!");
+        write_shard(d2.path(), "model-00002-of-00002.safetensors", b"content-B");
+        write_index(
+            d2.path(),
+            &[
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+        );
+        let a = TorchEngine::weights_content_digest(d1.path())
+            .await
+            .unwrap();
+        let b = TorchEngine::weights_content_digest(d2.path())
+            .await
+            .unwrap();
+        assert_ne!(a, b, "same basenames, different content must diverge");
+    }
+
+    /// Two shard sets equal as a (name → content) map but enumerated in
+    /// different creation order must produce the same digest (sorted determinism).
+    #[tokio::test]
+    async fn weights_content_digest_is_order_independent() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        write_shard(d1.path(), "model-00001-of-00002.safetensors", b"X");
+        write_shard(d1.path(), "model-00002-of-00002.safetensors", b"Y");
+        write_index(
+            d1.path(),
+            &[
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+        );
+        // Reverse creation order in d2.
+        write_shard(d2.path(), "model-00002-of-00002.safetensors", b"Y");
+        write_shard(d2.path(), "model-00001-of-00002.safetensors", b"X");
+        write_index(
+            d2.path(),
+            &[
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+        );
+        let a = TorchEngine::weights_content_digest(d1.path())
+            .await
+            .unwrap();
+        let b = TorchEngine::weights_content_digest(d2.path())
+            .await
+            .unwrap();
+        assert_eq!(a, b, "digest must be independent of enumeration order");
+    }
+
+    #[tokio::test]
+    async fn weights_content_digest_empty_dir_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .is_err(),
+            "an empty model dir must fail closed, not mint a partial digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn weights_content_digest_no_safetensors_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "config.json", b"{}");
+        write_shard(dir.path(), "tokenizer.json", b"{}");
+        assert!(
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .is_err(),
+            "a dir with no .safetensors shards must fail closed"
+        );
+    }
+
+    /// A small (<1 KiB) ordinary shard that is NOT an LFS pointer must be hashed
+    /// as content (not skipped, not treated as a pointer).
+    #[tokio::test]
+    async fn weights_content_digest_small_plain_shard_hashed_as_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"tiny-but-real-weights";
+        write_shard(dir.path(), "model.safetensors", bytes);
+        let digest = TorchEngine::weights_content_digest(dir.path())
+            .await
+            .unwrap();
+        let expected = kv_compat::base_weight_digest_from_shards(&[(
+            "model.safetensors".into(),
+            kv_compat::shard_content_digest(bytes),
+        )]);
+        assert_eq!(
+            digest, expected,
+            "a small non-pointer shard must hash its content bytes"
+        );
+    }
+
+    /// An un-smudged LFS/XET pointer shard must fail closed (never be hashed as a
+    /// pointer stub). With no resolvable object store in the test environment,
+    /// resolution errors out → the digest declines.
+    #[tokio::test]
+    async fn weights_content_digest_pointer_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A canonical LFS pointer header (<1 KiB). It is not resolvable here.
+        let pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:0000000000000000000000000000000000000000000000000000000000000000\nsize 1234\n";
+        write_shard(dir.path(), "model.safetensors", pointer);
+        assert!(
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .is_err(),
+            "an un-smudged LFS pointer must fail closed, not be hashed as a stub"
+        );
+    }
+
+    /// An unreadable shard must fail closed (read error propagates), not produce
+    /// a digest over the readable remainder. Skipped when running as root (root
+    /// bypasses the 0o000 permission).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn weights_content_digest_unreadable_shard_fails_closed() {
+        // Root bypasses the 0o000 permission, so the read would succeed and the
+        // fail-closed assertion could not hold — skip silently under root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_shard(dir.path(), "model.safetensors", b"real-content");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let res = TorchEngine::weights_content_digest(dir.path()).await;
+        // Restore so tempdir cleanup can remove it.
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
+        assert!(
+            res.is_err(),
+            "an unreadable shard must fail closed, not hash a partial set"
+        );
+    }
+
+    /// An extra/unreferenced `.safetensors` in the directory must NOT shift the
+    /// digest: only the index-referenced (loader-selected) shards are hashed.
+    #[tokio::test]
+    async fn weights_content_digest_ignores_unreferenced_extra_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            b"AAAA-content",
+        );
+        write_shard(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            b"BBBB-content",
+        );
+        write_index(
+            dir.path(),
+            &[
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+        );
+        let selected_only = TorchEngine::weights_content_digest(dir.path())
+            .await
+            .unwrap();
+
+        // A stale shard with a shard-like name the loader never references.
+        write_shard(
+            dir.path(),
+            "model-00003-of-00002.safetensors",
+            b"STALE-alt-precision",
+        );
+        let with_extra = TorchEngine::weights_content_digest(dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            selected_only, with_extra,
+            "an unreferenced extra shard must be invariant to the digest"
+        );
+        let expected = kv_compat::base_weight_digest_from_shards(&[
+            (
+                "model-00001-of-00002.safetensors".into(),
+                kv_compat::shard_content_digest(b"AAAA-content"),
+            ),
+            (
+                "model-00002-of-00002.safetensors".into(),
+                kv_compat::shard_content_digest(b"BBBB-content"),
+            ),
+        ]);
+        assert_eq!(
+            with_extra, expected,
+            "digest must cover exactly the loader-selected set, no more"
+        );
+    }
+
+    /// With a single `model.safetensors`, an extra shard-like file is not part
+    /// of the loader's selection and must not shift the digest.
+    #[tokio::test]
+    async fn weights_content_digest_single_file_ignores_extra_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "model.safetensors", b"single-file-weights");
+        let baseline = TorchEngine::weights_content_digest(dir.path())
+            .await
+            .unwrap();
+        let expected = kv_compat::base_weight_digest_from_shards(&[(
+            "model.safetensors".into(),
+            kv_compat::shard_content_digest(b"single-file-weights"),
+        )]);
+        assert_eq!(baseline, expected);
+
+        // Even a name matching the shard glob is not selected when
+        // `model.safetensors` is the loader's pick.
+        write_shard(
+            dir.path(),
+            "model-00001-of-00001.safetensors",
+            b"UNREFERENCED",
+        );
+        let with_extra = TorchEngine::weights_content_digest(dir.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            baseline, with_extra,
+            "an extra shard next to model.safetensors must be invariant"
+        );
+    }
+
+    /// Changing a SELECTED shard changes the digest; adding, removing, or
+    /// mutating an UNREFERENCED shard does not.
+    #[tokio::test]
+    async fn weights_content_digest_selected_mutations_diverge_unreferenced_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            b"AAAA-content",
+        );
+        write_shard(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            b"BBBB-content",
+        );
+        write_index(
+            dir.path(),
+            &[
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+        );
+        let baseline = TorchEngine::weights_content_digest(dir.path())
+            .await
+            .unwrap();
+
+        // Add an unreferenced shard.
+        let extra = write_shard(dir.path(), "stale-backup.safetensors", b"stale");
+        assert_eq!(
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .unwrap(),
+            baseline,
+            "adding an unreferenced shard must not change the digest"
+        );
+        // Mutate the unreferenced shard.
+        write_shard(dir.path(), "stale-backup.safetensors", b"stale-CHANGED");
+        assert_eq!(
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .unwrap(),
+            baseline,
+            "mutating an unreferenced shard must not change the digest"
+        );
+        // Remove the unreferenced shard.
+        std::fs::remove_file(&extra).unwrap();
+        assert_eq!(
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .unwrap(),
+            baseline,
+            "removing an unreferenced shard must not change the digest"
+        );
+        // Change a SELECTED shard.
+        write_shard(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            b"BBBB-CHANGED",
+        );
+        assert_ne!(
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .unwrap(),
+            baseline,
+            "changing a selected shard must change the digest"
+        );
+    }
+
+    /// A directory whose only `.safetensors` files match no loader selection
+    /// pattern has ZERO selected shards and must fail closed (reuse declined).
+    #[tokio::test]
+    async fn weights_content_digest_zero_selected_shards_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(dir.path(), "backup.safetensors", b"not-a-selected-shard");
+        write_shard(dir.path(), "optimizer.safetensors", b"also-not-selected");
+        assert!(
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .is_err(),
+            "a dir with no loader-selected shards must fail closed"
+        );
+    }
+
+    /// An index referencing a shard that does not exist on disk is an
+    /// inconsistent selection and must fail closed (reuse declined).
+    #[tokio::test]
+    async fn weights_content_digest_missing_index_shard_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            b"AAAA-content",
+        );
+        write_index(
+            dir.path(),
+            &[
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors", // referenced but absent
+            ],
+        );
+        assert!(
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .is_err(),
+            "an index referencing a missing shard must fail closed"
+        );
+    }
+
+    /// A manifest-less MULTI-shard glob selection is ambiguous (the glob can
+    /// silently drop/duplicate shards), so the digest must fail closed —
+    /// decline reuse — even though the LOADER only warns in its permissive
+    /// default mode. Fingerprint authority is stricter than loader
+    /// permissiveness (#1277 revise-4): this holds regardless of
+    /// `HYPRSTREAM_STRICT_LOADER` (the test env does not set it, exercising
+    /// the permissive loader path).
+    #[tokio::test]
+    async fn weights_content_digest_manifestless_multi_shard_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            b"AAAA-content",
+        );
+        write_shard(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            b"BBBB-content",
+        );
+        // NO model.safetensors.index.json — the loader warns and continues;
+        // the digest must refuse.
+        assert!(
+            TorchEngine::weights_content_digest(dir.path())
+                .await
+                .is_err(),
+            "an ambiguous manifest-less multi-shard glob set must fail closed"
+        );
+    }
+
+    /// A SINGLE globbed shard (no index, no model.safetensors) is unambiguous
+    /// and must still digest — only multi-shard glob sets are ambiguous.
+    #[tokio::test]
+    async fn weights_content_digest_single_globbed_shard_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shard(
+            dir.path(),
+            "model-00001-of-00001.safetensors",
+            b"single-shard-content",
+        );
+        let digest = TorchEngine::weights_content_digest(dir.path())
+            .await
+            .unwrap();
+        let expected = kv_compat::base_weight_digest_from_shards(&[(
+            "model-00001-of-00001.safetensors".into(),
+            kv_compat::shard_content_digest(b"single-shard-content"),
+        )]);
+        assert_eq!(
+            digest, expected,
+            "a single globbed shard is unambiguous and must digest"
+        );
+    }
+
+    #[test]
+    fn test_generation_config_in_engine_has_correct_max_tokens() {
+        // Create a minimal runtime config
+        let _runtime_config = RuntimeConfig::default();
+
+        // Create engine (this will fail without LIBTORCH but we can test the constructor logic)
+        // We're just verifying the default generation_config
+        let gen_config = GenerationConfig {
+            max_tokens: 2048,
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: Some(40),
+            repeat_penalty: 1.1,
+            stop_tokens: vec!["</s>".to_owned()],
+            seed: None,
+            stream: false,
+        };
+
+        // Verify the defaults we set
+        assert_eq!(
+            gen_config.max_tokens, 2048,
+            "TorchEngine should initialize with max_tokens=2048"
+        );
+    }
+
+    /// `with_device(.., None)` — the single-device path used by every legacy
+    /// caller — must produce an engine that reports single-device and exposes
+    /// no pool. This is the regression guard that the #314 wiring does not
+    /// perturb single-GPU/CPU construction.
+    #[test]
+    fn single_device_engine_is_not_multi_device() {
+        let engine =
+            super::TorchEngine::with_device(RuntimeConfig::default(), Device::Cpu, None).unwrap();
+        assert!(!engine.is_multi_device());
+        assert!(engine.device_pool().is_none());
+        assert_eq!(engine.device(), Device::Cpu);
+    }
+
+    /// #429: `release_device_resources` is the terminal teardown that drops
+    /// CUDA tensors (weights, KV cache, thread-local RoPE tables) on the
+    /// service thread at shutdown. It must:
+    /// - be safe on an engine that never loaded a model (no-op for the
+    ///   weight/KV paths, but must still clear RoPE TLS),
+    /// - be idempotent (double-call must not panic / double-free),
+    /// - leave the engine visibly unloaded afterward.
+    ///
+    /// This runs on CPU (no CUDA context), so it can't reproduce the SIGABRT
+    /// itself; it pins the *ordering contract* the GPU fix relies on. The
+    /// thread-local RoPE caches are populated on whichever thread runs the
+    /// forward pass — this test clears the test thread's own TLS, which is
+    /// exactly what the production Shutdown handler does on the service thread.
+    #[test]
+    fn release_device_resources_is_safe_and_idempotent() {
+        let mut engine =
+            super::TorchEngine::with_device(RuntimeConfig::default(), Device::Cpu, None).unwrap();
+
+        // Never loaded a model — these start empty.
+        assert!(!engine.has_varstore());
+
+        // First call: no model weights, no KV registry, no RoPE entries on this
+        // thread — must still succeed and clear the (empty) RoPE TLS.
+        engine.release_device_resources();
+        assert!(
+            !engine.has_varstore(),
+            "an unloaded engine stays unloaded after teardown"
+        );
+
+        // Second call: idempotent — must not panic or double-free.
+        engine.release_device_resources();
+        engine.release_device_resources();
+
+        // Dropping the engine afterward must also be clean (no double-drop of
+        // the already-None persistent_model / var_store).
+        drop(engine);
+    }
+
+    /// #429: a loaded-model teardown must actually drop the VarStore contents.
+    /// We can't load a real model without weights/libtorch-on-this-host, but we
+    /// can set the dummy VarStore (the same step `load_model_file` performs) and
+    /// confirm `release_device_resources` clears it — the contract the GPU path
+    /// relies on to free weight tensors before CUDA context teardown.
+    #[test]
+    fn release_device_resources_clears_loaded_varstore() {
+        let mut engine =
+            super::TorchEngine::with_device(RuntimeConfig::default(), Device::Cpu, None).unwrap();
+        // Mimic the load path: install a dummy VarStore on the engine's device.
+        {
+            let vs = VarStore::new(Device::Cpu);
+            let mut guard = engine.var_store.lock();
+            *guard = Some(vs);
+        }
+        assert!(engine.has_varstore());
+
+        engine.release_device_resources();
+
+        assert!(
+            !engine.has_varstore(),
+            "release_device_resources must drop the VarStore"
+        );
+    }
+
+    /// `with_device(.., Some(multi_pool))` must mark the engine multi-device and
+    /// expose the pool with the right primary. We build the pool from explicit
+    /// `Device::Cuda` values via `DevicePool::from_devices` (which does not probe
+    /// CUDA), so this runs on CPU-only CI — we never construct a model here, we
+    /// only exercise the engine-struct wiring (#314 selection logic).
+    #[test]
+    fn multi_device_pool_marks_engine_multi_device() {
+        use crate::runtime::device_pool::DevicePool;
+        let pool = DevicePool::from_devices(vec![Device::Cuda(0), Device::Cuda(1)]).unwrap();
+        assert_eq!(pool.len(), 2);
+        let primary = pool.primary();
+        let engine = super::TorchEngine::with_device(
+            RuntimeConfig::default(),
+            primary,
+            Some(std::sync::Arc::new(pool.clone())),
+        )
+        .unwrap();
+        assert!(engine.is_multi_device());
+        let exposed = engine
+            .device_pool()
+            .expect("multi-device engine must expose its pool");
+        assert_eq!(exposed.devices(), pool.devices());
+        assert_eq!(exposed.primary(), primary);
+        assert_eq!(engine.device(), primary);
+    }
+
+    /// The map the factory would build for a 2-device pool must be a contiguous
+    /// prefix-heavy split with exactly one stage boundary — the invariant the
+    /// `forward_layers` path relies on. This pins the planner the wiring hands
+    /// to model construction (#314 → #310 epic).
+    #[test]
+    fn engine_multi_device_map_has_one_boundary_per_stage_gap() {
+        use crate::runtime::device_pool::{DevicePool, LayerDeviceMap};
+        let pool = DevicePool::from_devices(vec![Device::Cuda(0), Device::Cuda(1)]).unwrap();
+        // 7 layers over 2 devices → [0,0,0,0, 1,1,1] (prefix gets the extra).
+        let map = LayerDeviceMap::even_split(&pool, 7).unwrap();
+        assert_eq!(map.len(), 7);
+        let mut boundaries = 0;
+        let mut prev = map.device_for(0);
+        for g in 1..map.len() {
+            if map.is_boundary(prev, g) {
+                boundaries += 1;
+            }
+            prev = map.device_for(g);
+        }
+        assert_eq!(
+            boundaries, 1,
+            "2-device even_split has exactly one cross-device copy per forward"
+        );
+        assert!(!map.is_single_device());
+    }
+}
+
+/// Internal sampling parameters passed to TensorSampler
+#[derive(Debug, Clone, Copy)]
+struct SamplingParams {
+    temperature: f32,
+    top_p: f32,
+    top_k: Option<usize>,
+    repeat_penalty: f32,
+}
+
+use futures::Stream;
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
+
+/// Statistics about text generation with separate prefill/inference metrics
+#[derive(Debug, Clone)]
+pub struct GenerationStats {
+    // Overall metrics
+    pub tokens_generated: usize,
+    pub generation_time_ms: u64,
+    pub tokens_per_second: f32,
+    pub finish_reason: Option<FinishReason>,
+    /// Quality metrics captured during generation (for self-supervised training)
+    pub quality_metrics: Option<crate::runtime::generation_metrics::GenerationQualityMetrics>,
+
+    // Prefill metrics (processing the prompt)
+    pub prefill_tokens: usize,
+    pub prefill_time_ms: u64,
+    pub prefill_tokens_per_sec: f32,
+
+    // Inference metrics (generating new tokens, excluding prefill)
+    pub inference_tokens: usize,
+    pub inference_time_ms: u64,
+    /// Cumulative average: tokens / time (accurate for final reporting)
+    pub inference_tokens_per_sec: f32,
+    /// Exponential moving average (responsive for real-time adaptive batching)
+    pub inference_tokens_per_sec_ema: f32,
+
+    // MTP self-speculative decoding outcomes (0 when speculation is off)
+    /// Draft tokens accepted by greedy exact-match verify this request
+    pub speculative_accepted: u64,
+    /// Draft tokens rejected (and rewound) this request
+    pub speculative_rejected: u64,
+}
+
+/// Stream that yields decoded UTF-8 text chunks during generation.
+///
+/// Automatically handles UTF-8 buffering, stop tokens, EOS detection,
+/// timeout handling, cancellation, and all generation complexities.
+/// Just iterate and get text!
+pub struct TextStream<'a> {
+    engine: &'a TorchEngine,
+
+    /// Optional per-tenant delta for delta-aware inference.
+    /// When present, LoRA corrections are injected at each attention layer.
+    delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+
+    prompt_tokens: Vec<i64>,
+    last_generated: Option<i64>,
+
+    recent_tokens: VecDeque<i64>,
+    repeat_last_n: usize,
+
+    // PERF: Individual sampling params removed - now stored in sampling_params field below
+    // This avoids struct recreation per token while keeping backward compatibility
+    max_tokens: usize,
+    stop_token_ids: Vec<u32>,
+
+    // Store tokenizer as Arc for safe sharing across streams
+    // IMPORTANT: This field is required for the unsafe transmute in TextStream::new()
+    // DO NOT REMOVE - it ensures the tokenizer lives long enough for the decode_stream lifetime 'a
+    #[allow(dead_code)]
+    tokenizer: Arc<Tokenizer>,
+    decode_stream: tokenizers::tokenizer::DecodeStream<
+        'a,
+        tokenizers::models::ModelWrapper,
+        tokenizers::normalizers::NormalizerWrapper,
+        tokenizers::pre_tokenizers::PreTokenizerWrapper,
+        tokenizers::processors::PostProcessorWrapper,
+        tokenizers::decoders::DecoderWrapper,
+    >,
+
+    prompt_len: usize,
+    /// Position from which prefill should start (0 = full prefill, >0 = partial via prefix cache hit)
+    prefill_start_pos: usize,
+    /// SSM (conv/rec) state snapshot captured at end-of-prefill (hybrid
+    /// recurrent models only; `None` for pure-attention models). Saved into
+    /// the session cache by `save_cached_tokens` so a later prefix hit can
+    /// rewind the recurrent state alongside the KV truncation
+    /// (`rewind_session_state`).
+    prefill_ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
+    /// KV cache position tracking for this stream
+    /// Each stream has exclusive access via &mut self, so no atomic needed
+    kv_cache_position: usize,
+    /// Total tokens generated (including buffered UTF-8) - for statistics only
+    tokens_generated: usize,
+    start_time: std::time::Instant,
+    finished: bool,
+    finish_reason: Option<FinishReason>,
+
+    // Timeout handling
+    timeout_ms: Option<u64>,
+
+    /// Whether to collect per-token quality metrics (expensive - ~10x overhead)
+    collect_metrics: bool,
+
+    /// Metrics accumulator for self-supervised training quality signals
+    metrics_accumulator: crate::runtime::generation_metrics::GenerationMetricsAccumulator,
+
+    // PERF: Cached values to avoid per-token recomputation
+    /// Pre-created sampling params - avoids struct creation per token
+    sampling_params: SamplingParams,
+    /// Cached tokenizer vocab size - avoids lock acquisition per token
+    vocab_size: usize,
+    /// Cached model vocab size (from logits shape) - set after first forward
+    model_vocab_size: usize,
+    /// Reusable buffer for recent_tokens when VecDeque wraps around
+    recent_tokens_buffer: Vec<i64>,
+    /// Token IDs exempt from repeat penalty (single-character tokens like digits 0-9,
+    /// punctuation, etc.) These tokens appear frequently in number generation and
+    /// should not be penalized just for reoccurring.
+    penalty_exempt_tokens: HashSet<i64>,
+
+    // Timing for prefill/inference separation
+    /// Time spent on prefill (processing prompt), set after first forward pass
+    prefill_time_ms: Option<u64>,
+    /// Timestamp when first token was sampled (after prefill completes)
+    first_token_time: Option<std::time::Instant>,
+
+    // EMA rate tracking for adaptive batching
+    /// Timestamp when the last token was generated (for inter-token timing)
+    last_token_time: Option<std::time::Instant>,
+    /// Exponential moving average of tokens per second
+    ema_tokens_per_sec: f32,
+
+    /// Model label for OTel token-burn metric attributes (#1261).
+    model_label: String,
+    /// Opaque (hashed) tenant id for token-burn metric attributes — never the
+    /// raw request subject (#1253). `None` when no tenant is in scope.
+    tenant_hash: Option<u64>,
+
+    // MTP self-speculative decoding state (v1: greedy, batch=1, dense Qwen3.5).
+    /// Whether this stream decodes via MTP draft + verify. Decided once at
+    /// construction from the engine config, model capability, and request
+    /// sampling params (see `new_with_delta`).
+    speculative: bool,
+    /// Draft token proposed by the MTP head for the position after
+    /// `last_generated`; always `Some` between speculative decode rounds.
+    spec_pending_draft: Option<u32>,
+    /// Accepted tokens from the current speculative round not yet consumed by
+    /// `poll_next` (1 on reject, up to 2 on accept).
+    spec_out_queue: VecDeque<u32>,
+    /// Draft outcome counters for this request (OTel `record_speculative` at
+    /// drop + `GenerationStats`). Plain fields, never gated on collect_metrics.
+    spec_accepted: u64,
+    spec_rejected: u64,
+}
+
+impl<'a> TextStream<'a> {
+    fn new(engine: &'a TorchEngine, request: GenerationRequest) -> Result<Self> {
+        // No delta path: no tenant dependency and adapter generation 0 (base
+        // weights only).
+        Self::new_with_delta(engine, request, None, None, 0, 0)
+    }
+
+    fn new_with_delta(
+        engine: &'a TorchEngine,
+        request: GenerationRequest,
+        delta: Option<std::sync::Arc<parking_lot::Mutex<crate::training::TenantDelta>>>,
+        tenant_id: Option<String>,
+        weight_epoch: u64,
+        adapter_generation: u64,
+    ) -> Result<Self> {
+        let prompt_tokens = engine.tokenize(&request.prompt)?;
+        let prompt_len = prompt_tokens.len();
+
+        // Token-burn metering (#1261): emit the prompt-token count at the
+        // tokenization boundary as an OTel metric. The raw tenant subject is never
+        // a metric attribute — it is reduced to an opaque hash (#1253); the
+        // authoritative spend ledger is #1264.
+        let tenant_hash = crate::runtime::token_metrics::opaque_tenant_id(&tenant_id);
+        let model_label = engine.model_label();
+        crate::runtime::token_metrics::global_meter().record_prompt(
+            &model_label,
+            tenant_hash,
+            prompt_len as u64,
+        );
+
+        let tokenizer = engine.get_tokenizer()?;
+        let stop_token_ids: Vec<u32> = request.stop_tokens.as_deref().unwrap_or(&[])
+            .iter()
+            .filter_map(|stop_str| {
+                let encoding = tokenizer.encode(stop_str.as_str(), false).ok()?;
+                let ids = encoding.get_ids();
+                if ids.len() == 1 {
+                    Some(ids[0])
+                } else {
+                    // The stop sequence is caller-supplied content and is never
+                    // logged (#1253); only its byte length and resulting token
+                    // count are retained. The tenant is referenced only by its
+                    // opaque hash — the raw subject is dropped from logs.
+                    tracing::warn!(
+                        stop_bytes = stop_str.len(),
+                        encoded_tokens = ids.len(),
+                        tenant_hash = ?tenant_hash,
+                        "Stop token encodes to multiple tokens, skipping (only single-token stops supported; content redacted)"
+                    );
+                    None
+                }
+            })
+            .collect();
+
+        // Evict LRU session caches if memory budget is exceeded.
+        // This must happen before allocating/swapping in a new cache.
+        engine.evict_session_caches();
+
+        // Session cache management with prefix detection:
+        // If an active session exists, swap its KV cache into the model and check
+        // if the new prompt shares a prefix with the cached tokens. This avoids
+        // re-computing attention for unchanged conversation history.
+        let prefill_start_pos = if engine.swap_session_cache(tenant_id, weight_epoch) {
+            // Session cache swapped in — check for prefix match
+            let prefix_len = if let Some(model_arc) = &engine.persistent_model {
+                let model = model_arc.lock();
+                if let Some(cache) = model.get_kv_cache() {
+                    let mut cache_guard = cache.lock();
+
+                    // KV-cache compatibility guard (#1277): KV produced under an
+                    // incompatible (or unproven) model/runtime config is never
+                    // reused. The policy is **fail-closed** via
+                    // `decide_cache_reuse`: a stamp mismatch, an unstamped but
+                    // *populated* cache, or the absence of an authoritative
+                    // expected identity all discard the KV and recompute. Only a
+                    // genuinely fresh (empty) cache under an authoritative
+                    // identity is stamped for reuse. This is the pull-based
+                    // complement to the registry's push-based delta invalidation.
+                    let expected = engine.kv_compat_fingerprint_for(adapter_generation);
+                    cache_guard.apply_reuse_policy(expected);
+
+                    let matched = cache_guard.prefix_match_len(&prompt_tokens);
+                    if matched > 0 {
+                        tracing::info!(
+                            "Prefix cache hit: {} of {} tokens reusable (skipping {:.0}% of prefill)",
+                            matched, prompt_len,
+                            (matched as f64 / prompt_len as f64) * 100.0
+                        );
+                    }
+                    matched
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            if prefix_len > 0 && prefix_len <= prompt_len {
+                // Resolve the hit: a strict partial prefix rewinds cached
+                // state (KV truncation; hybrid recurrent models additionally
+                // restore the end-of-prefill GDN conv/rec snapshot). An
+                // exact-prompt repeat (`prefix_len == prompt_len`) must
+                // recompute from cleared state instead — there is no suffix
+                // left to prefill, and the fresh forward would double-advance
+                // restored recurrent state. Both decisions live in
+                // `resolve_session_prefill_start`.
+                if let Some(model_arc) = &engine.persistent_model {
+                    let model = model_arc.lock();
+                    resolve_session_prefill_start(model.as_ref(), prefix_len, prompt_len)
+                } else {
+                    0
+                }
+            } else {
+                // No match — clear and start fresh
+                engine.clear_kv_cache();
+                0
+            }
+        } else {
+            engine.clear_kv_cache();
+            0
+        };
+
+        let repeat_last_n = request
+            .repeat_last_n
+            .map(|v| v as usize)
+            .filter(|&v| v > 0)
+            .unwrap_or(64);
+
+        // Use Arc for safe tokenizer sharing
+        // This Arc is REQUIRED by the TextStream struct - see the comment on the tokenizer field
+        let tokenizer_arc = Arc::new(tokenizer);
+
+        // Create DecodeStream with proper lifetime management
+        // The Arc<Tokenizer> is stored in the TextStream, ensuring the tokenizer lives as long as 'a
+        // DEPENDENCY: The unsafe transmute below depends on tokenizer_arc being stored in the struct
+        let decode_stream = {
+            // We need to extend the tokenizer lifetime to match 'a
+            // Since we have Arc<Tokenizer> stored in the struct, we can safely create a reference
+            let tokenizer_ref = unsafe {
+                // SAFETY: This is safe because:
+                // 1. The tokenizer_arc is stored in the TextStream struct, ensuring it lives as long as 'a
+                // 2. We're not moving or deallocating the tokenizer while the stream exists
+                // 3. Arc guarantees thread-safe reference counting and proper lifetime management
+                std::mem::transmute::<&Tokenizer, &'a Tokenizer>(tokenizer_arc.as_ref())
+            };
+
+            // Use skip_special_tokens=false because <|extra_N|> tokens are special tokens
+            // that should appear in output (they represent actual model vocabulary)
+            tokenizer_ref.decode_stream(false) // skip_special_tokens=false
+        };
+
+        // Build set of token IDs exempt from repeat penalty.
+        // Single-character tokens (digits, punctuation, single letters) appear frequently
+        // in number generation. Penalizing them causes digit suppression: "1917" → "209" → "41".
+        // We exempt any token whose decoded form is a single character.
+        let penalty_exempt_tokens = {
+            let vocab = tokenizer_arc.get_vocab(true);
+            let mut exempt = HashSet::new();
+            for (token_str, &id) in &vocab {
+                // Check if this token decodes to a single character
+                // Token strings in the vocab may have special prefixes (like Ġ for space+char)
+                // We want to exempt raw single characters: digits, punctuation, single letters
+                let clean = token_str.trim();
+                if clean.chars().count() == 1 {
+                    exempt.insert(id as i64);
+                }
+            }
+            tracing::debug!(
+                "Built penalty-exempt token set: {} single-char tokens",
+                exempt.len()
+            );
+            exempt
+        };
+
+        // PERF: Pre-create sampling params to avoid struct allocation per token.
+        // Fall back to model's generation_config defaults (from generation_config.json
+        // or engine defaults) when the request doesn't specify a value.
+        let gc = &engine.generation_config;
+        let sampling_params = SamplingParams {
+            temperature: request.temperature.unwrap_or(gc.temperature),
+            top_p: request.top_p.unwrap_or(gc.top_p),
+            top_k: request.top_k.map(|v| v as usize).or(gc.top_k),
+            repeat_penalty: request.repeat_penalty.unwrap_or(gc.repeat_penalty),
+        };
+
+        // PERF: Cache vocab_size to avoid lock acquisition per token
+        let vocab_size = engine.get_vocab_size();
+
+        // MTP self-speculative decoding (v1): opt-in via config, and only when
+        // every correctness prerequisite holds. Reasons are logged once here
+        // (counts/config only — never content, #1253).
+        let speculative = if !engine.config.speculative_decoding {
+            false
+        } else if delta.is_some() {
+            // The MTP head is never delta-adapted, so acceptance would degrade
+            // under a tenant delta. Correctness would be preserved (verify runs
+            // the delta'd model), but v1 keeps the two features disjoint.
+            info!("Speculative decoding disabled: tenant LoRA delta active (MTP head is not delta-adapted)");
+            false
+        } else if engine.config.kv_quant_type != crate::runtime::KVQuantType::None {
+            // Quantized LayerKVCache::truncate_to falls back to a full clear(),
+            // which would silently break the reject rewind.
+            info!("Speculative decoding disabled: quantized KV cache (reject rewind needs O(1) truncate)");
+            false
+        } else if sampling_params.temperature > 0.01 {
+            // Greedy-only v1: exact-match verify is only exact under argmax.
+            info!("Speculative decoding disabled: non-greedy sampling (v1 is greedy-only)");
+            false
+        } else if !engine.speculative_supported() {
+            info!("Speculative decoding disabled: model has no dense MTP draft head");
+            false
+        } else {
+            info!("Speculative decoding enabled (MTP self-draft, k=1, greedy)");
+            true
+        };
+
+        Ok(Self {
+            engine,
+            delta,
+            prompt_tokens,
+            last_generated: None,
+            recent_tokens: VecDeque::with_capacity(repeat_last_n),
+            repeat_last_n,
+            max_tokens: request.max_tokens.unwrap_or(2048) as usize,
+            stop_token_ids,
+            tokenizer: tokenizer_arc,
+            decode_stream,
+            prompt_len,
+            prefill_start_pos,
+            prefill_ssm_snapshot: None, // Captured after successful serial or speculative prefill
+            // KV cache starts with prompt already in it after first forward
+            kv_cache_position: prompt_len,
+            tokens_generated: 0,
+            start_time: std::time::Instant::now(),
+            finished: false,
+            finish_reason: None,
+            timeout_ms: request.timeout_ms,
+            collect_metrics: false, // Server-side concern, not per-request
+            metrics_accumulator:
+                crate::runtime::generation_metrics::GenerationMetricsAccumulator::new(),
+            // PERF: Cached values initialized here, avoid per-token recomputation
+            sampling_params,
+            vocab_size,
+            model_vocab_size: 0, // Set after first forward pass from logits shape
+            recent_tokens_buffer: Vec::with_capacity(repeat_last_n),
+            penalty_exempt_tokens,
+            prefill_time_ms: None,
+            first_token_time: None,
+            last_token_time: None,
+            ema_tokens_per_sec: 0.0,
+            model_label,
+            tenant_hash,
+            speculative,
+            spec_pending_draft: None,
+            spec_out_queue: VecDeque::new(),
+            spec_accepted: 0,
+            spec_rejected: 0,
+        })
+    }
+
+    /// Get generation statistics (call after stream exhausted)
+    pub fn stats(&self) -> GenerationStats {
+        let total_time = self.start_time.elapsed();
+
+        // Prefill metrics
+        let prefill_time_ms = self.prefill_time_ms.unwrap_or(0);
+        let prefill_tokens = self.prompt_len;
+        let prefill_tokens_per_sec = if prefill_time_ms > 0 {
+            (prefill_tokens as f32 * 1000.0) / prefill_time_ms as f32
+        } else {
+            0.0
+        };
+
+        // Inference metrics (time since first token was sampled)
+        let inference_time_ms = self
+            .first_token_time
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        let inference_tokens = self.tokens_generated;
+
+        // Cumulative average for final reporting
+        let inference_tokens_per_sec = if inference_time_ms > 0 {
+            (inference_tokens as f32 * 1000.0) / inference_time_ms as f32
+        } else {
+            0.0
+        };
+
+        // EMA for real-time adaptive batching (falls back to cumulative if not yet initialized)
+        let inference_tokens_per_sec_ema = if self.ema_tokens_per_sec > 0.0 {
+            self.ema_tokens_per_sec
+        } else {
+            inference_tokens_per_sec
+        };
+
+        // Finalize quality metrics from accumulator
+        let quality_metrics = if !self.metrics_accumulator.is_empty() {
+            Some(self.metrics_accumulator.finalize())
+        } else {
+            None
+        };
+
+        GenerationStats {
+            tokens_generated: self.tokens_generated,
+            generation_time_ms: total_time.as_millis() as u64,
+            tokens_per_second: if total_time.as_secs_f32() > 0.0 {
+                self.tokens_generated as f32 / total_time.as_secs_f32()
+            } else {
+                0.0
+            },
+            finish_reason: self.finish_reason.clone(),
+            quality_metrics,
+
+            // Separate prefill/inference metrics
+            prefill_tokens,
+            prefill_time_ms,
+            prefill_tokens_per_sec,
+            inference_tokens,
+            inference_time_ms,
+            inference_tokens_per_sec,
+            inference_tokens_per_sec_ema,
+
+            speculative_accepted: self.spec_accepted,
+            speculative_rejected: self.spec_rejected,
+        }
+    }
+
+    /// Update EMA rate after generating a token.
+    ///
+    /// Uses exponential moving average with alpha=0.3 to smooth rate measurements.
+    /// This handles initial acceleration gracefully without needing warmup hacks.
+    /// Save the current token sequence (prompt + generated) to the session KV cache.
+    ///
+    /// Called when generation finishes so the next turn can detect prefix overlap.
+    /// For hybrid recurrent models (Qwen3.5) the end-of-prefill SSM snapshot
+    /// captured by either prefill path is stored alongside the tokens, making
+    /// the next turn's prefix hit rewindable (`rewind_session_state`).
+    fn save_cached_tokens(&mut self) {
+        // Session-cache recording describes the model's live KV/SSM state,
+        // which exists only once this stream's first prefill completed. A drop
+        // before the first poll (cancellation, client disconnect) reaches this
+        // Drop with the cache already cleared — exact-hit/miss resolution runs
+        // at generation setup, before any forward — and a failed first prefill
+        // can leave partial forward state matching no token count. Recording
+        // prompt IDs in either case lets a later extending prompt claim a
+        // prefix_len over missing or wrong state (a pure-attention partial
+        // prefill would then resume with no history behind it). `prefill_time_ms`
+        // is set exactly when the first prefill forward returned successfully
+        // on either decoding path, so it is the fail-safe recording gate.
+        if self.prefill_time_ms.is_none() {
+            return;
+        }
+        if let Some(model_arc) = &self.engine.persistent_model {
+            let model = model_arc.lock();
+            if let Some(cache) = model.get_kv_cache() {
+                let mut cache_guard = cache.lock();
+                // Save the prompt token IDs for prefix matching on the next turn.
+                // We only save the prompt (not generated tokens) because the next turn's
+                // prompt will include the assistant's response via the chat template —
+                // so the entire current prompt becomes a prefix of the next turn's prompt.
+                cache_guard.set_cached_tokens_with_ssm(
+                    self.prompt_tokens.clone(),
+                    self.prefill_ssm_snapshot.take(),
+                );
+                tracing::debug!(
+                    "Saved {} cached tokens for prefix matching on next turn",
+                    cache_guard.cached_token_count()
+                );
+            }
+        }
+    }
+
+    fn update_ema_rate(&mut self) {
+        let now = std::time::Instant::now();
+
+        if let Some(last_time) = self.last_token_time {
+            let elapsed_secs = last_time.elapsed().as_secs_f32();
+            if elapsed_secs > 0.0 {
+                let instantaneous_rate = 1.0 / elapsed_secs;
+
+                // EMA: alpha=0.3 gives good responsiveness while smoothing noise
+                const ALPHA: f32 = 0.3;
+                if self.ema_tokens_per_sec > 0.0 {
+                    self.ema_tokens_per_sec =
+                        ALPHA * instantaneous_rate + (1.0 - ALPHA) * self.ema_tokens_per_sec;
+                } else {
+                    // First measurement - use instantaneous rate
+                    self.ema_tokens_per_sec = instantaneous_rate;
+                }
+            }
+        }
+
+        self.last_token_time = Some(now);
+    }
+
+    fn sample_next_token(&mut self) -> Result<u32> {
+        // Determine KV position for this forward pass
+        let current_kv_pos = if self.tokens_generated == 0 {
+            if self.prefill_start_pos > 0 {
+                self.prefill_start_pos // Resume from prefix cache hit
+            } else {
+                0 // Full prefill from start
+            }
+        } else {
+            self.kv_cache_position
+        };
+
+        // Lock delta once for this token's forward pass (if present)
+        let delta_guard = self.delta.as_ref().map(|d| d.lock());
+
+        let logits = if self.tokens_generated == 0 {
+            // PREFILL: Process prompt (full or partial based on prefix cache hit)
+            let prefill_start = std::time::Instant::now();
+
+            let result = if self.prefill_start_pos > 0
+                && self.prefill_start_pos < self.prompt_tokens.len()
+            {
+                // PARTIAL PREFILL: prefix is cached, only forward new tokens
+                let new_tokens = &self.prompt_tokens[self.prefill_start_pos..];
+                tracing::info!(
+                    "Partial prefill: processing {} new tokens (skipped {} cached)",
+                    new_tokens.len(),
+                    self.prefill_start_pos
+                );
+                if delta_guard.is_some() {
+                    let delta_ref = delta_guard.as_deref();
+                    self.engine.forward_with_delta_cached(
+                        new_tokens,
+                        self.prefill_start_pos,
+                        delta_ref,
+                    )?
+                } else {
+                    self.engine
+                        .forward_cached(new_tokens, self.prefill_start_pos)?
+                }
+            } else {
+                // FULL PREFILL: no prefix cache hit
+                if delta_guard.is_some() {
+                    let delta_ref = delta_guard.as_deref();
+                    self.engine
+                        .forward_with_delta_full(&self.prompt_tokens, delta_ref)?
+                } else {
+                    self.engine.forward(&self.prompt_tokens)?
+                }
+            };
+            let prefill_elapsed = prefill_start.elapsed();
+
+            // Hybrid recurrent models (Qwen3.5): capture the SSM conv/rec state
+            // as of end-of-prefill, before decode advances it. `save_cached_tokens`
+            // stores it with the prompt tokens so a later session prefix hit can
+            // rewind the recurrent state (KV truncation alone cannot). This is a
+            // cheap downcast returning `None` for pure-attention models.
+            self.prefill_ssm_snapshot = self.engine.snapshot_ssm_states();
+
+            // Store prefill timing
+            self.prefill_time_ms = Some(prefill_elapsed.as_millis() as u64);
+            self.first_token_time = Some(std::time::Instant::now());
+
+            let prefill_token_count = if self.prefill_start_pos > 0 {
+                self.prompt_tokens.len() - self.prefill_start_pos
+            } else {
+                self.prompt_tokens.len()
+            };
+            tracing::info!(
+                "PREFILL: {} tokens in {:?} ({:.2} tok/sec){}{}",
+                prefill_token_count,
+                prefill_elapsed,
+                if prefill_elapsed.as_secs_f32() > 0.0 {
+                    prefill_token_count as f32 / prefill_elapsed.as_secs_f32()
+                } else {
+                    0.0
+                },
+                if self.prefill_start_pos > 0 {
+                    format!(" [prefix cached: {} tokens]", self.prefill_start_pos)
+                } else {
+                    String::new()
+                },
+                if delta_guard.is_some() {
+                    " [delta-aware]"
+                } else {
+                    ""
+                }
+            );
+
+            result
+        } else {
+            let last_token = self.last_generated.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Internal error: last_generated not set after {} tokens",
+                    self.tokens_generated
+                )
+            })?;
+
+            if self.tokens_generated.is_multiple_of(50) {
+                // Counts/positions only — token IDs are reversible to text via the
+                // loaded tokenizer and must never hit process logs (#1253/#1261).
+                tracing::debug!(
+                    "🔵 KV cache position: {}, tokens_generated: {}",
+                    self.kv_cache_position,
+                    self.tokens_generated
+                );
+            }
+
+            // Use kv_cache_position directly - this is where the next token will be written
+            if delta_guard.is_some() {
+                let delta_ref = delta_guard.as_deref();
+                self.engine
+                    .forward_with_delta_cached(&[last_token], current_kv_pos, delta_ref)?
+            } else {
+                self.engine.forward_cached(&[last_token], current_kv_pos)?
+            }
+        };
+
+        // Release delta lock before sampling (no longer needed)
+        drop(delta_guard);
+
+        // NOTE: Logits truncation has been DISABLED (Nov 6, 2025)
+        //
+        // Previous code tried to truncate logits from model vocab (151936) to tokenizer vocab (151669).
+        // This was causing year tokens to be excluded from sampling, leading to "1 7 7 6" instead of "1776".
+        //
+        // vLLM with the same model does NOT have this issue, suggesting the truncation was too aggressive.
+        //
+        // Solution: Use model vocab directly. The sampler will only pick valid tokens anyway.
+        // The tokenizer's get_vocab_size() should match model vocab if properly configured.
+
+        // PERF: Use cached vocab_size - avoids lock acquisition per token
+        let vocab_size = self.vocab_size;
+
+        // PERF: Cache model_vocab_size on first call (from logits shape)
+        let model_vocab_size = if self.model_vocab_size == 0 {
+            let logits_shape = logits.size();
+            let size = logits_shape[logits_shape.len() - 1] as usize;
+            self.model_vocab_size = size;
+            size
+        } else {
+            self.model_vocab_size
+        };
+
+        if vocab_size == 0 {
+            // Tokenizer not loaded - this should never happen during generation
+            return Err(anyhow::anyhow!(
+                "Cannot sample tokens: tokenizer vocabulary size is 0 (tokenizer not loaded)"
+            ));
+        }
+
+        // Log mismatch for debugging but don't truncate
+        if model_vocab_size != vocab_size {
+            tracing::debug!(
+                "Vocab mismatch: model_vocab_size={}, tokenizer_vocab_size={}. Using model vocab directly.",
+                model_vocab_size, vocab_size
+            );
+        }
+
+        // UTF-8 reranking DISABLED - DecodeStream handles UTF-8 correctly
+        // The reranker was causing number corruption by manipulating logits
+        // for non-UTF-8 related tokens (like digits)
+        //
+        // YEAR CORRUPTION BUG FIX (Nov 6, 2025):
+        // The real issue is vocab mismatch: model (151936) vs tokenizer (151669).
+        // Years like "1776" are split into individual digits "1 7 7 6" because:
+        // 1. Year tokens may be in the truncated range (>151669) if model's vocab
+        //    extends beyond tokenizer's
+        // 2. OR the model's logits heavily favor digit tokens over year tokens
+        // 3. This is NOT a UTF-8 issue - it's a vocab/tokenization issue
+        //
+        // Current approach: Keep reranker disabled (it corrupted numbers), but
+        // we need to investigate why year tokens are disfavored in the logits.
+        // The truncation to vocab_size is necessary to prevent out-of-bounds,
+        // but may be filtering out valid year token IDs.
+
+        // PERF: Use pre-created sampling params - avoids struct allocation per token
+        let params = &self.sampling_params;
+
+        // PERF: Optimize VecDeque slice handling
+        // Pass penalty_exempt_tokens to sampler for reduced penalty on single-char tokens
+        let (slice1, slice2) = self.recent_tokens.as_slices();
+        let recent_tokens_slice = if slice2.is_empty() {
+            slice1
+        } else {
+            self.recent_tokens_buffer.clear();
+            self.recent_tokens_buffer
+                .extend(self.recent_tokens.iter().copied());
+            &self.recent_tokens_buffer
+        };
+        let next_token = self.engine.sample_token_with_params(
+            &logits,
+            params,
+            recent_tokens_slice,
+            &self.penalty_exempt_tokens,
+        )?;
+
+        // Validate sampled token is within model vocabulary
+        if model_vocab_size > 0 && next_token >= model_vocab_size {
+            return Err(anyhow::anyhow!(
+                "Generated out-of-bounds token {}: exceeds model vocab size {}",
+                next_token,
+                model_vocab_size
+            ));
+        }
+
+        // Warn if token is beyond tokenizer vocabulary (but allow it)
+        if next_token >= vocab_size {
+            tracing::warn!(
+                "⚠️ Sampled token {} is beyond tokenizer vocab ({}) but within model vocab ({}). This may indicate a vocab mismatch.",
+                next_token, vocab_size, model_vocab_size
+            );
+        }
+
+        // Capture metrics for self-supervised training (EXPENSIVE - only if explicitly enabled)
+        // Computes softmax + entropy over full vocabulary (~150K) with GPU->CPU syncs
+        // This adds ~10x overhead per token, so only enable for training
+        if self.collect_metrics {
+            // Get last token's logits (already squeezed to 1D in sampler, but handle 2D case)
+            let last_logits = if logits.dim() > 1 {
+                let shape = logits.size();
+                if shape.len() == 3 {
+                    // [batch, seq_len, vocab] -> take [-1, -1, :] -> [vocab]
+                    logits.select(1, shape[1] - 1).squeeze_dim(0)
+                } else if shape.len() == 2 {
+                    // [seq_len, vocab] or [batch, vocab] -> squeeze
+                    logits.squeeze_dim(0)
+                } else {
+                    logits.shallow_clone()
+                }
+            } else {
+                logits.shallow_clone()
+            };
+
+            // Compute stable softmax: exp(x - max(x)) / sum(exp(x - max(x)))
+            let max_logit = last_logits.max();
+            let shifted = &last_logits - &max_logit;
+            let exp_logits = shifted.exp();
+            let sum_exp = exp_logits.sum(tch::Kind::Float);
+            let probs = &exp_logits / &sum_exp;
+
+            // Compute log_prob of sampled token (in nats)
+            // log_prob = log(probs[next_token])
+            let log_prob = probs.select(0, next_token as i64).log().double_value(&[]) as f32;
+
+            // Compute entropy: -sum(p * log(p)) where p > 0
+            // Use a small epsilon to avoid log(0)
+            let eps = 1e-10f64;
+            let safe_probs = probs.clamp(eps, 1.0 - eps);
+            let log_probs = safe_probs.log();
+            let entropy = (-(&probs * &log_probs))
+                .sum(tch::Kind::Float)
+                .double_value(&[]) as f32;
+
+            // Add to accumulator (O(1) per token)
+            self.metrics_accumulator
+                .add_token(log_prob, entropy, next_token as u32);
+        }
+
+        Ok(next_token as u32)
+    }
+
+    /// Sample one token for the speculative path with the standard tiered
+    /// repeat penalty. `extra_window` holds tokens accepted earlier in the
+    /// current round but not yet pushed to `recent_tokens` by `poll_next`, so
+    /// the penalty window matches what serial decoding would see at this
+    /// position. Mirrors the sampling section of `sample_next_token`.
+    fn sample_spec_position(&mut self, logits: &Tensor, extra_window: &[i64]) -> Result<u32> {
+        let vocab_size = self.vocab_size;
+
+        // PERF: Cache model_vocab_size on first call (from logits shape)
+        let model_vocab_size = if self.model_vocab_size == 0 {
+            let logits_shape = logits.size();
+            let size = logits_shape[logits_shape.len() - 1] as usize;
+            self.model_vocab_size = size;
+            size
+        } else {
+            self.model_vocab_size
+        };
+
+        if vocab_size == 0 {
+            return Err(anyhow::anyhow!(
+                "Cannot sample tokens: tokenizer vocabulary size is 0 (tokenizer not loaded)"
+            ));
+        }
+
+        let params = self.sampling_params;
+        // Reuse the PERF buffer: recent_tokens (penalty window) + round-local extras.
+        self.recent_tokens_buffer.clear();
+        self.recent_tokens_buffer
+            .extend(self.recent_tokens.iter().copied());
+        self.recent_tokens_buffer
+            .extend(extra_window.iter().copied());
+        let excess = self
+            .recent_tokens_buffer
+            .len()
+            .saturating_sub(self.repeat_last_n);
+        self.recent_tokens_buffer.drain(..excess);
+        let next_token = self.engine.sample_token_with_params(
+            logits,
+            &params,
+            &self.recent_tokens_buffer,
+            &self.penalty_exempt_tokens,
+        )?;
+
+        if model_vocab_size > 0 && next_token >= model_vocab_size {
+            return Err(anyhow::anyhow!(
+                "Generated out-of-bounds token {}: exceeds model vocab size {}",
+                next_token,
+                model_vocab_size
+            ));
+        }
+        if next_token >= vocab_size {
+            tracing::warn!(
+                "⚠️ Sampled token {} is beyond tokenizer vocab ({}) but within model vocab ({}). This may indicate a vocab mismatch.",
+                next_token, vocab_size, model_vocab_size
+            );
+        }
+        Ok(next_token as u32)
+    }
+
+    /// Greedy argmax of draft logits `[1, 1, vocab]` (no repeat penalty — the
+    /// draft only proposes; the penalty-applied verify decides acceptance).
+    fn spec_argmax_draft(draft_logits: &Tensor) -> u32 {
+        draft_logits
+            .reshape([-1i64])
+            .argmax(-1, false)
+            .int64_value(&[]) as u32
+    }
+
+    /// One speculative decode step (MTP self-draft, k=1, greedy exact-match
+    /// verify). Returns the 1–2 tokens accepted this round, in order.
+    ///
+    /// Round structure (decode phase; `last_generated` = x_pos is emitted but
+    /// not yet forwarded, `kv_cache_position` = pos, and `spec_pending_draft`
+    /// holds the MTP head's candidate for position pos+1):
+    ///
+    /// 1. Snapshot the GDN conv/rec state (before the verify forward mutates it).
+    /// 2. Verify: one main forward over `[x_pos, draft]` at `pos`. Logits at
+    ///    position 0 check the draft; logits at position 1 yield the bonus
+    ///    token when the draft matches.
+    /// 3. Accept (draft == verifier's token): emit both tokens; the verify
+    ///    forward already consumed exactly the true sequence, so KV and SSM
+    ///    state are consistent. Draft the next round from the two new slots.
+    ///    Reject: emit only the verifier's correction token, restore the SSM
+    ///    snapshot, truncate KV to `pos + 1` (dropping the rejected draft's
+    ///    KV), then re-forward `x_pos` alone — the 2-token verify advanced the
+    ///    GDN state through the rejected draft as well, so the restore alone
+    ///    would leave SSM one accepted token behind the kept KV. Re-draft from
+    ///    the correction token's slot.
+    ///
+    /// Invariants: `last_generated`/`tokens_generated`/`recent_tokens`/
+    /// `decode_stream` advance only per accepted token (the rejected draft
+    /// never enters the penalty window or decode stream);
+    /// `kv_cache_position` advances by exactly the accepted count.
+    fn sample_speculative_tokens(&mut self) -> Result<Vec<u32>> {
+        if self.tokens_generated == 0 {
+            // ---- PREFILL (full, or partial on a session prefix-cache hit) ----
+            let prefill_start = std::time::Instant::now();
+            let prompt_len = self.prompt_tokens.len();
+            let partial = self.prefill_start_pos > 0 && self.prefill_start_pos < prompt_len;
+            // Owned copy: the forward + sampling below need `&mut self`.
+            let (slice, start_pos) = if partial {
+                tracing::info!(
+                    "Partial prefill: processing {} new tokens (skipped {} cached)",
+                    prompt_len - self.prefill_start_pos,
+                    self.prefill_start_pos
+                );
+                (
+                    self.prompt_tokens[self.prefill_start_pos..].to_vec(),
+                    self.prefill_start_pos,
+                )
+            } else {
+                (self.prompt_tokens.clone(), 0)
+            };
+
+            let (logits, hidden) = self.engine.forward_speculative(&slice, start_pos, true)?;
+
+            // Retain the prompt's recurrent state before verification advances
+            // it beyond the emitted-token queue. Session Drop persists this
+            // deep snapshot alongside the prompt IDs, just like serial prefill.
+            self.prefill_ssm_snapshot = self.engine.snapshot_ssm_states();
+
+            let prefill_elapsed = prefill_start.elapsed();
+            self.prefill_time_ms = Some(prefill_elapsed.as_millis() as u64);
+            self.first_token_time = Some(std::time::Instant::now());
+            tracing::info!(
+                "PREFILL: {} tokens in {:?} ({:.2} tok/sec){} [speculative]",
+                slice.len(),
+                prefill_elapsed,
+                if prefill_elapsed.as_secs_f32() > 0.0 {
+                    slice.len() as f32 / prefill_elapsed.as_secs_f32()
+                } else {
+                    0.0
+                },
+                if partial {
+                    format!(" [prefix cached: {} tokens]", self.prefill_start_pos)
+                } else {
+                    String::new()
+                },
+            );
+
+            let next = self.sample_spec_position(&logits, &[])?;
+
+            // MTP prompt prefill + first draft in one call: slot t pairs
+            // (hidden after x_t, embed(x_{t+1})); the final slot pairs the
+            // last hidden with the just-sampled token, yielding the draft for
+            // the following position. On a prefix-cache hit the pre-hit slots
+            // keep the swapped-in cache's contents (stale or zero entries only
+            // degrade acceptance, never correctness — the verify is decisive).
+            let mut mtp_tokens: Vec<i64> = slice[1..].to_vec();
+            mtp_tokens.push(next as i64);
+            let draft_logits = self
+                .engine
+                .forward_mtp_draft(&mtp_tokens, &hidden, start_pos)?;
+            self.spec_pending_draft = Some(Self::spec_argmax_draft(&draft_logits));
+
+            Ok(vec![next])
+        } else {
+            // ---- VERIFY ROUND ----
+            let pos = self.kv_cache_position;
+
+            // Context boundary: the 2-token verify forward writes KV at `pos`
+            // and `pos + 1`, and LayerKVCache::update hard-errors past
+            // max_seq_len. When fewer than two slots remain, the serial path
+            // can still forward `last` in the final slot — fall back to a
+            // single-token step for THIS round (not a permanent latch; the
+            // next round re-checks and ends exactly as the serial path would).
+            if let Some(cap) = self.spec_kv_capacity() {
+                if pos + 2 > cap {
+                    let token = self.sample_next_token()?;
+                    // poll_next's per-token increment is skipped on the
+                    // speculative path, so advance here like a serial step.
+                    self.kv_cache_position += 1;
+                    return Ok(vec![token]);
+                }
+            }
+
+            let last = self.last_generated.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Internal error: last_generated not set after {} tokens",
+                    self.tokens_generated
+                )
+            })?;
+            let draft = self.spec_pending_draft.take().ok_or_else(|| {
+                anyhow::anyhow!("Internal error: speculative round without a pending draft")
+            })?;
+
+            let snapshot = self.engine.snapshot_ssm_states();
+
+            let (logits, hidden) =
+                self.engine
+                    .forward_speculative(&[last, draft as i64], pos, false)?;
+            let v1 = self.sample_spec_position(&logits.select(1, 0), &[])?;
+
+            if v1 == draft {
+                // ACCEPT: the draft was the verifier's own greedy choice, so the
+                // verify forward consumed exactly the true sequence (KV + SSM
+                // consistent). Emit the verified draft plus the bonus token.
+                let v2 = self.sample_spec_position(&logits.select(1, 1), &[v1 as i64])?;
+                let next_draft_logits =
+                    self.engine
+                        .forward_mtp_draft(&[v1 as i64, v2 as i64], &hidden, pos)?;
+                self.spec_pending_draft = Some(Self::spec_argmax_draft(&next_draft_logits));
+                self.kv_cache_position += 2;
+                self.spec_accepted += 1;
+                Ok(vec![v1, v2])
+            } else {
+                // REJECT: emit only the verifier's correction token and rewind.
+                self.engine.restore_ssm_states(snapshot);
+                // Drop the rejected draft's KV; the +1 keeps the KV the verify
+                // forward wrote for `last`. The MTP slot lags one position
+                // behind the main cache (it never consumed the rejected draft),
+                // so this manager-wide truncate is a no-op for it.
+                if let Some(model_arc) = &self.engine.persistent_model {
+                    let model = model_arc.lock();
+                    if let Some(cache) = model.get_kv_cache() {
+                        cache.lock().truncate_to(pos + 1);
+                    }
+                }
+                // Re-forward `last` alone to re-sync the GDN conv/rec state
+                // with the kept KV (see fn docs); rewrites identical KV at pos.
+                let (_logits, hidden2) = self.engine.forward_speculative(&[last], pos, true)?;
+                let next_draft_logits =
+                    self.engine.forward_mtp_draft(&[v1 as i64], &hidden2, pos)?;
+                self.spec_pending_draft = Some(Self::spec_argmax_draft(&next_draft_logits));
+                self.kv_cache_position += 1;
+                self.spec_rejected += 1;
+                Ok(vec![v1])
+            }
+        }
+    }
+
+    /// Next token from the speculative path: drains the current round's
+    /// accepted-token queue, running a new speculative round when empty.
+    /// `kv_cache_position` is advanced inside `sample_speculative_tokens`
+    /// (per accepted token), so unlike the serial path no increment happens here.
+    fn next_speculative_token(&mut self) -> Result<u32> {
+        if self.spec_out_queue.is_empty() {
+            let tokens = self.sample_speculative_tokens()?;
+            self.spec_out_queue.extend(tokens);
+        }
+        self.spec_out_queue
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("Speculative sampler produced no tokens"))
+    }
+
+    /// KV capacity (max sequence length) of the model's cache manager — the
+    /// hard bound `LayerKVCache::update` enforces. `None` when no model/cache
+    /// is installed (caller then skips the boundary check).
+    fn spec_kv_capacity(&self) -> Option<usize> {
+        let model_arc = self.engine.persistent_model.as_ref()?;
+        let model = model_arc.lock();
+        let cache = model.get_kv_cache()?;
+        let cap = cache.lock().max_seq_len();
+        Some(cap)
+    }
+}
+
+// SAFETY: TextStream can be Send because:
+// - tokenizer pointer points to heap data that won't move
+// - decode_stream is tied to the tokenizer lifetime
+// - Tokenizer itself is Send
+unsafe impl<'a> Send for TextStream<'a> {}
+
+// No custom Drop needed - Arc handles automatic cleanup
+
+impl<'a> Stream for TextStream<'a> {
+    type Item = Result<String>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.finished {
+                return Poll::Ready(None);
+            }
+
+            // Check timeout
+            if let Some(timeout_ms) = self.timeout_ms {
+                let elapsed = self.start_time.elapsed();
+                if elapsed.as_millis() >= timeout_ms as u128 {
+                    tracing::debug!("Generation timed out after {}ms", timeout_ms);
+                    self.finished = true;
+                    self.finish_reason = Some(FinishReason::Error(format!(
+                        "Generation timed out after {timeout_ms}ms"
+                    )));
+                    return Poll::Ready(Some(Err(anyhow::anyhow!(
+                        "Generation timed out after {}ms",
+                        timeout_ms
+                    ))));
+                }
+            }
+
+            // Check max tokens
+            if self.max_tokens > 0 && self.tokens_generated >= self.max_tokens {
+                tracing::debug!("Reached max tokens: {}", self.max_tokens);
+                self.finished = true;
+                self.finish_reason = Some(FinishReason::MaxTokens);
+                return Poll::Ready(None);
+            }
+
+            // Sample next token
+            // The `!self.collect_metrics` guard keeps metrics-collecting
+            // (training-quality) requests on the serial path: the speculative
+            // sampler does not replicate the per-token logprob/entropy
+            // accumulator block from `sample_next_token`.
+            let next_token = if self.speculative && !self.collect_metrics {
+                match self.next_speculative_token() {
+                    Ok(token) => token,
+                    Err(e) => {
+                        self.finished = true;
+                        self.finish_reason = Some(FinishReason::Error(e.to_string()));
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                }
+            } else {
+                match self.sample_next_token() {
+                    Ok(token) => {
+                        // FIX: Increment KV cache position after successful token sampling
+                        // This ensures KV cache stays synchronized with generation state
+                        if self.tokens_generated > 0 {
+                            // Don't increment on initial prompt
+                            self.kv_cache_position += 1;
+                        }
+                        token
+                    }
+                    Err(e) => {
+                        self.finished = true;
+                        self.finish_reason = Some(FinishReason::Error(e.to_string()));
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                }
+            };
+
+            // Check EOS
+            if self.engine.is_eos_token(next_token as usize) {
+                tracing::debug!(
+                    "EOS token detected at generated position {}",
+                    self.tokens_generated
+                );
+                self.finished = true;
+                self.finish_reason = Some(FinishReason::EndOfSequence);
+                return Poll::Ready(None);
+            }
+
+            // Check stop tokens
+            if self.stop_token_ids.contains(&next_token) {
+                // Never log the matched stop-token ID: it identifies a
+                // caller-supplied stop string (#1253/#1261). Position only.
+                tracing::debug!(
+                    "Stop token matched at generated position {}",
+                    self.tokens_generated
+                );
+                self.finished = true;
+                self.finish_reason = Some(FinishReason::StopToken(format!("{next_token}")));
+                return Poll::Ready(None);
+            }
+
+            // KV cache position is already tracked correctly in sample_next_token
+            // No need to increment here
+
+            // Process decode_stream FIRST, then update state
+            // This prevents state corruption if decode_stream fails
+            match self.decode_stream.step(next_token) {
+                Ok(Some(text)) => {
+                    // DecodeStream succeeded - now update state
+                    let token_i64 = next_token as i64;
+                    self.last_generated = Some(token_i64);
+                    self.tokens_generated += 1;
+                    self.update_ema_rate();
+
+                    self.recent_tokens.push_back(token_i64);
+                    if self.recent_tokens.len() > self.repeat_last_n {
+                        self.recent_tokens.pop_front();
+                    }
+
+                    // DecodeStream returned text - emit it. The chunk text is
+                    // generated content and is never logged (#1253); generated-
+                    // token counts are now emitted as OTel metrics at completion
+                    // (#1261), so the per-chunk count log is dropped.
+                    return Poll::Ready(Some(Ok(text)));
+                }
+                Ok(None) => {
+                    // DecodeStream is buffering incomplete UTF-8 - update state and continue
+                    let token_i64 = next_token as i64;
+                    self.last_generated = Some(token_i64);
+                    self.tokens_generated += 1;
+                    self.update_ema_rate();
+
+                    self.recent_tokens.push_back(token_i64);
+                    if self.recent_tokens.len() > self.repeat_last_n {
+                        self.recent_tokens.pop_front();
+                    }
+
+                    // Simple trace without expensive tokenizer lock or decode.
+                    // Counts/positions only — token IDs are reversible to text
+                    // and must never hit process logs (#1253/#1261).
+                    tracing::trace!(
+                        "Token at generated position {} buffering (incomplete UTF-8)",
+                        self.tokens_generated
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    // CRITICAL: Do NOT update state on decode_stream error
+                    // This prevents state corruption and keeps generation consistent
+                    tracing::error!(
+                        "DecodeStream error at generated position {}: {}",
+                        self.tokens_generated,
+                        e
+                    );
+                    self.finished = true;
+                    self.finish_reason = Some(FinishReason::Error(e.to_string()));
+                    return Poll::Ready(Some(Err(anyhow::anyhow!("Decode error: {}", e))));
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Drop for TextStream<'a> {
+    fn drop(&mut self) {
+        // Save token IDs to the session cache for prefix matching on the next turn.
+        // This runs on all exit paths (EOS, stop token, max tokens, timeout, error).
+        self.save_cached_tokens();
+
+        // Token-burn metering (#1261): emit the generated-token count and the
+        // per-request total at completion. Drop runs on every exit path, so this
+        // covers normal EOS, stop-token, max-tokens, timeout, and error finishes.
+        // Only integer counts and the opaque tenant hash are metric attributes (#1253).
+        let generated = self.tokens_generated as u64;
+        let meter = crate::runtime::token_metrics::global_meter();
+        meter.record_generated(&self.model_label, self.tenant_hash, generated);
+        meter.record_request_total(
+            &self.model_label,
+            self.tenant_hash,
+            self.prompt_len as u64 + generated,
+        );
+        // MTP self-speculative draft outcomes (integer counts only, #1253).
+        meter.record_speculative(
+            &self.model_label,
+            self.tenant_hash,
+            self.spec_accepted,
+            self.spec_rejected,
+        );
+    }
+}

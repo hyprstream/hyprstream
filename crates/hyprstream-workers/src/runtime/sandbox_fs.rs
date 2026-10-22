@@ -547,8 +547,12 @@ mod tests {
         assert!(prefixes.contains(&"/deltas"));
 
         // The /stream registry is reachable and per-sandbox.
-        fs.injected().stream_registry.register("job-1", Some("tenant-a".into()));
-        fs.injected().stream_registry.push("job-1", b"chunk\n".to_vec());
+        fs.injected()
+            .stream_registry
+            .register("job-1", Some("tenant-a".into()));
+        fs.injected()
+            .stream_registry
+            .push("job-1", b"chunk\n".to_vec());
         let chunk = ns.read_one("/stream/job-1/data", &subj).await.unwrap();
         assert_eq!(chunk, b"chunk\n");
     }
@@ -561,8 +565,18 @@ mod tests {
         let store = make_store(tmp.path());
 
         // Two distinct images, each with a tenant-specific marker file.
-        add_image(&store, tmp.path(), "img:a", &[("etc/secret", b"SECRET-A\n")]);
-        add_image(&store, tmp.path(), "img:b", &[("etc/secret", b"SECRET-B\n")]);
+        add_image(
+            &store,
+            tmp.path(),
+            "img:a",
+            &[("etc/secret", b"SECRET-A\n")],
+        );
+        add_image(
+            &store,
+            tmp.path(),
+            "img:b",
+            &[("etc/secret", b"SECRET-B\n")],
+        );
 
         let subj_a = Subject::new("tenant-a");
         let subj_b = Subject::new("tenant-b");
@@ -586,28 +600,51 @@ mod tests {
         .unwrap();
 
         // Each sees only its own rootfs content.
-        assert_eq!(fs_a.namespace().cat("/etc/secret", &subj_a).await.unwrap(), b"SECRET-A\n");
-        assert_eq!(fs_b.namespace().cat("/etc/secret", &subj_b).await.unwrap(), b"SECRET-B\n");
+        assert_eq!(
+            fs_a.namespace().cat("/etc/secret", &subj_a).await.unwrap(),
+            b"SECRET-A\n"
+        );
+        assert_eq!(
+            fs_b.namespace().cat("/etc/secret", &subj_b).await.unwrap(),
+            b"SECRET-B\n"
+        );
 
         // Injected stream topics are per-sandbox: registering in A is invisible
         // in B's namespace (separate registries — A's path does not exist in B).
-        fs_a.injected().stream_registry.register("a-only", Some("tenant-a".into()));
-        fs_a.injected().stream_registry.push("a-only", b"a-data".to_vec());
+        fs_a.injected()
+            .stream_registry
+            .register("a-only", Some("tenant-a".into()));
+        fs_a.injected()
+            .stream_registry
+            .push("a-only", b"a-data".to_vec());
         // A can read it.
         assert_eq!(
-            fs_a.namespace().read_one("/stream/a-only/data", &subj_a).await.unwrap(),
+            fs_a.namespace()
+                .read_one("/stream/a-only/data", &subj_a)
+                .await
+                .unwrap(),
             b"a-data"
         );
         // B's namespace has no such topic: walk fails.
-        assert!(fs_b.namespace().read_one("/stream/a-only/data", &subj_b).await.is_err());
+        assert!(fs_b
+            .namespace()
+            .read_one("/stream/a-only/data", &subj_b)
+            .await
+            .is_err());
 
         // B's writable rootfs upper is a distinct directory from A's: a write in
         // A must not appear in B.
         let _ = std::fs::write(
-            tmp.path().join("sandbox-a").join("rootfs/upper/etc/written-by-a"),
+            tmp.path()
+                .join("sandbox-a")
+                .join("rootfs/upper/etc/written-by-a"),
             b"x",
         );
-        assert!(fs_b.namespace().cat("/etc/written-by-a", &subj_b).await.is_err());
+        assert!(fs_b
+            .namespace()
+            .cat("/etc/written-by-a", &subj_b)
+            .await
+            .is_err());
     }
 
     /// Fail-closed: composing with a missing image bootstrap hard-errors rather

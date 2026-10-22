@@ -119,7 +119,9 @@ pub fn validate_ref_name(name: &str) -> Result<(), FsError> {
         }
         // No leading or trailing '.' per component
         if component.starts_with('.') || component.ends_with('.') {
-            return Err(FsError::path_escape("ref name component cannot start/end with '.'"));
+            return Err(FsError::path_escape(
+                "ref name component cannot start/end with '.'",
+            ));
         }
     }
 

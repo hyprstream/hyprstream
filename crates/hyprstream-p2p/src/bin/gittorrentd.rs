@@ -1,7 +1,10 @@
 //! GitTorrent daemon binary
 
 use clap::Parser;
-use hyprstream_p2p::{daemon::{run_daemon, DaemonConfig}, init_tracing};
+use hyprstream_p2p::{
+    daemon::{run_daemon, DaemonConfig},
+    init_tracing,
+};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -80,13 +83,25 @@ async fn main() -> hyprstream_p2p::Result<()> {
 
     info!("Daemon configuration:");
     info!("  Repositories: {}", config.repositories_dir.display());
-    info!("  Git server: {} (port {})",
-          if config.enable_git_server { "enabled" } else { "disabled" },
-          config.git_port);
+    info!(
+        "  Git server: {} (port {})",
+        if config.enable_git_server {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        config.git_port
+    );
     info!("  Bind address: {}", config.service.bind_address);
-    info!("  P2P port: {} ({})",
-          config.service.p2p_port,
-          if config.service.p2p_port == 0 { "random" } else { "fixed" });
+    info!(
+        "  P2P port: {} ({})",
+        config.service.p2p_port,
+        if config.service.p2p_port == 0 {
+            "random"
+        } else {
+            "fixed"
+        }
+    );
     info!("  Bootstrap nodes: {:?}", config.service.bootstrap_nodes);
 
     if cli.standalone {
@@ -96,7 +111,10 @@ async fn main() -> hyprstream_p2p::Result<()> {
         info!("  Note: No bootstrap nodes provided, running in standalone mode");
         info!("  Use --bootstrap to specify P2P bootstrap nodes or --standalone for first node");
     } else {
-        info!("  P2P networking enabled with {} bootstrap nodes", config.service.bootstrap_nodes.len());
+        info!(
+            "  P2P networking enabled with {} bootstrap nodes",
+            config.service.bootstrap_nodes.len()
+        );
     }
 
     // Run the daemon

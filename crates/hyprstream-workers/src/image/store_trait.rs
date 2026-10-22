@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::generated::worker_client::{
+use hyprstream_rpc_std::worker_client::{
     AuthConfig, FilesystemUsage, ImageInfo, ImageStatusResult,
 };
 
@@ -70,9 +70,7 @@ pub struct ImageBackendRegistration {
     pub name: &'static str,
     /// Construct the store from an `ImageConfig`. Boxed because the config is
     /// owned by the caller and construction may fail.
-    pub construct: fn(
-        &crate::config::ImageConfig,
-    ) -> anyhow::Result<Arc<dyn ImageStore>>,
+    pub construct: fn(&crate::config::ImageConfig) -> anyhow::Result<Arc<dyn ImageStore>>,
 }
 
 inventory::collect!(ImageBackendRegistration);

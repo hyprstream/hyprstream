@@ -56,7 +56,7 @@ Multiple agents may share the one checkout at the repo root. That checkout has a
 
 | Crate | Purpose |
 |-------|---------|
-| `hyprstream` | Apache-2.0 main app: runtime, storage, git, training, API, services, CLI, native MAC; its combined distribution currently carries AGPL obligations through `hyprstream-flight` |
+| `hyprstream` | AGPL-3.0-only main app: runtime, storage, git, training, API, services, CLI, native MAC |
 | `git2db` | Git repository management library (has own CLAUDE.md) |
 | `git-xet-filter` | XET/LFS large file storage (libgit2 filter) |
 | `gittorrent` | P2P model distribution |
@@ -83,6 +83,7 @@ Multiple agents may share the one checkout at the repo root. That checkout has a
 | `hyprstream-compositor` | Pure Rust TUI compositor — WASM-compatible chrome state machine |
 | `waxterm` | Run ratatui apps natively and in the browser via WASI |
 | `chat-core` | Chat orchestration state machine — token parsing, tool call detection, agentic loop |
+| `hyprstream-decision` | jev-1 decision/question schema IR, YAML/JSON authoring, canonical serialization, Arrow emission (System One P0.1a) |
 | `bitsandbytes-sys` | bitsandbytes FFI bindings |
 
 Worker-engine crates are always `hyprstream-workers-{engine}`, never `hyprstream-<lang>` (decided, don't relitigate; `hyprstream-tcl` was renamed `hyprstream-workers-tcl` under this rule).
@@ -99,7 +100,8 @@ Worker-engine crates are always `hyprstream-workers-{engine}`, never `hyprstream
 - `mac/` — Native MAC data-plane: TE evaluator, AVC, UCAN→TE compiler, grant exchange, audit (see Native MAC below)
 - `events/` — group-keyed EventService integration (epic #600)
 - `auth/`, `inference/`, `tui/`, `cli/`, `config/`, `archetypes/` — supporting modules
-- `schema/` — app-local Cap'n Proto schemas: `tui.capnp`, `compositor_ipc.capnp` (service schemas live in `hyprstream-rpc-std/schema/`)
+- `schema/` — retained only for non-RPC application assets; service schemas,
+  including TUI/compositor IPC, live in `hyprstream-rpc-std/schema/`
 
 ## Services (13 total, registered via `#[service_factory]` in `services/factories.rs`)
 
@@ -161,14 +163,17 @@ ZMQ/ZeroMQ is **gone**. RPC uses ZMTP 3.1 *framing* (the wire serialization only
 | `#[authorize]` | Declarative JWT + Casbin authorization on handlers |
 | `#[register_scopes]` | Compile-time scope registration |
 | `#[service_factory]` | Inventory-based service registration |
-| `generate_rpc_service!` | Full client/handler/dispatch from CGR metadata |
+| `generate_rpc_service!` | Legacy full client/handler/dispatch generation |
+| `generate_rpc_client!` | Portable Apache client/data/metadata generation |
+| `generate_rpc_server!` | Server-only handler/dispatch generation against external contracts |
 
 ### Schema Locations
 
 - `crates/hyprstream-rpc/schema/` — `common.capnp` (envelopes, identity, claims), `streaming.capnp`, `events.capnp`, `annotations.capnp`, `nine.capnp` (9P bridge), `optional.capnp`
-- `crates/hyprstream-rpc-std/schema/` — `registry.capnp`, `model.capnp`, `policy.capnp`, `mcp.capnp`, `oauth.capnp`, `inference.capnp`, `metrics.capnp`, `chat_core.capnp`, `service_events.capnp`
-- `crates/hyprstream/schema/` — `tui.capnp`, `compositor_ipc.capnp`
-- `crates/hyprstream-workers/schema/` — `worker.capnp`, `workflow.capnp`
+- `crates/hyprstream-rpc-std/schema/` — all public service contracts:
+  `registry`, `model`, `policy`, `mcp`, `oauth`, `inference`, `metrics`,
+  `chat_core`, `service_events`, `worker`, `workflow`, `discovery`, `tui`, and
+  `compositor_ipc`
 
 ### Key RPC Types (`crates/hyprstream-rpc/src/`)
 
@@ -275,15 +280,18 @@ See: `README.md`, `DEVELOP.md`, `CONTRIBUTING.md`, `crates/git2db/CLAUDE.md`, `d
 
 ## Licensing
 
-- **MIT**: exactly `bitsandbytes-sys`, `cas-serve`, and `git-xet-filter`.
-- **AGPL-3.0-only**: exactly `hyprstream-flight`, `hyprstream-metrics`,
-  `hyprstream-vfs-server`, and `hyprstream-workers`.
-- **Apache-2.0**: every other local Cargo package, including `hyprstream`.
+- **MIT**: exactly `bitsandbytes-sys`, `cas-serve`, `git-xet-filter`, and
+  `hyprstream-pay`.
+- **AGPL-3.0-only**: the `hyprstream` application plus
+  `hyprstream-appview`, `hyprstream-discovery`, `hyprstream-flight`,
+  `hyprstream-k8s-pds`, `hyprstream-ledger`, `hyprstream-metrics` (the
+  DuckDB/DataFusion serving engine), `hyprstream-pds`,
+  `hyprstream-pds-service`, `hyprstream-service`, `hyprstream-vfs-server`,
+  and `hyprstream-workers`.
+- **Apache-2.0**: every other local Cargo package, including
+  `hyprstream-metrics-api` (the storage-abstract metrics API half).
 
-Those are source-package declarations, not a waiver of combined-distribution
-obligations. The Apache-declared `hyprstream` application currently aggregates
-the AGPL-declared `hyprstream-flight` package, so a combined distribution must
-satisfy the applicable AGPL terms. The exhaustive owner map, the one declared
-aggregator, and the reusable permissive-only roots are enforced by
-`.github/license-boundary.toml`; reusable roots must have no Cargo-resolved path
-to any local AGPL package.
+Those are source-package declarations; third-party dependencies retain their
+own licenses. The exhaustive owner map and reusable permissive-only roots are
+enforced by `.github/license-boundary.toml`; every permissive package must have
+no Cargo-resolved path to any local AGPL package.

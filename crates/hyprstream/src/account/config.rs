@@ -30,6 +30,7 @@
 //! ```
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -71,12 +72,46 @@ pub struct AccountZoneConfig {
     /// IPv6 target for the wildcard AAAA record (`*.<apex>`).
     #[serde(default)]
     pub wildcard_ipv6: Option<Ipv6Addr>,
+
+    /// Optional credential-free HTTPS listener for the public hosted-account
+    /// DID artifacts. The listener is disabled unless this section is present;
+    /// enabling it requires an explicit account-zone certificate and key.
+    #[serde(default)]
+    pub http: Option<AccountHttpConfig>,
+}
+
+/// Deployment configuration for the separate public hosted-account listener.
+///
+/// This deliberately has no default port or certificate. A deployment must
+/// opt in with all listener material present so an account host can never
+/// silently bind the OAuth listener or fall back to a self-signed certificate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountHttpConfig {
+    /// Bind address for the public account-artifact listener.
+    #[serde(default = "default_http_host")]
+    pub host: String,
+
+    /// Bind port for the public account-artifact listener.
+    pub port: u16,
+
+    /// PEM certificate chain covering `*.zone`.
+    pub tls_cert: PathBuf,
+
+    /// PEM private key corresponding to `tls_cert`.
+    pub tls_key: PathBuf,
+}
+
+fn default_http_host() -> String {
+    "0.0.0.0".to_owned()
 }
 
 impl AccountZoneConfig {
     /// Whether the deployment has configured an account zone at all.
     pub fn is_configured(&self) -> bool {
-        self.zone.as_deref().filter(|s| !s.trim().is_empty()).is_some()
+        self.zone
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .is_some()
     }
 
     /// Resolve the configured zone, or return [`AccountZoneError::Unset`].
@@ -120,6 +155,7 @@ mod tests {
         assert!(!cfg.is_configured());
         assert!(matches!(cfg.resolve_zone(), Err(AccountZoneError::Unset)));
         assert!(!cfg.dns01_ready());
+        assert!(cfg.http.is_none());
     }
 
     #[test]
@@ -162,7 +198,10 @@ mod tests {
                 dns01_credential: Some(blank.to_owned()),
                 ..Default::default()
             };
-            assert!(!cfg.dns01_ready(), "blank credential {blank:?} must not be ready");
+            assert!(
+                !cfg.dns01_ready(),
+                "blank credential {blank:?} must not be ready"
+            );
         }
     }
 
@@ -177,5 +216,21 @@ wildcard_ipv4 = "203.0.113.10"
         let cfg: AccountZoneConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.zone.as_deref(), Some("acct.example.com"));
         assert_eq!(cfg.wildcard_ipv4, Some("203.0.113.10".parse().unwrap()));
+        assert!(cfg.http.is_none());
+    }
+
+    #[test]
+    fn http_listener_requires_explicit_material() {
+        let toml = r#"
+zone = "acct.example.com"
+[http]
+port = 443
+tls_cert = "/run/secrets/account/fullchain.pem"
+tls_key = "/run/secrets/account/key.pem"
+"#;
+        let cfg: AccountZoneConfig = toml::from_str(toml).unwrap();
+        let http = cfg.http.unwrap();
+        assert_eq!(http.host, "0.0.0.0");
+        assert_eq!(http.port, 443);
     }
 }

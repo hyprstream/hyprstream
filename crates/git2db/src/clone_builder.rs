@@ -256,7 +256,11 @@ impl CloneBuilder {
 
             // Check if already registered (idempotent return)
             if let Some(tracked) = registry.get_by_name(&repo_name) {
-                tracing::info!("Repository '{}' already registered with ID {}", repo_name, tracked.id);
+                tracing::info!(
+                    "Repository '{}' already registered with ID {}",
+                    repo_name,
+                    tracked.id
+                );
                 return Ok(tracked.id.clone());
             }
 
@@ -284,11 +288,16 @@ impl CloneBuilder {
                 } else {
                     tracing::warn!("Removing incomplete/corrupted clone at {:?}", rd);
                     std::fs::remove_dir_all(&rd).map_err(|e| {
-                        Git2DBError::repository(&rd, format!("Failed to cleanup incomplete clone: {e}"))
+                        Git2DBError::repository(
+                            &rd,
+                            format!("Failed to cleanup incomplete clone: {e}"),
+                        )
                     })?;
                     Ok(false)
                 }
-            }).await.map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??
+            })
+            .await
+            .map_err(|e| Git2DBError::internal(format!("Task join error: {e}")))??
         } else {
             false
         };
@@ -299,17 +308,26 @@ impl CloneBuilder {
                 Git2DBError::repository(&repo_dir, format!("Failed to create repo directory: {e}"))
             })?;
             std::fs::create_dir_all(&worktrees_dir).map_err(|e| {
-                Git2DBError::repository(&worktrees_dir, format!("Failed to create worktrees directory: {e}"))
+                Git2DBError::repository(
+                    &worktrees_dir,
+                    format!("Failed to create worktrees directory: {e}"),
+                )
             })?;
         }
 
         // ===== Phase 2: No lock - perform network clone =====
         // Extract progress reporter before callback_config is consumed by clone options
-        let progress_reporter = self.callback_config.as_ref()
+        let progress_reporter = self
+            .callback_config
+            .as_ref()
             .and_then(crate::callback_config::CallbackConfig::progress_reporter);
 
         if !existing_valid {
-            tracing::info!("Cloning repository '{}' as bare to {:?}", repo_name, bare_repo_path);
+            tracing::info!(
+                "Cloning repository '{}' as bare to {:?}",
+                repo_name,
+                bare_repo_path
+            );
 
             let clone_options = if let Some(config) = self.callback_config.take() {
                 crate::clone_options::CloneOptions::with_callback_config(config)
@@ -326,14 +344,16 @@ impl CloneBuilder {
                 let mut git2_options = clone_options.to_git2_options();
                 let mut builder = git2::build::RepoBuilder::new();
                 builder.bare(true);
-                builder.fetch_options(git2_options.create_fetch_options()
-                    .map_err(|e| Git2DBError::internal(format!("Failed to create fetch options: {e}")))?);
+                builder.fetch_options(git2_options.create_fetch_options().map_err(|e| {
+                    Git2DBError::internal(format!("Failed to create fetch options: {e}"))
+                })?);
 
-                builder.clone(&url_clone, &bare_path_clone)
-                    .map_err(|e| Git2DBError::repository(
+                builder.clone(&url_clone, &bare_path_clone).map_err(|e| {
+                    Git2DBError::repository(
                         &bare_path_clone,
-                        format!("Failed to clone bare repository: {e}")
-                    ))?;
+                        format!("Failed to clone bare repository: {e}"),
+                    )
+                })?;
                 Ok(())
             })
             .await
@@ -345,8 +365,9 @@ impl CloneBuilder {
         let remotes_clone = self.remotes.clone();
         let bp = bare_repo_path.clone();
         let default_branch = tokio::task::spawn_blocking(move || -> Git2DBResult<String> {
-            let repo = git2::Repository::open_bare(&bp)
-                .map_err(|e| Git2DBError::repository(&bp, format!("Failed to open bare repo: {e}")))?;
+            let repo = git2::Repository::open_bare(&bp).map_err(|e| {
+                Git2DBError::repository(&bp, format!("Failed to open bare repo: {e}"))
+            })?;
             for (remote_name, remote_url) in &remotes_clone {
                 // Use remote_set_url: creates the remote if missing, updates if it exists.
                 // This is idempotent for the resume path where remotes may already exist.
@@ -364,18 +385,32 @@ impl CloneBuilder {
         hyprstream_containedfs::validate_ref_name(&default_branch)
             .map_err(|e| Git2DBError::configuration(format!("Unsafe default branch name: {e}")))?;
 
-        let initial_worktree = hyprstream_containedfs::contained_join(&worktrees_dir, &default_branch)
-            .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {e}")))?;
+        let initial_worktree =
+            hyprstream_containedfs::contained_join(&worktrees_dir, &default_branch)
+                .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {e}")))?;
         if let Some(parent) = initial_worktree.parent() {
             if parent != worktrees_dir {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    Git2DBError::configuration(format!("Failed to create worktree parent directories: {e}"))
+                    Git2DBError::configuration(format!(
+                        "Failed to create worktree parent directories: {e}"
+                    ))
                 })?;
             }
         }
 
-        tracing::info!("Creating default worktree '{}' at {:?}", default_branch, initial_worktree);
-        create_worktree(&driver, &bare_repo_path, &initial_worktree, &default_branch, progress_reporter.clone()).await?;
+        tracing::info!(
+            "Creating default worktree '{}' at {:?}",
+            default_branch,
+            initial_worktree
+        );
+        create_worktree(
+            &driver,
+            &bare_repo_path,
+            &initial_worktree,
+            &default_branch,
+            progress_reporter.clone(),
+        )
+        .await?;
 
         // Create additional worktree if requested ref differs from default
         let checkout_ref = match &self.reference {
@@ -388,17 +423,29 @@ impl CloneBuilder {
 
         if checkout_ref != default_branch && !matches!(self.reference, GitRef::DefaultBranch) {
             // Validate checkout ref for path safety (C2 fix)
-            hyprstream_containedfs::validate_ref_name(&checkout_ref)
-                .map_err(|e| Git2DBError::configuration(format!("Unsafe checkout ref name: {e}")))?;
-            let ref_worktree_path = hyprstream_containedfs::contained_join(&worktrees_dir, &checkout_ref)
-                .map_err(|e| Git2DBError::configuration(format!("Invalid worktree path: {e}")))?;
+            hyprstream_containedfs::validate_ref_name(&checkout_ref).map_err(|e| {
+                Git2DBError::configuration(format!("Unsafe checkout ref name: {e}"))
+            })?;
+            let ref_worktree_path =
+                hyprstream_containedfs::contained_join(&worktrees_dir, &checkout_ref).map_err(
+                    |e| Git2DBError::configuration(format!("Invalid worktree path: {e}")),
+                )?;
             if let Some(parent) = ref_worktree_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    Git2DBError::configuration(format!("Failed to create worktree parent directories: {e}"))
+                    Git2DBError::configuration(format!(
+                        "Failed to create worktree parent directories: {e}"
+                    ))
                 })?;
             }
             tracing::info!("Creating worktree for ref '{}'", checkout_ref);
-            create_worktree(&driver, &bare_repo_path, &ref_worktree_path, &checkout_ref, progress_reporter.clone()).await?;
+            create_worktree(
+                &driver,
+                &bare_repo_path,
+                &ref_worktree_path,
+                &checkout_ref,
+                progress_reporter.clone(),
+            )
+            .await?;
         }
 
         // Build remote configs
@@ -439,12 +486,16 @@ impl CloneBuilder {
 fn validate_repo_name(name: &str) -> Git2DBResult<()> {
     // Check for empty name
     if name.is_empty() {
-        return Err(Git2DBError::configuration("Repository name cannot be empty"));
+        return Err(Git2DBError::configuration(
+            "Repository name cannot be empty",
+        ));
     }
 
     // Check for path separators and parent directory references
     if name.contains('/') || name.contains("..") {
-        return Err(Git2DBError::configuration("Repository name cannot contain path separators or parent references"));
+        return Err(Git2DBError::configuration(
+            "Repository name cannot contain path separators or parent references",
+        ));
     }
 
     Ok(())
@@ -508,19 +559,34 @@ async fn create_worktree(
     match driver.create_worktree(&opts).await {
         Ok(_) => {
             // LFS fetch (idempotent) with progress reporting
-            crate::repository_handle::RepositoryHandle::fetch_lfs_files_with_progress(worktree_path, progress).await?;
-            tracing::info!("Created worktree at {:?} for branch '{}'", worktree_path, branch);
+            crate::repository_handle::RepositoryHandle::fetch_lfs_files_with_progress(
+                worktree_path,
+                progress,
+            )
+            .await?;
+            tracing::info!(
+                "Created worktree at {:?} for branch '{}'",
+                worktree_path,
+                branch
+            );
             Ok(())
         }
         Err(e) if e.is_worktree_exists() => {
             // Clone resume: worktree already exists, just fetch LFS
-            tracing::info!("Worktree already exists at {:?}, fetching LFS files", worktree_path);
-            crate::repository_handle::RepositoryHandle::fetch_lfs_files_with_progress(worktree_path, progress).await?;
+            tracing::info!(
+                "Worktree already exists at {:?}, fetching LFS files",
+                worktree_path
+            );
+            crate::repository_handle::RepositoryHandle::fetch_lfs_files_with_progress(
+                worktree_path,
+                progress,
+            )
+            .await?;
             Ok(())
         }
         Err(e) => Err(Git2DBError::repository(
             worktree_path,
-            format!("Failed to create worktree for branch '{branch}': {e}")
+            format!("Failed to create worktree for branch '{branch}': {e}"),
         )),
     }
 }
@@ -533,11 +599,12 @@ mod tests {
     fn test_builder_fluent_api() {
         // This test just validates the fluent API compiles correctly
         fn _example(registry: Arc<RwLock<Git2DB>>) {
-            let _builder = CloneBuilder::new(Arc::clone(&registry), "https://github.com/user/repo.git")
-                .name("my-repo")
-                .branch("main")
-                .remote("backup", "https://backup.com/repo.git")
-                .depth(1);
+            let _builder =
+                CloneBuilder::new(Arc::clone(&registry), "https://github.com/user/repo.git")
+                    .name("my-repo")
+                    .branch("main")
+                    .remote("backup", "https://backup.com/repo.git")
+                    .depth(1);
         }
     }
 

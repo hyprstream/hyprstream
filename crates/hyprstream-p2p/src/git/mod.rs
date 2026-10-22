@@ -11,10 +11,10 @@ pub use objects::*;
 pub use protocol::*;
 pub use remote::*;
 pub use repository::Repository;
-pub use transport::{GittorrentTransportFactory, register_gittorrent_transport};
+pub use transport::{register_gittorrent_transport, GittorrentTransportFactory};
 
-use std::path::PathBuf;
 use crate::Result;
+use std::path::PathBuf;
 
 /// Execute a blocking git2 operation on a repository opened from the given path.
 ///

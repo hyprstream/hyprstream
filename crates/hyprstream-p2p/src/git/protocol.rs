@@ -11,7 +11,10 @@ pub const CAPABILITIES: &[&str] = &["fetch"];
 pub enum GitCommand {
     Capabilities,
     List,
-    Fetch { commit_hash: String, refname: String },
+    Fetch {
+        commit_hash: String,
+        refname: String,
+    },
 }
 
 /// Parse a git remote helper command from a line
@@ -106,8 +109,10 @@ mod tests {
 
         assert!(matches!(parse_command("list"), Some(GitCommand::List)));
 
-        if let Some(GitCommand::Fetch { commit_hash, refname }) =
-            parse_command("fetch abc123 refs/heads/main")
+        if let Some(GitCommand::Fetch {
+            commit_hash,
+            refname,
+        }) = parse_command("fetch abc123 refs/heads/main")
         {
             assert_eq!(commit_hash, "abc123");
             assert_eq!(refname, "refs/heads/main");

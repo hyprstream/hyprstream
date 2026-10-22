@@ -12,11 +12,11 @@
 //! positional singleton — that anti-pattern forecloses both overlap rotation
 //! and PQ-hybrid publication (#1183).
 
-use anyhow::{Result, anyhow};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
-use hyprstream_discovery::DiscoveryClient;
 use hyprstream_rpc::auth::{FederationKey, FederationKeySource};
+use hyprstream_rpc_std::discovery_client::DiscoveryClient;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -95,7 +95,7 @@ pub struct FederationKeyResolver {
     ///
     /// `None` retains the legacy posture (config-only trust) for
     /// callers that haven't wired PolicyService access yet.
-    policy_client: Option<Arc<crate::services::PolicyClient>>,
+    policy_client: Option<Arc<hyprstream_rpc_std::policy_client::PolicyClient>>,
 }
 
 impl FederationKeyResolver {
@@ -144,7 +144,10 @@ impl FederationKeyResolver {
     /// set, calls to `get_keys` for issuers that aren't currently
     /// permitted by PolicyService policy return Err — fail-closed,
     /// matching the CIMD client path.
-    pub fn with_policy_client(mut self, client: Arc<crate::services::PolicyClient>) -> Self {
+    pub fn with_policy_client(
+        mut self,
+        client: Arc<hyprstream_rpc_std::policy_client::PolicyClient>,
+    ) -> Self {
         self.policy_client = Some(client);
         self
     }
@@ -194,7 +197,7 @@ impl FederationKeyResolver {
         // (do we currently accept this peer). Same gate as CIMD; same
         // fail-closed semantics on RPC outage.
         if let Some(ref pc) = self.policy_client {
-            use crate::services::generated::policy_client::PolicyCheck;
+            use hyprstream_rpc_std::policy_client::PolicyCheck;
             // Reuse the OAuth-side RFC 6454 origin extractor: same
             // normalization (scheme + lowercase host + non-default port)
             // means a single Casbin rule covers a CIMD client at
@@ -790,6 +793,7 @@ mod tests {
                 jwks_uri: Some("https://trusted.example.com/jwks".to_owned()),
                 jwks_cache_ttl_secs: 300,
                 allow_http: false,
+                federate_tui_client: None,
             },
         );
         let resolver = FederationKeyResolver::new(&issuers);
@@ -802,7 +806,7 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────
 
     use ed25519_dalek::{Signer, SigningKey};
-    use hyprstream_rpc::auth::{Claims, jwt};
+    use hyprstream_rpc::auth::{jwt, Claims};
     use rand::rngs::OsRng;
 
     fn b64u(bytes: &[u8]) -> String {
@@ -1089,6 +1093,7 @@ mod tests {
                 jwks_uri: Some(jwks_uri.to_owned()),
                 jwks_cache_ttl_secs: 300,
                 allow_http: true,
+                federate_tui_client: None,
             },
         );
         issuers
@@ -1214,12 +1219,10 @@ mod tests {
             .with_jwks_fetcher(fetcher);
 
         for _ in 0..3 {
-            assert!(
-                resolver
-                    .get_keys("https://fed.example", Some("kid-ghost"))
-                    .await
-                    .is_err()
-            );
+            assert!(resolver
+                .get_keys("https://fed.example", Some("kid-ghost"))
+                .await
+                .is_err());
         }
         assert_eq!(
             fetch_count.load(Ordering::SeqCst),
@@ -1261,7 +1264,11 @@ mod tests {
             let rotated = rotated.clone();
             Box::pin(async move {
                 let n = cc.fetch_add(1, Ordering::SeqCst);
-                if n == 0 { Ok(overlap) } else { Ok(rotated) }
+                if n == 0 {
+                    Ok(overlap)
+                } else {
+                    Ok(rotated)
+                }
             })
         });
 
@@ -1273,6 +1280,7 @@ mod tests {
                 jwks_uri: Some("https://fed.example/jwks".to_owned()),
                 jwks_cache_ttl_secs: 0,
                 allow_http: true,
+                federate_tui_client: None,
             },
         );
         let resolver = FederationKeyResolver::new(&issuers).with_jwks_fetcher(fetcher);

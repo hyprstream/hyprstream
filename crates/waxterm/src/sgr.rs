@@ -10,7 +10,12 @@ use ratatui::style::{Color, Modifier};
 
 /// Emit a single combined SGR sequence: `\x1b[0;...m`
 /// Resets all attributes then applies modifiers, fg, and bg in one escape.
-pub fn write_combined_sgr<W: Write>(w: &mut W, fg: Color, bg: Color, mods: Modifier) -> io::Result<()> {
+pub fn write_combined_sgr<W: Write>(
+    w: &mut W,
+    fg: Color,
+    bg: Color,
+    mods: Modifier,
+) -> io::Result<()> {
     // Start with reset
     write!(w, "\x1b[0")?;
 

@@ -6,8 +6,10 @@
 //! Git invokes this automatically when encountering gittorrent:// URLs.
 //! Configuration is read from environment variables and config files.
 
+use hyprstream_p2p::{
+    git::remote_helper::run_git_remote_helper, service::GitTorrentConfig, Result,
+};
 use std::io::Write;
-use hyprstream_p2p::{Result, git::remote_helper::run_git_remote_helper, service::GitTorrentConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,7 +18,10 @@ async fn main() -> Result<()> {
 
     if args.len() < 3 {
         // Write errors to stderr (git remote helper protocol)
-        let _ = writeln!(std::io::stderr(), "Usage: git-remote-gittorrent <remote-name> <url>");
+        let _ = writeln!(
+            std::io::stderr(),
+            "Usage: git-remote-gittorrent <remote-name> <url>"
+        );
         std::process::exit(1);
     }
 

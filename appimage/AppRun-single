@@ -68,7 +68,7 @@ case "$BACKEND" in
 esac
 
 # ROCm-specific environment
-if [[ "$BACKEND" == "rocm71" ]]; then
+if [[ "$BACKEND" == rocm* ]]; then
     if [[ -d /opt/rocm ]]; then
         export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
     fi

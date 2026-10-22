@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use capnp::traits::HasTypeId;
 use wasm_bindgen::prelude::*;
 
 use hyprstream_rpc::browser_provisioning::{
@@ -22,9 +23,16 @@ use hyprstream_rpc::browser_provisioning::{
 };
 
 use hyprstream_rpc::crypto::VerifyingKey;
+use hyprstream_rpc::envelope::RequestEnvelope;
+use hyprstream_rpc::proof::{
+    build::{build_authenticated_hybrid_request_proof_with_signer, AuthenticatedRequestProofInput},
+    recipient_binding::FederateRecipientBinding,
+};
+use hyprstream_rpc::rpc_client::FederateProofProvider;
 use hyprstream_rpc::rpc_client::{CallOptions, RpcClientImpl};
 use hyprstream_rpc::signer::JsSigner;
 use hyprstream_rpc::stream_consumer::{StreamHandle, StreamHandleImpl, StreamPayload};
+use hyprstream_rpc::transport_traits::Signer;
 use hyprstream_rpc::web_transport::WtConnection;
 
 // ============================================================================
@@ -40,7 +48,10 @@ unsafe impl Sync for JsTokenProvider {}
 
 impl JsTokenProvider {
     fn call(&self) -> Option<String> {
-        self.0.call0(&wasm_bindgen::JsValue::NULL).ok().and_then(|v| v.as_string())
+        self.0
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .ok()
+            .and_then(|v| v.as_string())
     }
 }
 
@@ -66,9 +77,11 @@ impl WasmWtConnection {
     #[wasm_bindgen(constructor)]
     pub async fn connect(
         _url: &str,
-        _cert_hash: Option<String>,) -> Result<WasmWtConnection, JsError> {
-        Err( JsError::new(
-            "unprovisioned browser WebTransport dial is disabled; use RpcClient.connectResolved",))
+        _cert_hash: Option<String>,
+    ) -> Result<WasmWtConnection, JsError> {
+        Err(JsError::new(
+            "unprovisioned browser WebTransport dial is disabled; use RpcClient.connectResolved",
+        ))
     }
 }
 
@@ -93,6 +106,76 @@ impl WasmWtConnection {
 #[wasm_bindgen(js_name = "RpcClient")]
 pub struct WasmRpcClient {
     inner: RpcClientImpl<JsSigner, WtConnection>,
+}
+
+struct BrowserFederateProofProvider {
+    signer: JsSigner,
+    ed_kid: Vec<u8>,
+    pq_kid: Vec<u8>,
+    service_name: String,
+    request_schema_id: u64,
+}
+
+#[async_trait::async_trait(?Send)]
+impl FederateProofProvider for BrowserFederateProofProvider {
+    async fn proof_for(
+        &self,
+        envelope: &RequestEnvelope,
+        capnp_body: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            envelope.delegation_token.is_none(),
+            "Federate proof cannot delegate a bearer"
+        );
+        let service = envelope
+            .service_domain
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Federate proof requires a canonical service domain"))?;
+        anyhow::ensure!(
+            service == self.service_name,
+            "Federate proof service mismatch"
+        );
+        let credential = envelope.jwt_token().ok_or_else(|| {
+            anyhow::anyhow!("Federate proof requires the host session credential")
+        })?;
+        let (issued_at, expires_at) = crate::federate_proof_time::proof_timestamps(envelope.iat)?;
+        let binding = FederateRecipientBinding::from_recipients(
+            envelope.response_kem_recipient.as_ref(),
+            envelope.client_kem_public.as_ref(),
+            envelope.client_dh_public,
+        )?;
+        let input = AuthenticatedRequestProofInput {
+            service_domain: service,
+            credential: credential.as_bytes(),
+            issued_at,
+            expires_at,
+            capnp_schema_id: self.request_schema_id,
+            capnp_body,
+            // v16 response-proof binding is a separate COSE response model.
+            // Current network responses use the hybrid envelope KEM, which is
+            // committed above by signed -70009; it is not an ML-KEM-only
+            // response-proof recipient.
+            response_binding: None,
+            federate_recipient_binding: Some(&binding),
+        };
+        build_authenticated_hybrid_request_proof_with_signer(
+            &input,
+            &self.signer,
+            &self.ed_kid,
+            &self.pq_kid,
+        )
+        .await
+    }
+}
+
+impl WasmRpcClient {
+    /// Wrap an already-built resolved client (see [`build_resolved_client`]).
+    /// Shared by [`WasmRpcClient::connect_resolved`] and by
+    /// `browser_session::BrowserSession`, which constructs direct typed
+    /// clients without a `VfsShell`.
+    pub(crate) fn from_resolved(inner: RpcClientImpl<JsSigner, WtConnection>) -> Self {
+        Self { inner }
+    }
 }
 
 fn call_options(jwt: Option<String>, delegated_bearer: Option<String>) -> CallOptions {
@@ -186,19 +269,21 @@ impl WasmRpcClient {
         sign_fn: js_sys::Function,
         server_verifying_key: Option<Vec<u8>>,
     ) -> Result<WasmRpcClient, JsError> {
-        let signer = JsSigner::new(signer_pubkey, sign_fn)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let signer =
+            JsSigner::new(signer_pubkey, sign_fn).map_err(|e| JsError::new(&e.to_string()))?;
 
-        let server_key: Option<VerifyingKey> = match server_verifying_key {
-            Some(bytes) => {
-                let arr: [u8; 32] = bytes.try_into()
-                    .map_err(|_| JsError::new("server_verifying_key must be 32 bytes"))?;
-                Some(VerifyingKey::from_bytes(&arr)
-                    .map_err(|e| { JsError::new(&format!("invalid server verifying key: {}", e))
+        let server_key: Option<VerifyingKey> =
+            match server_verifying_key {
+                Some(bytes) => {
+                    let arr: [u8; 32] = bytes
+                        .try_into()
+                        .map_err(|_| JsError::new("server_verifying_key must be 32 bytes"))?;
+                    Some(VerifyingKey::from_bytes(&arr).map_err(|e| {
+                        JsError::new(&format!("invalid server verifying key: {}", e))
                     })?)
-            }
-            None => None,
-        };
+                }
+                None => None,
+            };
 
         Ok(Self {
             inner: RpcClientImpl::new(signer, connection.inner, server_key),
@@ -243,7 +328,7 @@ impl WasmRpcClient {
             jwt,
         )
         .await?;
-        Ok(Self { inner })
+        Ok(Self::from_resolved(inner))
     }
 
     /// Builder: set a dynamic token provider called on every RPC request.
@@ -269,11 +354,70 @@ impl WasmRpcClient {
         }
     }
 
+    /// Opt into per-request Federate COSE proofs for a single canonical
+    /// Registry or Model client. These callbacks own the dedicated proof keys;
+    /// envelope-signing callbacks configured at connect time stay separate.
+    #[wasm_bindgen(js_name = "withFederateProofSigner")]
+    pub fn with_federate_proof_signer(
+        self,
+        service_name: &str,
+        ed_pubkey: &[u8],
+        ed_sign_fn: js_sys::Function,
+        pq_pubkey: &[u8],
+        pq_sign_fn: js_sys::Function,
+        ed_kid: &[u8],
+        pq_kid: &[u8],
+    ) -> Result<WasmRpcClient, JsError> {
+        hyprstream_rpc::envelope::validate_service_domain(service_name)
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let request_schema_id = match service_name {
+            "registry" => {
+                <crate::registry_capnp::registry_request::Reader<'static> as HasTypeId>::TYPE_ID
+            }
+            "model" => <crate::model_capnp::model_request::Reader<'static> as HasTypeId>::TYPE_ID,
+            _ => {
+                return Err(JsError::new(
+                    "Federate proof sender is limited to Registry and Model",
+                ))
+            }
+        };
+        if ed_pubkey == self.inner.signer.pubkey() {
+            return Err(JsError::new(
+                "Federate proof Ed25519 key must differ from the envelope key",
+            ));
+        }
+        if self.inner.signer.pq_pubkey().as_deref() == Some(pq_pubkey) {
+            return Err(JsError::new(
+                "Federate proof ML-DSA-65 key must differ from the envelope key",
+            ));
+        }
+        for (name, kid) in [("Ed25519", ed_kid), ("ML-DSA-65", pq_kid)] {
+            if kid.is_empty() || kid.len() > hyprstream_rpc::proof::MAX_KID_BYTES {
+                return Err(JsError::new(&format!(
+                    "Federate proof {name} kid must be 1..64 bytes"
+                )));
+            }
+        }
+        let signer = JsSigner::new_hybrid(ed_pubkey, ed_sign_fn, pq_pubkey, pq_sign_fn)
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let provider = BrowserFederateProofProvider {
+            signer,
+            ed_kid: ed_kid.to_vec(),
+            pq_kid: pq_kid.to_vec(),
+            service_name: service_name.to_owned(),
+            request_schema_id,
+        };
+        Ok(WasmRpcClient {
+            inner: self.inner.with_federate_proof_provider(Arc::new(provider)),
+        })
+    }
+
     /// Send a signed request and return the verified response payload (Cap'n Proto bytes).
     ///
     /// Uses the client's default JWT (set via `withDefaultJwt()`).
     pub async fn call(&self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
-        self.inner.call(payload.to_vec())
+        self.inner
+            .call(payload.to_vec())
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -287,11 +431,7 @@ impl WasmRpcClient {
         payload: &[u8],
     ) -> Result<Vec<u8>, JsError> {
         self.inner
-            .call_for_service_with_method(
-                service_name,
-                method_discriminator,
-                payload.to_vec(),
-            )
+            .call_for_service_with_method(service_name, method_discriminator, payload.to_vec())
             .await
             .map_err(|error| JsError::new(&error.to_string()))
     }
@@ -309,7 +449,8 @@ impl WasmRpcClient {
         delegated_bearer: Option<String>,
     ) -> Result<Vec<u8>, JsError> {
         let options = call_options(jwt, delegated_bearer);
-        self.inner.call_with_options(payload.to_vec(), options)
+        self.inner
+            .call_with_options(payload.to_vec(), options)
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -344,7 +485,8 @@ impl WasmRpcClient {
         ephemeral_pubkey: &[u8],
     ) -> Result<Vec<u8>, JsError> {
         let epk = fixed_ephemeral_pubkey(ephemeral_pubkey)?;
-        self.inner.call_streaming(payload.to_vec(), epk)
+        self.inner
+            .call_streaming(payload.to_vec(), epk)
             .await
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -389,7 +531,41 @@ impl WasmRpcClient {
         method_discriminator: u16,
         payload: &[u8],
     ) -> Result<WasmStreamHandle, JsError> {
-        let handle = self.inner
+        if service_name == "model" && method_discriminator == 6 {
+            let (secret, public) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
+            let public_bytes = public.to_bytes();
+            let response = self
+                .inner
+                .call_streaming_for_service_with_method(
+                    service_name,
+                    method_discriminator,
+                    payload.to_vec(),
+                    public_bytes,
+                )
+                .await
+                .map_err(|error| JsError::new(&error.to_string()))?;
+            let info = crate::model_stream_response::decode_model_stream_response(
+                service_name,
+                method_discriminator,
+                &response,
+            )
+            .map_err(|error| JsError::new(&error.to_string()))?;
+            let (tls_url, tls_pins) = self.inner.transport.tls_policy();
+            let handle = crate::browser_moq_stream::BrowserMoqHandle::open(
+                info,
+                &secret.scalar().to_bytes(),
+                &public_bytes,
+                tls_url,
+                tls_pins,
+            )
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+            return Ok(WasmStreamHandle {
+                inner: BrowserStreamHandle::Moq(handle),
+            });
+        }
+        let handle = self
+            .inner
             .open_stream_for_service_with_method(
                 service_name,
                 method_discriminator,
@@ -397,7 +573,9 @@ impl WasmRpcClient {
             )
             .await
             .map_err(|error| JsError::new(&error.to_string()))?;
-        Ok(WasmStreamHandle { inner: handle })
+        Ok(WasmStreamHandle {
+            inner: BrowserStreamHandle::Legacy(handle),
+        })
     }
 
     /// Open an option-bearing generated stream with explicit service and method metadata.
@@ -410,7 +588,42 @@ impl WasmRpcClient {
         jwt: Option<String>,
         delegated_bearer: Option<String>,
     ) -> Result<WasmStreamHandle, JsError> {
-        let handle = self.inner
+        if service_name == "model" && method_discriminator == 6 {
+            let (secret, public) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
+            let public_bytes = public.to_bytes();
+            let response = self
+                .inner
+                .call_streaming_with_options_for_service_with_method(
+                    service_name,
+                    method_discriminator,
+                    payload.to_vec(),
+                    public_bytes,
+                    call_options(jwt, delegated_bearer),
+                )
+                .await
+                .map_err(|error| JsError::new(&error.to_string()))?;
+            let info = crate::model_stream_response::decode_model_stream_response(
+                service_name,
+                method_discriminator,
+                &response,
+            )
+            .map_err(|error| JsError::new(&error.to_string()))?;
+            let (tls_url, tls_pins) = self.inner.transport.tls_policy();
+            let handle = crate::browser_moq_stream::BrowserMoqHandle::open(
+                info,
+                &secret.scalar().to_bytes(),
+                &public_bytes,
+                tls_url,
+                tls_pins,
+            )
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+            return Ok(WasmStreamHandle {
+                inner: BrowserStreamHandle::Moq(handle),
+            });
+        }
+        let handle = self
+            .inner
             .open_stream_with_options_for_service_with_method(
                 service_name,
                 method_discriminator,
@@ -419,16 +632,22 @@ impl WasmRpcClient {
             )
             .await
             .map_err(|error| JsError::new(&error.to_string()))?;
-        Ok(WasmStreamHandle { inner: handle })
+        Ok(WasmStreamHandle {
+            inner: BrowserStreamHandle::Legacy(handle),
+        })
     }
 
     /// Open a verified streaming subscription.
     #[wasm_bindgen(js_name = "openStream")]
     pub async fn open_stream(&self, payload: &[u8]) -> Result<WasmStreamHandle, JsError> {
-        let handle = self.inner.open_stream(payload.to_vec())
+        let handle = self
+            .inner
+            .open_stream(payload.to_vec())
             .await
             .map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(WasmStreamHandle { inner: handle })
+        Ok(WasmStreamHandle {
+            inner: BrowserStreamHandle::Legacy(handle),
+        })
     }
 }
 
@@ -442,25 +661,33 @@ impl WasmRpcClient {
 /// Cap'n Proto parsing as the native `StreamHandle<LazyUdsTransport>`.
 #[wasm_bindgen(js_name = "StreamHandle")]
 pub struct WasmStreamHandle {
-    inner: StreamHandleImpl<WtConnection>,
+    inner: BrowserStreamHandle,
+}
+
+enum BrowserStreamHandle {
+    Legacy(StreamHandleImpl<WtConnection>),
+    Moq(crate::browser_moq_stream::BrowserMoqHandle),
 }
 
 #[wasm_bindgen(js_class = "StreamHandle")]
 impl WasmStreamHandle {
     /// Get next verified payload as raw bytes.
     ///
-    /// Returns the payload data bytes for Data/Complete variants,
+    /// Returns Data bytes; MoQ completion returns null, never completion metadata.
+    /// Legacy streams also return bytes for Complete variants,
     /// null on stream end, or throws on error.
     #[wasm_bindgen(js_name = "nextPayload")]
     pub async fn next_payload(&mut self) -> Result<JsValue, JsError> {
-        match self.inner.next_payload().await {
-            Ok(Some(StreamPayload::Data(data))) =>
-                Ok(js_sys::Uint8Array::from(&data[..]).into()),
+        let result = match &mut self.inner {
+            BrowserStreamHandle::Legacy(handle) => handle.next_payload().await,
+            BrowserStreamHandle::Moq(handle) => handle.next_payload().await,
+        };
+        match result {
+            Ok(Some(StreamPayload::Data(data))) => Ok(js_sys::Uint8Array::from(&data[..]).into()),
             Ok(Some(StreamPayload::Complete(meta))) => {
                 Ok(js_sys::Uint8Array::from(&meta[..]).into())
             }
-            Ok(Some(StreamPayload::Error(msg))) =>
-                Err(JsError::new(&msg)),
+            Ok(Some(StreamPayload::Error(msg))) => Err(JsError::new(&msg)),
             Ok(Some(StreamPayload::Tagged { payload, .. })) => {
                 Ok(js_sys::Uint8Array::from(&payload[..]).into())
             }
@@ -469,21 +696,36 @@ impl WasmStreamHandle {
         }
     }
 
-    /// Cancel the stream via authenticated ctrl channel.
+    /// Cancel consumption. MoQ closes its subscription/session; legacy streams
+    /// retain their authenticated ctrl channel. No RPC PUB fallback is used.
     pub async fn cancel(&mut self) -> Result<(), JsError> {
-        self.inner.cancel().await
-            .map_err(|e| JsError::new(&e.to_string()))
+        match &mut self.inner {
+            BrowserStreamHandle::Legacy(handle) => handle
+                .cancel()
+                .await
+                .map_err(|e| JsError::new(&e.to_string())),
+            BrowserStreamHandle::Moq(handle) => {
+                handle.cancel();
+                Ok(())
+            }
+        }
     }
 
     /// Get the stream ID.
     #[wasm_bindgen(js_name = "streamId")]
     pub fn stream_id(&self) -> String {
-        self.inner.stream_id().to_owned()
+        match &self.inner {
+            BrowserStreamHandle::Legacy(handle) => handle.stream_id().to_owned(),
+            BrowserStreamHandle::Moq(handle) => handle.stream_id().to_owned(),
+        }
     }
 
     /// Check if stream is completed.
     #[wasm_bindgen(js_name = "isCompleted")]
     pub fn is_completed(&self) -> bool {
-        self.inner.is_completed()
+        match &self.inner {
+            BrowserStreamHandle::Legacy(handle) => handle.is_completed(),
+            BrowserStreamHandle::Moq(handle) => handle.is_completed(),
+        }
     }
 }

@@ -20,20 +20,58 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::warn;
 
+/// Maximum serialized holder evidence accepted by mediated authorization.
+const MAX_MEDIATED_EVIDENCE_BYTES: usize = crate::envelope::MAX_MEDIATED_EVIDENCE_BYTES;
+
+/// Original signed material is sensitive; Debug must never expose it.
+#[derive(Clone)]
+struct MediatedEvidence(Arc<[u8]>);
+
+impl std::fmt::Debug for MediatedEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MediatedEvidence([REDACTED])")
+    }
+}
+
+impl MediatedEvidence {
+    fn from_envelope(envelope: &SignedEnvelope) -> Option<Self> {
+        // Never represent recovered plaintext as an outer ciphertext signature.
+        if envelope.encrypted_envelope.is_some() {
+            return crate::authorization_witness::package(&envelope.envelope, &envelope.cnf)
+                .map(|bytes| Self(bytes.into()));
+        }
+        if !crate::envelope::mediated_request_fits(&envelope.envelope)
+            || envelope.cose.len() > MAX_MEDIATED_EVIDENCE_BYTES
+            || envelope
+                .pq_kem_ciphertext
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > MAX_MEDIATED_EVIDENCE_BYTES)
+        {
+            return None;
+        }
+        let mut message = capnp::message::Builder::new_default();
+        envelope.write_to(
+            &mut message.init_root::<crate::common_capnp::signed_envelope::Builder<'_>>(),
+        );
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        (bytes.len() <= MAX_MEDIATED_EVIDENCE_BYTES).then(|| Self(bytes.into()))
+    }
+}
+
 /// Authorization callback for policy checks.
 ///
-/// Parameters: (subject, domain, resource, operation) -> allowed.
+/// Parameters: (verified ingress context, resource, operation) -> allowed.
+/// Carry the original evidence with the context; a subject string and bearer
+/// alone cannot prove a service holder's request to a mediator.
 /// Services store this and call it from their `authorize()` handler method.
 /// The concrete implementation typically wraps `PolicyClient::check_policy()`.
 ///
 /// Returns a boxed future to support async policy checks on single-threaded runtimes.
 pub type AuthorizeFn = Arc<
     dyn Fn(
+            EnvelopeContext,
             String,
             String,
-            String,
-            String,
-            Option<String>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send>>
         + Send
         + Sync,
@@ -122,6 +160,23 @@ pub struct EnvelopeContext {
     /// Raw JWT token from the envelope. Server decodes and verifies this.
     /// Preferred over the legacy `claims` field when present.
     jwt_token: Option<String>,
+    /// Set only after the complete direct JWT verification path succeeds,
+    /// including revocation, session, confirmation and WTH checks. Prevents a
+    /// future dynamic proof consumer from constructing an authority handle
+    /// from merely parsed, legacy or partially verified claims.
+    direct_jwt_verified: bool,
+    /// A signature-verified reserved Federate JWT awaiting its original-holder
+    /// proof and Policy admission. It confers no identity before commit.
+    deferred_federate: Option<(crate::auth::Claims, Subject)>,
+    /// Set by `verify_claims()`: the credential is of the Federate TUI client
+    /// class (marker set, or the authority-owned deployment class pin).
+    /// Dispatch fences classified credentials (see dispatch.rs); evidence
+    /// verification never sets this on the REQUEST context.
+    federate_tui_class: bool,
+    /// Installed only after the H3b hybrid proof and durable Policy admission.
+    /// The envelope signer may be a relay and is never the caller's assurance.
+    federate_holder_ed: Option<[u8; 32]>,
+    federate_request_use: Option<(String, String)>,
     /// Bearer relayed by an authenticated service; deny-by-default.
     delegation_token: Option<String>,
 
@@ -162,9 +217,19 @@ pub struct EnvelopeContext {
     pub(crate) response_kem_recipient: Option<crate::crypto::hybrid_kem::RecipientPublic>,
     pub(crate) service_domain: Option<String>,
 
+    /// v16 proof CWT bytes, if present on the verified envelope.
+    pub(crate) envelope_proof_cwt: Option<Vec<u8>>,
+    original_holder_evidence: Option<MediatedEvidence>,
+
     /// Browser-only method commitment independently checked by generated
     /// service dispatch after the sealed transcript is recovered.
     pub(crate) browser_method_discriminator: Option<u16>,
+
+    /// Verified internal execution work order (`iw+jwt`, single-service
+    /// Model→Inference boundary). Set ONLY by `verify_claims` after the
+    /// service's `verify_internal_work_bearer` hook authenticated the token
+    /// against its pinned controller; never populated from wire data alone.
+    pub(crate) internal_work: Option<crate::auth::internal_work::InternalWorkContext>,
 
     /// Whether this request originated from a genuine in-process / IPC caller
     /// (the `FixedSigner` mutual-auth plane), as opposed to a networked peer
@@ -179,6 +244,109 @@ pub struct EnvelopeContext {
 }
 
 impl EnvelopeContext {
+    /// Verify the original holder's hybrid transcript without granting local
+    /// transport provenance. Credential verification is still mandatory.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_mediated_evidence(
+        evidence: &[u8],
+        mediator_service: &str,
+        operation: &str,
+    ) -> Result<Self> {
+        if crate::authorization_witness::is_witness_evidence(evidence) {
+            let verified = crate::authorization_witness::verify(evidence, mediator_service)?;
+            if let Some(signed_operation) = verified.operation.as_deref() {
+                anyhow::ensure!(
+                    signed_operation == operation,
+                    "mediated operation does not match holder-signed request leaf"
+                );
+            } else {
+                crate::proof::policy::verify_mediated_operation(
+                    mediator_service,
+                    &verified.request.payload,
+                    operation,
+                )?;
+            }
+            return Ok(Self::from_authenticated_request(
+                &verified.request,
+                verified.signer,
+                Some(MediatedEvidence(evidence.to_vec().into())),
+            ));
+        }
+        let signed =
+            crate::envelope::verify_mediated_envelope_evidence(evidence, mediator_service)?;
+        crate::proof::policy::verify_mediated_operation(
+            mediator_service,
+            &signed.envelope.payload,
+            operation,
+        )?;
+        Ok(Self::from_verified(&signed))
+    }
+
+    /// Bounded original signed request for a read-only mediated Policy query.
+    /// Possession of these bytes is not an identity grant; the receiver must
+    /// independently verify holder, credential, target, method and freshness.
+    pub fn original_holder_evidence(&self) -> Option<&[u8]> {
+        self.original_holder_evidence
+            .as_ref()
+            .map(|evidence| evidence.0.as_ref())
+    }
+
+    /// Record a verified holder's derived authorization query, independently
+    /// of the request's original dispatch admission. No default local store:
+    /// startup must install the topology-qualified replay backend.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn admit_mediated_query(
+        &self,
+        mediator: &str,
+        resource: &str,
+        operation: &str,
+    ) -> Result<()> {
+        use crate::proof::admission::{
+            admit_mediated_query, global_proof_replay_store, validate_mediated_query_dimensions,
+            MediatedQueryReplayKey, ProofAdmissionResult,
+        };
+        use sha2::{Digest, Sha256};
+        anyhow::ensure!(
+            self.claims().is_some() && self.original_holder_evidence.is_some(),
+            "verified holder evidence required"
+        );
+        // Validate mediated-query dimensions on the borrowed values before the
+        // owned replay key is built (bounded preallocation, Sol MED-2).
+        validate_mediated_query_dimensions(mediator, resource, operation)?;
+        anyhow::ensure!(
+            self.service_domain.as_deref() == Some(mediator),
+            "mediator target mismatch"
+        );
+        // Envelope iat is milliseconds and its age boundary is inclusive.
+        // Retain through that last accepted millisecond, rounding up to the
+        // replay store's exclusive seconds boundary, never down.
+        let last_valid_ms = self
+            .request_iat
+            .checked_add(crate::envelope::MAX_TIMESTAMP_AGE_MS)
+            .ok_or_else(|| anyhow::anyhow!("mediated expiry overflow"))?;
+        let expires_at = u64::try_from(
+            last_valid_ms
+                .div_euclid(1000)
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("mediated expiry overflow"))?,
+        )?;
+        let key = MediatedQueryReplayKey {
+            signer_thumbprint: Sha256::digest(self.cnf).into(),
+            request_id: self.request_id,
+            request_nonce: self.request_nonce,
+            mediator: mediator.to_owned(),
+            resource: resource.to_owned(),
+            operation: operation.to_owned(),
+        };
+        let store = global_proof_replay_store()
+            .ok_or_else(|| anyhow::anyhow!("no mediated replay backend installed"))?;
+        anyhow::ensure!(
+            admit_mediated_query(store, &key, expires_at) == ProofAdmissionResult::Admitted,
+            "mediated query replay admission denied"
+        );
+        Ok(())
+    }
+
     /// Create context from a verified SignedEnvelope (AnySigner path).
     ///
     /// `key_derived_subject` is `Anonymous`. Use `from_verified_as_system()` for
@@ -187,23 +355,45 @@ impl EnvelopeContext {
     /// `pub(crate)` — external callers should use the named constructors above
     /// to make the trust level explicit.
     pub(crate) fn from_verified(envelope: &SignedEnvelope) -> Self {
+        Self::from_authenticated_request(
+            &envelope.envelope,
+            envelope.cnf,
+            MediatedEvidence::from_envelope(envelope),
+        )
+    }
+
+    // Only callers that verified either the envelope or the purpose-bound
+    // witness may use this. Credential verification is still mandatory.
+    fn from_authenticated_request(
+        envelope: &crate::envelope::RequestEnvelope,
+        cnf: [u8; 32],
+        evidence: Option<MediatedEvidence>,
+    ) -> Self {
         Self {
-            request_id: envelope.request_id(),
+            request_id: envelope.request_id,
             claims: None,
             verified_tenant: None,
-            jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
-            delegation_token: envelope.envelope.delegation_token.clone(),
+            jwt_token: envelope.jwt_token().map(ToOwned::to_owned),
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
+            delegation_token: envelope.delegation_token.clone(),
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
-            cnf: envelope.cnf,
-            envelope_wit_hash: envelope.envelope.wth,
-            client_dh_public: envelope.envelope.client_dh_public,
-            client_kem_public: envelope.envelope.client_kem_public.clone(),
-            request_iat: envelope.envelope.iat,
-            request_nonce: envelope.envelope.nonce,
-            response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
-            service_domain: envelope.envelope.service_domain.clone(),
+            cnf,
+            envelope_wit_hash: envelope.wth,
+            client_dh_public: envelope.client_dh_public,
+            client_kem_public: envelope.client_kem_public.clone(),
+            request_iat: envelope.iat,
+            request_nonce: envelope.nonce,
+            response_kem_recipient: envelope.response_kem_recipient.clone(),
+            service_domain: envelope.service_domain.clone(),
+            envelope_proof_cwt: envelope.proof_cwt.clone(),
+            original_holder_evidence: evidence,
             browser_method_discriminator: None,
+            internal_work: None,
             // AnySigner / networked plane — NOT a local caller (#328).
             is_local_caller: false,
         }
@@ -220,6 +410,11 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: Some("local".to_owned()),
             jwt_token: envelope.envelope.jwt_token().map(ToOwned::to_owned),
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: envelope.envelope.delegation_token.clone(),
             key_derived_subject: Subject::new("system"),
             jwt_subject: None,
@@ -231,7 +426,10 @@ impl EnvelopeContext {
             request_nonce: envelope.envelope.nonce,
             response_kem_recipient: envelope.envelope.response_kem_recipient.clone(),
             service_domain: envelope.envelope.service_domain.clone(),
+            envelope_proof_cwt: envelope.envelope.proof_cwt.clone(),
+            original_holder_evidence: MediatedEvidence::from_envelope(envelope),
             browser_method_discriminator: None,
+            internal_work: None,
             // FixedSigner mutual-auth plane — genuine in-process / IPC caller (#328).
             is_local_caller: true,
         }
@@ -252,6 +450,11 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: Some("local".to_owned()),
             jwt_token: None,
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::new(format!("service:{service_name}")),
             jwt_subject: None,
@@ -263,7 +466,10 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             // Internal self-call that never crosses a network boundary (#328).
             is_local_caller: true,
         }
@@ -298,6 +504,11 @@ impl EnvelopeContext {
             claims,
             verified_tenant: Some("local".to_owned()),
             jwt_token: None,
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: crate::envelope::Subject::anonymous(),
             jwt_subject: None,
@@ -309,7 +520,10 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller: false,
         }
     }
@@ -398,10 +612,11 @@ impl EnvelopeContext {
     /// deliberately refused.
     #[must_use]
     pub fn authenticated_signer_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
-        if !self.is_authenticated() || self.cnf == [0u8; 32] {
+        let ed = self.federate_holder_ed.unwrap_or(self.cnf);
+        if !self.is_authenticated() || ed == [0u8; 32] {
             return None;
         }
-        ed25519_dalek::VerifyingKey::from_bytes(&self.cnf).ok()
+        ed25519_dalek::VerifyingKey::from_bytes(&ed).ok()
     }
 
     /// Return this request's self-certifying pairwise DID.
@@ -450,6 +665,11 @@ impl EnvelopeContext {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: subject,
             jwt_subject: None,
@@ -461,7 +681,10 @@ impl EnvelopeContext {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller: false,
         }
     }
@@ -475,6 +698,21 @@ impl EnvelopeContext {
     ) -> Self {
         let mut context = Self::for_test_authenticated_subject(subject, signer);
         context.verified_tenant = Some(tenant.into());
+        context
+    }
+
+    /// Build an authenticated, tenant-bound context fixture that also carries
+    /// verified `claims` — for exercising handlers that read `ctx.claims()`
+    /// (e.g. a service credential's `workload_session_id` on renewal).
+    #[cfg(any(test, feature = "test-classical-policy"))]
+    pub fn for_test_authenticated_subject_with_claims(
+        subject: Subject,
+        tenant: impl Into<String>,
+        signer: ed25519_dalek::VerifyingKey,
+        claims: crate::auth::Claims,
+    ) -> Self {
+        let mut context = Self::for_test_authenticated_subject_in_tenant(subject, tenant, signer);
+        context.claims = Some(claims);
         context
     }
 
@@ -499,8 +737,14 @@ impl EnvelopeContext {
     ///   the kid-anchored binding the rest of the TCB uses — the PQ key is
     ///   resolved from the trust store keyed by the EdDSA identity, never
     ///   self-asserted.
+    ///   A session-overlay binding also reaches `PqHybrid`, but **only** when it
+    ///   has been confirmed out of band; a first-contact binding is capped at
+    ///   `Classical` by
+    ///   [`crate::session_pq_overlay::PqProvenance::key_material`].
     /// - **`Classical`** — the `cnf` Ed25519 signer key is verified but NO bound
-    ///   ML-DSA-65 anchor is present (the federation edge, or a pre-PQ identity).
+    ///   ML-DSA-65 anchor is present (the federation edge, or a pre-PQ
+    ///   identity), or the only binding is a first-contact one, which makes the
+    ///   signature checkable without making the signer more trusted.
     /// - **`Unverified`** — the `cnf` key is zeroed (a callback-service context
     ///   with no real envelope; assurance floors to the S1 `Unverified` floor
     ///   so it dominates nothing above it).
@@ -514,6 +758,12 @@ impl EnvelopeContext {
     /// [`crate::auth::mac::SubjectContextClaims::security_context`].
     #[must_use]
     pub fn verified_key_material(&self) -> crate::auth::mac::VerifiedKeyMaterial {
+        // A completed Federate request proved the original holder's hybrid
+        // suite. The envelope signer may be a relay: its key must not supply
+        // the caller's MAC assurance or subject-keyed identity.
+        if self.federate_holder_ed.is_some() {
+            return crate::auth::mac::VerifiedKeyMaterial::PqHybrid;
+        }
         // The callback-service path mints a context with a zeroed cnf and no
         // real envelope — there is no signature to derive assurance from. Floor
         // to Unverified so the S1 dominance check denies anything above the
@@ -530,6 +780,16 @@ impl EnvelopeContext {
             if let Some(store) = crate::envelope::global_pq_store() {
                 if store.ml_dsa_key_for(&self.cnf).is_some() {
                     return crate::auth::mac::VerifiedKeyMaterial::PqHybrid;
+                }
+            }
+            // A session overlay binding makes the signature checkable; whether
+            // it makes the signer more believed is a separate question, and
+            // `PqProvenance::key_material` is the only place it is answered. A
+            // first-contact binding maps to Classical there — the overlay lets
+            // the request in, it does not promote the requester.
+            if let Some(overlay) = crate::session_pq_overlay::global_session_pq_overlay() {
+                if let Some(provenance) = overlay.provenance_for(&self.cnf) {
+                    return provenance.key_material();
                 }
             }
         }
@@ -564,15 +824,114 @@ impl EnvelopeContext {
     /// For an authorized relay this is the delegated bearer, allowing a
     /// downstream service to preserve the original user's verified identity
     /// across another local service boundary.
+    /// Whether the verified credential is of the Federate TUI client class
+    /// (set by `verify_claims`; never caller-supplied).
+    pub fn is_federate_tui_class(&self) -> bool {
+        self.federate_tui_class
+    }
+
+    /// Whether this request's identity came from a delegated bearer token
+    /// (an authenticated service mediator presented the holder's token).
+    pub fn is_delegated_bearer(&self) -> bool {
+        self.jwt_token.is_none() && self.delegation_token.is_some()
+    }
+
     pub fn jwt_token(&self) -> Option<&str> {
         self.jwt_token
             .as_deref()
             .or(self.delegation_token.as_deref())
     }
 
+    /// A direct network credential only after the full verifier returned
+    /// successfully. Never substitutes a relayed bearer, legacy claims,
+    /// local callback identity, or a partially checked JWT. The returned
+    /// claims remain evidence, not a dispatch permit.
+    pub fn verified_direct_jwt(&self) -> Option<(&crate::auth::Claims, &str)> {
+        if !self.direct_jwt_verified
+            || self.is_local_caller
+            || self.delegation_token.is_some()
+            || self.internal_work.is_some()
+        {
+            return None;
+        }
+        Some((self.claims.as_ref()?, self.jwt_token.as_deref()?))
+    }
+
+    /// Signature-verified reserved credential awaiting dynamic holder proof,
+    /// current session and Policy request-use admission. This is evidence only;
+    /// `subject()`, `domain()` and `claims()` remain unpublished meanwhile.
+    pub fn deferred_federate_credential(&self) -> Option<(&crate::auth::Claims, &str)> {
+        let (claims, _) = self.deferred_federate.as_ref()?;
+        Some((claims, self.jwt_token.as_deref()?))
+    }
+
+    /// Original verified-envelope proof bytes, still untrusted until the
+    /// appropriate signer-suite verifier authenticates them.
+    pub fn request_proof_cwt(&self) -> Option<&[u8]> {
+        self.envelope_proof_cwt.as_deref()
+    }
+
+    pub(crate) fn commit_deferred_federate(
+        &mut self,
+        verified: &crate::proof::verify::VerifiedProof,
+        holder_ed: [u8; 32],
+        resource: String,
+        operation: String,
+    ) -> anyhow::Result<()> {
+        let (claims, subject) = self
+            .deferred_federate
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no deferred Federate credential"))?;
+        anyhow::ensure!(
+            holder_ed != [0; 32]
+                && claims.cnf_key_bytes() == Some(holder_ed)
+                && verified.primary_principal.as_deref() == Some(claims.sub.as_str())
+                && verified.primary_suite == "hs-cose-sign-ed25519-mldsa65-wns-v1"
+                && subject.name() == Some(claims.sub.as_str())
+                && claims
+                    .tenant
+                    .as_deref()
+                    .is_some_and(|tenant| !tenant.is_empty() && tenant != "*")
+                && !resource.is_empty()
+                && !operation.is_empty(),
+            "Federate holder/subject/profile mismatch"
+        );
+        self.verified_tenant = claims.tenant.clone();
+        self.jwt_subject = Some(subject);
+        self.claims = Some(claims);
+        self.federate_holder_ed = Some(holder_ed);
+        self.federate_request_use = Some((resource, operation));
+        // This is not the ordinary cnf-to-envelope direct JWT provenance;
+        // keep `verified_direct_jwt()` unavailable to downstream consumers.
+        Ok(())
+    }
+
+    /// Exact request-local Policy-use coordinate, never a reusable permit.
+    /// A serving handler must compare every generated authorization call with
+    /// this tuple and perform its ordinary fresh Policy check as well.
+    pub fn admitted_federate_operation(&self, resource: &str, operation: &str) -> bool {
+        self.federate_request_use
+            .as_ref()
+            .is_some_and(|(r, a)| r == resource && a == operation)
+    }
+
+    pub fn is_federate_admitted(&self) -> bool {
+        self.federate_request_use.is_some()
+    }
+
     /// Check if request has user context
     pub fn has_user_context(&self) -> bool {
         self.claims.is_some()
+    }
+
+    /// The verified internal execution work order, when this request crossed a
+    /// pinned single-service execution boundary (Model → its Inference
+    /// subprocessor). `None` for every direct caller; a service MUST treat its
+    /// presence as "the controller already authorized this exact operation" —
+    /// never as bearer delegation.
+    #[must_use]
+    pub fn internal_work(&self) -> Option<&crate::auth::internal_work::InternalWorkContext> {
+        self.internal_work.as_ref()
     }
 
     /// Get the client's ephemeral DH public key (if present).
@@ -584,6 +943,13 @@ impl EnvelopeContext {
     /// Get the authenticated identified-stream HyKEM recipient.
     pub fn stream_kem_recipient(&self) -> Option<&crate::crypto::hybrid_kem::RecipientPublic> {
         self.client_kem_public.as_ref()
+    }
+
+    /// The one-shot unary reply recipient authenticated by the envelope.
+    /// Deferred Federate admission additionally requires the original holder
+    /// proof to bind this value before any handler or authority side effect.
+    pub fn response_kem_recipient(&self) -> Option<&crate::crypto::hybrid_kem::RecipientPublic> {
+        self.response_kem_recipient.as_ref()
     }
 
     /// Whether this request came from a genuine in-process / IPC caller (#328).
@@ -690,7 +1056,12 @@ pub trait RequestService: 'static {
     /// # Arguments
     ///
     /// * `ctx` - Verified envelope context with identity
-    /// * `payload` - Raw inner request bytes (Cap'n Proto encoded)
+    /// * `body` - The request body decoded exactly once by
+    ///   [`RequestService::decode_request_body`] (v16 §5.2). Generated
+    ///   dispatch reads the typed request from [`DecodedRequestBody::root`]
+    ///   — the same decoded message whose derived leaf fed the generated
+    ///   method policy and the dispatch MAC PEP — never from a second decode
+    ///   of the bytes.
     ///
     /// Returns `(response_bytes, optional_continuation)`:
     /// - `response_bytes`: Cap'n Proto encoded response sent as REP
@@ -701,8 +1072,33 @@ pub trait RequestService: 'static {
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &crate::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)>;
+
+    /// Decode the signed request body **exactly once** (bounded) and derive
+    /// the full numeric method leaf path (v16 §5.2 step 4).
+    ///
+    /// The returned [`DecodedRequestBody`] is the one decode for the entire
+    /// request lifetime: its leaf path keys the generated method policy and
+    /// the dispatch MAC PEP, and its decoded message is what
+    /// [`RequestService::handle_request`] dispatches from. The leaf comes
+    /// from the signed body — never from a transport-specific hint such as
+    /// the browser transcript's method commitment, which does not exist on
+    /// other carriers and is not the signed leaf.
+    ///
+    /// This method is **required** — there is deliberately no default. A
+    /// schema-generated service delegates to its generated
+    /// `decode_<service>_request_body` function; a service with no Cap'n
+    /// Proto request schema must affirmatively construct
+    /// [`DecodedRequestBody::opaque`], which denies proof-bearing dispatch at
+    /// leaf derivation instead of silently passing a policy row it never
+    /// resolved.
+    ///
+    /// An unknown discriminant, a malformed body, or a body exceeding the
+    /// reviewed decode caps is an error — the same denial as an unlisted
+    /// leaf, never a coarser fallback.
+    fn decode_request_body(&self, signed_body: &[u8])
+        -> Result<crate::service::DecodedRequestBody>;
 
     /// Service name (for logging and registry).
     fn name(&self) -> &str;
@@ -784,12 +1180,17 @@ pub trait RequestService: 'static {
         true
     }
 
-    /// JWT ID blocklist for access token revocation.
+    /// Credential revocation store for access token revocation.
     ///
-    /// When `Some`, `verify_claims()` rejects tokens whose `jti` appears
-    /// in the blocklist. Override to provide a shared blocklist instance.
-    fn jti_blocklist(&self) -> Option<&dyn crate::auth::JtiBlocklist> {
-        None
+    /// Returns the process-global store published at startup: the durable
+    /// authority store in the policy process, or a policy-authority RPC
+    /// client store in every other process (checks cross the RPC bus to the
+    /// policy service, the one canonical revocation authority). When `None`
+    /// (startup not yet complete or authority initialization failed),
+    /// `verify_claims()` rejects tokens with a jti (fail-closed). Override
+    /// only for specialized testing.
+    fn credential_revocation_store(&self) -> Option<&dyn crate::auth::CredentialRevocationStore> {
+        crate::auth::global_credential_revocation_store().map(std::convert::AsRef::as_ref)
     }
 
     /// Fu4/#677: the minimum JWT `alg` policy enforced in `verify_claims`.
@@ -858,6 +1259,69 @@ pub trait RequestService: 'static {
         false
     }
 
+    /// Opt in only when this serving instance has a complete request-local
+    /// holder-proof, current-primary and durable Policy-use adapter. Default
+    /// false preserves the generic verifier's reserved-profile denial.
+    fn accept_deferred_federate_credential(&self) -> bool {
+        false
+    }
+
+    /// Verify the original holder's proof and bind it to the exact decoded
+    /// body/leaf/resource/action before identity publication. This stage must
+    /// not consume replay state: generated method-policy and MAC authorization
+    /// still run afterward. Durable Policy admission happens in
+    /// `commit_deferred_federate_request` only after those gates pass.
+    async fn admit_deferred_federate_request(
+        &self,
+        _ctx: &EnvelopeContext,
+        _body: &crate::service::DecodedRequestBody,
+        _proof: &crate::proof::parser::ParsedProof,
+    ) -> anyhow::Result<(
+        crate::proof::verify::VerifiedProof,
+        [u8; 32],
+        String,
+        String,
+        crate::proof::admission::ProofReplayKey,
+        u64,
+    )> {
+        anyhow::bail!("Federate request admission is disabled")
+    }
+
+    /// Perform fresh Policy admission and durable replay consumption after the
+    /// generated method-policy and mandatory MAC gates, immediately before
+    /// handler dispatch. Implementations must fail closed if the durable
+    /// admission service is unavailable. The default never admits a request.
+    async fn commit_deferred_federate_request(
+        &self,
+        _ctx: &EnvelopeContext,
+        _resource: &str,
+        _operation: &str,
+        _replay_key: &crate::proof::admission::ProofReplayKey,
+        _replay_expiry: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("Federate durable request admission is disabled")
+    }
+
+    /// Verify an `iw+jwt` internal execution work order presented as the
+    /// direct JWT (single-service Model→Inference boundary, user-approved D5).
+    ///
+    /// The generic pipeline rejects this token type at EVERY service by
+    /// default; only a service operating a pinned execution boundary overrides
+    /// this hook. The override must authenticate the token against the PINNED
+    /// controller key and bind it to the exact instance/tenant/model/operation
+    /// admitted. On `Ok` the pipeline installs the original-caller identity
+    /// (subject, tenant, claims snapshot) and the
+    /// [`InternalWorkContext`](crate::auth::internal_work::InternalWorkContext)
+    /// on the context; the work order is never a bearer anywhere else.
+    async fn verify_internal_work_bearer(
+        &self,
+        _ctx: &EnvelopeContext,
+        _token: &str,
+        _protected: &crate::auth::ProtectedHeader,
+    ) -> anyhow::Result<crate::auth::internal_work::InternalWorkClaims> {
+        anyhow::bail!("internal work bearer is not accepted by this service")
+    }
+
     /// E2E JWT verification with unified key source.
     ///
     /// Called by `process_request` after envelope signature verification.
@@ -906,6 +1370,84 @@ pub trait RequestService: 'static {
             return Ok(());
         };
 
+        // Parse the protected JOSE header once with duplicate detection. All
+        // dispatch and primitive verification below consumes this exact value.
+        let protected = crate::auth::parse_protected_header(&token)
+            .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?;
+
+        // Internal execution work order (single-service Model→Inference
+        // boundary). Routed to the per-service hook BEFORE the CA key source
+        // and the generic credential grammar: the hook verifies against the
+        // PINNED controller key (never the CA source), and its DEFAULT denies —
+        // so only a service that explicitly operates a pinned execution
+        // boundary can admit this type, and every other service fails closed
+        // here (and again at its own grammar below for any unknown typ). Never
+        // treated as delegation.
+        if protected.typ == crate::auth::internal_work::INTERNAL_WORK_JWT_TYP {
+            let work = self
+                .verify_internal_work_bearer(ctx, &token, &protected)
+                .await?;
+            // Sol S1 (MED): work.sub is the ALREADY-RESOLVED subject string
+            // that Model verified at ingress (`ctx.subject().to_string()`).
+            // Install the typed subject from that exact string — NEVER
+            // re-normalize through the legacy `Subject::from_str`, which
+            // strips `local:`/`token:`/`peer:`/`user:` prefixes and silently
+            // changes the principal (cross-principal subject-keyed TTT state
+            // and mis-audit at the worker). Do not apply `Subject::validate`
+            // here either: it rejects `:` for legitimate service subjects and
+            // federated subjects have their own grammar.
+            anyhow::ensure!(
+                !work.sub.is_empty(),
+                "internal work bearer subject is empty"
+            );
+            anyhow::ensure!(
+                work.sub != "anonymous",
+                "internal work bearer subject is the anonymous marker"
+            );
+            anyhow::ensure!(
+                work.sub != UNAUTHENTICATED_DID_SENTINEL,
+                "internal work bearer subject is the reserved unauthenticated sentinel"
+            );
+            let subject = crate::envelope::Subject::new(&work.sub);
+            // The installed typed identity must round-trip to the exact
+            // verified string (newtype Display is the string itself).
+            anyhow::ensure!(
+                subject.to_string() == work.sub,
+                "internal work bearer subject installation is not exact"
+            );
+            // Snapshot/subject coherence (K3 finding m1): the pinned
+            // controller authored both fields; require them to agree so
+            // audit and subject-keyed state are provably consistent.
+            anyhow::ensure!(
+                work.caller.sub == work.sub,
+                "internal work caller snapshot subject disagrees with the work-order subject"
+            );
+            let caller = work.caller.clone();
+            ctx.verified_tenant = Some(work.tenant.clone());
+            ctx.claims = Some(caller);
+            ctx.jwt_subject = Some(subject.clone());
+            ctx.internal_work = Some(crate::auth::internal_work::InternalWorkContext {
+                subject,
+                owner_did: work.owner_did.clone(),
+                resource: work.resource.clone(),
+                operation: work.operation.clone(),
+                tenant: work.tenant.clone(),
+                model: work.model.clone(),
+                jti: work.jti.clone(),
+            });
+            tracing::info!(
+                target: "audit",
+                subject = %ctx.subject(),
+                resource = %work.resource,
+                action = %work.operation,
+                decision = "allow",
+                request_id = ctx.request_id,
+                via = "model-internal-work",
+                "internal work admission"
+            );
+            return Ok(());
+        }
+
         // Get key source — if not configured, JWT verification is disabled
         let key_source = match self.jwt_key_source() {
             Some(ks) => ks,
@@ -937,10 +1479,6 @@ pub trait RequestService: 'static {
             anyhow::bail!("empty JWT issuer is only accepted from in-process callers");
         }
 
-        // Parse the protected JOSE header once with duplicate detection. All
-        // dispatch and primitive verification below consumes this exact value.
-        let protected = crate::auth::parse_protected_header(&token)
-            .map_err(|e| anyhow::anyhow!("JWT header parse failed: {}", e))?;
         anyhow::ensure!(
             crate::auth::is_rfc9068_access_token_type(&protected.typ) || protected.typ == "wit+jwt",
             "unsupported JWT typ"
@@ -1058,9 +1596,16 @@ pub trait RequestService: 'static {
                 ];
                 let dispatch = crate::auth::parse_composite_dispatch(&token, &allowed_types)
                     .map_err(|error| anyhow::anyhow!("JWT dispatch failed: {error}"))?;
-                let snapshot = key_source.composite_key_set().snapshot();
-                let pair = snapshot
-                    .pair(dispatch.kid())
+                // Role note: pairs of BOTH issuer roles are acceptable at this
+                // layer — the OAuth pair signs browser access tokens and
+                // browser/workload WITs, the Policy pair signs PolicyService-
+                // issued tokens including service WITs — because this is
+                // transport authentication only. Handlers whose decisions
+                // confer signing-domain privileges (e.g. service-key
+                // certification, announcements) must additionally constrain
+                // the resolved pair's role themselves.
+                let pair = key_source
+                    .composite_pair(dispatch.kid())
                     .ok_or_else(|| anyhow::anyhow!("unknown composite JWT kid"))?;
                 crate::auth::jwt::decode_composite(
                     &token,
@@ -1088,23 +1633,20 @@ pub trait RequestService: 'static {
                             );
                             anyhow::anyhow!("JWT key resolution failed")
                         })?;
-                    crate::auth::decode_with_key(
-                        &token,
-                        &verifying_key,
-                        self.expected_audience(),
-                    )
+                    crate::auth::decode_with_key(&token, &verifying_key, self.expected_audience())
                 } else {
-                    let candidates = key_source
-                        .get_keys(&unverified.iss, None)
-                        .await
-                        .map_err(|e| {
-                            tracing::warn!(
-                                "JWT key resolution failed for kid-less iss={}: {}",
-                                unverified.iss,
-                                e
-                            );
-                            anyhow::anyhow!("JWT key resolution failed")
-                        })?;
+                    let candidates =
+                        key_source
+                            .get_keys(&unverified.iss, None)
+                            .await
+                            .map_err(|e| {
+                                tracing::warn!(
+                                    "JWT key resolution failed for kid-less iss={}: {}",
+                                    unverified.iss,
+                                    e
+                                );
+                                anyhow::anyhow!("JWT key resolution failed")
+                            })?;
                     crate::auth::decode_with_any_key_lenient(
                         &token,
                         &candidates,
@@ -1119,14 +1661,218 @@ pub trait RequestService: 'static {
             _ => anyhow::bail!("unsupported JWT algorithm"),
         };
 
-        // Check jti against blocklist (revoked access tokens)
-        if let Some(ref jti) = verified.jti {
-            if let Some(blocklist) = self.jti_blocklist() {
-                if blocklist.is_revoked(jti) {
-                    tracing::warn!(jti = %jti, sub = %verified.sub, "Revoked JWT rejected");
-                    anyhow::bail!("JWT has been revoked");
+        // Federate's browser proof key is intentionally distinct from the
+        // envelope/relay key. Reserved credentials use the signed signer
+        // inventory digest, not a server-side session generation. Reject
+        // malformed or mixed profiles here before publishing identity or
+        // caching a key binding; the serving adapter still verifies holder
+        // proof, shared replay, and fresh Policy authority before dispatch.
+        let reserved_federate = self
+            .expected_audience()
+            .is_some_and(|host| verified.is_reserved_federate_credential(host))
+            || key_source
+                .local_issuers()
+                .iter()
+                .any(|host| verified.is_reserved_federate_credential(host));
+        if verified.has_federate_profile_marker() || reserved_federate {
+            let inventory = verified.federate_signer_inventory()?;
+            let session_generation = verified.session_authority_generation()?;
+            anyhow::ensure!(
+                self.accept_deferred_federate_credential()
+                    && matches!(self.name(), "registry" | "model")
+                    && reserved_federate
+                    && self
+                        .expected_audience()
+                        .is_some_and(|host| { verified.is_reserved_federate_credential(host) })
+                    && verified.aud.as_deref() == self.expected_audience()
+                    && self.expected_audience().is_some_and(|host| {
+                        crate::auth::claims::FederateHost::new(host).is_ok()
+                    })
+                    && verified.hs_profile.as_deref() == Some("federate-session-v1")
+                    && inventory.is_some_and(|value| value != [0; 32])
+                    && session_generation.is_none()
+                    && protected.typ == "at+jwt"
+                    && !ctx.is_local_caller
+                    && !delegated
+                    && ctx.delegation_token.is_none()
+                    && ctx.jwt_token.as_deref() == Some(token.as_str())
+                    && verified.jti.as_deref().is_some_and(|id| !id.is_empty()),
+                "Federate session dispatch is disabled or malformed"
+            );
+            let local = key_source.local_issuers();
+            let local_refs: Vec<&str> = local.iter().map(String::as_str).collect();
+            anyhow::ensure!(
+                crate::auth::is_local_iss(&verified.iss, &local_refs),
+                "Federate host issuer is not local"
+            );
+            let jti = verified
+                .jti
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing Federate jti"))?;
+            let revocations = self
+                .credential_revocation_store()
+                .ok_or_else(|| anyhow::anyhow!("Federate revocation authority unavailable"))?;
+            anyhow::ensure!(
+                !revocations
+                    .is_revoked(&crate::auth::CredentialId::jwt(&verified.iss, jti))
+                    .await,
+                "Federate credential revoked"
+            );
+            if let Some(expected) = ctx.envelope_wit_hash {
+                use sha2::{Digest, Sha256};
+                use subtle::ConstantTimeEq as _;
+                let actual: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+                anyhow::ensure!(bool::from(expected.ct_eq(&actual)), "Federate wth mismatch");
+            }
+            let subject = verified.subject(&local_refs);
+            anyhow::ensure!(
+                !subject.is_federated() && subject.name() == Some(verified.sub.as_str()),
+                "Federate subject is not local"
+            );
+            // No subject, tenant, claims or key cache is published. The
+            // dispatcher must complete original-holder proof + Policy use.
+            ctx.deferred_federate = Some((verified, subject));
+            return Ok(());
+        }
+
+        // Credential/session checks. The local-issuer set is resolved first:
+        // the credential profile makes `jti` REQUIRED on locally issued
+        // tokens, and the session registry is a local authority — both
+        // enforcements below apply to local issuers. Federated tokens keep
+        // the revocation check only (their sessions are not local state).
+        let local_issuers = key_source.local_issuers();
+        let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
+        let token_is_local = crate::auth::is_local_iss(&verified.iss, &local_issuers_refs);
+
+        // W1.3: classify Federate TUI-class credentials — marker set, or the
+        // authority-owned class pin (deployment-configured client id at a
+        // local issuer). This flag is routing metadata only; ENFORCEMENT
+        // happens at dispatch (dispatch.rs fences classified credentials to
+        // the tui service and policy's read-only delegated check) and at the
+        // TUI consumer gate. Verification itself must stay class-blind here:
+        // this method also runs for evidence verification (e.g. Policy
+        // verifying a mediated holder), which is not dispatch.
+        ctx.federate_tui_class = verified.is_federate_tui_class(&local_issuers_refs);
+
+        // v16 §3.1/§3.3: issuer-scoped credential and session enforcement
+        // applies only to tokens carrying a real authoritative issuer. An
+        // empty `iss` is the in-process provenance sentinel — accepted solely
+        // from in-process callers (gated above where an empty issuer from a
+        // networked caller is rejected) and never issuer-scoped: a
+        // `CredentialId` requires a non-empty issuer by construction (§3.1), so
+        // an empty-iss token has no revocable credential identity and no
+        // issuer namespace to scope a session to. The `jti` that `jwt::encode`
+        // auto-injects is then an encoding artifact, not a credential —
+        // running it through the issuer-scoped gate would build an invalid
+        // `CredentialId`, fail closed, and reject a legitimate in-process
+        // caller. `is_local_iss` deliberately reports empty-iss as local, so
+        // the credential gate must additionally require a non-empty issuer.
+        let issuer_scoped = !verified.iss.is_empty();
+
+        // A locally issued token with a real issuer must carry a jti:
+        // revocation could never observe it otherwise. Reject rather than
+        // skipping the check. Empty-iss in-process provenance is exempt (no
+        // issuer to scope the credential to).
+        if token_is_local && issuer_scoped && verified.jti.is_none() {
+            tracing::warn!(iss = %verified.iss, sub = %verified.sub, "Rejected local-issuer JWT without jti");
+            anyhow::bail!("local credential missing required jti");
+        }
+
+        // Check credential against the revocation store (revoked access
+        // tokens). Only issuer-scoped tokens (non-empty issuer) have a valid
+        // `CredentialId`; empty-iss in-process provenance carries no revocable
+        // credential identity and is exempt.
+        if let Some(jti) = verified.jti.as_ref().filter(|_| issuer_scoped) {
+            match self.credential_revocation_store() {
+                Some(store) => {
+                    let cred_id = crate::auth::CredentialId::jwt(&verified.iss, jti);
+                    if store.is_revoked(&cred_id).await {
+                        tracing::warn!(jti = %jti, iss = %verified.iss, sub = %verified.sub, "Revoked JWT rejected");
+                        anyhow::bail!("JWT has been revoked");
+                    }
+                }
+                None => {
+                    // Fail-closed: a token carrying a jti cannot be verified
+                    // for revocation without a store. Reject rather than
+                    // admitting a potentially-revoked credential.
+                    tracing::warn!(jti = %jti, sub = %verified.sub, "Token with jti rejected: no revocation store configured");
+                    anyhow::bail!("revocation store unavailable");
                 }
             }
+        }
+
+        // Session check (v16 §3.3): a local token carrying a session ID is
+        // rejected when the session is revoked, expired, unknown, or cannot
+        // be checked. Only issuer-scoped local tokens participate — an
+        // empty-iss in-process token has no issuer namespace to scope a
+        // session to (a `SessionKey` requires a non-empty issuer).
+        if token_is_local && issuer_scoped {
+            // Exact-one session parsing (v16 §3.3): both-present or empty
+            // session identifiers are malformed and reject here, before any
+            // authorization or cache insertion.
+            let session_key = match verified.session_key() {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::warn!(iss = %verified.iss, sub = %verified.sub, error = %e, "Rejected JWT with malformed session claims");
+                    anyhow::bail!("malformed session claims");
+                }
+            };
+            if let Some(session_key) = session_key {
+                match crate::auth::global_session_registry() {
+                    Some(registry) => {
+                        if registry.is_revoked(&session_key).await {
+                            tracing::warn!(iss = %verified.iss, sub = %verified.sub, "JWT with revoked/unknown session rejected");
+                            anyhow::bail!("session has been revoked");
+                        }
+                    }
+                    None => {
+                        tracing::warn!(sub = %verified.sub, "Token with session id rejected: no session registry configured");
+                        anyhow::bail!("session registry unavailable");
+                    }
+                }
+            }
+        }
+
+        // RFC 9068 §2.2.1 (v16 credential profile): an issuer-scoped `at+jwt`
+        // credential MUST carry a non-empty `client_id`. Positively typed on
+        // the already-exact-validated JOSE `typ` (parsed once above): a
+        // `wit+jwt` service credential is exempt (it carries no client_id), and
+        // empty-iss in-process provenance is exempt (`issuer_scoped` is false).
+        // This covers EVERY accepted `at+jwt` — local AND trusted
+        // federated/delegated — not merely local ones; `token_is_local` is
+        // deliberately NOT part of the predicate.
+        if issuer_scoped
+            && crate::auth::is_rfc9068_access_token_type(&protected.typ)
+            && verified
+                .client_id
+                .as_deref()
+                .is_none_or(|c| c.trim().is_empty())
+        {
+            tracing::warn!(iss = %verified.iss, sub = %verified.sub, typ = %protected.typ, "Rejected at+jwt without client_id");
+            anyhow::bail!("at+jwt credential missing required client_id");
+        }
+
+        // Service credentials are also published as verification-key
+        // attestations. Possession of one therefore cannot authorize a relay
+        // to impersonate its holder, even when that relay may forward users.
+        // Keep this before publishing any authenticated identity on context.
+        if delegated && verified.sub.starts_with("service:") {
+            use subtle::ConstantTimeEq as _;
+            let holder_matches = if let Some(expected) = verified.cnf_key_bytes() {
+                bool::from(expected.ct_eq(&ctx.cnf))
+            } else if let Some(jkt) = verified.cnf_jkt() {
+                let signer_jkt =
+                    crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 {
+                        x: &ctx.cnf,
+                    });
+                bool::from(signer_jkt.as_bytes().ct_eq(jkt.as_bytes()))
+            } else {
+                false
+            };
+            anyhow::ensure!(
+                holder_matches,
+                "delegated service credential requires its bound holder signer"
+            );
         }
 
         // Store verified claims on context for downstream use
@@ -1136,8 +1882,6 @@ pub trait RequestService: 'static {
                 "{UNAUTHENTICATED_DID_SENTINEL} is credential absence and cannot authenticate"
             );
         }
-        let local_issuers = key_source.local_issuers();
-        let local_issuers_refs: Vec<&str> = local_issuers.iter().map(String::as_str).collect();
         // Fu5/#677: MAC clearance is authority-asserted and honored only from
         // local-issuer tokens. An external OIDC issuer trusted for identity is
         // not trusted to assert MAC clearance on this node — strip the claim
@@ -1233,6 +1977,7 @@ pub trait RequestService: 'static {
             }
         }
 
+        ctx.direct_jwt_verified = !delegated && ctx.jwt_token.is_some();
         Ok(())
     }
 
@@ -1269,6 +2014,8 @@ pub trait RequestService: 'static {
 ///
 /// QUIC server configuration for the service loop.
 pub struct QuicLoopConfig {
+    /// Cancels all announcements owned by this bound service before teardown.
+    pub announcement_cancellation: tokio_util::sync::CancellationToken,
     /// DER-encoded certificate chain (leaf first, then intermediates/CA)
     pub cert_chain: Vec<Vec<u8>>,
     /// DER-encoded private key — zeroed on drop.
@@ -1290,12 +2037,16 @@ pub struct QuicLoopConfig {
     /// Set `false` (via `[quic] iroh = false`) to run quinn-only (legacy).
     #[cfg(not(target_arch = "wasm32"))]
     pub iroh_enabled: bool,
+    /// Iroh is a startup/readiness requirement for native traffic. Quinn may
+    /// still serve the browser edge but cannot satisfy this native contract.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub iroh_required: bool,
     /// #282: callback invoked after the iroh substrate binds, with
     /// (service_name, node_id) where `node_id` is the endpoint's 32-byte Ed25519
     /// public carrier address. Used to advertise only an `IrohTransport` service
     /// entry when bound; it must never become a verification method.
     #[cfg(not(target_arch = "wasm32"))]
-    pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) + Send>>,
+    pub on_iroh_bound: Option<Box<dyn FnOnce(String, [u8; 32]) -> anyhow::Result<()> + Send>>,
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, in
     /// wire-reach form ([`crate::stream_info::TransportConfig`]). When set, the
     /// spawner places it in the service's `ProducerReachConfig` (so published
@@ -1309,6 +2060,26 @@ pub struct QuicLoopConfig {
     /// drift. `None` = direct-only (the S1/S2 behaviour). Native-only.
     #[cfg(not(target_arch = "wasm32"))]
     pub moq_relay: Option<crate::stream_info::TransportConfig>,
+    /// Resolver-verified accepted-state witness for `moq_relay`. Iroh relay
+    /// links require this distinct remote identity for mutual admission.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_relay_server_identity: Option<crate::stream_info::MoqlServerIdentity>,
+    /// #1027: optional inside-carrier admission authenticator for the iroh
+    /// `moql` accept path. When set, every accepted `moql` connection must
+    /// prove an accepted current Ed25519 + ML-DSA-65 identity (fresh
+    /// challenge/response binding epoch/head/nonces) before the moq handshake;
+    /// the admitted peer is served only its resolved tenant's scope. When
+    /// `None`, the pre-#1027 posture stands: anonymous carriers are refused.
+    /// Native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_admission: Option<Arc<crate::transport::moql_admission::MoqlAdmissionAuthenticator>>,
+    /// Optional service-owned ingress authorization. The spawner forwards it
+    /// unchanged to the Iroh MoQL handler; absence is deliberately read-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_ingress_authorizer: Option<crate::transport::iroh_moq::SharedIngressAuthorizer>,
+    /// Native client proof for authenticated Iroh `moql` dials in this process.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub moq_admission_proof: Option<crate::transport::moql_admission::MoqlAdmissionProof>,
 }
 
 /// Handle for a running service
@@ -1437,6 +2208,11 @@ mod empty_iss_gate_tests {
         policy: crate::crypto::CryptoPolicy,
         relay: Option<[u8; 32]>,
         cached_subjects: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+        /// Pinned controller key for `iw+jwt` internal work admission
+        /// (mirrors the Inference subprocessor adapter shape).
+        internal_controller: Option<ed25519_dalek::VerifyingKey>,
+        federate_opt_in: bool,
+        audience: Option<String>,
     }
 
     #[async_trait(?Send)]
@@ -1444,12 +2220,31 @@ mod empty_iss_gate_tests {
         async fn handle_request(
             &self,
             _ctx: &EnvelopeContext,
-            _payload: &[u8],
+            _body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<Continuation>)> {
             Ok((vec![], None))
         }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            // Byte-oriented mock: no Cap'n Proto schema, no derivable leaf.
+            Ok(crate::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
+        }
         fn name(&self) -> &str {
-            "mock"
+            if self.federate_opt_in {
+                "model"
+            } else {
+                "mock"
+            }
+        }
+        fn accept_deferred_federate_credential(&self) -> bool {
+            self.federate_opt_in
+        }
+        fn expected_audience(&self) -> Option<&str> {
+            self.audience.as_deref()
         }
         fn transport(&self) -> &TransportConfig {
             &self.transport
@@ -1459,6 +2254,19 @@ mod empty_iss_gate_tests {
         }
         fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
             Some(self.key_source.clone())
+        }
+        fn credential_revocation_store(
+            &self,
+        ) -> Option<&dyn crate::auth::CredentialRevocationStore> {
+            // Test-local revocation store: these tests verify local
+            // jti-bearing tokens, and every production process publishes a
+            // store at startup (the policy-authority bootstrap). Without
+            // this, verification fails closed on store absence and the tests
+            // only pass when an unrelated sibling test happens to publish
+            // the process-global handle first.
+            static STORE: std::sync::OnceLock<crate::auth::InMemoryCredentialRevocationStore> =
+                std::sync::OnceLock::new();
+            Some(STORE.get_or_init(crate::auth::InMemoryCredentialRevocationStore::new))
         }
         fn require_cnf_binding(&self) -> bool {
             false
@@ -1474,6 +2282,36 @@ mod empty_iss_gate_tests {
         }
         fn accept_delegated_bearer(&self, signer_pubkey: &[u8; 32]) -> bool {
             self.relay.as_ref() == Some(signer_pubkey)
+        }
+        async fn verify_internal_work_bearer(
+            &self,
+            ctx: &EnvelopeContext,
+            token: &str,
+            _protected: &crate::auth::ProtectedHeader,
+        ) -> anyhow::Result<crate::auth::internal_work::InternalWorkClaims> {
+            let controller = self.internal_controller.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("internal work bearer is not accepted by this service")
+            })?;
+            anyhow::ensure!(
+                ctx.cnf == controller.to_bytes(),
+                "internal work bearer envelope was not signed by the pinned controller"
+            );
+            let now = chrono::Utc::now().timestamp();
+            let claims = crate::auth::internal_work::verify_internal_work(
+                token,
+                controller,
+                "mock-instance-1",
+                now,
+            )?;
+            anyhow::ensure!(
+                crate::auth::internal_work::admit_internal_work_jti_once(
+                    &claims.jti,
+                    claims.exp,
+                    now,
+                ),
+                "internal work token jti was already admitted (replay)"
+            );
+            Ok(claims)
         }
         fn cache_key_binding(
             &self,
@@ -1494,6 +2332,11 @@ mod empty_iss_gate_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: Some(token),
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -1505,12 +2348,73 @@ mod empty_iss_gate_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller,
         }
     }
 
+    #[test]
+    fn deferred_federate_identity_stays_unpublished_until_exact_holder_commit() {
+        let holder = SigningKey::from_bytes(&[41; 32]).verifying_key().to_bytes();
+        let relay = SigningKey::from_bytes(&[42; 32]).verifying_key().to_bytes();
+        let claims = Claims::new("alice".into(), 1, 100)
+            .with_tenant("tenant-a".into())
+            .with_scope(Some(
+                "query:model:qwen2.5-0.5b-instruct query:registry:List".into(),
+            ))
+            .with_cnf_jwk(&holder);
+        let mut ctx = ctx_with_token("signature-verified-token".into(), false);
+        ctx.cnf = relay;
+        ctx.deferred_federate = Some((claims, Subject::new("alice")));
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
+        assert!(ctx.domain().is_err());
+        assert!(ctx.security_context().is_none());
+        assert!(ctx.verified_direct_jwt().is_none());
+        let proof = crate::proof::verify::VerifiedProof {
+            replay_thumbprint: [1; 32],
+            primary_principal: Some("alice".into()),
+            primary_suite: "hs-cose-sign-ed25519-mldsa65-wns-v1".into(),
+            approvers: vec![],
+        };
+        let mut wrong = ctx.clone();
+        assert!(wrong
+            .commit_deferred_federate(&proof, relay, "registry:List".into(), "query".into())
+            .is_err());
+        assert!(wrong.subject().is_anonymous());
+        assert!(ctx
+            .commit_deferred_federate(&proof, holder, "registry:List".into(), "query".into())
+            .is_ok());
+        assert_eq!(ctx.subject().name(), Some("alice"));
+        assert_eq!(ctx.domain().unwrap(), "tenant-a");
+        assert_eq!(ctx.authenticated_signer_key().unwrap().to_bytes(), holder);
+        assert_eq!(
+            ctx.verified_key_material(),
+            crate::auth::mac::VerifiedKeyMaterial::PqHybrid
+        );
+        assert!(ctx.admitted_federate_operation("registry:List", "query"));
+        assert!(!ctx.admitted_federate_operation("registry:Get", "query"));
+        assert!(ctx.verified_direct_jwt().is_none());
+    }
+
+    /// `verify_claims` fails closed on jti-bearing, issuer-bearing tokens
+    /// without the process-global revocation store (`jwt::encode`
+    /// auto-assigns a jti). Install an in-memory authority when no other test
+    /// in this binary got there first — under nextest per-test process
+    /// isolation no other test can provide it.
+    fn ensure_test_revocation_store() {
+        if crate::auth::global_credential_revocation_store().is_none() {
+            let _ = crate::auth::set_global_credential_revocation_store(std::sync::Arc::new(
+                crate::auth::InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+    }
+
     fn mock_service() -> (MockService, SigningKey) {
+        ensure_test_revocation_store();
         // The CA key signs the bare-sub (empty-iss) token; the ClusterKeySource
         // anchors that same CA key with an empty local issuer URL (so empty iss
         // is "local").
@@ -1524,6 +2428,9 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
             cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
+            federate_opt_in: false,
+            audience: None,
         };
         (svc, ca)
     }
@@ -1587,6 +2494,278 @@ mod empty_iss_gate_tests {
         );
         // And the local bare-sub subject is resolved.
         assert_eq!(ctx.subject().name(), Some("alice"));
+        assert!(ctx.verified_direct_jwt().is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_credential_snapshot_is_exposed_only_after_full_network_verification() {
+        let (mut svc, ca) = mock_service();
+        svc.key_source = std::sync::Arc::new(ClusterKeySource::new(
+            ca.verifying_key(),
+            "https://ordinary.example".into(),
+        ));
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = Claims::new("alice".into(), now, now + 300);
+        claims.iss = "https://ordinary.example".into();
+        claims.client_id = Some("ordinary-client".into());
+        let token = crate::auth::jwt::encode(&claims, &ca);
+        let mut ctx = ctx_with_token(token.clone(), false);
+        assert!(ctx.verified_direct_jwt().is_none());
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("direct credential");
+        let (verified, exact_token) = ctx.verified_direct_jwt().expect("verified direct token");
+        assert_eq!(verified.sub, "alice");
+        assert_eq!(exact_token, token);
+    }
+
+    #[tokio::test]
+    async fn signed_federate_generation_denies_before_identity_or_key_cache() {
+        let (svc, ca) = mock_service();
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".into(), now, now + 300)
+            .with_session_authority_generation([0x42; 32]);
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), true);
+        assert!(svc.verify_claims(&mut ctx).await.is_err());
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
+        assert!(ctx.verified_direct_jwt().is_none());
+        assert!(svc.cached_subjects.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn isolated_federate_profile_claims_cannot_downgrade_to_generic_jwt() {
+        let (svc, ca) = mock_service();
+        let now = chrono::Utc::now().timestamp();
+        for claims in [
+            Claims::new("alice".into(), now, now + 300)
+                .with_federate_signer_suite("fixture-suite".into()),
+            {
+                let mut claims = Claims::new("alice".into(), now, now + 300);
+                claims.hs_profile = Some("federate-session-v1".into());
+                claims
+            },
+            {
+                let mut claims = Claims::new("alice".into(), now, now + 300);
+                claims.hs_signer_suite_v1 = Some("fixture-suite".into());
+                claims
+            },
+        ] {
+            let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), true);
+            assert!(svc.verify_claims(&mut ctx).await.is_err());
+            assert!(ctx.subject().is_anonymous());
+            assert!(ctx.claims().is_none());
+            assert!(svc.cached_subjects.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_client_without_inventory_cannot_fall_back_to_static_jwt() {
+        let (mut svc, ca) = mock_service();
+        svc.key_source = std::sync::Arc::new(ClusterKeySource::new(
+            ca.verifying_key(),
+            crate::auth::claims::FEDERATE_STAGING_HOST.into(),
+        ));
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = Claims::new("alice".into(), now, now + 300);
+        claims.iss = crate::auth::claims::FEDERATE_STAGING_HOST.into();
+        claims.client_id = Some(crate::auth::claims::FEDERATE_STAGING_CLIENT.into());
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), false);
+        assert!(svc.verify_claims(&mut ctx).await.is_err());
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
+        assert!(svc.cached_subjects.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn opted_in_federate_jwt_is_deferred_and_marker_stripping_denies() {
+        let (mut svc, ca) = mock_service();
+        svc.federate_opt_in = true;
+        svc.audience = Some(crate::auth::claims::FEDERATE_STAGING_HOST.into());
+        svc.key_source = std::sync::Arc::new(ClusterKeySource::new(
+            ca.verifying_key(),
+            crate::auth::claims::FEDERATE_STAGING_HOST.into(),
+        ));
+        let holder = SigningKey::from_bytes(&[41; 32]).verifying_key().to_bytes();
+        let relay = SigningKey::from_bytes(&[42; 32]).verifying_key().to_bytes();
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims::new("alice".into(), now, now + 300)
+            .with_issuer(crate::auth::claims::FEDERATE_STAGING_HOST.into())
+            .with_audience(Some(crate::auth::claims::FEDERATE_STAGING_HOST.into()))
+            .with_client_id(crate::auth::claims::FEDERATE_STAGING_CLIENT)
+            .with_tenant("tenant-a".into())
+            .with_sid("sid-a")
+            .with_scope(Some("query:registry:List".into()))
+            .with_cnf_jwk(&holder)
+            .with_federate_signer_suite("fixture-suite".into())
+            .with_federate_signer_inventory([7; 32]);
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), false);
+        ctx.cnf = relay;
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("reserved JWT snapshot may defer");
+        assert!(ctx.deferred_federate_credential().is_some());
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
+        assert!(ctx.verified_direct_jwt().is_none());
+        assert!(svc.cached_subjects.lock().is_empty());
+
+        let mut stripped = claims.clone();
+        stripped.hs_signer_inventory_v1 = None;
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&stripped, &ca), false);
+        ctx.cnf = relay;
+        assert!(svc.verify_claims(&mut ctx).await.is_err());
+        assert!(ctx.deferred_federate_credential().is_none());
+        assert!(ctx.subject().is_anonymous());
+        assert!(svc.cached_subjects.lock().is_empty());
+
+        let mut mixed = claims.clone();
+        mixed.hs_session_authority_generation = Some(URL_SAFE_NO_PAD.encode([8; 32]));
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&mixed, &ca), false);
+        ctx.cnf = relay;
+        assert!(svc.verify_claims(&mut ctx).await.is_err());
+        assert!(ctx.deferred_federate_credential().is_none());
+        assert!(ctx.subject().is_anonymous());
+
+        let mut malformed = claims;
+        malformed.hs_signer_inventory_v1 =
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into());
+        let mut ctx = ctx_with_token(crate::auth::jwt::encode(&malformed, &ca), false);
+        ctx.cnf = relay;
+        assert!(svc.verify_claims(&mut ctx).await.is_err());
+        assert!(ctx.deferred_federate_credential().is_none());
+        assert!(ctx.subject().is_anonymous());
+    }
+
+    #[tokio::test]
+    async fn configured_federate_host_tokens_cannot_cross_or_downgrade() {
+        for local in ["https://vm-a.example", "https://vm-b.example:8443"] {
+            let (mut svc, ca) = mock_service();
+            svc.federate_opt_in = true;
+            svc.audience = Some(local.into());
+            svc.key_source =
+                std::sync::Arc::new(ClusterKeySource::new(ca.verifying_key(), local.into()));
+            let now = chrono::Utc::now().timestamp();
+            let claims = Claims::new("alice".into(), now, now + 120)
+                .with_issuer(local.into())
+                .with_audience(Some(local.into()))
+                .with_client_id(crate::auth::claims::FEDERATE_STAGING_CLIENT)
+                .with_federate_signer_suite("fixture-suite".into())
+                .with_federate_signer_inventory([7; 32]);
+            let mut ctx = ctx_with_token(crate::auth::jwt::encode(&claims, &ca), false);
+            svc.verify_claims(&mut ctx).await.unwrap();
+            assert!(ctx.deferred_federate_credential().is_some());
+            for variant in 0..5 {
+                let mut bad = claims.clone();
+                match variant {
+                    0 => {
+                        bad.iss = "https://other.example".into();
+                        bad.aud = Some("https://other.example".into());
+                    }
+                    1 => {
+                        bad.hs_profile = None;
+                        bad.hs_signer_suite_v1 = None;
+                        bad.hs_signer_inventory_v1 = None;
+                    }
+                    2 => bad.hs_signer_inventory_v1 = Some("malformed".into()),
+                    3 => {
+                        bad.hs_session_authority_generation = Some(URL_SAFE_NO_PAD.encode([8; 32]));
+                    }
+                    _ => bad.aud = Some("https://other.example".into()),
+                }
+                let mut ctx = ctx_with_token(crate::auth::jwt::encode(&bad, &ca), false);
+                assert!(
+                    svc.verify_claims(&mut ctx).await.is_err(),
+                    "{local} variant {variant}"
+                );
+                assert!(ctx.subject().is_anonymous());
+                assert!(ctx.deferred_federate_credential().is_none());
+                assert!(ctx.claims().is_none());
+                assert!(svc.cached_subjects.lock().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_federate_access_token_passes_production_verification_gate() {
+        use crate::auth::{
+            CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
+        };
+
+        let (mut svc, ca) = mock_service();
+        svc.federate_opt_in = true;
+        svc.audience = Some(crate::auth::claims::FEDERATE_STAGING_HOST.into());
+        svc.policy = crate::crypto::CryptoPolicy::Hybrid;
+
+        let ed = SigningKey::from_bytes(&[61; 32]);
+        let (pq, pq_vk) = crate::crypto::pq::ml_dsa_generate_keypair();
+        let proof_pq_public = crate::crypto::pq::ml_dsa_vk_bytes(&pq_vk);
+        let kid = crate::auth::composite_kid(&pq_vk, &ed.verifying_key());
+        let key_set = std::sync::Arc::new(CompositeKeySet::default());
+        key_set
+            .publish(
+                1,
+                "hybrid-federate-verifier-test".to_owned(),
+                vec![CompositeKeyPair::verifying(
+                    kid.clone(),
+                    pq_vk,
+                    ed.verifying_key(),
+                    CompositePairRole::OAuth,
+                    CompositePairState::Active,
+                    0,
+                    i64::MAX,
+                )],
+            )
+            .unwrap();
+        svc.key_source = std::sync::Arc::new(
+            ClusterKeySource::new(
+                ca.verifying_key(),
+                crate::auth::claims::FEDERATE_STAGING_HOST.into(),
+            )
+            .with_composite_key_set(key_set),
+        );
+
+        let holder = SigningKey::from_bytes(&[62; 32]).verifying_key().to_bytes();
+        let suite_thumbprint = crate::auth::signer_suite_thumbprint(
+            crate::auth::SUITE_HYBRID_ED25519_MLDSA65,
+            &[&holder, &proof_pq_public],
+        );
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = Claims::new("did:plc:3f7ldey5bivhfjapwqi2sljy".into(), now, now + 300)
+            .with_issuer(crate::auth::claims::FEDERATE_STAGING_HOST.into())
+            .with_audience(Some(crate::auth::claims::FEDERATE_STAGING_HOST.into()))
+            .with_client_id(crate::auth::claims::FEDERATE_STAGING_CLIENT)
+            .with_tenant("tenant-a".into())
+            .with_sid("sid-hybrid")
+            .with_scope(Some("query:registry:List".into()))
+            .with_cnf_jwk(&holder)
+            .with_federate_signer_suite(URL_SAFE_NO_PAD.encode(suite_thumbprint))
+            .with_federate_signer_inventory([7; 32])
+            .with_jti();
+        claims.hs_signer_pq_key_v1 = Some(URL_SAFE_NO_PAD.encode(proof_pq_public));
+        claims.hs_source_issuer_v1 = Some("https://login.federate.to".into());
+        claims.hs_source_subject_v1 = Some("opaque-atproto-connector-subject".into());
+        let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid}"}}"#);
+        let token = composite_token(&header, &claims, &pq, &ed, false);
+        let mut ctx = ctx_with_token(token, false);
+        ctx.cnf = SigningKey::from_bytes(&[63; 32]).verifying_key().to_bytes();
+
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("hybrid Federate access token should pass Hybrid verification");
+        let (verified_claims, _) = ctx
+            .deferred_federate_credential()
+            .expect("stateless Federate token should be deferred");
+        assert_eq!(
+            verified_claims.federate_signer_inventory().unwrap(),
+            Some([7; 32])
+        );
+        assert!(verified_claims
+            .session_authority_generation()
+            .unwrap()
+            .is_none());
+        assert!(ctx.subject().is_anonymous());
+        assert!(ctx.claims().is_none());
     }
 
     #[tokio::test]
@@ -1725,7 +2904,87 @@ mod empty_iss_gate_tests {
     }
 
     #[tokio::test]
+    async fn delegated_public_service_credential_requires_holder_proof() {
+        let (mut svc, ca) = mock_service();
+        let holder = SigningKey::from_bytes(&[21u8; 32]);
+        let relay = SigningKey::from_bytes(&[22u8; 32]);
+        svc.relay = Some(relay.verifying_key().to_bytes());
+        let now = chrono::Utc::now().timestamp();
+        let claims = crate::auth::Claims::new("service:policy".to_owned(), now, now + 300)
+            .with_cnf_jwk(&holder.verifying_key().to_bytes());
+        let token = crate::auth::jwt::encode_service_jwt(&claims, &ca);
+
+        // The credential itself is valid when presented by its holder.
+        let mut direct = ctx_with_token(token.clone(), true);
+        direct.cnf = holder.verifying_key().to_bytes();
+        svc.verify_claims(&mut direct)
+            .await
+            .expect("valid holder credential");
+        assert_eq!(direct.subject().name(), Some("service:policy"));
+
+        // Service WITs are distributed as key attestations. Relay admission
+        // cannot turn knowledge of one into proof of the attested private key.
+        let mut replay = ctx_with_token(token.clone(), true);
+        replay.jwt_token = None;
+        replay.delegation_token = Some(token);
+        replay.cnf = relay.verifying_key().to_bytes();
+        let error = svc.verify_claims(&mut replay).await.expect_err(
+            "an admitted relay must not impersonate a published service credential's holder",
+        );
+        assert!(error
+            .to_string()
+            .contains("requires its bound holder signer"));
+        assert!(
+            replay.claims().is_none(),
+            "rejected relay must not acquire verified claims"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_service_thumbprint_requires_holder_and_missing_binding_denies() {
+        let (mut svc, ca) = mock_service();
+        let holder = SigningKey::from_bytes(&[23u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let foreign = SigningKey::from_bytes(&[24u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let now = chrono::Utc::now().timestamp();
+        let base = Claims::new("service:policy".to_owned(), now, now + 300);
+        for (claims, signer, allowed) in [
+            (base.clone().with_cnf_jkt(&holder), holder, true),
+            (base.clone().with_cnf_jkt(&holder), foreign, false),
+            (base, holder, false),
+        ] {
+            svc.relay = Some(signer);
+            let token = crate::auth::jwt::encode_service_jwt(&claims, &ca);
+            let mut ctx = ctx_with_token(token.clone(), true);
+            ctx.jwt_token = None;
+            ctx.delegation_token = Some(token);
+            ctx.cnf = signer;
+            let result = svc.verify_claims(&mut ctx).await;
+            if allowed {
+                result.expect("thumbprint-bound holder must remain accepted");
+                assert_eq!(ctx.subject().name(), Some("service:policy"));
+            } else {
+                let error = result.expect_err("foreign or unbound service delegation must deny");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("requires its bound holder signer"),
+                    "{error:#}"
+                );
+                assert!(
+                    ctx.claims().is_none(),
+                    "rejected delegation must publish no claims"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn federated_issuer_cannot_assert_local_tenant() {
+        ensure_test_revocation_store();
         let local_ca = SigningKey::from_bytes(&[9u8; 32]);
         let federated_signer = SigningKey::from_bytes(&[10u8; 32]);
         let local_issuer = "https://this.node";
@@ -1745,11 +3004,15 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
             cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
+            federate_opt_in: false,
+            audience: None,
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
             .with_issuer(federated_issuer.to_owned())
-            .with_tenant("acme".to_owned());
+            .with_tenant("acme".to_owned())
+            .with_client_id("hyprstream-oauth-client-1");
         let token = crate::auth::jwt::encode(&claims, &federated_signer);
         let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
 
@@ -1768,6 +3031,7 @@ mod empty_iss_gate_tests {
 
     #[tokio::test]
     async fn local_issuer_preserves_verified_tenant() {
+        ensure_test_revocation_store();
         let local_ca = SigningKey::from_bytes(&[11u8; 32]);
         let local_issuer = "https://this.node";
         let key_source = std::sync::Arc::new(ClusterKeySource::new(
@@ -1781,11 +3045,15 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Classical,
             relay: None,
             cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
+            federate_opt_in: false,
+            audience: None,
         };
         let now = chrono::Utc::now().timestamp();
         let claims = Claims::new("alice".to_owned(), now, now + 3600)
             .with_issuer(local_issuer.to_owned())
-            .with_tenant("acme".to_owned());
+            .with_tenant("acme".to_owned())
+            .with_client_id("hyprstream-oauth-client-1");
         let token = crate::auth::jwt::encode(&claims, &local_ca);
         let mut ctx = ctx_with_token(token, /* is_local_caller */ false);
 
@@ -1796,6 +3064,148 @@ mod empty_iss_gate_tests {
         assert_eq!(ctx.subject().name(), Some("alice"));
         assert_eq!(ctx.verified_tenant(), Some("acme"));
         assert_eq!(ctx.domain().expect("local tenant domain"), "acme");
+    }
+
+    /// RFC 9068 §2.2.1 (v16 credential profile) at the signed verify boundary:
+    /// an issuer-scoped `at+jwt` credential MUST carry a non-empty `client_id`.
+    /// A missing or empty `client_id` is rejected; a `wit+jwt` service
+    /// credential is positively exempt (it carries no client_id). The
+    /// federated/nonlocal `at+jwt` path is covered by the sibling
+    /// `federated_at_jwt_missing_client_id_is_rejected`.
+    #[tokio::test]
+    async fn local_at_jwt_requires_client_id_and_wit_jwt_is_exempt() {
+        let local_ca = SigningKey::from_bytes(&[11u8; 32]);
+        let local_issuer = "https://this.node";
+        let key_source = std::sync::Arc::new(ClusterKeySource::new(
+            local_ca.verifying_key(),
+            local_issuer.to_owned(),
+        ));
+        let svc = MockService {
+            signing_key: local_ca.clone(),
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
+            relay: None,
+            cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
+            federate_opt_in: false,
+            audience: None,
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        // Local at+jwt WITHOUT client_id → rejected.
+        let missing = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&missing, &local_ca),
+                false,
+            ))
+            .await
+            .expect_err("local at+jwt without client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for missing client_id: {err}"
+        );
+
+        // Local at+jwt with EMPTY client_id → rejected (set directly, bypassing
+        // the empty-filtering builder).
+        let mut empty = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        empty.client_id = Some(String::new());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&empty, &local_ca),
+                false,
+            ))
+            .await
+            .expect_err("local at+jwt with empty client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for empty client_id: {err}"
+        );
+
+        // A local `wit+jwt` service credential WITHOUT client_id is positively
+        // exempt — it is ADMITTED (not merely un-rejected-for-client_id). The
+        // MockService provides a test-local revocation store, so the
+        // jti-bearing service token verifies.
+        let service = Claims::new("service:model".to_owned(), now, now + 3600)
+            .with_issuer(local_issuer.to_owned())
+            .with_jti();
+        let mut wit_ctx = ctx_with_token(
+            crate::auth::jwt::encode_service_jwt(&service, &local_ca),
+            false,
+        );
+        svc.verify_claims(&mut wit_ctx)
+            .await
+            .expect("local wit+jwt without client_id must be admitted (type-driven exemption)");
+        assert_eq!(wit_ctx.subject().name(), Some("service:model"));
+    }
+
+    /// A trusted federated (nonlocal) `at+jwt` without `client_id` is rejected —
+    /// the requirement is positively typed on `at+jwt` and applies regardless of
+    /// issuer locality.
+    #[tokio::test]
+    async fn federated_at_jwt_missing_or_empty_client_id_is_rejected() {
+        let local_ca = SigningKey::from_bytes(&[9u8; 32]);
+        let federated_signer = SigningKey::from_bytes(&[10u8; 32]);
+        let local_issuer = "https://this.node";
+        let federated_issuer = "https://idp.example.com";
+        let federation = std::sync::Arc::new(MockFederation {
+            issuer: federated_issuer.to_owned(),
+            verifying_key: federated_signer.verifying_key(),
+        });
+        let key_source = std::sync::Arc::new(FederatedKeySource::new(
+            ClusterKeySource::new(local_ca.verifying_key(), local_issuer.to_owned()),
+            federation,
+        ));
+        let svc = MockService {
+            signing_key: local_ca,
+            transport: TransportConfig::inproc("mock"),
+            key_source,
+            policy: crate::crypto::CryptoPolicy::Classical,
+            relay: None,
+            cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
+            federate_opt_in: false,
+            audience: None,
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        // Missing client_id → rejected.
+        let missing = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(federated_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&missing, &federated_signer),
+                false,
+            ))
+            .await
+            .expect_err("federated at+jwt without client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for federated missing client_id: {err}"
+        );
+
+        // Empty/whitespace client_id → rejected.
+        let mut empty = Claims::new("alice".to_owned(), now, now + 3600)
+            .with_issuer(federated_issuer.to_owned())
+            .with_tenant("acme".to_owned());
+        empty.client_id = Some("   ".to_owned());
+        let err = svc
+            .verify_claims(&mut ctx_with_token(
+                crate::auth::jwt::encode(&empty, &federated_signer),
+                false,
+            ))
+            .await
+            .expect_err("federated at+jwt with empty client_id must be rejected");
+        assert!(
+            err.to_string().contains("client_id"),
+            "unexpected error for federated empty client_id: {err}"
+        );
     }
 
     fn composite_token(
@@ -1876,10 +3286,18 @@ mod empty_iss_gate_tests {
             policy: crate::crypto::CryptoPolicy::Hybrid,
             relay: None,
             cached_subjects: std::sync::Arc::default(),
+            internal_controller: None,
+            federate_opt_in: false,
+            audience: None,
         };
         let now = chrono::Utc::now().timestamp();
-        let claims =
-            Claims::new("alice".to_owned(), now, now + 60).with_issuer("https://local".to_owned());
+        // Local-issuer credentials must carry a credential ID (jti is a
+        // REQUIRED profile claim); the hand-rolled composite helper does not
+        // inject one, so set it explicitly.
+        let claims = Claims::new("alice".to_owned(), now, now + 60)
+            .with_issuer("https://local".to_owned())
+            .with_jti()
+            .with_client_id("hyprstream-oauth-client-1");
         for typ in crate::auth::RFC9068_ACCESS_TOKEN_TYPES {
             let header = format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"{typ}","kid":"{kid_a}"}}"#);
             let valid = composite_token(&header, &claims, &pq_a, &ed_a, false);
@@ -1893,6 +3311,27 @@ mod empty_iss_gate_tests {
 
         let valid_header =
             format!(r#"{{"alg":"ML-DSA-65-Ed25519","typ":"at+jwt","kid":"{kid_a}"}}"#);
+
+        // Exact-one session parsing (v16 §3.3) at the PRIMARY verify boundary: a
+        // local credential carrying BOTH `sid` and `workload_session_id` is
+        // ambiguous and rejected before any authorization — an active OIDC sid
+        // must never mask a revoked/unknown workload session.
+        let both_sessions = Claims::new("alice".to_owned(), now, now + 60)
+            .with_issuer("https://local".to_owned())
+            .with_jti()
+            .with_sid("s1")
+            .with_workload_session_id("w1");
+        let ambiguous_token = composite_token(&valid_header, &both_sessions, &pq_a, &ed_a, false);
+        let ambiguous_err = svc
+            .verify_claims(&mut ctx_with_token(ambiguous_token, false))
+            .await
+            .expect_err("a credential carrying both sid and workload_session_id must be rejected");
+        assert!(
+            ambiguous_err
+                .to_string()
+                .contains("malformed session claims"),
+            "unexpected error for ambiguous session claims: {ambiguous_err}"
+        );
 
         let mutations = [
             (
@@ -2065,9 +3504,17 @@ mod ipc_key_identity_tests {
         async fn handle_request(
             &self,
             _ctx: &EnvelopeContext,
-            _payload: &[u8],
+            _body: &crate::service::DecodedRequestBody,
         ) -> Result<(Vec<u8>, Option<Continuation>)> {
             Ok((vec![], None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            Ok(crate::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
         }
         fn name(&self) -> &str {
             "discovery"
@@ -2105,6 +3552,11 @@ mod ipc_key_identity_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -2116,7 +3568,10 @@ mod ipc_key_identity_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             // AnySigner / networked-or-UDS plane.
             is_local_caller: false,
         }
@@ -2284,6 +3739,47 @@ mod stripping_defense_tests {
             );
         }
     }
+
+    /// A freshly minted hybrid service WIT — the exact pair (derived ML-DSA,
+    /// CA Ed25519) a clean bootstrap signs with — passes the Hybrid alg gate
+    /// and round-trips through the real dispatch verification: header-alg
+    /// gate, composite dispatch, key-source pair resolution, and composite
+    /// decode. An unknown composite kid still fails to resolve.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[test]
+    fn hybrid_service_jwt_passes_gate_and_dispatch_verification() {
+        use crate::auth::{jwt, ClusterKeySource, JwtKeySource};
+
+        let ca_ed = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let ca_pq = crate::node_identity::derive_mesh_mldsa_key(&ca_ed);
+        let ca_pq_vk = crate::crypto::pq::ml_dsa_sk_to_vk(&ca_pq);
+
+        let issuer = "http://localhost:9080";
+        let now = chrono::Utc::now().timestamp();
+        let claims = crate::auth::Claims::new("service:discovery".to_owned(), now, now + 3600)
+            .with_issuer(issuer.to_owned());
+        let token = jwt::encode_service_jwt_hybrid(&claims, &ca_ed, &ca_pq, &ca_pq_vk);
+
+        // The minted alg satisfies the Hybrid policy floor.
+        let alg = jwt::header_alg(&token).unwrap().unwrap();
+        assert!(jwt_alg_satisfies_policy(CryptoPolicy::Hybrid, &alg).is_ok());
+
+        // The dispatch path resolves the composite kid to BOTH halves and the
+        // token verifies against them.
+        let key_source = ClusterKeySource::new(ca_ed.verifying_key(), issuer.to_owned())
+            .with_ca_composite_key(ca_pq_vk.clone());
+        let dispatch = crate::auth::parse_composite_dispatch(&token, &["wit+jwt"]).unwrap();
+        let pair = key_source
+            .composite_pair(dispatch.kid())
+            .expect("CA composite kid must resolve on the dispatch plane");
+        let verified =
+            jwt::decode_composite(&token, pair.ml_dsa(), pair.ed25519(), None, &dispatch)
+                .expect("hybrid service JWT must verify with the resolved pair");
+        assert_eq!(verified.sub, "service:discovery");
+
+        // Unknown kids stay unresolvable — fail closed.
+        assert!(key_source.composite_pair("some-other-kid").is_none());
+    }
 }
 
 /// Accounting (#445): the **A** of AAA. `EnvelopeContext::audit_authz` is the
@@ -2366,6 +3862,11 @@ mod accounting_audit_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::new(name),
             jwt_subject: None,
@@ -2377,7 +3878,10 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller: true,
         }
     }
@@ -2424,6 +3928,11 @@ mod accounting_audit_tests {
             claims: None,
             verified_tenant: None,
             jwt_token: None,
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -2435,7 +3944,10 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller: false,
         };
         let records = capture(|| {
@@ -2492,6 +4004,11 @@ mod accounting_audit_tests {
             claims,
             verified_tenant: None,
             jwt_token: None,
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
             delegation_token: None,
             key_derived_subject: Subject::anonymous(),
             jwt_subject: None,
@@ -2503,7 +4020,10 @@ mod accounting_audit_tests {
             request_nonce: [0; 16],
             response_kem_recipient: None,
             service_domain: None,
+            envelope_proof_cwt: None,
+            original_holder_evidence: None,
             browser_method_discriminator: None,
+            internal_work: None,
             is_local_caller: false,
         }
     }
@@ -2690,5 +4210,415 @@ mod browser_method_commitment_tests {
         let ctx = EnvelopeContext::from_callback_service(7, "model");
         ctx.ensure_browser_method(u16::MAX)
             .expect("non-browser carriers have no method commitment to compare");
+    }
+}
+
+/// Internal execution work order (`iw+jwt`) routing tests — the
+/// single-service Model→Inference boundary's GENERIC pipeline half.
+///
+/// The default service posture is deny: `iw+jwt` is authority at NO service
+/// unless it explicitly operates a pinned execution boundary. The accepting
+/// shape here mirrors the Inference subprocessor adapter (pinned controller
+/// key + instance audience + single-use jti) and proves the pipeline installs
+/// the ORIGINAL caller identity on the context.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod internal_work_routing_tests {
+    use super::*;
+    use crate::auth::internal_work::{
+        encode_internal_work, InternalWorkClaims, INTERNAL_WORK_ISSUER,
+    };
+    use ed25519_dalek::SigningKey;
+    use parking_lot::Mutex as PlMutex;
+
+    const CONTROLLER: [u8; 32] = [0xC7; 32];
+    const STRANGER: [u8; 32] = [0xC9; 32];
+
+    struct BoundaryMockService {
+        signing_key: SigningKey,
+        transport: TransportConfig,
+        key_source: std::sync::Arc<dyn crate::auth::JwtKeySource>,
+        internal_controller: Option<ed25519_dalek::VerifyingKey>,
+        _cached: std::sync::Arc<PlMutex<Vec<String>>>,
+    }
+
+    impl BoundaryMockService {
+        fn without_boundary() -> Self {
+            Self {
+                signing_key: SigningKey::from_bytes(&[8u8; 32]),
+                transport: TransportConfig::inproc("boundary-mock"),
+                key_source: std::sync::Arc::new(crate::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[7u8; 32]).verifying_key(),
+                    "http://127.0.0.1:1".to_owned(),
+                )),
+                internal_controller: None,
+                _cached: std::sync::Arc::default(),
+            }
+        }
+
+        fn with_controller(controller: &SigningKey) -> Self {
+            Self {
+                internal_controller: Some(controller.verifying_key()),
+                ..Self::without_boundary()
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl RequestService for BoundaryMockService {
+        async fn handle_request(
+            &self,
+            _ctx: &EnvelopeContext,
+            _body: &crate::service::DecodedRequestBody,
+        ) -> Result<(Vec<u8>, Option<Continuation>)> {
+            Ok((vec![], None))
+        }
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<crate::service::DecodedRequestBody> {
+            Ok(crate::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
+        }
+        fn name(&self) -> &str {
+            "boundary-mock"
+        }
+        fn transport(&self) -> &TransportConfig {
+            &self.transport
+        }
+        fn signing_key(&self) -> SigningKey {
+            self.signing_key.clone()
+        }
+        fn jwt_key_source(&self) -> Option<std::sync::Arc<dyn crate::auth::JwtKeySource>> {
+            Some(self.key_source.clone())
+        }
+        fn require_cnf_binding(&self) -> bool {
+            false
+        }
+        fn pq_signing_key(&self) -> Option<crate::crypto::pq::MlDsaSigningKey> {
+            None
+        }
+        async fn verify_internal_work_bearer(
+            &self,
+            ctx: &EnvelopeContext,
+            token: &str,
+            _protected: &crate::auth::ProtectedHeader,
+        ) -> anyhow::Result<crate::auth::internal_work::InternalWorkClaims> {
+            let controller = self.internal_controller.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("internal work bearer is not accepted by this service")
+            })?;
+            anyhow::ensure!(
+                ctx.cnf == controller.to_bytes(),
+                "internal work bearer envelope was not signed by the pinned controller"
+            );
+            let now = chrono::Utc::now().timestamp();
+            let claims = crate::auth::internal_work::verify_internal_work(
+                token,
+                controller,
+                "mock-instance-1",
+                now,
+            )?;
+            anyhow::ensure!(
+                crate::auth::internal_work::admit_internal_work_jti_once(
+                    &claims.jti,
+                    claims.exp,
+                    now,
+                ),
+                "internal work token jti was already admitted (replay)"
+            );
+            Ok(claims)
+        }
+    }
+
+    fn fixture_claims(controller: &SigningKey, aud: &str, now: i64) -> InternalWorkClaims {
+        let caller = crate::auth::Claims::new("alice".to_owned(), now, now + 3600)
+            .with_tenant("tenant-a".to_owned());
+        InternalWorkClaims {
+            iss: INTERNAL_WORK_ISSUER.to_owned(),
+            sub: "alice".to_owned(),
+            aud: aud.to_owned(),
+            tenant: "tenant-a".to_owned(),
+            model: "qwen3:main".to_owned(),
+            resource: "inference:generateStream".to_owned(),
+            operation: "infer".to_owned(),
+            iat: now,
+            exp: now + 60,
+            jti: format!(
+                "jti-{}-{}",
+                hex::encode(&controller.verifying_key().as_bytes()[..4]),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos(),
+            ),
+            cnf: InternalWorkClaims::controller_cnf(&controller.verifying_key()),
+            owner_did: Some("did:key:z6Mktest".to_owned()),
+            caller,
+        }
+    }
+
+    fn ctx_with_internal_token(token: String, cnf: [u8; 32]) -> EnvelopeContext {
+        EnvelopeContext {
+            request_id: 1,
+            claims: None,
+            verified_tenant: None,
+            jwt_token: Some(token),
+            direct_jwt_verified: false,
+            deferred_federate: None,
+            federate_tui_class: false,
+            federate_holder_ed: None,
+            federate_request_use: None,
+            delegation_token: None,
+            key_derived_subject: Subject::anonymous(),
+            jwt_subject: None,
+            cnf,
+            envelope_wit_hash: None,
+            client_dh_public: None,
+            client_kem_public: None,
+            request_iat: 0,
+            request_nonce: [0; 16],
+            response_kem_recipient: None,
+            service_domain: None,
+            envelope_proof_cwt: None,
+            original_holder_evidence: None,
+            browser_method_discriminator: None,
+            internal_work: None,
+            is_local_caller: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_work_denied_at_default_service() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_claims(&controller, "mock-instance-1", now),
+            &controller,
+        );
+        let svc = BoundaryMockService::without_boundary();
+        let mut ctx = ctx_with_internal_token(token, controller.verifying_key().to_bytes());
+        let error = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("iw+jwt must deny at a service that operates no execution boundary");
+        assert!(error.to_string().contains("not accepted"), "{error:#}");
+        assert!(ctx.claims().is_none(), "no claims may publish on denial");
+        assert!(ctx.internal_work().is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_work_admits_original_caller_at_pinned_boundary() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_claims(&controller, "mock-instance-1", now),
+            &controller,
+        );
+        let svc = BoundaryMockService::with_controller(&controller);
+        let mut ctx = ctx_with_internal_token(token, controller.verifying_key().to_bytes());
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("the pinned controller's work order must be admitted");
+        assert_eq!(
+            ctx.subject().name(),
+            Some("alice"),
+            "original caller identity"
+        );
+        assert_eq!(ctx.verified_tenant(), Some("tenant-a"));
+        assert_eq!(
+            ctx.claims().map(|c| c.sub.as_str()),
+            Some("alice"),
+            "caller claims snapshot installed for subject-dependent semantics"
+        );
+        let work = ctx.internal_work().expect("work order installed");
+        assert_eq!(work.resource, "inference:generateStream");
+        assert_eq!(work.operation, "infer");
+        assert_eq!(work.tenant, "tenant-a");
+        assert_eq!(work.model, "qwen3:main");
+        assert_eq!(work.owner_did.as_deref(), Some("did:key:z6Mktest"));
+    }
+
+    #[tokio::test]
+    async fn internal_work_rejected_from_foreign_envelope_signer() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let stranger = SigningKey::from_bytes(&STRANGER);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_claims(&controller, "mock-instance-1", now),
+            &controller,
+        );
+        let svc = BoundaryMockService::with_controller(&controller);
+        // The token is genuine — but the ENVELOPE was signed by a stranger.
+        let mut ctx = ctx_with_internal_token(token, stranger.verifying_key().to_bytes());
+        let error = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a stolen work order cannot be replayed under a foreign signer");
+        assert!(error.to_string().contains("pinned controller"), "{error:#}");
+        assert!(ctx.claims().is_none());
+    }
+
+    // ── Sol S1: the resolved subject must survive admission EXACTLY ────────
+    //
+    // Model mints work.sub from the ALREADY-RESOLVED ctx.subject().to_string()
+    // of the verified caller envelope. The legacy `Subject::from_str` parser
+    // strips `local:`/`token:`/`peer:`/`user:` prefixes, so re-normalizing
+    // here silently changed the principal (cross-principal state keyed at the
+    // worker and mis-audit). These tests drive the REAL `verify_claims` in the
+    // AnySigner serving shape (anonymous key-derived subject, so
+    // `ctx.subject()` is exactly the installed jwt_subject).
+
+    fn work_ctx_with_subject(token: String, cnf: [u8; 32]) -> EnvelopeContext {
+        ctx_with_internal_token(token, cnf)
+    }
+
+    #[tokio::test]
+    async fn sol_s1_prefixed_subject_survives_internal_work_admission_exactly() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = fixture_claims(&controller, "mock-instance-1", now);
+        claims.sub = "user:alice".to_owned();
+        claims.caller.sub = "user:alice".to_owned();
+        let token = encode_internal_work(&claims, &controller);
+        let svc = BoundaryMockService::with_controller(&controller);
+        let mut ctx = work_ctx_with_subject(token, controller.verifying_key().to_bytes());
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("the pinned controller's work order must be admitted");
+        // The EXACT resolved identity — no legacy prefix normalization.
+        assert_eq!(ctx.subject(), crate::envelope::Subject::new("user:alice"));
+        assert_eq!(ctx.subject().name(), Some("user:alice"));
+        assert_eq!(
+            ctx.internal_work().expect("work order").subject,
+            ctx.subject()
+        );
+        assert_eq!(ctx.claims().map(|c| c.sub.as_str()), Some("user:alice"));
+        assert_eq!(ctx.verified_tenant(), Some("tenant-a"));
+    }
+
+    #[tokio::test]
+    async fn sol_s1_all_legacy_prefix_families_preserve_exact_identity() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let svc = BoundaryMockService::with_controller(&controller);
+        for subject_string in ["token:bob", "local:carol", "peer:dave", "user:dave#2"] {
+            let now = chrono::Utc::now().timestamp();
+            let mut claims = fixture_claims(&controller, "mock-instance-1", now);
+            claims.sub = subject_string.to_owned();
+            claims.caller.sub = subject_string.to_owned();
+            claims.jti = format!(
+                "jti-{}-{}",
+                hex::encode(&controller.verifying_key().as_bytes()[..4]),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            );
+            let token = encode_internal_work(&claims, &controller);
+            let mut ctx = work_ctx_with_subject(token, controller.verifying_key().to_bytes());
+            svc.verify_claims(&mut ctx)
+                .await
+                .unwrap_or_else(|error| panic!("{subject_string} must be admitted: {error:#}"));
+            assert_eq!(
+                ctx.subject(),
+                crate::envelope::Subject::new(subject_string),
+                "{subject_string} identity must survive admission verbatim"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sol_s1_bare_subject_remains_compatible() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let claims = fixture_claims(&controller, "mock-instance-1", now); // sub "alice"
+        let token = encode_internal_work(&claims, &controller);
+        let svc = BoundaryMockService::with_controller(&controller);
+        let mut ctx = work_ctx_with_subject(token, controller.verifying_key().to_bytes());
+        svc.verify_claims(&mut ctx)
+            .await
+            .expect("bare subject stays admitted");
+        assert_eq!(ctx.subject(), crate::envelope::Subject::new("alice"));
+    }
+
+    #[tokio::test]
+    async fn sol_s1_empty_anonymous_and_sentinel_subjects_deny() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let svc = BoundaryMockService::with_controller(&controller);
+        for bad in ["", "anonymous", UNAUTHENTICATED_DID_SENTINEL] {
+            let now = chrono::Utc::now().timestamp();
+            let mut claims = fixture_claims(&controller, "mock-instance-1", now);
+            claims.sub = bad.to_owned();
+            claims.caller.sub = bad.to_owned();
+            claims.jti = format!(
+                "jti-{}-{}",
+                hex::encode(&controller.verifying_key().as_bytes()[..4]),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            );
+            let token = encode_internal_work(&claims, &controller);
+            let mut ctx = work_ctx_with_subject(token, controller.verifying_key().to_bytes());
+            let error = svc
+                .verify_claims(&mut ctx)
+                .await
+                .expect_err("a subject-less work order must deny");
+            assert!(
+                !error.to_string().is_empty(),
+                "denial must carry the reason for {bad:?}"
+            );
+            assert!(ctx.claims().is_none());
+            assert!(ctx.internal_work().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_work_snapshot_subject_disagreement_denies() {
+        // K3 finding m1: the controller authors both the subject and the
+        // caller snapshot; production mints them identical (resolved form),
+        // and admission enforces the coherence so audit and subject-keyed
+        // state cannot diverge.
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = fixture_claims(&controller, "mock-instance-1", now);
+        claims.caller.sub = "someone-else".to_owned();
+        let token = encode_internal_work(&claims, &controller);
+        let svc = BoundaryMockService::with_controller(&controller);
+        let mut ctx = ctx_with_internal_token(token, controller.verifying_key().to_bytes());
+        let error = svc
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("an incoherent snapshot must deny");
+        assert!(
+            error.to_string().contains("snapshot subject disagrees"),
+            "{error:#}"
+        );
+        assert!(ctx.claims().is_none());
+        assert!(ctx.internal_work().is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_work_replayed_jti_denies_on_second_admission() {
+        let controller = SigningKey::from_bytes(&CONTROLLER);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_claims(&controller, "mock-instance-1", now),
+            &controller,
+        );
+        let svc = BoundaryMockService::with_controller(&controller);
+        let admit =
+            |token: String| ctx_with_internal_token(token, controller.verifying_key().to_bytes());
+        let mut first = admit(token.clone());
+        svc.verify_claims(&mut first)
+            .await
+            .expect("first admission of a fresh work order");
+        let mut second = admit(token);
+        let error = svc
+            .verify_claims(&mut second)
+            .await
+            .expect_err("the same work order jti must not admit twice");
+        assert!(error.to_string().contains("replay"), "{error:#}");
+        assert!(second.claims().is_none(), "no claims on replay denial");
     }
 }

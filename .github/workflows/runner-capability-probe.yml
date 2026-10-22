@@ -1,0 +1,74 @@
+name: Runner capability probe
+
+# Dispatch-only capability probe for the self-hosted runner classes (native
+# CI plan N0.2). The self-hosted AMD64 classes (`hyprstream-release`,
+# `hyprstream-canary`) are defined in metal stacks/aws-runners but no
+# hyprstream job has ever consumed them, so their liveness is UNPROVEN until
+# this probe runs green on the class. Wave 2 x86 migrations are gated on that
+# evidence: an indefinitely-queued job is the failure mode of migrating onto
+# a dead pool.
+#
+# The probe records the concrete host identity — architecture, cores, memory,
+# disk, podman, dedicated cache mount, GPU presence, registry reachability —
+# and fails closed when the class does not deliver the amd64 architecture it
+# promises. It executes no repository code, needs no checkout, and holds no
+# secrets. Repeat per class (runner_label input) before each Wave 2 batch;
+# record the run URL in the capability evidence file.
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Self-hosted runner class label to probe (hyprstream-canary or hyprstream-release)'
+        required: false
+        default: 'hyprstream-canary'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe self-hosted amd64 (${{ inputs.runner_label || 'hyprstream-canary' }})
+    runs-on: [self-hosted, linux, amd64, "${{ inputs.runner_label || 'hyprstream-canary' }}"]
+    timeout-minutes: 15
+    steps:
+      - name: Record host capability evidence
+        run: |
+          set -euo pipefail
+          echo "### Runner capability probe" >> "$GITHUB_STEP_SUMMARY"
+          record() { printf '%s\n' "$1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+
+          arch="$(uname -m)"
+          record "- arch: ${arch}"
+          test "$arch" = "x86_64" || {
+            echo "::error::expected an amd64 host for this class, got ${arch}" >&2
+            exit 1
+          }
+          record "- kernel: $(uname -r)"
+          record "- cpus: $(nproc)"
+          record "- memory: $(grep MemTotal /proc/meminfo | awk '{print $2 " KiB"}')"
+          echo "workspace filesystem:"; df -h .
+          if [[ -d /mnt/hypr-ci-cache ]]; then
+            record "- /mnt/hypr-ci-cache: present"
+            df -h /mnt/hypr-ci-cache
+            mountpoint -q /mnt/hypr-ci-cache \
+              && record "- /mnt/hypr-ci-cache: dedicated mount" \
+              || record "- /mnt/hypr-ci-cache: NOT a dedicated mount (plain directory)"
+          else
+            record "- /mnt/hypr-ci-cache: ABSENT (target-cache mounts unavailable on this class)"
+          fi
+          record "- podman: $(podman --version 2>/dev/null || echo 'not installed')"
+          record "- user: $(id -un) (uid $(id -u))"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            record "- GPU: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
+          else
+            record "- GPU: none (no nvidia-smi)"
+          fi
+          # Any HTTP status (including 401 — the normal anonymous registry
+          # auth challenge) proves reachability; only a transport failure
+          # does not.
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 https://ghcr.io/v2/ || true)"
+          if [[ "$code" =~ ^[0-9]{3}$ ]]; then
+            record "- ghcr.io: reachable (HTTP ${code})"
+          else
+            record "- ghcr.io: NOT reachable (transport failure)"
+          fi

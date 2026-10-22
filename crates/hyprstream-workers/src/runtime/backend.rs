@@ -30,8 +30,10 @@ use async_trait::async_trait;
 use crate::config::PoolConfig;
 use crate::error::Result;
 
-use super::client::{CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxConfig};
 use super::sandbox::PodSandbox;
+use hyprstream_rpc_std::worker_client::{
+    CpuUsage, LinuxContainerResources, MemoryUsage, PodSandboxConfig,
+};
 use hyprstream_vfs::{Namespace, Subject};
 
 /// Opaque handle stored on each `PodSandbox`.

@@ -30,7 +30,9 @@
 //! resolve names → bits via [`Lattice::intern`]; nothing on the per-op hot path
 //! ever touches a string.
 
-use super::label::{Assurance, Compartment, CompartmentSet, Level, SecurityLabel, MAX_COMPARTMENTS};
+use super::label::{
+    Assurance, Compartment, CompartmentSet, Level, SecurityLabel, MAX_COMPARTMENTS,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -45,9 +47,7 @@ use std::fmt;
 /// `compiled::CompiledPolicy.generation` carries — a compiled TE matrix is valid
 /// only against the lattice generation that minted its bit assignments. See
 /// [`LatticeVersion::generation`].
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LatticeVersion(pub u32);
 
 impl LatticeVersion {
@@ -506,7 +506,11 @@ mod tests {
     #[test]
     fn compartment_names_are_in_construction_order() {
         let p = policy();
-        let names: Vec<&str> = p.compartment_names().iter().map(Compartment::as_str).collect();
+        let names: Vec<&str> = p
+            .compartment_names()
+            .iter()
+            .map(Compartment::as_str)
+            .collect();
         // Exactly the order passed to `new`, i.e. bit order 0,1,2.
         assert_eq!(names, ["pii", "finance", "tenant:acme"]);
         // And it agrees with the name↔bit map for every entry.

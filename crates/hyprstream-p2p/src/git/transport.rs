@@ -5,10 +5,10 @@
 //! rather than just through the git-remote-gittorrent binary.
 
 use crate::service::GitTorrentService;
-use crate::{Result, Error, GitTorrentUrl};
-use git2::transport::{SmartSubtransport, SmartSubtransportStream, Service};
-use std::sync::Arc;
+use crate::{Error, GitTorrentUrl, Result};
+use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream};
 use std::io::{Read, Write};
+use std::sync::Arc;
 
 /// Factory for creating GitTorrent transports
 ///
@@ -36,7 +36,10 @@ pub trait TransportFactory {
 
 impl TransportFactory for GittorrentTransportFactory {
     fn create_transport(&self, url: &str) -> anyhow::Result<Box<dyn SmartSubtransport>> {
-        Ok(Box::new(GittorrentTransport::new(url, Arc::clone(&self.service))?))
+        Ok(Box::new(GittorrentTransport::new(
+            url,
+            Arc::clone(&self.service),
+        )?))
     }
 
     fn supports_url(&self, url: &str) -> bool {
@@ -67,45 +70,41 @@ impl SmartSubtransport for GittorrentTransport {
         url: &str,
         service: Service,
     ) -> std::result::Result<Box<dyn SmartSubtransportStream>, git2::Error> {
-        tracing::debug!("GitTorrent transport action: {} (service: {})", url, match service {
-            Service::UploadPack => "upload-pack",
-            Service::ReceivePack => "receive-pack",
-            Service::UploadPackLs => "upload-pack-ls",
-            Service::ReceivePackLs => "receive-pack-ls",
-        });
+        tracing::debug!(
+            "GitTorrent transport action: {} (service: {})",
+            url,
+            match service {
+                Service::UploadPack => "upload-pack",
+                Service::ReceivePack => "receive-pack",
+                Service::UploadPackLs => "upload-pack-ls",
+                Service::ReceivePackLs => "receive-pack-ls",
+            }
+        );
 
         match service {
             Service::UploadPack => {
                 // Handle fetch operations (upload-pack)
-                GittorrentStream::new_upload_pack(
-                    self.url.clone(),
-                    Arc::clone(&self.service),
-                ).map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
-                .map_err(|e| git2::Error::from_str(&e.to_string()))
+                GittorrentStream::new_upload_pack(self.url.clone(), Arc::clone(&self.service))
+                    .map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
+                    .map_err(|e| git2::Error::from_str(&e.to_string()))
             }
             Service::ReceivePack => {
                 // Handle push operations (receive-pack)
-                GittorrentStream::new_receive_pack(
-                    self.url.clone(),
-                    Arc::clone(&self.service),
-                ).map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
-                .map_err(|e| git2::Error::from_str(&e.to_string()))
+                GittorrentStream::new_receive_pack(self.url.clone(), Arc::clone(&self.service))
+                    .map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
+                    .map_err(|e| git2::Error::from_str(&e.to_string()))
             }
             Service::UploadPackLs => {
                 // Handle reference discovery for fetch
-                GittorrentStream::new_upload_pack(
-                    self.url.clone(),
-                    Arc::clone(&self.service),
-                ).map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
-                .map_err(|e| git2::Error::from_str(&e.to_string()))
+                GittorrentStream::new_upload_pack(self.url.clone(), Arc::clone(&self.service))
+                    .map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
+                    .map_err(|e| git2::Error::from_str(&e.to_string()))
             }
             Service::ReceivePackLs => {
                 // Handle reference discovery for push
-                GittorrentStream::new_receive_pack(
-                    self.url.clone(),
-                    Arc::clone(&self.service),
-                ).map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
-                .map_err(|e| git2::Error::from_str(&e.to_string()))
+                GittorrentStream::new_receive_pack(self.url.clone(), Arc::clone(&self.service))
+                    .map(|s| Box::new(s) as Box<dyn SmartSubtransportStream>)
+                    .map_err(|e| git2::Error::from_str(&e.to_string()))
             }
         }
     }
@@ -220,22 +219,23 @@ pub fn register_gittorrent_transport(service: Arc<GitTorrentService>) -> Result<
 
     unsafe {
         git2::transport::register("gittorrent", move |remote| {
-            let url = remote.url().ok_or_else(|| {
-                git2::Error::from_str("Remote URL is required")
-            })?;
+            let url = remote
+                .url()
+                .ok_or_else(|| git2::Error::from_str("Remote URL is required"))?;
 
             tracing::debug!("Creating GitTorrent transport for URL: {}", url);
 
             match GittorrentTransport::new(url, Arc::clone(&factory.service)) {
-                Ok(subtransport) => {
-                    git2::transport::Transport::smart(remote, true, subtransport)
-                },
+                Ok(subtransport) => git2::transport::Transport::smart(remote, true, subtransport),
                 Err(e) => {
                     tracing::error!("Failed to create GitTorrent transport: {}", e);
-                    Err(git2::Error::from_str(&format!("Transport creation failed: {e}")))
+                    Err(git2::Error::from_str(&format!(
+                        "Transport creation failed: {e}"
+                    )))
                 }
             }
-        }).map_err(|e| Error::other(format!("Failed to register gittorrent transport: {e}")))?;
+        })
+        .map_err(|e| Error::other(format!("Failed to register gittorrent transport: {e}")))?;
     }
 
     tracing::info!("GitTorrent transport registered for gittorrent:// URLs");
@@ -264,10 +264,7 @@ mod tests {
         let service = Arc::new(GitTorrentService::new(config).await?);
 
         // Test with a short string (not a valid hash) - should parse as Username
-        let transport = GittorrentTransport::new(
-            "gittorrent://abc123def456",
-            service.clone()
-        )?;
+        let transport = GittorrentTransport::new("gittorrent://abc123def456", service.clone())?;
         assert!(matches!(transport.url, GitTorrentUrl::Username { .. }));
 
         // Test with a valid 40-char SHA1 - should parse as Commit
@@ -282,7 +279,7 @@ mod tests {
         // For now, test with a 64-char SHA256
         let transport = GittorrentTransport::new(
             "gittorrent://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            service
+            service,
         )?;
         assert!(matches!(transport.url, GitTorrentUrl::Commit { .. }));
         Ok(())

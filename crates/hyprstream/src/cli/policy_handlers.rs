@@ -13,43 +13,68 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::auth::{jwt, Claims};
-use crate::services::generated::policy_client::{
-    PolicyClient, GetHistory, GetDiff, ApplyDraft, RollbackPolicy, PolicyCheck, ApplyTemplate,
-    AddGrouping, RemoveGrouping,
-};
-use hyprstream_pds::repo_authority::is_path_form_did_web;
 use anyhow::{Context, Result};
 use chrono::Duration;
 use ed25519_dalek::SigningKey;
+use hyprstream_pds::repo_authority::is_path_form_did_web;
+use hyprstream_rpc_std::policy_client::{
+    AddGrouping, ApplyDraft, ApplyTemplate, GetDiff, GetHistory, PolicyCheck, PolicyClient,
+    RemoveGrouping, RollbackPolicy,
+};
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 
 /// Create a PolicyClient for RPC calls.
 ///
-/// Bootstrap: PolicyService key needed to create the PolicyClient for peer key resolution.
-fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
-    PolicyClient::for_local_bootstrap(
+/// Required profile resolves through the checkpoint-backed discovery resolver;
+/// compatibility bootstrap dials the deterministic same-host PolicyService IPC
+/// endpoint, which unlike `registered_endpoint` is available to a separate
+/// `podman exec` process that did not start the PolicyService itself.
+pub(crate) fn create_policy_client(signing_key: &SigningKey) -> Result<PolicyClient> {
+    if hyprstream_discovery::native_network_required() {
+        return PolicyClient::from_provider(
+            &hyprstream_discovery::ProductionRpcClientProvider,
+            signing_key.clone(),
+            None,
+        );
+    }
+    let registry = hyprstream_rpc::registry::try_global()
+        .ok_or_else(|| anyhow::anyhow!("EndpointRegistry not initialized"))?;
+    let transport = policy_ipc_transport(&registry)?;
+    PolicyClient::for_local_transport_bootstrap(
+        &transport,
         signing_key.clone(),
-        // Bootstrap: PolicyService uses the root key
         signing_key.verifying_key(),
         None,
     )
 }
 
+/// Resolve the deterministic same-host PolicyService REP socket without
+/// requiring a process-local service registration.
+fn policy_ipc_transport(
+    registry: &hyprstream_rpc::registry::EndpointRegistry,
+) -> Result<hyprstream_rpc::transport::TransportConfig> {
+    registry
+        .try_endpoint("policy", hyprstream_rpc::registry::SocketKind::Rep)
+        .context("resolve local PolicyService IPC endpoint")
+}
+
 /// Handle `policy show` - Display the running policy via RPC
-pub async fn handle_policy_show(
-    signing_key: &SigningKey,
-    raw: bool,
-) -> Result<()> {
+pub async fn handle_policy_show(signing_key: &SigningKey, raw: bool) -> Result<()> {
     let client = create_policy_client(signing_key)?;
-    let policy_info = client.get_policy().await
+    let policy_info = client
+        .get_policy()
+        .await
         .context("Failed to get policy from PolicyService. Are services running?")?;
 
     if raw {
         // Reconstruct CSV from structured data
         for rule in &policy_info.rules {
-            println!("p, {}, {}, {}, {}, {}", rule.subject, rule.domain, rule.resource, rule.action, rule.effect);
+            println!(
+                "p, {}, {}, {}, {}, {}",
+                rule.subject, rule.domain, rule.resource, rule.action, rule.effect
+            );
         }
         for grouping in &policy_info.groupings {
             println!("g, {}, {}", grouping.user, grouping.role);
@@ -66,11 +91,21 @@ pub async fn handle_policy_show(
 
         // Print policy rules as a table
         if !policy_info.rules.is_empty() {
-            println!("┌──────────────────────────────────────────────────────────────────────────────┐");
-            println!("│ Policy Rules                                                                 │");
-            println!("├────────────────┬────────────────┬────────────────┬────────────────┬──────────┤");
-            println!("│ Subject        │ Domain         │ Resource       │ Action         │ Effect   │");
-            println!("├────────────────┼────────────────┼────────────────┼────────────────┼──────────┤");
+            println!(
+                "┌──────────────────────────────────────────────────────────────────────────────┐"
+            );
+            println!(
+                "│ Policy Rules                                                                 │"
+            );
+            println!(
+                "├────────────────┬────────────────┬────────────────┬────────────────┬──────────┤"
+            );
+            println!(
+                "│ Subject        │ Domain         │ Resource       │ Action         │ Effect   │"
+            );
+            println!(
+                "├────────────────┼────────────────┼────────────────┼────────────────┼──────────┤"
+            );
 
             for rule in &policy_info.rules {
                 println!(
@@ -82,7 +117,9 @@ pub async fn handle_policy_show(
                     truncate_str(&rule.effect, 8)
                 );
             }
-            println!("└────────────────┴────────────────┴────────────────┴────────────────┴──────────┘");
+            println!(
+                "└────────────────┴────────────────┴────────────────┴────────────────┴──────────┘"
+            );
         }
 
         // Print role assignments
@@ -115,7 +152,11 @@ pub async fn handle_policy_history(
     _oneline: bool,
 ) -> Result<()> {
     let client = create_policy_client(signing_key)?;
-    let history = client.get_history(&GetHistory { count: count as u32 }).await
+    let history = client
+        .get_history(&GetHistory {
+            count: count as u32,
+        })
+        .await
         .context("Failed to get policy history from PolicyService. Are services running?")?;
 
     if history.entries.is_empty() {
@@ -125,7 +166,10 @@ pub async fn handle_policy_history(
     }
 
     for entry in &history.entries {
-        println!("\x1b[33m{}\x1b[0m \x1b[32m{}\x1b[0m {}", entry.hash, entry.date, entry.message);
+        println!(
+            "\x1b[33m{}\x1b[0m \x1b[32m{}\x1b[0m {}",
+            entry.hash, entry.date, entry.message
+        );
     }
 
     Ok(())
@@ -134,10 +178,7 @@ pub async fn handle_policy_history(
 /// Handle `policy edit` - Open policy in $VISUAL/$EDITOR
 ///
 /// The editor itself must be local, but draft detection uses PolicyService RPC.
-pub async fn handle_policy_edit(
-    signing_key: &SigningKey,
-    policy_csv_path: &Path,
-) -> Result<()> {
+pub async fn handle_policy_edit(signing_key: &SigningKey, policy_csv_path: &Path) -> Result<()> {
     // Get editor from environment
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
@@ -165,7 +206,10 @@ pub async fn handle_policy_edit(
     match client.get_draft_status().await {
         Ok(draft) if draft.has_changes => {
             println!();
-            println!("✏️  Draft changes detected ({}). Run 'hyprstream quick policy diff' to review.", draft.summary);
+            println!(
+                "✏️  Draft changes detected ({}). Run 'hyprstream quick policy diff' to review.",
+                draft.summary
+            );
         }
         Ok(_) => {} // No changes
         Err(_) => {
@@ -179,14 +223,15 @@ pub async fn handle_policy_edit(
 }
 
 /// Handle `policy diff` - Show diff between draft and running policy via RPC
-pub async fn handle_policy_diff(
-    signing_key: &SigningKey,
-    against: Option<String>,
-) -> Result<()> {
+pub async fn handle_policy_diff(signing_key: &SigningKey, against: Option<String>) -> Result<()> {
     let client = create_policy_client(signing_key)?;
     let git_ref = against.as_deref().unwrap_or("");
 
-    let diff_text = client.get_diff(&GetDiff { git_ref: Some(git_ref.to_owned()) }).await
+    let diff_text = client
+        .get_diff(&GetDiff {
+            git_ref: Some(git_ref.to_owned()),
+        })
+        .await
         .context("Failed to get diff from PolicyService. Are services running?")?;
 
     if diff_text.is_empty() {
@@ -221,7 +266,9 @@ pub async fn handle_policy_apply(
     let client = create_policy_client(signing_key)?;
 
     // Check for uncommitted changes via RPC
-    let draft = client.get_draft_status().await
+    let draft = client
+        .get_draft_status()
+        .await
         .context("Failed to check draft status from PolicyService. Are services running?")?;
 
     if !draft.has_changes {
@@ -230,7 +277,11 @@ pub async fn handle_policy_apply(
     }
 
     // Show what would be committed
-    let diff_text = client.get_diff(&GetDiff { git_ref: Some(String::new()) }).await
+    let diff_text = client
+        .get_diff(&GetDiff {
+            git_ref: Some(String::new()),
+        })
+        .await
         .context("Failed to get diff from PolicyService.")?;
 
     println!("Changes to be applied ({}):", draft.summary);
@@ -254,7 +305,11 @@ pub async fn handle_policy_apply(
         format!("policy: update access control rules ({timestamp})")
     });
 
-    let result_msg = client.apply_draft(&ApplyDraft { message: Some(commit_msg) }).await
+    let result_msg = client
+        .apply_draft(&ApplyDraft {
+            message: Some(commit_msg),
+        })
+        .await
         .context("Failed to apply draft via PolicyService.")?;
 
     println!("✓ Policy applied successfully.");
@@ -273,11 +328,16 @@ pub async fn handle_policy_rollback(
 
     if dry_run {
         // Use history RPC to show what we'd be rolling back to
-        let history = client.get_history(&GetHistory { count: 20 }).await
+        let history = client
+            .get_history(&GetHistory { count: 20 })
+            .await
             .context("Failed to get history from PolicyService. Are services running?")?;
 
         // Find the matching entry
-        let target = history.entries.iter().find(|e| e.hash.starts_with(git_ref) || git_ref.contains('~'));
+        let target = history
+            .entries
+            .iter()
+            .find(|e| e.hash.starts_with(git_ref) || git_ref.contains('~'));
         if let Some(entry) = target {
             println!("Rolling back to: {} {}", entry.hash, entry.message);
         } else {
@@ -300,7 +360,11 @@ pub async fn handle_policy_rollback(
     }
 
     // Use PolicyService RPC
-    let result_msg = client.rollback(&RollbackPolicy { git_ref: git_ref.to_owned() }).await
+    let result_msg = client
+        .rollback(&RollbackPolicy {
+            git_ref: git_ref.to_owned(),
+        })
+        .await
         .context("Failed to rollback via PolicyService. Are services running?")?;
 
     println!();
@@ -319,7 +383,14 @@ pub async fn handle_policy_check(
 ) -> Result<()> {
     let client = create_policy_client(signing_key)?;
 
-    let allowed = client.check(&PolicyCheck { subject: user.to_owned(), domain: user.to_owned(), resource: resource.to_owned(), operation: action.to_owned() }).await
+    let allowed = client
+        .check(&PolicyCheck {
+            subject: user.to_owned(),
+            domain: user.to_owned(),
+            resource: resource.to_owned(),
+            operation: action.to_owned(),
+        })
+        .await
         .context("Failed to check policy via PolicyService. Are services running?")?;
 
     println!("User:     {user}");
@@ -356,9 +427,8 @@ pub async fn handle_token_create(
     let duration = expires_duration.unwrap_or_else(|| Duration::days(90));
 
     // Generate name for display (not stored in JWT, just for user reference)
-    let name = name.unwrap_or_else(|| {
-        format!("token-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
-    });
+    let name =
+        name.unwrap_or_else(|| format!("token-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S")));
 
     // Mint JWT with proper iss/aud claims for OAI middleware compatibility
     let (token, exp) = mint_local_token(signing_key, user, duration)?;
@@ -375,7 +445,11 @@ pub async fn handle_token_create(
     let expires_at = chrono::DateTime::from_timestamp(exp, 0);
     if let Some(expires_at) = expires_at {
         let days = duration.num_days();
-        println!("  Expires: {} ({} days)", expires_at.format("%Y-%m-%d %H:%M UTC"), days);
+        println!(
+            "  Expires: {} ({} days)",
+            expires_at.format("%Y-%m-%d %H:%M UTC"),
+            days
+        );
     } else {
         println!("  Expires: never");
     }
@@ -391,12 +465,14 @@ pub async fn handle_token_create(
     println!();
     println!("  Usage:");
     let display_len = std::cmp::min(30, token.len());
-    println!("    curl -H \"Authorization: Bearer {}...\" http://localhost:8080/v1/models", &token[..display_len]);
+    println!(
+        "    curl -H \"Authorization: Bearer {}...\" http://localhost:8080/v1/models",
+        &token[..display_len]
+    );
     println!();
 
     Ok(())
 }
-
 
 /// Load or generate the Ed25519 node signing key from the configured secrets
 /// directory.
@@ -440,7 +516,11 @@ pub(crate) fn mint_local_token(
         Ok(ref c) => (c.oauth.issuer_url(), c.oai.resource_url()),
         Err(_) => {
             // Fallback to defaults when config is not available
-            ("http://localhost:6791".to_owned(), "http://localhost:6789".to_owned())
+            let local_origin = "http://localhost";
+            (
+                format!("{local_origin}:6791"),
+                format!("{local_origin}:6789"),
+            )
         }
     };
 
@@ -448,7 +528,8 @@ pub(crate) fn mint_local_token(
         .with_issuer(issuer)
         .with_audience(Some(audience));
 
-    let jwt_key = hyprstream_rpc::node_identity::derive_purpose_key(signing_key, "hyprstream-jwt-v1");
+    let jwt_key =
+        hyprstream_rpc::node_identity::derive_purpose_key(signing_key, "hyprstream-jwt-v1");
     let token = jwt::encode(&claims, &jwt_key);
     Ok((token, exp))
 }
@@ -512,20 +593,19 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_owned()
     } else if max_len > 3 {
-        let end = s.char_indices()
+        let end = s
+            .char_indices()
             .nth(max_len - 3)
             .map_or(s.len(), |(i, _)| i);
         format!("{}...", &s[..end])
     } else {
-        let end = s.char_indices()
-            .nth(max_len)
-            .map_or(s.len(), |(i, _)| i);
+        let end = s.char_indices().nth(max_len).map_or(s.len(), |(i, _)| i);
         s[..end].to_owned()
     }
 }
 
 // Re-export policy templates from shared location
-pub use crate::auth::policy_templates::{PolicyTemplate, get_template, get_templates};
+pub use crate::auth::policy_templates::{get_template, get_templates, PolicyTemplate};
 
 // === Role handlers ===
 
@@ -542,7 +622,12 @@ pub async fn handle_policy_role_add(
     }
 
     let client = create_policy_client(signing_key)?;
-    let sha = client.add_grouping(&AddGrouping { user: user.to_owned(), role: role.to_owned() }).await
+    let sha = client
+        .add_grouping(&AddGrouping {
+            user: user.to_owned(),
+            role: role.to_owned(),
+        })
+        .await
         .context("Failed to add role assignment via PolicyService. Are services running?")?;
 
     println!("Role assigned. Commit: {}", &sha[..sha.len().min(8)]);
@@ -570,7 +655,12 @@ pub async fn handle_policy_role_remove(
     }
 
     let client = create_policy_client(signing_key)?;
-    let sha = client.remove_grouping(&RemoveGrouping { user: user.to_owned(), role: role.to_owned() }).await
+    let sha = client
+        .remove_grouping(&RemoveGrouping {
+            user: user.to_owned(),
+            role: role.to_owned(),
+        })
+        .await
         .context("Failed to remove role assignment via PolicyService. Are services running?")?;
 
     println!("Role removed. Commit: {}", &sha[..sha.len().min(8)]);
@@ -584,10 +674,14 @@ pub async fn handle_policy_role_list(
     role: Option<&str>,
 ) -> Result<()> {
     let client = create_policy_client(signing_key)?;
-    let policy_info = client.get_policy().await
+    let policy_info = client
+        .get_policy()
+        .await
         .context("Failed to get policy from PolicyService. Are services running?")?;
 
-    let groupings: Vec<_> = policy_info.groupings.iter()
+    let groupings: Vec<_> = policy_info
+        .groupings
+        .iter()
         .filter(|g| user.is_none_or(|u| g.user == u))
         .filter(|g| role.is_none_or(|r| g.role == r))
         .collect();
@@ -654,7 +748,11 @@ pub async fn handle_policy_apply_template(
 
     // Use PolicyService RPC to apply the template (writes file, validates, stages, commits)
     let client = create_policy_client(signing_key)?;
-    let result_msg = client.apply_template(&ApplyTemplate { name: template_name.to_owned() }).await
+    let result_msg = client
+        .apply_template(&ApplyTemplate {
+            name: template_name.to_owned(),
+        })
+        .await
         .context("Failed to apply template via PolicyService. Are services running?")?;
 
     println!();
@@ -679,7 +777,9 @@ mod tests {
         )
         .expect_err("path-form account subject must not reach the direct CLI signer");
 
-        assert!(error.to_string().contains("path-form did:web account subjects are frozen"));
+        assert!(error
+            .to_string()
+            .contains("path-form did:web account subjects are frozen"));
     }
 
     #[test]
@@ -688,8 +788,29 @@ mod tests {
         let (token, _) = mint_local_token(&signing_key, "alice", Duration::hours(1))
             .expect("ordinary CLI subject must still mint");
 
-        let claims = hyprstream_rpc::auth::decode_unverified(&token)
-            .expect("minted token must decode");
+        let claims =
+            hyprstream_rpc::auth::decode_unverified(&token).expect("minted token must decode");
         assert_eq!(claims.sub, "alice");
+    }
+
+    #[test]
+    fn policy_cli_uses_ipc_default_without_process_local_registration() {
+        let registry = hyprstream_rpc::registry::EndpointRegistry::new(
+            hyprstream_rpc::registry::EndpointMode::Ipc,
+            Some(std::path::PathBuf::from("/run/hyprstream")),
+        );
+
+        assert!(
+            registry
+                .registered_endpoint("policy", hyprstream_rpc::registry::SocketKind::Rep)
+                .is_none(),
+            "this simulates the distinct podman-exec CLI process"
+        );
+        let transport = policy_ipc_transport(&registry)
+            .expect("IPC mode must provide the deterministic policy REP socket");
+        assert_eq!(
+            transport.endpoint_string(),
+            "ipc:///run/hyprstream/policy.sock",
+        );
     }
 }

@@ -1,46 +1,17 @@
 //! Worker service types and helpers.
 //!
-//! Uses the generated `WorkerClient` from `hyprstream_workers` for schema-driven RPC.
-//! All methods are inherent — no domain trait wrappers.
-//!
-//! Response types use generated types directly — no domain type wrappers.
+//! Worker-service authorization glue. Public worker RPC contracts and clients
+//! are owned by `hyprstream-rpc-std`; this module contains no client facade.
 
 use hyprstream_rpc::service::AuthorizeFn;
+use hyprstream_rpc_std::policy_client::PolicyCheck;
 use std::sync::Arc;
-use crate::services::generated::policy_client::PolicyCheck;
-
-// Re-export generated types with clean OCI-aligned names (no Gen*/Wire/Enum aliases)
-pub use hyprstream_workers::runtime::{
-    WorkerClient,
-    VersionInfo, RuntimeStatus,
-    PodSandboxStatusResponse, ContainerStatusResponse,
-    ExecSyncResult,
-    PodSandboxStats, PodSandboxInfo, ContainerInfo,
-    ContainerStats, FilesystemUsage,
-    PodSandboxState, ContainerState,
-    PodSandboxConfig, ContainerConfig, ImageSpec,
-    AuthConfig, StreamInfo,
-    ImageInfo, ImageStatusResult,
-    StatusResponse, KeyValue,
-    // Filter types (generated)
-    PodSandboxFilter, ContainerFilter,
-    PodSandboxStatsFilter, ContainerStatsFilter,
-    Timestamp,
-};
-
-// Generated request types for struct-based client calls
-pub use hyprstream_workers::generated::worker_client::{
-    StatusRequest as WkStatusRequest,
-    PodSandboxStatusRequest, CreateContainerRequest, StopContainerRequest,
-    ContainerStatusRequest, ExecSyncRequest, AttachRequest,
-    ImageFilter, ImageStatusRequest, PullImageRequest,
-};
 
 // ============================================================================
 // Authorization Helper
 // ============================================================================
 
-use crate::services::PolicyClient;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 
 /// Build an `AuthorizeFn` backed by a `PolicyClient`.
 ///
@@ -48,26 +19,26 @@ use crate::services::PolicyClient;
 /// works on single-threaded runtimes used by RequestService.
 pub fn build_authorize_fn(policy_client: PolicyClient) -> AuthorizeFn {
     Arc::new(
-        move |subject: String,
-              domain: String,
+        move |ctx: hyprstream_rpc::service::EnvelopeContext,
               resource: String,
-              operation: String,
-              bearer: Option<String>| {
+              operation: String| {
             let client = policy_client.clone();
             Box::pin(async move {
-                let upstream_subject =
-                    hyprstream_rpc::envelope::Subject::new(subject.clone());
+                let upstream_subject = ctx.subject();
                 let request = PolicyCheck {
-                    subject,
-                    domain,
+                    subject: upstream_subject.to_string(),
+                    // Compatibility fields only; Policy derives the domain
+                    // from independently verified caller evidence.
+                    domain: String::new(),
                     resource,
                     operation,
                 };
-                crate::services::policy::check_with_verified_bearer(
+                crate::services::policy::check_with_holder_evidence(
                     &client,
                     &request,
-                    bearer.as_deref(),
+                    ctx.jwt_token(),
                     &upstream_subject,
+                    ctx.original_holder_evidence(),
                 )
                 .await
             })
@@ -75,5 +46,6 @@ pub fn build_authorize_fn(policy_client: PolicyClient) -> AuthorizeFn {
     )
 }
 
-// WorkerZmqClient / attach_container removed — use generated WorkerClient +
-// ContainerRpc trait method directly (DH key exchange encapsulated by codegen).
+// WorkerZmqClient / attach_container removed — use
+// `hyprstream_rpc_std::worker_client::WorkerClient` directly (DH key exchange
+// is encapsulated by the canonical client codegen).

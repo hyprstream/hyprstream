@@ -583,8 +583,7 @@ impl<'a> Transaction<'a> {
             "Legacy transaction {}: ensure {} from {}",
             self.tx_id, name, url
         );
-        self.operations
-            .push(format!("ensure {name} from {url}"));
+        self.operations.push(format!("ensure {name} from {url}"));
         self.registry.upsert_repository(name, url).await
     }
 
@@ -642,7 +641,6 @@ impl<'a> Transaction<'a> {
 
 #[cfg(test)]
 mod tests {
-    
 
     // Integration tests will be in tests/ directory
 }

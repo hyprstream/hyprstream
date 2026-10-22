@@ -22,9 +22,9 @@ pub struct ShellWindow {
     /// ANSI bytes from the PTY — poll with try_recv() in tick().
     pub stdout_rx: Receiver<Vec<u8>>,
     /// Send input bytes or control signals to the shell.
-    pub input_tx:  SyncSender<ShellInput>,
+    pub input_tx: SyncSender<ShellInput>,
     /// OS PID for SIGTERM on close.
-    pub pid:       u32,
+    pub pid: u32,
 }
 
 // ============================================================================
@@ -42,7 +42,7 @@ pub fn spawn_shell(cwd: Option<PathBuf>, cols: u16, rows: u16) -> io::Result<She
     let slave_dup1 = dup_fd(slave_fd)?;
     let slave_dup2 = dup_fd(slave_fd)?;
 
-    let slave_in  = unsafe { Stdio::from_raw_fd(slave_fd) };
+    let slave_in = unsafe { Stdio::from_raw_fd(slave_fd) };
     let slave_out = unsafe { Stdio::from_raw_fd(slave_dup1) };
     let slave_err = unsafe { Stdio::from_raw_fd(slave_dup2) };
 
@@ -78,7 +78,10 @@ pub fn spawn_shell(cwd: Option<PathBuf>, cols: u16, rows: u16) -> io::Result<She
             // Without this, the exec'd shell inherits ZMQ's internal socketpair FDs.
             // When the shell eventually closes them, the parent's ZMQ signaler receives
             // an unexpected EOF that triggers zmq_assert(dummy == 0) in recv_failable().
-            let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let mut rl = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             let soft_limit = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
                 rl.rlim_cur as i32
             } else {
@@ -112,7 +115,7 @@ pub fn spawn_shell(cwd: Option<PathBuf>, cols: u16, rows: u16) -> io::Result<She
     let mut writer = unsafe { std::fs::File::from_raw_fd(write_fd) };
 
     let (stdout_tx, stdout_rx) = mpsc::sync_channel::<Vec<u8>>(64);
-    let (input_tx, input_rx)   = mpsc::sync_channel::<ShellInput>(64);
+    let (input_tx, input_rx) = mpsc::sync_channel::<ShellInput>(64);
 
     // Reader: PTY master → stdout_tx
     std::thread::spawn(move || {
@@ -152,7 +155,11 @@ pub fn spawn_shell(cwd: Option<PathBuf>, cols: u16, rows: u16) -> io::Result<She
         }
     });
 
-    Ok(ShellWindow { stdout_rx, input_tx, pid })
+    Ok(ShellWindow {
+        stdout_rx,
+        input_tx,
+        pid,
+    })
 }
 
 pub fn kill_shell(pid: u32) {
@@ -164,11 +171,22 @@ pub fn kill_shell(pid: u32) {
 // ============================================================================
 
 fn open_pty(cols: u16, rows: u16) -> io::Result<(i32, i32)> {
-    let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     let mut master: libc::c_int = -1;
-    let mut slave:  libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
     let ret = unsafe {
-        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws)
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        )
     };
     if ret != 0 {
         return Err(io::Error::last_os_error());
@@ -178,7 +196,11 @@ fn open_pty(cols: u16, rows: u16) -> io::Result<(i32, i32)> {
 
 fn dup_fd(fd: i32) -> io::Result<i32> {
     let new = unsafe { libc::dup(fd) };
-    if new < 0 { Err(io::Error::last_os_error()) } else { Ok(new) }
+    if new < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(new)
+    }
 }
 
 // ============================================================================
@@ -202,7 +224,10 @@ fn dup_fd(fd: i32) -> io::Result<i32> {
 /// were allocated in the parent before the fork; no heap allocation occurs here.
 #[cfg(target_os = "linux")]
 fn apply_worktree_sandbox(worktree: &Path, home: Option<&Path>) {
-    use landlock::{ABI, Access, AccessFs, Compatible, CompatLevel, Ruleset, RulesetAttr, RulesetCreatedAttr, path_beneath_rules};
+    use landlock::{
+        path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, ABI,
+    };
 
     // ABI::V3 = Linux 5.19 (Truncate right).  The crate degrades gracefully on older ABIs.
     let abi = ABI::V3;
@@ -286,20 +311,17 @@ fn apply_worktree_sandbox(worktree: &Path, home: Option<&Path>) {
 
     // Open a path with the given unveil permissions.  Errors are silently ignored.
     let do_unveil = |path: &Path, perms: &[u8]| {
-        let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else { return };
+        let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+            return;
+        };
         unsafe { libc::unveil(c_path.as_ptr(), perms.as_ptr() as *const libc::c_char) };
     };
 
     // Standard system paths the shell needs to read/execute.
     // /proc is not mounted by default on OpenBSD so is omitted.
     let sys_paths: &[&str] = &[
-        "/usr",
-        "/lib",
-        "/libexec",     // OpenBSD: ld.so lives here
-        "/bin",
-        "/sbin",
-        "/etc",
-        "/dev",
+        "/usr", "/lib", "/libexec", // OpenBSD: ld.so lives here
+        "/bin", "/sbin", "/etc", "/dev",
     ];
     for &p in sys_paths {
         do_unveil(Path::new(p), b"rx\0");

@@ -12,6 +12,15 @@
 #     build-test.sh itself runs as `ci` and cannot apt-get/dnf install).
 set -euo pipefail
 
+# R4 (#1425): the arm64 builder image bakes chromium + chromium-driver
+# (Dockerfile builder-cpu-arm64). No-op there — this keeps every consumer
+# (the rust.yml build job, browser-wasm-test-ci.sh, the merge-gate
+# preflight) working unchanged against both the baked image and older
+# digests that still need the real install.
+if command -v chromium >/dev/null 2>&1; then
+  exit 0
+fi
+
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq
   apt-get install -y -qq chromium chromium-driver

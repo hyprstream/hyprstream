@@ -16,19 +16,19 @@
 //!        (terminal)    (WebTransport) (StructuredBackend)
 //! ```
 
-pub mod state;
+pub mod backend;
 pub mod diff;
 pub mod ninep;
 pub mod process;
-pub mod service;
-pub mod wt_viewer;
-pub mod backend;
-pub mod vte_parser;
-pub mod shell_client;
-pub mod vfs;
 pub mod rpc_transport;
+pub mod service;
+pub mod shell_client;
+pub mod state;
+pub mod vfs;
+pub mod vte_parser;
+pub mod wt_viewer;
 
 pub use state::{
-    CursorShape, CursorState, IngestionMode, LayoutNode, PaneBuffer, ScrollOp, TuiEvent,
-    TuiPane, TuiSession, TuiState, TuiWindow,
+    CursorShape, CursorState, IngestionMode, LayoutNode, PaneBuffer, ScrollOp, TuiEvent, TuiPane,
+    TuiSession, TuiState, TuiWindow,
 };

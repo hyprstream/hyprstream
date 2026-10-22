@@ -178,6 +178,19 @@ pub(crate) mod sealed {
 ///
 /// (Name retained from the iroh-only era to avoid churn in callers.)
 pub trait IrohRequestProcessor: sealed::Sealed + Send + Sync + 'static {
+    /// Close service admission before removing an in-process endpoint. The
+    /// owning bridge performs the bounded drain and join separately.
+    fn close_admission(&self) {
+        self.begin_shutdown(tokio::time::Instant::now() + DRAIN_TIMEOUT);
+    }
+
+    /// Close admission and establish one absolute request-drain deadline. A
+    /// bridge returns its first deadline so later carrier/owner calls cannot
+    /// restart the grace period. Joining remains the service owner's duty.
+    fn begin_shutdown(&self, deadline: tokio::time::Instant) -> tokio::time::Instant {
+        deadline
+    }
+
     fn process(
         &self,
         request: Bytes,
@@ -352,7 +365,10 @@ where
 /// no trailing bytes.
 fn decode_browser_zmtp_request(request: &[u8]) -> Result<Bytes> {
     let (command_frame, command_len) = crate::zmtp_framing::decode_frame(request)?;
-    anyhow::ensure!(command_frame.command, "browser request omitted STREAM_TYPE command");
+    anyhow::ensure!(
+        command_frame.command,
+        "browser request omitted STREAM_TYPE command"
+    );
     let command = crate::zmtp_framing::ZmtpCommand::parse(&command_frame.data)?;
     anyhow::ensure!(
         command.name == "STREAM_TYPE" && command.body == b"REQ",

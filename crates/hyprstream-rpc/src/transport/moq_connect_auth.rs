@@ -102,10 +102,7 @@ impl MoqConnectAuthz {
     /// Build with the verifying key for the JWT issuer this `/moq` endpoint
     /// trusts and the authoritative subject→tenant resolver. The endpoint
     /// accepts any `aud` unless [`Self::with_expected_aud`] is set.
-    pub fn new(
-        verify_key: VerifyingKey,
-        tenant_resolver: VerifiedSubjectTenantResolver,
-    ) -> Self {
+    pub fn new(verify_key: VerifyingKey, tenant_resolver: VerifiedSubjectTenantResolver) -> Self {
         Self {
             verify_key,
             expected_aud: None,
@@ -140,7 +137,8 @@ impl MoqConnectAuthz {
     /// Every branch is fail-closed; none falls back to an unscoped identity.
     pub fn verify(&self, headers: &http::HeaderMap) -> Option<VerifiedConnect> {
         let token = bearer_token(headers)?;
-        let claims = jwt::decode_with_key(&token, &self.verify_key, self.expected_aud.as_deref()).ok()?;
+        let claims =
+            jwt::decode_with_key(&token, &self.verify_key, self.expected_aud.as_deref()).ok()?;
         // [`jwt::decode_with_key`] is lenient on a *missing* `aud` (accepts
         // absent, rejects mismatch) to tolerate legacy federated issuers across
         // the codebase. This dedicated `/moq` boundary is stricter: when an
@@ -273,7 +271,10 @@ mod tests {
         let tok = mint(&rogue_key, "s", 60); // signed by rogue
         let mut h = http::HeaderMap::new();
         h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
-        assert!(authz.verify(&h).is_none(), "forged signature must fail closed");
+        assert!(
+            authz.verify(&h).is_none(),
+            "forged signature must fail closed"
+        );
     }
 
     #[test]
@@ -369,6 +370,9 @@ mod tests {
         let tok = mint(&key, "s", 60); // no aud
         let mut h = http::HeaderMap::new();
         h.insert("authorization", format!("Bearer {tok}").parse().unwrap());
-        assert!(authz.verify(&h).is_some(), "no-aud token admitted when no audience configured");
+        assert!(
+            authz.verify(&h).is_some(),
+            "no-aud token admitted when no audience configured"
+        );
     }
 }

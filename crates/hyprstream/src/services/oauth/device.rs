@@ -132,7 +132,11 @@ pub async fn device_authorize(
         match super::state::validate_requested_scopes(
             &requested,
             &state.server_supported_scopes(),
-            if client_declared.is_empty() { None } else { Some(&client_declared) },
+            if client_declared.is_empty() {
+                None
+            } else {
+                Some(&client_declared)
+            },
             require_atproto,
         ) {
             Ok(g) => g,
@@ -225,7 +229,10 @@ pub async fn verify_get(
     let device_code = match device_code {
         Some(dc) => dc,
         None => {
-            let html = render_entry_page(&state.issuer_url, Some("Invalid or expired code. Please check your device and try again."));
+            let html = render_entry_page(
+                &state.issuer_url,
+                Some("Invalid or expired code. Please check your device and try again."),
+            );
             return Html(html).into_response();
         }
     };
@@ -234,12 +241,18 @@ pub async fn verify_get(
         let device_codes = state.pending_device_codes.read().await;
         match device_codes.get(&device_code) {
             Some(pending) if pending.is_expired() => {
-                let html = render_entry_page(&state.issuer_url, Some("This code has expired. Please request a new one from your device."));
+                let html = render_entry_page(
+                    &state.issuer_url,
+                    Some("This code has expired. Please request a new one from your device."),
+                );
                 return Html(html).into_response();
             }
             Some(pending) => pending.nonce.clone(),
             None => {
-                let html = render_entry_page(&state.issuer_url, Some("Invalid or expired code. Please try again."));
+                let html = render_entry_page(
+                    &state.issuer_url,
+                    Some("Invalid or expired code. Please try again."),
+                );
                 return Html(html).into_response();
             }
         }
@@ -273,7 +286,12 @@ pub async fn verify_post(
     let device_code = match device_code {
         Some(dc) => dc,
         None => {
-            return verify_err(json_client, &form.user_code, "", "Invalid or expired code. Please try again.");
+            return verify_err(
+                json_client,
+                &form.user_code,
+                "",
+                "Invalid or expired code. Please try again.",
+            );
         }
     };
 
@@ -282,14 +300,29 @@ pub async fn verify_post(
         let device_codes = state.pending_device_codes.read().await;
         match device_codes.get(&device_code) {
             Some(pending) if pending.is_expired() => {
-                return verify_err(json_client, &form.user_code, "", "This code has expired. Please request a new one.");
+                return verify_err(
+                    json_client,
+                    &form.user_code,
+                    "",
+                    "This code has expired. Please request a new one.",
+                );
             }
             Some(pending) if pending.status != DeviceCodeStatus::Pending => {
-                return verify_err(json_client, &form.user_code, "", "This code has already been used.");
+                return verify_err(
+                    json_client,
+                    &form.user_code,
+                    "",
+                    "This code has already been used.",
+                );
             }
             Some(pending) => pending.nonce.clone(),
             None => {
-                return verify_err(json_client, &form.user_code, "", "Invalid or expired code. Please try again.");
+                return verify_err(
+                    json_client,
+                    &form.user_code,
+                    "",
+                    "Invalid or expired code. Please try again.",
+                );
             }
         }
     };
@@ -302,7 +335,12 @@ pub async fn verify_post(
     let user_store = match state.user_store_reader() {
         Some(store) => store,
         None => {
-            return verify_err(json_client, &form.user_code, &nonce, "User credential store not configured on this server.");
+            return verify_err(
+                json_client,
+                &form.user_code,
+                &nonce,
+                "User credential store not configured on this server.",
+            );
         }
     };
 
@@ -312,7 +350,9 @@ pub async fn verify_post(
         &form.username,
         &challenge_str,
         &form.signature,
-    ).await {
+    )
+    .await
+    {
         Ok(vk) => vk,
         Err(e) => {
             if matches!(e, challenge::ChallengeError::UserStoreError(_)) {
@@ -350,7 +390,11 @@ pub async fn verify_post(
     match result {
         Ok(()) => {
             if json_client {
-                (StatusCode::OK, Json(serde_json::json!({"status": "approved", "username": form.username}))).into_response()
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"status": "approved", "username": form.username})),
+                )
+                    .into_response()
             } else {
                 Html(render_result_page(true, &form.username)).into_response()
             }
@@ -374,7 +418,8 @@ fn verify_err(json_client: bool, user_code: &str, nonce: &str, msg: &str) -> Res
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "verification_failed", "error_description": msg})),
-        ).into_response()
+        )
+            .into_response()
     } else {
         Html(render_verify_page(user_code, nonce, Some(msg))).into_response()
     }
@@ -540,7 +585,11 @@ pub(crate) fn render_verify_page(user_code: &str, nonce: &str, error: Option<&st
         None => String::new(),
     };
     // The challenge template (username is substituted by the user's client)
-    let challenge_display = format!("{{username}}:{}:{}", user_code.replace('-', "").to_uppercase(), nonce);
+    let challenge_display = format!(
+        "{{username}}:{}:{}",
+        user_code.replace('-', "").to_uppercase(),
+        nonce
+    );
 
     format!(
         r#"<!DOCTYPE html>
@@ -655,21 +704,30 @@ fn render_result_page(approved: bool, username: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{SigningKey, Signer};
+    use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
     fn test_render_verify_page_contains_nonce() {
         let nonce = "abc123XYZ_nonce_value_here_for_test";
         let html = render_verify_page("ABCD-EFGH", nonce, None);
         assert!(html.contains(nonce), "rendered page must contain the nonce");
-        assert!(html.contains("ABCDEFGH"), "rendered page must contain normalized user_code in challenge");
-        assert!(html.contains("Authorize Device"), "page must have the heading");
+        assert!(
+            html.contains("ABCDEFGH"),
+            "rendered page must contain normalized user_code in challenge"
+        );
+        assert!(
+            html.contains("Authorize Device"),
+            "page must have the heading"
+        );
     }
 
     #[test]
     fn test_render_verify_page_shows_error() {
         let html = render_verify_page("ABCD-EFGH", "somenonce", Some("Invalid signature"));
-        assert!(html.contains("Invalid signature"), "error message must appear in page");
+        assert!(
+            html.contains("Invalid signature"),
+            "error message must appear in page"
+        );
     }
 
     #[test]
@@ -698,22 +756,28 @@ mod tests {
 
         // Verify with the verifying key
         assert!(
-            verifying_key.verify_strict(challenge.as_bytes(), &signature).is_ok(),
+            verifying_key
+                .verify_strict(challenge.as_bytes(), &signature)
+                .is_ok(),
             "signature must verify successfully"
         );
 
         // Tampered challenge should fail
         let tampered = format!("mallory:{}:{}", user_code, nonce);
         assert!(
-            verifying_key.verify_strict(tampered.as_bytes(), &signature).is_err(),
+            verifying_key
+                .verify_strict(tampered.as_bytes(), &signature)
+                .is_err(),
             "signature must NOT verify for tampered challenge"
         );
     }
 
     #[test]
     fn test_html_escape() {
-        assert_eq!(html_escape("<script>alert('xss')</script>"),
-                   "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;");
+        assert_eq!(
+            html_escape("<script>alert('xss')</script>"),
+            "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;"
+        );
         assert_eq!(html_escape("a & b"), "a &amp; b");
         assert_eq!(html_escape(r#"say "hi""#), "say &quot;hi&quot;");
     }

@@ -154,7 +154,8 @@ impl RafsStoreMount {
         } else {
             on_disk.to_path_buf()
         };
-        std::fs::read(&path).map_err(|e| MountError::Io(format!("failed to read {}: {e}", path.display())))
+        std::fs::read(&path)
+            .map_err(|e| MountError::Io(format!("failed to read {}: {e}", path.display())))
     }
 
     /// List the entries of a top-level directory as `DirEntry`s.
@@ -201,13 +202,13 @@ impl Mount for RafsStoreMount {
         let kind = match components {
             [] => NodeKind::Root,
             [top] => {
-                let dir = TopDir::parse(top)
-                    .ok_or_else(|| MountError::NotFound(components.join("/")))?;
+                let dir =
+                    TopDir::parse(top).ok_or_else(|| MountError::NotFound(components.join("/")))?;
                 NodeKind::TopDir(dir)
             }
             [top, name] => {
-                let dir = TopDir::parse(top)
-                    .ok_or_else(|| MountError::NotFound(components.join("/")))?;
+                let dir =
+                    TopDir::parse(top).ok_or_else(|| MountError::NotFound(components.join("/")))?;
                 let on_disk = self
                     .resolve_leaf(dir, name)
                     .ok_or_else(|| MountError::NotFound(components.join("/")))?;
@@ -334,7 +335,12 @@ mod tests {
             cache_dir: root.join("cache"),
             ..Default::default()
         };
-        for dir in [&config.blobs_dir, &config.bootstrap_dir, &config.refs_dir, &config.cache_dir] {
+        for dir in [
+            &config.blobs_dir,
+            &config.bootstrap_dir,
+            &config.refs_dir,
+            &config.cache_dir,
+        ] {
             std::fs::create_dir_all(dir).unwrap();
         }
 
@@ -401,13 +407,19 @@ mod tests {
         let mount = RafsStoreMount::new(store);
 
         // On-disk sanitized name.
-        let mut fid1 = mount.walk(&["blobs", "sha256_deadbeef"], &subject()).await.unwrap();
+        let mut fid1 = mount
+            .walk(&["blobs", "sha256_deadbeef"], &subject())
+            .await
+            .unwrap();
         mount.open(&mut fid1, 0, &subject()).await.unwrap();
         let data1 = mount.read(&fid1, 0, 4096, &subject()).await.unwrap();
         assert_eq!(data1, b"blob-bytes");
 
         // Raw OCI digest form.
-        let mut fid2 = mount.walk(&["blobs", "sha256:deadbeef"], &subject()).await.unwrap();
+        let mut fid2 = mount
+            .walk(&["blobs", "sha256:deadbeef"], &subject())
+            .await
+            .unwrap();
         mount.open(&mut fid2, 0, &subject()).await.unwrap();
         let data2 = mount.read(&fid2, 0, 4096, &subject()).await.unwrap();
         assert_eq!(data2, b"blob-bytes");
@@ -429,7 +441,10 @@ mod tests {
         let (_tmp, store, _ref_name) = make_store_with_fake_image();
         let mount = RafsStoreMount::new(store);
 
-        let mut fid = mount.walk(&["blobs", "sha256_deadbeef"], &subject()).await.unwrap();
+        let mut fid = mount
+            .walk(&["blobs", "sha256_deadbeef"], &subject())
+            .await
+            .unwrap();
         mount.open(&mut fid, 0, &subject()).await.unwrap();
         let data = mount.read(&fid, 5, 3, &subject()).await.unwrap();
         assert_eq!(data, b"byt"); // "blob-bytes"[5..8]
@@ -455,7 +470,10 @@ mod tests {
     async fn write_is_rejected() {
         let (_tmp, store, _ref_name) = make_store_with_fake_image();
         let mount = RafsStoreMount::new(store);
-        let mut fid = mount.walk(&["blobs", "sha256_deadbeef"], &subject()).await.unwrap();
+        let mut fid = mount
+            .walk(&["blobs", "sha256_deadbeef"], &subject())
+            .await
+            .unwrap();
         mount.open(&mut fid, 0, &subject()).await.unwrap();
         let result = mount.write(&fid, 0, b"x", &subject()).await;
         assert!(matches!(result, Err(MountError::NotSupported(_))));
@@ -465,8 +483,13 @@ mod tests {
     async fn open_for_write_rejected() {
         let (_tmp, store, _ref_name) = make_store_with_fake_image();
         let mount = RafsStoreMount::new(store);
-        let mut fid = mount.walk(&["blobs", "sha256_deadbeef"], &subject()).await.unwrap();
-        let result = mount.open(&mut fid, hyprstream_vfs::OWRITE, &subject()).await;
+        let mut fid = mount
+            .walk(&["blobs", "sha256_deadbeef"], &subject())
+            .await
+            .unwrap();
+        let result = mount
+            .open(&mut fid, hyprstream_vfs::OWRITE, &subject())
+            .await;
         assert!(matches!(result, Err(MountError::PermissionDenied(_))));
     }
 
@@ -483,7 +506,10 @@ mod tests {
     async fn stat_blob_reports_size() {
         let (_tmp, store, _ref_name) = make_store_with_fake_image();
         let mount = RafsStoreMount::new(store);
-        let fid = mount.walk(&["blobs", "sha256_deadbeef"], &subject()).await.unwrap();
+        let fid = mount
+            .walk(&["blobs", "sha256_deadbeef"], &subject())
+            .await
+            .unwrap();
         let st = mount.stat(&fid, &subject()).await.unwrap();
         assert_eq!(st.size, b"blob-bytes".len() as u64);
         assert_eq!(st.qtype, 0);

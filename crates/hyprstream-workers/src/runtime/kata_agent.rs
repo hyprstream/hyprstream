@@ -402,7 +402,10 @@ impl KataAgentClient {
         rootfs: Option<&ContainerRootfs>,
     ) -> Result<()> {
         let create_exec_id = format!("{container_id}-init");
-        match self.create_container(container_id, &create_exec_id, argv, rootfs).await {
+        match self
+            .create_container(container_id, &create_exec_id, argv, rootfs)
+            .await
+        {
             Ok(()) => {}
             Err(e) if is_already_exists(&e) => {
                 tracing::debug!(container_id, "container already exists, skipping create");
@@ -422,7 +425,12 @@ impl KataAgentClient {
 
     /// `ExecProcess` — run `argv` inside `container_id` under a fresh
     /// `exec_id`. Does not block for completion; pair with [`Self::wait_process`].
-    pub async fn exec_process(&self, container_id: &str, exec_id: &str, argv: &[String]) -> Result<()> {
+    pub async fn exec_process(
+        &self,
+        container_id: &str,
+        exec_id: &str,
+        argv: &[String],
+    ) -> Result<()> {
         let process = oci::Process {
             Args: argv.to_vec(),
             Cwd: "/".to_owned(),
@@ -574,8 +582,14 @@ impl KataAgentClient {
             self.ensure_container(container_id, argv, rootfs).await?;
             self.exec_process(container_id, &exec_id, argv).await?;
             let status = self.wait_process(container_id, &exec_id).await?;
-            let stdout = self.read_stdout_all(container_id, &exec_id).await.unwrap_or_default();
-            let stderr = self.read_stderr_all(container_id, &exec_id).await.unwrap_or_default();
+            let stdout = self
+                .read_stdout_all(container_id, &exec_id)
+                .await
+                .unwrap_or_default();
+            let stderr = self
+                .read_stderr_all(container_id, &exec_id)
+                .await
+                .unwrap_or_default();
             Ok::<_, anyhow::Error>((status, stdout, stderr))
         })
         .await
@@ -919,13 +933,23 @@ mod tests {
     /// the `Arc<FakeAgent>` for post-call assertions.
     async fn spin_up_fake_agent(
         wait_status: i32,
-    ) -> (KataAgentClient, Arc<FakeAgent>, tokio::task::JoinHandle<()>, TempDir) {
+    ) -> (
+        KataAgentClient,
+        Arc<FakeAgent>,
+        tokio::task::JoinHandle<()>,
+        TempDir,
+    ) {
         spin_up_fake_agent_with(FakeAgent::new(wait_status)).await
     }
 
     async fn spin_up_fake_agent_with(
         fake: FakeAgent,
-    ) -> (KataAgentClient, Arc<FakeAgent>, tokio::task::JoinHandle<()>, TempDir) {
+    ) -> (
+        KataAgentClient,
+        Arc<FakeAgent>,
+        tokio::task::JoinHandle<()>,
+        TempDir,
+    ) {
         let dir = TempDir::new().unwrap();
         let sock_path = dir.path().join("agent.sock");
         let sockaddr = format!("unix://{}", sock_path.display());
@@ -968,7 +992,10 @@ mod tests {
         assert_eq!(seen.container_id, "ctr-1");
         assert_eq!(seen.exec_id, "exec-1");
         assert!(seen.OCI.is_some());
-        assert_eq!(seen.OCI.Process.Args, vec!["echo".to_owned(), "hi".to_owned()]);
+        assert_eq!(
+            seen.OCI.Process.Args,
+            vec!["echo".to_owned(), "hi".to_owned()]
+        );
         // No rootfs supplied → no virtio-fs Storage entry.
         assert!(seen.storages.is_empty(), "no rootfs → no storages");
         assert_eq!(
@@ -997,7 +1024,10 @@ mod tests {
         assert_eq!(seen.storages.len(), 1, "exactly one rootfs Storage entry");
         let st = &seen.storages[0];
         assert_eq!(st.driver, "virtio-fs");
-        assert_eq!(st.source, "hyprstream-vfs", "source is the virtio-fs mount tag");
+        assert_eq!(
+            st.source, "hyprstream-vfs",
+            "source is the virtio-fs mount tag"
+        );
         assert_eq!(st.fstype, "virtiofs");
         assert_eq!(st.mount_point, "/run/kata-containers/ctr-1/rootfs");
         assert_eq!(
@@ -1041,11 +1071,19 @@ mod tests {
         let (client, _fake, _server, _dir) = spin_up_fake_agent(42).await;
 
         let (status, stdout, stderr) = client
-            .exec("ctr-1", &["echo".into(), "hi".into()], Duration::from_secs(5), None)
+            .exec(
+                "ctr-1",
+                &["echo".into(), "hi".into()],
+                Duration::from_secs(5),
+                None,
+            )
             .await
             .unwrap();
 
-        assert_eq!(status, 42, "exit code must be the real WaitProcessResponse.status");
+        assert_eq!(
+            status, 42,
+            "exit code must be the real WaitProcessResponse.status"
+        );
         assert_eq!(stdout, b"hello from stdout");
         assert_eq!(stderr, b"");
     }
@@ -1062,7 +1100,10 @@ mod tests {
         let result = client
             .exec("ctr-1", &["echo".into()], Duration::from_millis(50), None)
             .await;
-        assert!(result.is_err(), "exec must time out when wait_process stalls");
+        assert!(
+            result.is_err(),
+            "exec must time out when wait_process stalls"
+        );
         assert!(result.unwrap_err().to_string().contains("timed out"));
     }
 

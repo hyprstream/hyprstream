@@ -47,14 +47,14 @@
 //! The implementation follows standard caching patterns while ensuring
 //! data consistency between cache and backing store.
 
-use crate::storage::view::ViewDefinition;
-use crate::storage::{Credentials, StorageBackend};
 #[cfg(feature = "adbc")]
 use crate::storage::adbc::AdbcBackend;
-use std::sync::Arc;
-use std::collections::HashMap;
+use crate::storage::view::ViewDefinition;
+use crate::storage::{Credentials, StorageBackend};
 use duckdb::arrow::array::RecordBatch;
 use duckdb::arrow::datatypes::Schema;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tonic::Status;
 
 /// Two-tier storage backend with caching support.
@@ -87,14 +87,8 @@ impl CachedStorageBackend {
     ///
     /// * `cache` - Fast storage backend for caching
     /// * `store` - Persistent storage backend
-    pub fn new(
-        cache: Arc<dyn StorageBackend>,
-        store: Arc<dyn StorageBackend>,
-    ) -> Self {
-        Self {
-            cache,
-            store,
-        }
+    pub fn new(cache: Arc<dyn StorageBackend>, store: Arc<dyn StorageBackend>) -> Self {
+        Self { cache, store }
     }
 }
 
@@ -144,7 +138,9 @@ impl StorageBackend for CachedStorageBackend {
         _options: &HashMap<String, String>,
         _credentials: Option<&Credentials>,
     ) -> Result<Self, Status> {
-        Err(Status::invalid_argument("Use CachedStorageBackend::new() instead"))
+        Err(Status::invalid_argument(
+            "Use CachedStorageBackend::new() instead",
+        ))
     }
 
     async fn create_table(&self, table_name: &str, schema: &Schema) -> Result<(), Status> {
@@ -154,9 +150,18 @@ impl StorageBackend for CachedStorageBackend {
         Ok(())
     }
 
+    async fn execute_ddl(&self, sql: &str) -> Result<(), Status> {
+        // DDL applies to both tiers, like create_table
+        self.cache.execute_ddl(sql).await?;
+        self.store.execute_ddl(sql).await?;
+        Ok(())
+    }
+
     async fn insert_into_table(&self, table_name: &str, batch: RecordBatch) -> Result<(), Status> {
         // Insert into both cache and store
-        self.cache.insert_into_table(table_name, batch.clone()).await?;
+        self.cache
+            .insert_into_table(table_name, batch.clone())
+            .await?;
         self.store.insert_into_table(table_name, batch).await?;
         Ok(())
     }
@@ -175,7 +180,9 @@ impl StorageBackend for CachedStorageBackend {
             Err(_) => {
                 // On cache miss, get from store and update cache
                 let view = self.store.get_view(name).await?;
-                self.cache.create_view(name, view.definition.clone()).await?;
+                self.cache
+                    .create_view(name, view.definition.clone())
+                    .await?;
                 Ok(view)
             }
         }

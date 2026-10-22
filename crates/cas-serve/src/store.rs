@@ -98,8 +98,7 @@ impl CasStore {
     /// return the original bytes. This is the in-process equivalent of the
     /// binary's `GetFile` handler.
     pub async fn get_file_bytes(&self, hash: &str) -> Result<Vec<u8>, StoreError> {
-        let _file_hash =
-            Request::parse_hash(hash).map_err(StoreError::InvalidHash)?;
+        let _file_hash = Request::parse_hash(hash).map_err(StoreError::InvalidHash)?;
 
         // 1. Reconstruction shard (chunked / multi-xorb path).
         let shard_path = self.shard_path(hash);
@@ -189,9 +188,9 @@ impl CasStore {
         let path = self.xorb_path(xorb_hash_hex);
         match tokio::fs::read(&path).await {
             Ok(data) => Ok(data),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(StoreError::NotFound(format!("Xorb not found: {xorb_hash_hex}")))
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StoreError::NotFound(
+                format!("Xorb not found: {xorb_hash_hex}"),
+            )),
             Err(e) => Err(StoreError::Io(format!("Failed to read xorb: {e}"))),
         }
     }
@@ -206,13 +205,14 @@ impl CasStore {
         let mdb_bytes = match tokio::fs::read(shard_path).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(StoreError::NotFound(format!("Shard not found: {file_hash}")))
+                return Err(StoreError::NotFound(format!(
+                    "Shard not found: {file_hash}"
+                )))
             }
             Err(e) => return Err(StoreError::Io(format!("Failed to read shard: {e}"))),
         };
 
-        let file_hash_parsed =
-            Request::parse_hash(file_hash).map_err(StoreError::InvalidHash)?;
+        let file_hash_parsed = Request::parse_hash(file_hash).map_err(StoreError::InvalidHash)?;
 
         let segments = Shard::segments(&mdb_bytes, &file_hash_parsed)
             .map_err(|e| StoreError::CorruptShard(e.to_string()))?;
@@ -259,7 +259,9 @@ mod tests {
 
     // A payload large enough to exercise CDC into multiple chunks/xorbs.
     fn payload(seed: u8, len: usize) -> Vec<u8> {
-        (0..len).map(|i| seed.wrapping_add((i as u8).wrapping_mul(31))).collect()
+        (0..len)
+            .map(|i| seed.wrapping_add((i as u8).wrapping_mul(31)))
+            .collect()
     }
 
     #[tokio::test]

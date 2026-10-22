@@ -2,11 +2,11 @@
 // CLI handlers intentionally print to stdout/stderr for user interaction
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use crate::services::RegistryClient;
-use crate::services::generated::registry_client::{
-    AddRemoteRequest, RemoveRemoteRequest, SetRemoteUrlRequest, RenameRemoteRequest,
-};
 use anyhow::Result;
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::registry_client::{
+    AddRemoteRequest, RemoveRemoteRequest, RenameRemoteRequest, SetRemoteUrlRequest,
+};
 use tracing::info;
 
 /// Handle remote add command - add a new remote to a model
@@ -18,12 +18,17 @@ pub async fn handle_remote_add(
 ) -> Result<()> {
     info!("Adding remote '{}' to model {}", name, model);
 
-    let tracked = registry.get_by_name(model).await
+    let tracked = registry
+        .get_by_name(model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
     repo_client
-        .add_remote(&AddRemoteRequest { name: name.to_owned(), url: url.to_owned() })
+        .add_remote(&AddRemoteRequest {
+            name: name.to_owned(),
+            url: url.to_owned(),
+        })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to add remote '{}': {}", name, e))?;
 
@@ -39,7 +44,9 @@ pub async fn handle_remote_list(
 ) -> Result<()> {
     info!("Listing remotes for model {}", model);
 
-    let tracked = registry.get_by_name(model).await
+    let tracked = registry
+        .get_by_name(model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
@@ -78,12 +85,16 @@ pub async fn handle_remote_remove(
 ) -> Result<()> {
     info!("Removing remote '{}' from model {}", name, model);
 
-    let tracked = registry.get_by_name(model).await
+    let tracked = registry
+        .get_by_name(model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
     repo_client
-        .remove_remote(&RemoveRemoteRequest { name: name.to_owned() })
+        .remove_remote(&RemoveRemoteRequest {
+            name: name.to_owned(),
+        })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to remove remote '{}': {}", name, e))?;
 
@@ -100,12 +111,17 @@ pub async fn handle_remote_set_url(
 ) -> Result<()> {
     info!("Setting URL for remote '{}' in model {}", name, model);
 
-    let tracked = registry.get_by_name(model).await
+    let tracked = registry
+        .get_by_name(model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
     repo_client
-        .set_remote_url(&SetRemoteUrlRequest { name: name.to_owned(), url: url.to_owned() })
+        .set_remote_url(&SetRemoteUrlRequest {
+            name: name.to_owned(),
+            url: url.to_owned(),
+        })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to set URL for remote '{}': {}", name, e))?;
 
@@ -125,12 +141,17 @@ pub async fn handle_remote_rename(
         old_name, new_name, model
     );
 
-    let tracked = registry.get_by_name(model).await
+    let tracked = registry
+        .get_by_name(model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
     repo_client
-        .rename_remote(&RenameRemoteRequest { old_name: old_name.to_owned(), new_name: new_name.to_owned() })
+        .rename_remote(&RenameRemoteRequest {
+            old_name: old_name.to_owned(),
+            new_name: new_name.to_owned(),
+        })
         .await
         .map_err(|e| {
             anyhow::anyhow!(

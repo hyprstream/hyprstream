@@ -1,0 +1,1789 @@
+//! **Typed RPC dispatch labels** — the focused #1499 boot-labeling slice.
+//!
+//! The mandatory RPC dispatch PEP (`hyprstream_rpc::auth::mac::dispatch_pep`)
+//! evaluates a **typed declared `(service, leaf/method)` object identity** plus
+//! a **deliberate service subject clearance**. This module supplies both, keyed
+//! on the dispatch plane's own coordinates:
+//!
+//! - [`DispatchMethodId`] — the typed object identity: the canonical service
+//!   name plus the canonical request-union discriminant (the leaf/method),
+//!   decoded once from the verified payload by the dispatch pipeline. It is
+//!   **never** a VFS path, and bare service domains are never routed through
+//!   the VFS object-label adapter (`CompositeObjectLabelResolver`'s
+//!   `RpcObjectLabelResolver` impl now serves the VFS plane only).
+//! - [`ServiceSubjectClearance`] — the deliberate clearance a declared
+//!   bootstrap service holds as a *caller*, the dispatch-plane seed of the
+//!   v16 `ServiceEnrollmentManifest` clearance. The assurance axis is clamped
+//!   by the cryptographically verified key material at evaluation time, so the
+//!   declaration can never outrun what the envelope signature proved.
+//!
+//! ## Deny-by-default
+//!
+//! There is no wildcard, catch-all, prefix rule, or permissive default. An
+//! unknown service, an unknown leaf on a known service, a bare/VFS-shaped
+//! alias (`"/srv/policy"`, `"srv/policy"`), and a call whose payload carries
+//! no canonical method identity all resolve to `None` ⇒ `UnlabeledObject` ⇒
+//! deny before handler entry. A caller with no declared service clearance —
+//! including an anonymous caller, for whom the activation floor would
+//! otherwise suffice against a floor-labeled row — denies `NoClearance`. The
+//! permit of a declared bootstrap call is therefore justified by the
+//! *declared pair* (typed object + deliberate clearance), never by a
+//! fabricated anonymous/public clearance.
+//!
+//! ## Relationship to #1507 (v16)
+//!
+//! This is the smallest deny-by-default representation the production PEP can
+//! evaluate today. #1507 replaces the hand-maintained tables with the
+//! generated full-method inventory (transitional/target label columns, scope
+//! and signature policy) without changing the PEP contract: typed `(service,
+//! leaf)` resolution, declared subject clearance, activation-gated selection,
+//! and intrinsic lattice dominance all stay. Object labels here are
+//! deliberately the lattice floor (`SecurityLabel::bottom()`): the bootstrap
+//! identity-lifecycle leaves precede identity standing and must remain
+//! reachable under the permanent narrow-to-floor incident control
+//! (`FloorOnly`); every raising above the floor is #1507's reviewed
+//! transitional/target column work, not this slice.
+
+use hyprstream_rpc::auth::mac::{
+    Assurance, CompartmentSet, Level, MacDecision, MacDenyReason, MacDispatchPep,
+    RpcObjectLabelResolver, SecurityContext, SecurityLabel,
+};
+use hyprstream_rpc::service::EnvelopeContext;
+
+/// Subject-name prefix of a verified service identity (`service:{name}`).
+///
+/// Service JWTs minted by the CA carry `sub = "service:{name}"`
+/// (`crates/hyprstream-rpc-std/schema/policy.capnp`), so the verified subject
+/// produced by claims verification has this exact shape.
+pub const SERVICE_SUBJECT_PREFIX: &str = "service:";
+
+/// Canonical `PolicyRequest` union discriminants (the leaf/method axis of
+/// [`DispatchMethodId`]).
+///
+/// The values are the Cap'n Proto union discriminant ordinals — 0-based
+/// declaration order in `hyprstream-rpc-std/schema/policy.capnp`, which
+/// assigns no explicit discriminants. The drift test in this module decodes
+/// real serialized requests and pins these values to the schema; changing the
+/// union order fails CI rather than silently relabeling the dispatch plane.
+pub mod policy_methods {
+    /// `check` — an authenticated service asks the PolicyService to evaluate
+    /// its own authorization request. The handler derives caller identity and
+    /// domain from the verified envelope; this declaration adds no anonymous
+    /// or tokenless exception.
+    pub const CHECK: u16 = 0;
+    /// `issueToken` — PolicyService mints a session-bound credential. Its
+    /// schema declares `internal:pq-hybrid`; only the verified hybrid OAuth
+    /// authority receives the corresponding scoped dispatch clearance.
+    pub const ISSUE_TOKEN: u16 = 1;
+    /// `getPolicy` — read the local control-plane policy.
+    pub const GET_POLICY: u16 = 3;
+    /// `applyTemplate` — install a reviewed bootstrap template.
+    pub const APPLY_TEMPLATE: u16 = 4;
+    /// `applyDraft` — commit a local policy draft.
+    pub const APPLY_DRAFT: u16 = 5;
+    /// `rollback` — restore a local policy revision.
+    pub const ROLLBACK: u16 = 6;
+    /// `getHistory` — inspect local policy revisions.
+    pub const GET_HISTORY: u16 = 7;
+    /// `getDiff` — inspect a local policy draft.
+    pub const GET_DIFF: u16 = 8;
+    /// `getDraftStatus` — inspect local draft state.
+    pub const GET_DRAFT_STATUS: u16 = 9;
+    /// `addGrouping` — add a local role assignment.
+    pub const ADD_GROUPING: u16 = 10;
+    /// `removeGrouping` — remove a local role assignment.
+    pub const REMOVE_GROUPING: u16 = 11;
+    /// `registerServiceKey` — a keyed service installs its identity with the
+    /// CA. Bootstrap-critical: it precedes identity standing.
+    pub const REGISTER_SERVICE_KEY: u16 = 18;
+    /// `refreshServiceToken` — a registered service renews the identity the
+    /// registration created. Same bootstrap identity-lifecycle class; without
+    /// a declared row the first hourly renewal would deny on any live node.
+    pub const REFRESH_SERVICE_TOKEN: u16 = 19;
+}
+
+/// Canonical `DiscoveryRequest` union discriminants used by native startup.
+pub mod discovery_methods {
+    /// `announce @9` is union discriminant 8, not wire field ordinal 9.
+    pub const ANNOUNCE: u16 = 8;
+}
+
+/// Canonical `InferenceRequest` union discriminants.
+///
+/// The values are the Cap'n Proto union discriminants: 0-based DECLARATION
+/// order of the members in `hyprstream-rpc-std/schema/inference.capnp` — NOT
+/// the members' explicit `@N` field ordinals (generateStream is `@1` on the
+/// wire-field axis but carries union discriminant 0). Every member declares
+/// `$dispatchMac("internal:pq-hybrid")`, so every row these constants index
+/// carries the schema-declared hybrid label. The drift test in this module
+/// decodes real serialized requests and pins representative values to the
+/// schema; changing the union order fails CI rather than silently relabeling
+/// the dispatch plane.
+pub mod inference_methods {
+    /// `generateStream` — tenant-authorized streaming generation.
+    pub const GENERATE_STREAM: u16 = 0;
+    pub const MODEL_INFO: u16 = 1;
+    pub const IS_READY: u16 = 2;
+    pub const APPLY_CHAT_TEMPLATE: u16 = 3;
+    pub const CREATE_LORA: u16 = 4;
+    pub const LOAD_LORA: u16 = 5;
+    pub const SAVE_LORA: u16 = 6;
+    pub const UNLOAD_LORA: u16 = 7;
+    pub const HAS_LORA: u16 = 8;
+    pub const SET_SESSION: u16 = 9;
+    pub const CLEAR_SESSION: u16 = 10;
+    pub const RELEASE_SESSION: u16 = 11;
+    pub const HEALTH_CHECK: u16 = 12;
+    /// `shutdown` — engine lifecycle management (`$scope(manage)`).
+    pub const SHUTDOWN: u16 = 13;
+    pub const TTT_WRITEBACK: u16 = 14;
+    pub const TTT_EVICT: u16 = 15;
+    pub const TRAIN_STEP: u16 = 16;
+    pub const TTT_ZERO: u16 = 17;
+    pub const GET_DELTA_STATUS: u16 = 18;
+    pub const SAVE_ADAPTATION: u16 = 19;
+    pub const SNAPSHOT_DELTA: u16 = 20;
+    pub const TRAIN_STEP_STREAM: u16 = 21;
+    pub const EXPORT_PEFT_ADAPTER: u16 = 22;
+    pub const MERGE_LORA: u16 = 23;
+    pub const CREATE_LORA_STREAM: u16 = 24;
+    pub const LOAD_LORA_STREAM: u16 = 25;
+    pub const SAVE_LORA_STREAM: u16 = 26;
+    pub const SAVE_ADAPTATION_STREAM: u16 = 27;
+    pub const SNAPSHOT_DELTA_STREAM: u16 = 28;
+    pub const EXPORT_PEFT_ADAPTER_STREAM: u16 = 29;
+    pub const MERGE_LORA_STREAM: u16 = 30;
+    pub const EMBED: u16 = 31;
+    pub const GET_LAYER_PROFILE: u16 = 32;
+}
+
+/// Clearance for the narrow local Policy bootstrap authority and classical
+/// test fixtures. Enrolled native services use the hybrid ceiling below.
+/// The assurance axis is a *ceiling*, not a grant — evaluation clamps it
+/// to the cryptographically verified key material (#548), so a caller whose
+/// envelope proved less derives less.
+pub const BOOTSTRAP_SERVICE_CLEARANCE: SecurityLabel = SecurityLabel {
+    level: Level::Internal,
+    assurance: Assurance::Classical,
+    compartments: CompartmentSet::EMPTY,
+};
+
+/// Schema-declared label of `PolicyRequest.issueToken`.
+///
+/// The issuing authority crosses a signing boundary and is explicitly marked
+/// `$dispatchMac("internal:pq-hybrid")` in `policy.capnp`; it is therefore not
+/// a floor-labelled bootstrap operation. The only staging caller cleared for
+/// this row is `service:oauth`, whose verified hybrid envelope is additionally
+/// checked by the regular PolicyService authorization and issuance guards.
+pub const OAUTH_ISSUANCE_LABEL: SecurityLabel = SecurityLabel {
+    level: Level::Internal,
+    assurance: Assurance::PqHybrid,
+    compartments: CompartmentSet::EMPTY,
+};
+
+/// Schema-declared label of every `InferenceRequest` member.
+///
+/// All `inference.capnp` members are annotated
+/// `$dispatchMac("internal:pq-hybrid")`; the schema is the security contract,
+/// so the declared rows carry the hybrid label rather than the bootstrap
+/// floor. Callers are the hybrid-enrolled internal services (`model`, `oai`)
+/// whose tenant/user authorization runs at their own layer; the verified
+/// PqHybrid key material of those envelopes is what lets them dominate this
+/// label.
+pub const INFERENCE_METHOD_LABEL: SecurityLabel = SecurityLabel {
+    level: Level::Internal,
+    assurance: Assurance::PqHybrid,
+    compartments: CompartmentSet::EMPTY,
+};
+
+/// Service subject clearance for the hybrid-enrolled runtime services whose
+/// RPC surfaces are schema-declared `internal:pq-hybrid` (`model`, `oai`,
+/// `inference`). Identical in value to [`OAUTH_ISSUANCE_LABEL`] and
+/// [`INFERENCE_METHOD_LABEL`]; the distinct names keep each declaration's
+/// review intent legible.
+pub const HYBRID_SERVICE_CLEARANCE: SecurityLabel = SecurityLabel {
+    level: Level::Internal,
+    assurance: Assurance::PqHybrid,
+    compartments: CompartmentSet::EMPTY,
+};
+
+/// Typed dispatch object identity: canonical service name + canonical
+/// request-union discriminant. Never a VFS path; never interpreted by another
+/// plane's resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DispatchMethodId {
+    /// The canonical registered service name (`policy`, `discovery`, …).
+    pub service: &'static str,
+    /// The canonical request-union discriminant of the method leaf.
+    pub method: u16,
+}
+
+/// One declared `(service, leaf/method)` policy row: the typed object label
+/// for exactly one RPC method on exactly one service.
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchMethodPolicy {
+    /// The typed object identity this row labels.
+    pub id: DispatchMethodId,
+    /// The symbolic leaf name (`registerServiceKey`) — audit and drift-test
+    /// evidence; resolution is by the numeric identity only.
+    pub method_name: &'static str,
+    /// The declared object label. Bootstrap rows are the lattice floor; see
+    /// the module docs for why no row may rise above it in this slice.
+    pub label: SecurityLabel,
+    /// Why this row exists and why its label is correct (reviewed text).
+    pub justification: &'static str,
+}
+
+/// The deliberate MAC clearance a declared service holds as a dispatch
+/// *caller* — the dispatch-plane seed of the v16 `ServiceEnrollmentManifest`
+/// service clearance.
+#[derive(Debug, Clone, Copy)]
+pub struct ServiceSubjectClearance {
+    /// The canonical service name (the `service:{name}` subject suffix).
+    pub service: &'static str,
+    /// The declared clearance. Assurance is clamped to the verified key
+    /// material at evaluation time.
+    pub clearance: SecurityLabel,
+    /// Why this clearance is correct for this service (reviewed text).
+    pub justification: &'static str,
+}
+
+/// The declared dispatch table: a closed, deny-by-default set of typed
+/// `(service, leaf/method)` object labels plus the deliberate per-service
+/// subject clearances. Consumed by [`DeclaredDispatchPep`]; replaceable by
+/// #1507's generated inventory without changing the PEP contract.
+#[derive(Debug, Clone, Copy)]
+pub struct DeclaredDispatchTable {
+    methods: &'static [DispatchMethodPolicy],
+    clearances: &'static [ServiceSubjectClearance],
+}
+
+impl DeclaredDispatchTable {
+    /// The production staging-bootstrap declarations (#1499).
+    ///
+    /// Object rows cover the fresh-state
+    /// `service start --services event,policy,discovery,registry,model,oai,oauth` boot
+    /// graph plus the PolicyService authority's local policy-control-plane
+    /// commands. The production wrapper further restricts those local commands
+    /// to the verified, tokenless `service:policy` authority. Subject rows
+    /// declare the deliberate caller clearance for all seven bootstrap services.
+    #[must_use]
+    pub fn production() -> &'static Self {
+        &PRODUCTION_TABLE
+    }
+
+    /// Construct a table from explicit rows (test fixtures). Production uses
+    /// [`Self::production`].
+    #[must_use]
+    pub const fn from_rows(
+        methods: &'static [DispatchMethodPolicy],
+        clearances: &'static [ServiceSubjectClearance],
+    ) -> Self {
+        Self {
+            methods,
+            clearances,
+        }
+    }
+
+    /// Every declared method row (table-driven test and audit evidence).
+    #[must_use]
+    pub fn methods(&self) -> &'static [DispatchMethodPolicy] {
+        self.methods
+    }
+
+    /// Every declared service subject clearance row.
+    #[must_use]
+    pub fn clearances(&self) -> &'static [ServiceSubjectClearance] {
+        self.clearances
+    }
+
+    /// Resolve the declared policy row for a typed `(service, leaf)` call.
+    ///
+    /// Exact match only: `method` must be `Some` (the canonical discriminant
+    /// committed by the verified payload) and the pair must be declared.
+    /// Unknown services, unknown leaves, VFS-shaped aliases, and calls with
+    /// no committed method identity all return `None` ⇒ deny.
+    #[must_use]
+    pub fn resolve_row(
+        &self,
+        service_domain: &str,
+        method: Option<&[u16]>,
+    ) -> Option<&DispatchMethodPolicy> {
+        // Existing declarations name top-level leaves only. A nested path must
+        // not inherit the row of either its first or last discriminant.
+        let [method] = method? else {
+            return None;
+        };
+        self.methods
+            .iter()
+            .find(|row| row.id.service == service_domain && row.id.method == *method)
+    }
+
+    /// The deliberate clearance declared for a service caller, if any.
+    ///
+    /// `service` is the canonical service name (the `service:` subject prefix
+    /// is stripped by the caller). Exact match; no declaration ⇒ `None` ⇒ the
+    /// caller has no dispatch authority (deny `NoClearance`).
+    #[must_use]
+    pub fn service_clearance(&self, service: &str) -> Option<SecurityLabel> {
+        self.clearances
+            .iter()
+            .find(|row| row.service == service)
+            .map(|row| row.clearance)
+    }
+}
+
+impl RpcObjectLabelResolver for DeclaredDispatchTable {
+    /// Typed dispatch-plane resolution. No path splitting, no prefix
+    /// matching, no VFS adapter: an exact declared `(service, leaf)` row or
+    /// `None` (deny).
+    fn resolve(&self, service_domain: &str, method: Option<&[u16]>) -> Option<SecurityLabel> {
+        self.resolve_row(service_domain, method)
+            .map(|row| row.label)
+    }
+}
+
+/// The production dispatch PEP over the declared table.
+///
+/// Decision procedure (every missing input denies; no permissive mode):
+///
+/// 1. **Activation-selected context** — the coverage-gated operator control
+///    (`FloorOnly` ⇒ anonymous floor; `IdentityAware` ⇒ the verified
+///    Claims × VerifiedKeyMaterial derivation). `None` ⇒ `NoClearance`. The
+///    activation gate and the narrow-to-floor kill-switch are unchanged: a
+///    narrowed process still evaluates every dispatch, and only floor-labeled
+///    (bootstrap-critical) rows remain reachable.
+/// 2. **Deliberate service subject clearance** — the verified subject must be
+///    a `service:{name}` identity with a real authenticated envelope signer
+///    key AND a declared clearance in the table. The declared clearance is
+///    composed with the crypto-derived assurance (`SecurityContext::
+///    from_clearance` clamps down, never up). No declaration ⇒ `NoClearance`
+///    — an anonymous or undeclared caller can never ride the activation floor
+///    into a declared row.
+/// 3. **Typed object identity** — an exact declared `(service, leaf)` row.
+///    `None` ⇒ `UnlabeledObject`.
+/// 4. **Dominance** — BOTH the activation-selected context and the deliberate
+///    declared-service context must dominate the declared object label
+///    (`can_access`). Otherwise `FloorDeny`.
+///
+/// Like the genesis PEP it replaces at the install seam, this PEP performs no
+/// permit caching and holds no permissive state.
+pub struct DeclaredDispatchPep {
+    table: &'static DeclaredDispatchTable,
+    activation_controlled: bool,
+}
+
+impl DeclaredDispatchPep {
+    /// Construct over a declared table.
+    ///
+    /// Direct unit-test and embedding constructors keep the historical
+    /// identity-aware behavior (the verified context is used as-is);
+    /// production installs with [`Self::with_activation_control`].
+    #[must_use]
+    pub fn new(table: &'static DeclaredDispatchTable) -> Self {
+        Self {
+            table,
+            activation_controlled: false,
+        }
+    }
+
+    /// Select subject contexts through the process-global coverage gate.
+    /// Production's install path opts in explicitly.
+    #[must_use]
+    pub fn with_activation_control(mut self) -> Self {
+        self.activation_controlled = true;
+        self
+    }
+
+    /// The declared table this PEP evaluates.
+    #[must_use]
+    pub fn table(&self) -> &'static DeclaredDispatchTable {
+        self.table
+    }
+
+    /// Evaluate an already-established subject context against the typed table.
+    ///
+    /// This remains crate-private so production callers cannot substitute an
+    /// arbitrary clearance for an unverified envelope. The local policy
+    /// bootstrap wrapper uses it only after proving its exact bearerless,
+    /// non-federated root authority and derives this context from the
+    /// authenticated service clearance.
+    pub(crate) fn check_with_explicit_context(
+        &self,
+        ctx: &EnvelopeContext,
+        service_domain: &str,
+        method: Option<&[u16]>,
+        selected: SecurityContext,
+    ) -> MacDecision {
+        hyprstream_rpc::auth::mac::remember_verified_subject(ctx);
+        self.check_selected_context(ctx, service_domain, method, selected)
+    }
+
+    fn check_selected_context(
+        &self,
+        ctx: &EnvelopeContext,
+        service_domain: &str,
+        method: Option<&[u16]>,
+        selected: SecurityContext,
+    ) -> MacDecision {
+        let Some(service_name) = declared_service_subject(ctx) else {
+            return MacDecision::Deny(MacDenyReason::NoClearance);
+        };
+        let Some(declared_clearance) = self.table.service_clearance(&service_name) else {
+            return MacDecision::Deny(MacDenyReason::NoClearance);
+        };
+        let service_ctx =
+            SecurityContext::from_clearance(declared_clearance, ctx.verified_key_material());
+
+        let Some(row) = self.table.resolve_row(service_domain, method) else {
+            return MacDecision::Deny(MacDenyReason::UnlabeledObject);
+        };
+
+        if selected.can_access(&row.label) && service_ctx.can_access(&row.label) {
+            MacDecision::Permit
+        } else {
+            MacDecision::Deny(MacDenyReason::FloorDeny)
+        }
+    }
+}
+
+/// Extract the canonical service name from a verified service subject.
+///
+/// The declared clearance attaches only to a `service:{name}` identity backed
+/// by a real authenticated envelope signer key — never to an anonymous
+/// subject and never to a keyless internal callback context
+/// (`EnvelopeContext::from_callback_service` zeroes `cnf`, so
+/// `authenticated_signer_key` refuses it).
+fn declared_service_subject(ctx: &EnvelopeContext) -> Option<String> {
+    ctx.authenticated_signer_key()?;
+    let subject = ctx.subject();
+    let name = subject.name()?;
+    name.strip_prefix(SERVICE_SUBJECT_PREFIX)
+        .filter(|suffix| !suffix.is_empty())
+        .map(str::to_owned)
+}
+
+impl MacDispatchPep for DeclaredDispatchPep {
+    fn check(
+        &self,
+        ctx: &EnvelopeContext,
+        service_domain: &str,
+        method: Option<&[u16]>,
+    ) -> MacDecision {
+        // Preserve the verified context for the direct VFS/CAS/MoQ PEPs, whose
+        // low-level APIs carry Subject but not the full verified envelope.
+        // (Parity with DefaultMacDispatchPep.)
+        hyprstream_rpc::auth::mac::remember_verified_subject(ctx);
+
+        // 1. Activation-selected subject context (floor-only or verified
+        //    identity-aware). The operator gate is unchanged by this PEP.
+        let selected = if self.activation_controlled {
+            hyprstream_rpc::auth::mac::global_mac_activation_control()
+                .select_context(ctx.security_context())
+        } else {
+            ctx.security_context()
+        };
+        let Some(selected) = selected else {
+            return MacDecision::Deny(MacDenyReason::NoClearance);
+        };
+
+        // 2. Deliberate declared service subject clearance. The assurance axis
+        //    is clamped to the verified key material; the declaration cannot
+        //    outrun the crypto.
+        self.check_selected_context(ctx, service_domain, method, selected)
+    }
+}
+
+// ── Production declarations (the staging bootstrap set, #1499) ─────────────
+
+static BOOTSTRAP_METHODS: &[DispatchMethodPolicy] = &[
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "discovery",
+            method: discovery_methods::ANNOUNCE,
+        },
+        method_name: "announce",
+        label: HYBRID_SERVICE_CLEARANCE,
+        justification: "native endpoint publication requires the schema-declared internal:pq-hybrid context; Discovery additionally verifies the service credential, signer binding, and accepted current identity state",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::GENERATE_STREAM,
+        },
+        method_name: "generateStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-authorized generation/embedding against the admitted engine; the handler enforces tenant binding, model admission, and the spend ledger (infer scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::MODEL_INFO,
+        },
+        method_name: "modelInfo",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::IS_READY,
+        },
+        method_name: "isReady",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::APPLY_CHAT_TEMPLATE,
+        },
+        method_name: "applyChatTemplate",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::CREATE_LORA,
+        },
+        method_name: "createLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::LOAD_LORA,
+        },
+        method_name: "loadLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SAVE_LORA,
+        },
+        method_name: "saveLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::UNLOAD_LORA,
+        },
+        method_name: "unloadLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::HAS_LORA,
+        },
+        method_name: "hasLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SET_SESSION,
+        },
+        method_name: "setSession",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::CLEAR_SESSION,
+        },
+        method_name: "clearSession",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::RELEASE_SESSION,
+        },
+        method_name: "releaseSession",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::HEALTH_CHECK,
+        },
+        method_name: "healthCheck",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SHUTDOWN,
+        },
+        method_name: "shutdown",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "engine lifecycle management restricted to the verified hybrid model-service authority; the handler retains its own admission checks (manage scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::TTT_WRITEBACK,
+        },
+        method_name: "tttWriteback",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "TTT training/adaptation step against the tenant-bound engine; the handler enforces tenant binding (train scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::TTT_EVICT,
+        },
+        method_name: "tttEvict",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "TTT training/adaptation step against the tenant-bound engine; the handler enforces tenant binding (train scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::TRAIN_STEP,
+        },
+        method_name: "trainStep",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "TTT training/adaptation step against the tenant-bound engine; the handler enforces tenant binding (train scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::TTT_ZERO,
+        },
+        method_name: "tttZero",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "engine lifecycle management restricted to the verified hybrid model-service authority; the handler retains its own admission checks (manage scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::GET_DELTA_STATUS,
+        },
+        method_name: "getDeltaStatus",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SAVE_ADAPTATION,
+        },
+        method_name: "saveAdaptation",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SNAPSHOT_DELTA,
+        },
+        method_name: "snapshotDelta",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::TRAIN_STEP_STREAM,
+        },
+        method_name: "trainStepStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "TTT training/adaptation step against the tenant-bound engine; the handler enforces tenant binding (train scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::EXPORT_PEFT_ADAPTER,
+        },
+        method_name: "exportPeftAdapter",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::MERGE_LORA,
+        },
+        method_name: "mergeLora",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::CREATE_LORA_STREAM,
+        },
+        method_name: "createLoraStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::LOAD_LORA_STREAM,
+        },
+        method_name: "loadLoraStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SAVE_LORA_STREAM,
+        },
+        method_name: "saveLoraStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SAVE_ADAPTATION_STREAM,
+        },
+        method_name: "saveAdaptationStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::SNAPSHOT_DELTA_STREAM,
+        },
+        method_name: "snapshotDeltaStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::EXPORT_PEFT_ADAPTER_STREAM,
+        },
+        method_name: "exportPeftAdapterStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::MERGE_LORA_STREAM,
+        },
+        method_name: "mergeLoraStream",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-scoped engine/adaptation lifecycle; the handler enforces tenant binding, admission, and rollback windows (write scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::EMBED,
+        },
+        method_name: "embed",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "tenant-authorized generation/embedding against the admitted engine; the handler enforces tenant binding, model admission, and the spend ledger (infer scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "inference",
+            method: inference_methods::GET_LAYER_PROFILE,
+        },
+        method_name: "getLayerProfile",
+        label: INFERENCE_METHOD_LABEL,
+        justification: "read-only introspection of the admitted engine; the handler retains tenant binding and readiness gating (query scope; schema-declared internal:pq-hybrid)",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::CHECK },
+        method_name: "check",
+        label: SecurityLabel::bottom(),
+        justification: "authenticated declared services mediate PolicyService authorization checks; the handler derives subject and domain from the verified envelope and Casbin retains the federation decision",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::ISSUE_TOKEN },
+        method_name: "issueToken",
+        label: OAUTH_ISSUANCE_LABEL,
+        justification: "the OAuth authority mints a session-bound credential through the schema-declared internal:pq-hybrid signing boundary; only a verified hybrid service:oauth envelope can dominate this row, while PolicyService retains target-tenant policy:IssueToken/manage, subject, tenant, audience, scope, session, client, confirmation, and signing checks",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_POLICY },
+        method_name: "getPolicy",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService control-plane read; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::APPLY_TEMPLATE },
+        method_name: "applyTemplate",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService installs a reviewed bootstrap template; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::APPLY_DRAFT },
+        method_name: "applyDraft",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService commits a local draft; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::ROLLBACK },
+        method_name: "rollback",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService restores a local revision; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_HISTORY },
+        method_name: "getHistory",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService control-plane history read; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_DIFF },
+        method_name: "getDiff",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService control-plane draft inspection; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::GET_DRAFT_STATUS },
+        method_name: "getDraftStatus",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService draft-state inspection; only the tokenless policy authority reaches this row",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::ADD_GROUPING },
+        method_name: "addGrouping",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService role update; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId { service: "policy", method: policy_methods::REMOVE_GROUPING },
+        method_name: "removeGrouping",
+        label: SecurityLabel::bottom(),
+        justification: "verified local PolicyService role removal; the handler still enforces Casbin writeback",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "policy",
+            method: policy_methods::REGISTER_SERVICE_KEY,
+        },
+        method_name: "registerServiceKey",
+        label: SecurityLabel::bottom(),
+        justification: "a keyed service installs its identity with the CA; \
+             bootstrap-critical (it precedes identity standing) and reachable \
+             only by declared service subjects; handler-level CA-JWT, subject, \
+             and cnf binding checks are unchanged",
+    },
+    DispatchMethodPolicy {
+        id: DispatchMethodId {
+            service: "policy",
+            method: policy_methods::REFRESH_SERVICE_TOKEN,
+        },
+        method_name: "refreshServiceToken",
+        label: SecurityLabel::bottom(),
+        justification: "a registered service renews the identity registration \
+             created; same bootstrap identity-lifecycle class — the handler \
+             re-binds cnf to the verified caller key and requires prior \
+             registration",
+    },
+];
+
+static BOOTSTRAP_SERVICE_CLEARANCES: &[ServiceSubjectClearance] = &[
+    ServiceSubjectClearance {
+        service: "discovery",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled discovery identity publishes its accepted native endpoint; verified envelope material clamps assurance",
+    },
+    ServiceSubjectClearance {
+        service: "event",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled event service publishes its accepted native endpoint; verified envelope material clamps assurance",
+    },
+    ServiceSubjectClearance {
+        service: "inference",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled engine service answers the declared \
+             internal:pq-hybrid inference rows; its handler retains tenant \
+             binding, admission, and spend-ledger checks",
+    },
+    ServiceSubjectClearance {
+        service: "model",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled model service mediates tenant- \
+             authorized generation to the schema-declared internal:pq-hybrid \
+             inference surface; its load/tenant admission checks are unchanged",
+    },
+    ServiceSubjectClearance {
+        service: "oai",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled OpenAI-compatible API bridges \
+             verified browser sessions to the schema-declared internal:pq- \
+             hybrid model/inference surfaces; session and tenant authorization \
+             run at this layer",
+    },
+    ServiceSubjectClearance {
+        service: "oauth",
+        clearance: OAUTH_ISSUANCE_LABEL,
+        justification: "the verified hybrid OAuth authority performs the declared internal:pq-hybrid session-token issuance boundary; its exact typed row and PolicyService authorization remain mandatory",
+    },
+    ServiceSubjectClearance {
+        service: "policy",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the CA itself; its local control-plane rows are separately \
+             restricted to the verified tokenless service:policy authority",
+    },
+    ServiceSubjectClearance {
+        service: "registry",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "service/model registration is part of boot; registry \
+             registers its key at boot",
+    },
+    ServiceSubjectClearance {
+        service: "streams",
+        clearance: HYBRID_SERVICE_CLEARANCE,
+        justification: "the hybrid-enrolled streams service publishes its accepted native endpoint; stream authorization remains in its handler",
+    },
+];
+
+static PRODUCTION_TABLE: DeclaredDispatchTable =
+    DeclaredDispatchTable::from_rows(BOOTSTRAP_METHODS, BOOTSTRAP_SERVICE_CLEARANCES);
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    // ── fixtures ────────────────────────────────────────────────────────
+
+    fn service_subject_ctx(service: &str, key_byte: u8) -> EnvelopeContext {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[key_byte; 32]);
+        let claims = hyprstream_rpc::auth::Claims::new(format!("service:{service}"), 1, i64::MAX)
+            .with_clearance(BOOTSTRAP_SERVICE_CLEARANCE);
+        EnvelopeContext::for_test_authenticated_subject_with_claims(
+            hyprstream_rpc::Subject::new(format!("service:{service}")),
+            "test-tenant",
+            signer.verifying_key(),
+            claims,
+        )
+    }
+
+    fn user_subject_ctx() -> EnvelopeContext {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+        EnvelopeContext::for_test_authenticated_subject(
+            hyprstream_rpc::Subject::new("did:web:alice"),
+            signer.verifying_key(),
+        )
+    }
+
+    /// The production PEP exactly as the daemon installs it (identity-aware
+    /// activation control, production table).
+    fn production_pep() -> DeclaredDispatchPep {
+        DeclaredDispatchPep::new(DeclaredDispatchTable::production()).with_activation_control()
+    }
+
+    // ── table coverage: every declared (service, leaf) + clearance ──────
+
+    #[test]
+    fn every_declared_call_resolves_to_the_intended_typed_label_and_clearance() {
+        let table = DeclaredDispatchTable::production();
+
+        // The fresh boot graph declares the local PolicyService control-plane
+        // operations plus authenticated authorization checks, registration,
+        // and renewal. Every declared row resolves to the intended typed label
+        // — the lattice floor, deliberate and reviewed.
+        let expected: &[(u16, &str)] = &[
+            (policy_methods::CHECK, "check"),
+            (policy_methods::ISSUE_TOKEN, "issueToken"),
+            (policy_methods::GET_POLICY, "getPolicy"),
+            (policy_methods::APPLY_TEMPLATE, "applyTemplate"),
+            (policy_methods::APPLY_DRAFT, "applyDraft"),
+            (policy_methods::ROLLBACK, "rollback"),
+            (policy_methods::GET_HISTORY, "getHistory"),
+            (policy_methods::GET_DIFF, "getDiff"),
+            (policy_methods::GET_DRAFT_STATUS, "getDraftStatus"),
+            (policy_methods::ADD_GROUPING, "addGrouping"),
+            (policy_methods::REMOVE_GROUPING, "removeGrouping"),
+            (policy_methods::REGISTER_SERVICE_KEY, "registerServiceKey"),
+            (policy_methods::REFRESH_SERVICE_TOKEN, "refreshServiceToken"),
+        ];
+        assert!(
+            table.methods().len() > expected.len(),
+            "the table must also carry the inference surface declared below"
+        );
+        for (method, name) in expected {
+            let row = table
+                .resolve_row("policy", Some(&[*method]))
+                .unwrap_or_else(|| panic!("declared row for policy.{name} must resolve"));
+            assert_eq!(row.method_name, *name);
+            assert_eq!(row.id.service, "policy");
+            let expected_label = if *method == policy_methods::ISSUE_TOKEN {
+                OAUTH_ISSUANCE_LABEL
+            } else {
+                SecurityLabel::bottom()
+            };
+            assert_eq!(
+                row.label, expected_label,
+                "declared row {name} must retain its reviewed schema/bootstrap label"
+            );
+            assert!(!row.justification.is_empty());
+        }
+
+        // Every schema-declared inference member resolves to the hybrid label.
+        const INFERENCE_EXPECTED: &[(u16, &str)] = &[
+            (inference_methods::GENERATE_STREAM, "generateStream"),
+            (inference_methods::MODEL_INFO, "modelInfo"),
+            (inference_methods::IS_READY, "isReady"),
+            (inference_methods::APPLY_CHAT_TEMPLATE, "applyChatTemplate"),
+            (inference_methods::CREATE_LORA, "createLora"),
+            (inference_methods::LOAD_LORA, "loadLora"),
+            (inference_methods::SAVE_LORA, "saveLora"),
+            (inference_methods::UNLOAD_LORA, "unloadLora"),
+            (inference_methods::HAS_LORA, "hasLora"),
+            (inference_methods::SET_SESSION, "setSession"),
+            (inference_methods::CLEAR_SESSION, "clearSession"),
+            (inference_methods::RELEASE_SESSION, "releaseSession"),
+            (inference_methods::HEALTH_CHECK, "healthCheck"),
+            (inference_methods::SHUTDOWN, "shutdown"),
+            (inference_methods::TTT_WRITEBACK, "tttWriteback"),
+            (inference_methods::TTT_EVICT, "tttEvict"),
+            (inference_methods::TRAIN_STEP, "trainStep"),
+            (inference_methods::TTT_ZERO, "tttZero"),
+            (inference_methods::GET_DELTA_STATUS, "getDeltaStatus"),
+            (inference_methods::SAVE_ADAPTATION, "saveAdaptation"),
+            (inference_methods::SNAPSHOT_DELTA, "snapshotDelta"),
+            (inference_methods::TRAIN_STEP_STREAM, "trainStepStream"),
+            (inference_methods::EXPORT_PEFT_ADAPTER, "exportPeftAdapter"),
+            (inference_methods::MERGE_LORA, "mergeLora"),
+            (inference_methods::CREATE_LORA_STREAM, "createLoraStream"),
+            (inference_methods::LOAD_LORA_STREAM, "loadLoraStream"),
+            (inference_methods::SAVE_LORA_STREAM, "saveLoraStream"),
+            (
+                inference_methods::SAVE_ADAPTATION_STREAM,
+                "saveAdaptationStream",
+            ),
+            (
+                inference_methods::SNAPSHOT_DELTA_STREAM,
+                "snapshotDeltaStream",
+            ),
+            (
+                inference_methods::EXPORT_PEFT_ADAPTER_STREAM,
+                "exportPeftAdapterStream",
+            ),
+            (inference_methods::MERGE_LORA_STREAM, "mergeLoraStream"),
+            (inference_methods::EMBED, "embed"),
+            (inference_methods::GET_LAYER_PROFILE, "getLayerProfile"),
+        ];
+        for (method, name) in INFERENCE_EXPECTED {
+            let row = table
+                .resolve_row("inference", Some(&[*method]))
+                .unwrap_or_else(|| panic!("declared row for inference.{name} must resolve"));
+            assert_eq!(row.method_name, *name);
+            assert_eq!(row.id.service, "inference");
+            assert_eq!(
+                row.label, INFERENCE_METHOD_LABEL,
+                "inference.{name} must retain its schema-declared hybrid label"
+            );
+            assert!(!row.justification.is_empty());
+        }
+
+        // The seven staging bootstrap services each hold the deliberate
+        // service subject clearance, and each declared caller's clearance
+        // dominates every declared object label (the boot calls evaluate).
+        let mut services: Vec<&str> = table.clearances().iter().map(|row| row.service).collect();
+        services.sort_unstable();
+        assert_eq!(
+            services,
+            [
+                "discovery",
+                "event",
+                "inference",
+                "model",
+                "oai",
+                "oauth",
+                "policy",
+                "registry",
+                "streams"
+            ]
+        );
+        // Hybrid-enrolled runtime services hold the hybrid clearance; the
+        // bootstrap identity-lifecycle services stay at the floor.
+        const HYBRID_SERVICES: &[&str] = &[
+            "discovery",
+            "event",
+            "inference",
+            "model",
+            "oai",
+            "oauth",
+            "policy",
+            "registry",
+            "streams",
+        ];
+        for row in table.clearances() {
+            let is_hybrid = HYBRID_SERVICES.contains(&row.service);
+            let expected_clearance = match row.service {
+                "oauth" => OAUTH_ISSUANCE_LABEL,
+                "discovery" | "event" | "model" | "oai" | "inference" | "policy" | "registry"
+                | "streams" => HYBRID_SERVICE_CLEARANCE,
+                _ => BOOTSTRAP_SERVICE_CLEARANCE,
+            };
+            assert_eq!(row.clearance, expected_clearance);
+            assert_eq!(
+                table.service_clearance(row.service),
+                Some(row.clearance),
+                "clearance lookup by canonical name"
+            );
+            assert!(!row.justification.is_empty());
+            for method in table.methods() {
+                let ctx = SecurityContext::from_clearance(
+                    row.clearance,
+                    if is_hybrid {
+                        hyprstream_rpc::auth::mac::VerifiedKeyMaterial::PqHybrid
+                    } else {
+                        hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical
+                    },
+                );
+                // Hybrid-enrolled services dominate every declared row
+                // (verified PqHybrid key material x hybrid clearance); floor
+                // services dominate only the floor-labelled bootstrap rows —
+                // never the schema-declared hybrid rows (issueToken,
+                // inference.*).
+                let expected = is_hybrid || method.label == SecurityLabel::bottom();
+                assert_eq!(
+                    ctx.can_access(&method.label),
+                    expected,
+                    "{} against {} ({})",
+                    row.service,
+                    method.label,
+                    method.method_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn table_has_no_duplicate_or_unsorted_rows() {
+        let table = DeclaredDispatchTable::production();
+        let ids: Vec<DispatchMethodId> = table.methods().iter().map(|row| row.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids, sorted, "method rows must be sorted and unique");
+        let services: Vec<&str> = table.clearances().iter().map(|row| row.service).collect();
+        let mut sorted_services = services.clone();
+        sorted_services.sort_unstable();
+        sorted_services.dedup();
+        assert_eq!(
+            services, sorted_services,
+            "clearance rows must be sorted and unique"
+        );
+    }
+
+    #[test]
+    fn native_announce_row_matches_schema_and_requires_hybrid_identity() {
+        let mut message = capnp::message::Builder::new_default();
+        message
+            .init_root::<hyprstream_rpc_std::discovery_capnp::discovery_request::Builder>()
+            .init_announce();
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        let method =
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap();
+        assert_eq!(method, discovery_methods::ANNOUNCE);
+        let table = DeclaredDispatchTable::production();
+        let row = table.resolve_row("discovery", Some(&[method])).unwrap();
+        assert_eq!(row.method_name, "announce");
+        assert_eq!(row.label, HYBRID_SERVICE_CLEARANCE);
+        let pep = DeclaredDispatchPep::new(table);
+        for service in [
+            "policy",
+            "discovery",
+            "registry",
+            "event",
+            "streams",
+            "model",
+            "oai",
+            "oauth",
+        ] {
+            let clearance = table.service_clearance(service).unwrap();
+            assert!(SecurityContext::from_clearance(
+                clearance,
+                hyprstream_rpc::auth::mac::VerifiedKeyMaterial::PqHybrid
+            )
+            .can_access(&row.label));
+            assert!(!SecurityContext::from_clearance(
+                clearance,
+                hyprstream_rpc::auth::mac::VerifiedKeyMaterial::Classical
+            )
+            .can_access(&row.label));
+            let ctx = EnvelopeContext::for_test_authenticated_subject(
+                hyprstream_rpc::Subject::new(format!("service:{service}")),
+                ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]).verifying_key(),
+            );
+            assert_eq!(
+                pep.check(&ctx, "discovery", Some(&[method])),
+                MacDecision::Deny(MacDenyReason::NoClearance),
+                "bearerless identity cannot announce"
+            );
+        }
+        assert!(table.resolve_row("discovery", Some(&[method, 0])).is_none());
+        assert!(table.resolve_row("discovery", Some(&[u16::MAX])).is_none());
+    }
+
+    // ── deny-by-default: unknown service / leaf / VFS alias ─────────────
+
+    #[test]
+    fn unknown_service_unknown_leaf_and_vfs_alias_resolve_to_none() {
+        let table = DeclaredDispatchTable::production();
+
+        // Unknown service, even with a declared method number.
+        assert!(table
+            .resolve_row("ghost", Some(&[policy_methods::REGISTER_SERVICE_KEY]))
+            .is_none());
+        // Unknown leaf on a known service: resolveServiceKey (17) is a real
+        // policy method but NOT declared — declaration, not schema, is the
+        // authority.
+        assert!(table.resolve_row("policy", Some(&[17])).is_none());
+        // Out-of-schema leaf on a known service.
+        assert!(table.resolve_row("policy", Some(&[u16::MAX])).is_none());
+        // No committed method identity (a payload without a canonical
+        // discriminant) matches no declared row, even on a known service.
+        assert!(table.resolve_row("policy", None).is_none());
+        // Bare/VFS-shaped aliases never enter the VFS adapter and never match.
+        for alias in ["/srv/policy", "srv/policy", "/policy", "policy/", "/"] {
+            assert!(
+                table
+                    .resolve_row(alias, Some(&[policy_methods::REGISTER_SERVICE_KEY]))
+                    .is_none(),
+                "VFS-shaped alias {alias:?} must not resolve"
+            );
+        }
+        // Case and whitespace variants are not canonical names.
+        assert!(table
+            .resolve_row("Policy", Some(&[policy_methods::REGISTER_SERVICE_KEY]))
+            .is_none());
+        assert!(table
+            .resolve_row(" policy", Some(&[policy_methods::REGISTER_SERVICE_KEY]))
+            .is_none());
+        // Undeclared service clearance.
+        assert!(table.service_clearance("ghost").is_none());
+        assert!(table.service_clearance("metrics").is_none());
+
+        // The RpcObjectLabelResolver view agrees (None ⇒ deny).
+        let resolver: &dyn RpcObjectLabelResolver = table;
+        assert!(resolver
+            .resolve("policy", Some(&[policy_methods::REGISTER_SERVICE_KEY]))
+            .is_some());
+        assert!(resolver.resolve("policy", Some(&[17])).is_none());
+        assert!(resolver
+            .resolve("/srv/policy", Some(&[policy_methods::REGISTER_SERVICE_KEY]))
+            .is_none());
+    }
+
+    // ── causal PEP pair over the production table ───────────────────────
+
+    #[test]
+    fn declared_call_permits_and_identical_undeclared_call_denies() {
+        let pep = production_pep();
+        let caller = service_subject_ctx("discovery", 0x61);
+
+        // Positive: the exact fresh-boot call — discovery registering its key.
+        let declared = pep.check(
+            &caller,
+            "policy",
+            Some(&[policy_methods::REGISTER_SERVICE_KEY]),
+        );
+        assert_eq!(
+            declared,
+            MacDecision::Permit,
+            "declared (policy, registerServiceKey) from declared discovery must permit"
+        );
+
+        // Causal twin: identical caller, identical service, undeclared leaf.
+        let undeclared = pep.check(&caller, "policy", Some(&[17]));
+        assert_eq!(
+            undeclared,
+            MacDecision::Deny(MacDenyReason::UnlabeledObject),
+            "an otherwise identical undeclared call must deny UnlabeledObject"
+        );
+
+        // Unknown service denies the same way.
+        assert_eq!(
+            pep.check(
+                &caller,
+                "ghost",
+                Some(&[policy_methods::REGISTER_SERVICE_KEY])
+            ),
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        );
+
+        // VFS-shaped alias of a declared pair denies (never routed through the
+        // VFS adapter).
+        assert_eq!(
+            pep.check(
+                &caller,
+                "/srv/policy",
+                Some(&[policy_methods::REGISTER_SERVICE_KEY])
+            ),
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        );
+
+        // No committed method identity ⇒ no declared row ⇒ deny.
+        assert_eq!(
+            pep.check(&caller, "policy", None),
+            MacDecision::Deny(MacDenyReason::UnlabeledObject)
+        );
+    }
+
+    #[test]
+    fn authenticated_oauth_policy_methods_require_exact_declared_hybrid_authority() {
+        let pep = production_pep();
+        let oauth = service_subject_ctx("oauth", 0x66);
+
+        // The PAR registration path is an authenticated service:oauth call to
+        // PolicyRequest.check (union ordinal zero). It must resolve through
+        // the normal declared-service PEP, not a tokenless policy exception.
+        assert_eq!(
+            pep.check(&oauth, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Permit,
+            "verified service:oauth must reach the declared policy.check leaf"
+        );
+
+        // The real production client test below verifies a hybrid envelope;
+        // this classical fixture intentionally cannot dominate issueToken's
+        // schema-declared internal:pq-hybrid label.
+        assert_eq!(
+            pep.check(&oauth, "policy", Some(&[policy_methods::ISSUE_TOKEN])),
+            MacDecision::Deny(MacDenyReason::FloorDeny),
+            "a classical envelope must not reach the PQ-hybrid token issuer"
+        );
+
+        // The same floor-labelled object remains unavailable to an
+        // undeclared service, a non-service subject, and a keyless callback.
+        // Adding the row therefore cannot fabricate an anonymous clearance.
+        let ghost = service_subject_ctx("ghost", 0x67);
+        assert_eq!(
+            pep.check(&ghost, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+        let user = user_subject_ctx();
+        assert_eq!(
+            pep.check(&user, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+        let callback = EnvelopeContext::from_callback_service(1, "oauth");
+        assert_eq!(
+            pep.check(&callback, "policy", Some(&[policy_methods::CHECK])),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+    }
+
+    #[test]
+    fn permit_requires_the_deliberate_service_clearance_not_the_anonymous_floor() {
+        let pep = production_pep();
+
+        // An undeclared service subject denies even for a declared object row:
+        // the activation floor alone must NOT carry a caller into the table —
+        // that is the fabricated-anonymous-clearance hole this slice closes.
+        let ghost = service_subject_ctx("ghost", 0x62);
+        assert_eq!(
+            pep.check(
+                &ghost,
+                "policy",
+                Some(&[policy_methods::REGISTER_SERVICE_KEY])
+            ),
+            MacDecision::Deny(MacDenyReason::NoClearance),
+            "undeclared service subject must deny NoClearance"
+        );
+
+        // A non-service (user) identity has no service clearance.
+        let user = user_subject_ctx();
+        assert_eq!(
+            pep.check(
+                &user,
+                "policy",
+                Some(&[policy_methods::REGISTER_SERVICE_KEY])
+            ),
+            MacDecision::Deny(MacDenyReason::NoClearance)
+        );
+
+        // A keyless internal callback context (zeroed cnf) asserting a service
+        // subject has no authenticated signer key and must not inherit the
+        // declared clearance.
+        let callback = EnvelopeContext::from_callback_service(1, "discovery");
+        assert_eq!(
+            pep.check(
+                &callback,
+                "policy",
+                Some(&[policy_methods::REGISTER_SERVICE_KEY])
+            ),
+            MacDecision::Deny(MacDenyReason::NoClearance),
+            "keyless callback contexts must not claim a service clearance"
+        );
+
+        // Every declared bootstrap service caller permits the boot
+        // registration call (deliberate clearance composed with verified key
+        // material).
+        for service in [
+            "discovery",
+            "event",
+            "model",
+            "oai",
+            "oauth",
+            "policy",
+            "registry",
+        ] {
+            let ctx = service_subject_ctx(service, 0x63);
+            assert_eq!(
+                pep.check(
+                    &ctx,
+                    "policy",
+                    Some(&[policy_methods::REGISTER_SERVICE_KEY])
+                ),
+                MacDecision::Permit,
+                "declared service:{service} must permit the declared bootstrap call"
+            );
+        }
+    }
+
+    #[test]
+    fn floor_deny_when_declared_clearance_cannot_dominate_the_label() {
+        // Fixture table: a declared row above the declared clearance. Both
+        // dominance checks must hold; here the declared service context
+        // (Internal) cannot dominate a Secret object label.
+        static SECRET_ROW: &[DispatchMethodPolicy] = &[DispatchMethodPolicy {
+            id: DispatchMethodId {
+                service: "policy",
+                method: 7,
+            },
+            method_name: "fixture",
+            label: SecurityLabel {
+                level: Level::Secret,
+                assurance: Assurance::Unverified,
+                compartments: CompartmentSet::EMPTY,
+            },
+            justification: "test fixture: label deliberately above the declared clearance",
+        }];
+        static TABLE: DeclaredDispatchTable =
+            DeclaredDispatchTable::from_rows(SECRET_ROW, BOOTSTRAP_SERVICE_CLEARANCES);
+        let pep = DeclaredDispatchPep::new(&TABLE).with_activation_control();
+        let caller = service_subject_ctx("discovery", 0x64);
+        assert_eq!(
+            pep.check(&caller, "policy", Some(&[7])),
+            MacDecision::Deny(MacDenyReason::FloorDeny),
+            "a label above the declared clearance must FloorDeny"
+        );
+    }
+
+    // ── installed-PEP causal pair ───────────────────────────────────────
+    //
+    // The process-global install + "the PEP stayed installed" assertion lives
+    // in the integration binary `tests/mac_dispatch_boot_labeling.rs`, which
+    // owns its own globals; lib tests share this binary's global PEP slot with
+    // the `install_explicit_test_dispatch_pep` plumbing fixtures and cannot
+    // serialize against them.
+
+    // ── drift: declared discriminants == real schema discriminants ──────
+
+    #[test]
+    fn declared_policy_discriminants_match_the_serialized_schema() {
+        use capnp::message::Builder;
+
+        // check
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            let mut check = req.reborrow().init_check();
+            check.set_subject("service:oauth");
+            check.set_domain("");
+            check.set_resource("federation:register:https://signup.example.test");
+            check.set_operation("check");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::CHECK,
+            "the declared check discriminant must match the schema union ordinal"
+        );
+
+        // issueToken
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_issue_token();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::ISSUE_TOKEN,
+            "the declared issueToken discriminant must match the schema union ordinal"
+        );
+
+        // getPolicy
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.set_get_policy(());
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_POLICY,
+            "the declared getPolicy discriminant must match the schema union ordinal"
+        );
+
+        // applyTemplate
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_apply_template().set_name("public-read");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::APPLY_TEMPLATE,
+            "the declared applyTemplate discriminant must match the schema union ordinal"
+        );
+
+        // applyDraft
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_apply_draft();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::APPLY_DRAFT,
+            "the declared applyDraft discriminant must match the schema union ordinal"
+        );
+
+        // rollback
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_rollback().set_git_ref("HEAD");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::ROLLBACK,
+            "the declared rollback discriminant must match the schema union ordinal"
+        );
+
+        // getHistory
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_get_history().set_count(1);
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_HISTORY,
+            "the declared getHistory discriminant must match the schema union ordinal"
+        );
+
+        // getDiff
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_get_diff();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_DIFF,
+            "the declared getDiff discriminant must match the schema union ordinal"
+        );
+
+        // getDraftStatus
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.set_get_draft_status(());
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::GET_DRAFT_STATUS,
+            "the declared getDraftStatus discriminant must match the schema union ordinal"
+        );
+
+        // addGrouping
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            let mut call = req.reborrow().init_add_grouping();
+            call.set_user("bootstrap-user");
+            call.set_role("viewer");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::ADD_GROUPING,
+            "the declared addGrouping discriminant must match the schema union ordinal"
+        );
+
+        // removeGrouping
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            let mut call = req.reborrow().init_remove_grouping();
+            call.set_user("bootstrap-user");
+            call.set_role("viewer");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::REMOVE_GROUPING,
+            "the declared removeGrouping discriminant must match the schema union ordinal"
+        );
+
+        // registerServiceKey
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            let mut call = req.reborrow().init_register_service_key();
+            call.set_service_name("discovery");
+            call.set_verifying_key(&[0x42; 32]);
+            call.set_service_jwt("header.payload.signature");
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::REGISTER_SERVICE_KEY,
+            "the declared registerServiceKey discriminant must match the schema union ordinal"
+        );
+
+        // refreshServiceToken
+        let mut message = Builder::new_default();
+        {
+            let mut req =
+                message.init_root::<hyprstream_rpc_std::policy_capnp::policy_request::Builder>();
+            req.set_id(1);
+            req.reborrow()
+                .init_refresh_service_token()
+                .set_ttl_seconds(2_592_000);
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            policy_methods::REFRESH_SERVICE_TOKEN,
+            "the declared refreshServiceToken discriminant must match the schema union ordinal"
+        );
+
+        // inference.generateStream — lowest declared ordinal (schema assigns
+        // no @0 member; the union starts at @1).
+        let mut message = Builder::new_default();
+        {
+            let mut req = message
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_generate_stream();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            inference_methods::GENERATE_STREAM,
+            "the declared generateStream discriminant must match the schema union ordinal"
+        );
+
+        // inference.healthCheck — mid-table ordinal 13.
+        let mut message = Builder::new_default();
+        {
+            let mut req = message
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>();
+            req.set_id(1);
+            req.set_health_check(());
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            inference_methods::HEALTH_CHECK,
+            "the declared healthCheck discriminant must match the schema union ordinal"
+        );
+
+        // inference.embed — high ordinal 32.
+        let mut message = Builder::new_default();
+        {
+            let mut req = message
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>();
+            req.set_id(1);
+            req.reborrow().init_embed();
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            inference_methods::EMBED,
+            "the declared embed discriminant must match the schema union ordinal"
+        );
+
+        // inference.getLayerProfile — highest declared ordinal 33.
+        let mut message = Builder::new_default();
+        {
+            let mut req = message
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>();
+            req.set_id(1);
+            req.set_get_layer_profile(());
+        }
+        let bytes = capnp::serialize::write_message_to_words(&message);
+        assert_eq!(
+            hyprstream_rpc::browser_provisioning::canonical_method_discriminator(&bytes).unwrap(),
+            inference_methods::GET_LAYER_PROFILE,
+            "the declared getLayerProfile discriminant must match the schema union ordinal"
+        );
+    }
+
+    // ── drift: declared services exist in the factory inventory ─────────
+
+    #[test]
+    fn declared_bootstrap_services_are_registered_factories() {
+        let registered: Vec<&str> = hyprstream_service::list_factories()
+            .map(|factory| factory.name)
+            .collect();
+        for row in DeclaredDispatchTable::production().clearances() {
+            assert!(
+                registered.contains(&row.service),
+                "declared bootstrap service {} must be a registered service factory",
+                row.service
+            );
+        }
+        for row in DeclaredDispatchTable::production().methods() {
+            assert!(
+                registered.contains(&row.id.service),
+                "declared dispatch target {} must be a registered service factory",
+                row.id.service
+            );
+        }
+    }
+}

@@ -26,6 +26,30 @@ const PACKAGE_NAME = '@hyprstream/rpc';
 const STAGING_VERSION = '0.1.0-dev.1.abc1234';
 const PRODUCTION_VERSION = '9.9.9';
 
+// Read the same authoritative source the verifier itself now checks against,
+// rather than hardcoding a license string here — a hardcoded value would
+// silently stop testing anything real the next time the crate's declared
+// license changes (the exact staleness class this whole check exists to
+// catch). A tarball manifest with any OTHER value is guaranteed wrong.
+function readCrateLicense() {
+  const cargoTomlPath = path.join(HERE, '..', '..', 'crates', 'hyprstream-rpc-std', 'Cargo.toml');
+  const lines = fs.readFileSync(cargoTomlPath, 'utf8').split(/\r?\n/);
+  let inPackageTable = false;
+  for (const line of lines) {
+    const tableHeader = line.match(/^\[([^\]]*)\]\s*$/);
+    if (tableHeader) {
+      inPackageTable = tableHeader[1] === 'package';
+      continue;
+    }
+    if (!inPackageTable) continue;
+    const licenseLine = line.match(/^license\s*=\s*"([^"]+)"/);
+    if (licenseLine) return licenseLine[1];
+  }
+  throw new Error(`no license field in [package] table of ${cargoTomlPath}`);
+}
+const CRATE_LICENSE = readCrateLicense();
+const WRONG_LICENSE = CRATE_LICENSE === 'MIT' ? 'Apache-2.0' : 'MIT';
+
 function tarHeader(name, size) {
   const buf = Buffer.alloc(512);
   buf.write(name, 0, 100, 'utf8');
@@ -46,11 +70,11 @@ function buildTarGz(entries) {
   return zlib.gzipSync(Buffer.concat([body, end]));
 }
 
-function manifestBuf(version) {
-  return Buffer.from(JSON.stringify({ name: PACKAGE_NAME, version }), 'utf8');
+function manifestBuf(version, license = CRATE_LICENSE) {
+  return Buffer.from(JSON.stringify({ name: PACKAGE_NAME, version, license }), 'utf8');
 }
 
-function writeCase(dir, entries, version) {
+function writeCase(dir, entries, version, manifestSize = manifestBuf(version).length) {
   fs.mkdirSync(dir, { recursive: true });
   const gz = buildTarGz(entries);
   const tarballName = `hyprstream-rpc-${version}.tgz`;
@@ -70,7 +94,7 @@ function writeCase(dir, entries, version) {
     npmShasum: crypto.createHash('sha1').update(gz).digest('hex'),
     source: { repository: 'https://github.com/hyprstream/hyprstream', commit: '0'.repeat(40), ref: 'refs/heads/main', workflow: null, crate: 'crates/hyprstream-rpc-std' },
     build: { target: 'web', profile: 'release', rustToolchain: '1.97.0', wasmPack: '0.13.1' },
-    files: [{ path: 'package.json', size: manifestBuf(version).length }],
+    files: [{ path: 'package.json', size: manifestSize }],
   };
   fs.writeFileSync(path.join(dir, 'integrity.json'), `${JSON.stringify(evidence, null, 2)}\n`);
   return tarballPath;
@@ -108,10 +132,27 @@ if (controlResult.status !== 0) {
   failures.push(`control case: verifier REJECTED a single-entry tarball that should have passed. stderr:\n${controlResult.stderr}`);
 }
 
+// --- Adversarial case: manifest license differs from the crate's own -----
+// Proves a package whose declared license diverges from the authoritative
+// crates/hyprstream-rpc-std/Cargo.toml license (e.g. a hardcoded/stale
+// value) is refused, even with an otherwise-valid single manifest entry and
+// matching hashes. This is the causal negative for the regression that
+// motivated the check: a manifest hardcoding one license while the crate's
+// Cargo.toml declares another.
+const licenseMismatchDir = path.join(root, 'license-mismatch');
+const wrongManifest = manifestBuf(STAGING_VERSION, WRONG_LICENSE);
+writeCase(licenseMismatchDir, [tarEntry('package/package.json', wrongManifest)], STAGING_VERSION, wrongManifest.length);
+const licenseMismatchResult = runVerifier(licenseMismatchDir);
+if (licenseMismatchResult.status === 0) {
+  failures.push(`license-mismatch case: verifier ACCEPTED a manifest declaring "${WRONG_LICENSE}" against a crate declaring "${CRATE_LICENSE}" (expected rejection)`);
+} else if (!/manifest license .* != authoritative crate license/i.test(licenseMismatchResult.stderr)) {
+  failures.push(`license-mismatch case: verifier rejected, but not for the expected license-mismatch reason. stderr:\n${licenseMismatchResult.stderr}`);
+}
+
 fs.rmSync(root, { recursive: true, force: true });
 
 if (failures.length > 0) {
   for (const f of failures) console.error(`FAIL: ${f}`);
   throw new Error(`verify-rpc-std-wasm-package.probe.mjs: ${failures.length} assertion(s) failed`);
 }
-console.log('PASS: verifier rejects duplicate package/package.json entries and still accepts the equivalent single-entry tarball');
+console.log('PASS: verifier rejects duplicate package/package.json entries, rejects a manifest license diverging from the crate\'s own, and still accepts a correct single-entry tarball');

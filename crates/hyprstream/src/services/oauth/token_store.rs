@@ -1,13 +1,17 @@
 //! Persistent refresh token store abstraction.
 //!
-//! `TokenStore` is the trait. `RocksDbTokenStore` wraps the existing rocksdb::DB.
-//! A Valkey implementation is provided when the `valkey` feature is enabled.
+//! `TokenStore` is the trait. `RocksDbTokenStore` (the `rocksdb` feature)
+//! wraps the existing rocksdb::DB. A Valkey implementation is provided when
+//! the `valkey` feature is enabled.
 
-use std::sync::Arc;
-use std::path::Path;
 use anyhow::Result;
 use async_trait::async_trait;
+#[cfg(feature = "rocksdb")]
 use parking_lot::Mutex;
+#[cfg(feature = "rocksdb")]
+use std::path::Path;
+#[cfg(any(feature = "rocksdb", feature = "valkey"))]
+use std::sync::Arc;
 
 use super::state::RefreshTokenEntry;
 
@@ -22,11 +26,14 @@ pub trait TokenStore: Send + Sync {
     async fn delete(&self, token: &str) -> Result<()>;
 }
 
+/// RocksDB-backed refresh token store (requires the `rocksdb` feature).
+#[cfg(feature = "rocksdb")]
 pub struct RocksDbTokenStore {
     db: Arc<rocksdb::DB>,
     take_lock: Mutex<()>,
 }
 
+#[cfg(feature = "rocksdb")]
 impl RocksDbTokenStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut opts = rocksdb::Options::default();
@@ -39,6 +46,7 @@ impl RocksDbTokenStore {
     }
 }
 
+#[cfg(feature = "rocksdb")]
 #[async_trait]
 impl TokenStore for RocksDbTokenStore {
     async fn put(&self, token: &str, entry: &RefreshTokenEntry, _ttl_secs: u64) -> Result<()> {
@@ -99,7 +107,10 @@ impl ValkeyTokenStore {
         let pool = Builder::from_config(config).build_pool(8)?;
         pool.connect();
         pool.wait_for_connect().await?;
-        Ok(Self { pool, key_prefix: "hs:token:".to_owned() })
+        Ok(Self {
+            pool,
+            key_prefix: "hs:token:".to_owned(),
+        })
     }
 
     fn key(&self, token: &str) -> String {
@@ -114,7 +125,13 @@ impl TokenStore for ValkeyTokenStore {
         use fred::prelude::*;
         let bytes = serde_json::to_string(entry)?;
         self.pool
-            .set::<(), _, _>(self.key(token), bytes, Some(Expiration::EX(ttl_secs as i64)), None, false)
+            .set::<(), _, _>(
+                self.key(token),
+                bytes,
+                Some(Expiration::EX(ttl_secs as i64)),
+                None,
+                false,
+            )
             .await?;
         Ok(())
     }
@@ -156,6 +173,7 @@ impl TokenStore for ValkeyTokenStore {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "rocksdb")]
     #[tokio::test]
     async fn rocksdb_take_allows_exactly_one_claim() {
         let dir = tempfile::tempdir().unwrap();
@@ -170,13 +188,17 @@ mod tests {
             dpop_jkt: None,
             client_assertion_jkt: None,
             ucan_grant: None,
+            session_id: None,
         };
         store.put("refresh", &entry, 60).await.unwrap();
 
         let first = store.take("refresh").await.unwrap();
         let second = store.take("refresh").await.unwrap();
 
-        assert_eq!(first.as_ref().map(|entry| entry.client_id.as_str()), Some("client"));
+        assert_eq!(
+            first.as_ref().map(|entry| entry.client_id.as_str()),
+            Some("client")
+        );
         assert!(second.is_none());
     }
 }

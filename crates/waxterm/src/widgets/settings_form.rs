@@ -3,9 +3,9 @@
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-use crate::input::KeyPress;
-use super::WidgetResult;
 use super::numeric_field::NumericField;
+use super::WidgetResult;
+use crate::input::KeyPress;
 
 /// A vertical form of numeric fields with arrow-key navigation.
 ///
@@ -19,7 +19,10 @@ pub struct SettingsForm {
 
 impl SettingsForm {
     pub fn new(fields: Vec<NumericField>) -> Self {
-        Self { fields, selected: 0 }
+        Self {
+            fields,
+            selected: 0,
+        }
     }
 
     /// Index of the currently selected field.
@@ -39,7 +42,9 @@ impl SettingsForm {
 
     /// Whether the currently selected field is in edit (text entry) mode.
     pub fn is_editing(&self) -> bool {
-        self.fields.get(self.selected).is_some_and(|f| f.is_editing())
+        self.fields
+            .get(self.selected)
+            .is_some_and(|f| f.is_editing())
     }
 
     /// Get all current field values.
@@ -113,14 +118,26 @@ impl SettingsForm {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::numeric_field::NumericField;
+    use super::*;
 
     fn make_form() -> SettingsForm {
         SettingsForm::new(vec![
-            NumericField::new("A").integer().range(0.0, 100.0).step(1.0).value(Some(10.0)),
-            NumericField::new("B").float(2).range(0.0, 1.0).step(0.1).value(Some(0.5)),
-            NumericField::new("C").integer().range(0.0, 50.0).step(5.0).value(Some(25.0)),
+            NumericField::new("A")
+                .integer()
+                .range(0.0, 100.0)
+                .step(1.0)
+                .value(Some(10.0)),
+            NumericField::new("B")
+                .float(2)
+                .range(0.0, 1.0)
+                .step(0.1)
+                .value(Some(0.5)),
+            NumericField::new("C")
+                .integer()
+                .range(0.0, 50.0)
+                .step(5.0)
+                .value(Some(25.0)),
         ])
     }
 
@@ -141,7 +158,10 @@ mod tests {
     #[test]
     fn test_enter_confirms_form() {
         let mut form = make_form();
-        assert_eq!(form.handle_key(&KeyPress::Enter), WidgetResult::Confirmed(()));
+        assert_eq!(
+            form.handle_key(&KeyPress::Enter),
+            WidgetResult::Confirmed(())
+        );
     }
 
     #[test]

@@ -25,11 +25,11 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::GenerationResult;
-use crate::runtime::GenerationRequest;
-use crate::runtime::ModelInfo;
-use crate::training::TenantDeltaConfig;
 use crate::runtime::kv_cache::CacheOwner;
-use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
+use crate::runtime::{create_engine, RuntimeConfig, RuntimeEngine, TorchEngine};
+use crate::training::TenantDeltaConfig;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
 
 use super::client::{InferenceClient, InferenceError};
 use super::request::InferenceRequest;
@@ -125,7 +125,7 @@ impl LocalInferenceService {
         config: RuntimeConfig,
         requests: mpsc::UnboundedReceiver<InferenceRequest>,
     ) -> Result<Self, anyhow::Error> {
-        let mut engine = TorchEngine::new(config.clone())?;
+        let mut engine = create_engine(&config)?;
         engine.load_model(&model_path).await?;
 
         // Initialize KV cache registry for session-based cache isolation
@@ -134,12 +134,7 @@ impl LocalInferenceService {
         let num_layers = model_info.num_hidden_layers.unwrap_or(32) as usize;
         let max_seq_len = config.max_context.unwrap_or(model_info.context_length) as usize;
         let kv_budget = engine.compute_kv_budget();
-        engine.initialize_kv_registry(
-            num_layers,
-            max_seq_len,
-            config.kv_quant_type,
-            kv_budget,
-        );
+        engine.initialize_kv_registry(num_layers, max_seq_len, config.kv_quant_type, kv_budget);
         info!(
             "KV cache registry initialized: {} layers, max_seq_len={}",
             num_layers, max_seq_len
@@ -237,7 +232,9 @@ impl LocalInferenceService {
             }
 
             InferenceRequest::SetSession { session_id, reply } => {
-                let result = self.engine.set_session(CacheOwner::Session(session_id))
+                let result = self
+                    .engine
+                    .set_session(CacheOwner::Session(session_id))
                     .map_err(|e| InferenceError::Session(e.to_string()));
                 let _ = reply.send(result);
             }
@@ -248,7 +245,9 @@ impl LocalInferenceService {
             }
 
             InferenceRequest::ReleaseSession { session_id, reply } => {
-                let result = self.engine.release_session(&CacheOwner::Session(session_id.clone()))
+                let result = self
+                    .engine
+                    .release_session(&CacheOwner::Session(session_id.clone()))
                     .map_err(|e| InferenceError::Session(e.to_string()));
                 let _ = reply.send(result);
             }
@@ -337,10 +336,7 @@ impl LocalInferenceService {
     }
 
     /// Handle embedding request.
-    async fn handle_embed(
-        &self,
-        images: Vec<Vec<u8>>,
-    ) -> Result<Vec<Vec<f32>>, InferenceError> {
+    async fn handle_embed(&self, images: Vec<Vec<u8>>) -> Result<Vec<Vec<f32>>, InferenceError> {
         self.engine
             .embed_images(&images)
             .map_err(|e| InferenceError::Generation(e.to_string()))
@@ -366,7 +362,8 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::Generate { request, reply: tx })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn generate_stream(
@@ -399,7 +396,8 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::ModelInfo { reply: tx })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn is_ready(&self) -> Result<bool, InferenceError> {
@@ -407,7 +405,8 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::IsReady { reply: tx })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn apply_chat_template(
@@ -425,7 +424,8 @@ impl InferenceClient for LocalInferenceClient {
                 reply: tx,
             })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn create_lora(&self, config: TenantDeltaConfig) -> Result<(), InferenceError> {
@@ -433,7 +433,8 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::CreateLora { config, reply: tx })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn load_lora(&self, path: &Path) -> Result<(), InferenceError> {
@@ -444,7 +445,8 @@ impl InferenceClient for LocalInferenceClient {
                 reply: tx,
             })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn save_lora(&self, path: &Path) -> Result<(), InferenceError> {
@@ -455,7 +457,8 @@ impl InferenceClient for LocalInferenceClient {
                 reply: tx,
             })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn unload_lora(&self) -> Result<(), InferenceError> {
@@ -463,7 +466,8 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::UnloadLora { reply: tx })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn has_lora(&self) -> Result<bool, InferenceError> {
@@ -471,7 +475,8 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::HasLora { reply: tx })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn set_session(&self, session_id: String) -> Result<(), InferenceError> {
@@ -482,7 +487,8 @@ impl InferenceClient for LocalInferenceClient {
                 reply: tx,
             })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn clear_session(&self) -> Result<(), InferenceError> {
@@ -490,7 +496,8 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::ClearSession { reply: tx })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn release_session(&self, session_id: &str) -> Result<(), InferenceError> {
@@ -501,7 +508,8 @@ impl InferenceClient for LocalInferenceClient {
                 reply: tx,
             })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn embed(&self, images: &[Vec<u8>]) -> Result<Vec<Vec<f32>>, InferenceError> {
@@ -512,7 +520,8 @@ impl InferenceClient for LocalInferenceClient {
                 reply: tx,
             })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn health_check(&self) -> Result<(), InferenceError> {
@@ -520,7 +529,8 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::HealthCheck { reply: tx })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 
     async fn shutdown(&self) -> Result<(), InferenceError> {
@@ -528,6 +538,7 @@ impl InferenceClient for LocalInferenceClient {
         self.sender
             .send(InferenceRequest::Shutdown { reply: tx })
             .map_err(|_| InferenceError::Unavailable)?;
-        rx.await.map_err(|_| InferenceError::channel("No response"))?
+        rx.await
+            .map_err(|_| InferenceError::channel("No response"))?
     }
 }

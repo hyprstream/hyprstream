@@ -102,10 +102,9 @@ mod tests {
     async fn trait_object_compiles_and_rejects() {
         let src: Arc<dyn FederationKeySource> = Arc::new(AlwaysReject);
         assert!(!src.is_trusted("https://evil.example.com"));
-        assert!(
-            src.get_keys("https://evil.example.com", None)
-                .await
-                .is_err()
-        );
+        assert!(src
+            .get_keys("https://evil.example.com", None)
+            .await
+            .is_err());
     }
 }

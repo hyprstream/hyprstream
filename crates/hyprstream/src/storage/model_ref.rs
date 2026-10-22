@@ -38,7 +38,6 @@ pub struct ModelRef {
     pub git_ref: GitRef,
 }
 
-
 impl ModelRef {
     /// Create a new ModelRef with default branch
     #[allow(deprecated)] // constructs via field init; the field itself carries the deprecation
@@ -94,7 +93,6 @@ impl ModelRef {
 
         Ok(ModelRef { model, git_ref })
     }
-
 
     /// Get the git reference as an option string (for compatibility)
     pub fn git_ref_str(&self) -> Option<String> {
@@ -217,7 +215,9 @@ mod tests {
         // Model with commit SHA
         let ref4 = ModelRef::parse("llama3:1234567890abcdef1234567890abcdef12345678")?;
         assert_eq!(ref4.model, "llama3");
-        assert!(matches!(ref4.git_ref, GitRef::Commit(oid) if oid.to_string() == "1234567890abcdef1234567890abcdef12345678"));
+        assert!(
+            matches!(ref4.git_ref, GitRef::Commit(oid) if oid.to_string() == "1234567890abcdef1234567890abcdef12345678")
+        );
 
         // Model with revspec
         let ref5 = ModelRef::parse("llama3:HEAD~1")?;
@@ -235,33 +235,21 @@ mod tests {
     #[test]
     fn test_git_ref_parsing() -> Result<()> {
         // Test GitRef parsing (now using git2db's GitRef::parse)
-        assert_eq!(
-            GitRef::parse("main")?,
-            GitRef::Branch("main".to_owned())
-        );
+        assert_eq!(GitRef::parse("main")?, GitRef::Branch("main".to_owned()));
         // Explicit tag syntax required
-        assert!(matches!(
-            GitRef::parse("tags/v1.0.0")?,
-            GitRef::Tag(_)
-        ));
+        assert!(matches!(GitRef::parse("tags/v1.0.0")?, GitRef::Tag(_)));
         assert!(matches!(
             GitRef::parse("HEAD~1")?,
             GitRef::Revspec(_) | GitRef::DefaultBranch
         ));
-        assert!(matches!(
-            GitRef::parse("main^2")?,
-            GitRef::Revspec(_)
-        ));
+        assert!(matches!(GitRef::parse("main^2")?, GitRef::Revspec(_)));
 
         // Full SHA
         let sha = "1234567890abcdef1234567890abcdef12345678";
         assert!(matches!(GitRef::parse(sha)?, GitRef::Commit(oid) if oid.to_string() == sha));
 
         // Abbreviated SHA (should be treated as revspec)
-        assert!(matches!(
-            GitRef::parse("1234567")?,
-            GitRef::Revspec(_)
-        ));
+        assert!(matches!(GitRef::parse("1234567")?, GitRef::Revspec(_)));
         Ok(())
     }
 
@@ -269,12 +257,11 @@ mod tests {
     fn test_git_ref_display() -> Result<()> {
         // Test display_name (git2db's API)
         assert_eq!(GitRef::DefaultBranch.display_name(), "HEAD");
-        assert_eq!(
-            GitRef::Branch("main".to_owned()).display_name(),
-            "main"
-        );
+        assert_eq!(GitRef::Branch("main".to_owned()).display_name(), "main");
         // git2db's Tag display includes tags/ prefix
-        assert!(GitRef::Tag("v1.0".to_owned()).display_name().contains("v1.0"));
+        assert!(GitRef::Tag("v1.0".to_owned())
+            .display_name()
+            .contains("v1.0"));
         assert_eq!(
             GitRef::Revspec("HEAD~1".to_owned()).display_name(),
             "HEAD~1"
@@ -345,39 +332,21 @@ mod tests {
         // Test that git2db's GitRef parsing handles various git reference formats
 
         // Simple branch names
-        assert!(matches!(
-            GitRef::parse("main")?,
-            GitRef::Branch(_)
-        ));
+        assert!(matches!(GitRef::parse("main")?, GitRef::Branch(_)));
         assert!(matches!(
             GitRef::parse("feature/new-model")?,
             GitRef::Branch(_)
         ));
 
         // Tags (explicit tag syntax required)
-        assert!(matches!(
-            GitRef::parse("tags/v1.0.0")?,
-            GitRef::Tag(_)
-        ));
-        assert!(matches!(
-            GitRef::parse("refs/tags/v2.1")?,
-            GitRef::Tag(_)
-        ));
+        assert!(matches!(GitRef::parse("tags/v1.0.0")?, GitRef::Tag(_)));
+        assert!(matches!(GitRef::parse("refs/tags/v2.1")?, GitRef::Tag(_)));
 
         // Revspecs or DefaultBranch
         // Note: git2db treats "HEAD" as DefaultBranch, not Revspec
-        assert!(matches!(
-            GitRef::parse("HEAD")?,
-            GitRef::DefaultBranch
-        ));
-        assert!(matches!(
-            GitRef::parse("main~1")?,
-            GitRef::Revspec(_)
-        ));
-        assert!(matches!(
-            GitRef::parse("HEAD^")?,
-            GitRef::Revspec(_)
-        ));
+        assert!(matches!(GitRef::parse("HEAD")?, GitRef::DefaultBranch));
+        assert!(matches!(GitRef::parse("main~1")?, GitRef::Revspec(_)));
+        assert!(matches!(GitRef::parse("HEAD^")?, GitRef::Revspec(_)));
         assert!(matches!(
             GitRef::parse("branch..other")?,
             GitRef::Revspec(_)

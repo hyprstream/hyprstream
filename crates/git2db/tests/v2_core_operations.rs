@@ -112,19 +112,17 @@ async fn test_upsert_repository_idempotent() -> Result<(), Box<dyn std::error::E
     let url = format!("file://{}", test_repo_dir.display());
 
     // First upsert - should clone
-    let id1 = registry
-        .upsert_repository("test-project", &url)
-        .await?;
+    let id1 = registry.upsert_repository("test-project", &url).await?;
 
     // Verify repository exists (2 = .registry self-track + test-project)
     let repos: Vec<_> = registry.list().collect();
     assert_eq!(repos.len(), 2);
-    assert!(repos.iter().any(|r| r.name.as_deref() == Some("test-project")));
+    assert!(repos
+        .iter()
+        .any(|r| r.name.as_deref() == Some("test-project")));
 
     // Second upsert - should return existing
-    let id2 = registry
-        .upsert_repository("test-project", &url)
-        .await?;
+    let id2 = registry.upsert_repository("test-project", &url).await?;
 
     // Should be the same ID
     assert_eq!(id1, id2);
@@ -265,11 +263,17 @@ async fn test_repository_handle_commit() -> Result<(), Box<dyn std::error::Error
     let repo = handle.open_repo()?;
     let commit = repo.find_commit(commit_oid)?;
     let tree = commit.tree()?;
-    assert!(tree.get_path(std::path::Path::new("test.txt")).is_ok(), "test.txt should be in the commit");
+    assert!(
+        tree.get_path(std::path::Path::new("test.txt")).is_ok(),
+        "test.txt should be in the commit"
+    );
 
     // Verify commit message (git2 may or may not include trailing newline)
     let msg = commit.message().ok_or("Commit message not found")?;
-    assert!(msg.starts_with("Add test file"), "Commit message should start with expected text");
+    assert!(
+        msg.starts_with("Add test file"),
+        "Commit message should start with expected text"
+    );
 
     // Test commit_as with custom signature
     let test_file2 = worktree_path.join("test2.txt");
@@ -278,7 +282,9 @@ async fn test_repository_handle_commit() -> Result<(), Box<dyn std::error::Error
 
     use git2::Signature;
     let custom_sig = Signature::now("Test User", "test@example.com")?;
-    let commit_oid2 = handle.commit_as(&custom_sig, "Add second test file").await?;
+    let commit_oid2 = handle
+        .commit_as(&custom_sig, "Add second test file")
+        .await?;
 
     // Verify custom signature was used
     let commit2 = repo.find_commit(commit_oid2)?;
@@ -333,7 +339,9 @@ async fn test_update_repository() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Verify URL was updated in metadata
-    let repo_info = registry.get_by_id(&repo_id).ok_or("Repository not found after update")?;
+    let repo_info = registry
+        .get_by_id(&repo_id)
+        .ok_or("Repository not found after update")?;
     assert_eq!(repo_info.url, new_url);
 
     // Note: repo_info.remotes tracks registry-level remote config, not git remotes.
@@ -392,9 +400,7 @@ async fn test_list_repositories() -> Result<(), Box<dyn std::error::Error>> {
         create_test_repo(&test_repo).await?;
         let url = format!("file://{}", test_repo.display());
 
-        registry
-            .add_repository(&format!("repo{i}"), &url)
-            .await?;
+        registry.add_repository(&format!("repo{i}"), &url).await?;
     }
 
     // Should have 3 repositories + .registry self-tracking entry
@@ -434,17 +440,12 @@ async fn test_registry_clone_with_auth_callbacks() -> Result<(), Box<dyn std::er
 
     // Verify the repository was cloned successfully
     let registry_guard = registry.read().await;
-    let handle = registry_guard
-        .repo(&repo_id)?;
-    assert_eq!(
-        handle.name()?,
-        Some("cloned-repo")
-    );
+    let handle = registry_guard.repo(&repo_id)?;
+    assert_eq!(handle.name()?, Some("cloned-repo"));
 
     // Verify the bare repository exists
     // Note: handle.worktree() returns the bare repo path for cloned repos
-    let bare_repo_path = handle
-        .worktree()?;
+    let bare_repo_path = handle.worktree()?;
     assert!(bare_repo_path.exists(), "Bare repository path should exist");
 
     // Verify it's actually a bare repository
@@ -527,12 +528,20 @@ async fn test_worktree_status_ahead_behind() -> Result<(), Box<dyn std::error::E
 
     // Create a worktree for "test-branch"
     let worktree_path = temp_dir.path().join("worktrees").join("test-branch");
-    let mut worktree_handle = handle.create_worktree(&worktree_path, "test-branch").await?;
+    let mut worktree_handle = handle
+        .create_worktree(&worktree_path, "test-branch")
+        .await?;
 
     // Get status - should show ahead: 0, behind: 0 since there's no upstream tracking
     let status = worktree_handle.status().await?;
-    assert_eq!(status.ahead, 0, "Should be 0 ahead when no upstream is configured");
-    assert_eq!(status.behind, 0, "Should be 0 behind when no upstream is configured");
+    assert_eq!(
+        status.ahead, 0,
+        "Should be 0 ahead when no upstream is configured"
+    );
+    assert_eq!(
+        status.behind, 0,
+        "Should be 0 behind when no upstream is configured"
+    );
 
     // Now set up upstream tracking by creating a "remote" branch in the same repo
     // and setting it as upstream
@@ -543,7 +552,12 @@ async fn test_worktree_status_ahead_behind() -> Result<(), Box<dyn std::error::E
     let head_commit = repo.head()?.peel_to_commit()?;
     let test_branch = "test-branch";
     let remote_ref_name = format!("refs/remotes/origin/{test_branch}");
-    repo.reference(&remote_ref_name, head_commit.id(), false, "Create remote ref")?;
+    repo.reference(
+        &remote_ref_name,
+        head_commit.id(),
+        false,
+        "Create remote ref",
+    )?;
 
     // Set upstream for the current branch (test-branch)
     let mut branch = repo.find_branch(test_branch, git2::BranchType::Local)?;
@@ -594,10 +608,22 @@ async fn test_worktree_status_ahead_behind() -> Result<(), Box<dyn std::error::E
     let tree_id = index.write_tree()?;
     let tree = repo.find_tree(tree_id)?;
     // Create commit D with parent B (not C)
-    let remote_commit = repo.commit(None, &sig, &sig, "Remote commit D", &tree, &[&parent_commit])?;
+    let remote_commit = repo.commit(
+        None,
+        &sig,
+        &sig,
+        "Remote commit D",
+        &tree,
+        &[&parent_commit],
+    )?;
 
     // Update the remote ref to point to this new commit D
-    repo.reference(&remote_ref_name, remote_commit, true, "Update remote to diverged commit")?;
+    repo.reference(
+        &remote_ref_name,
+        remote_commit,
+        true,
+        "Update remote to diverged commit",
+    )?;
 
     // Clean up the working directory (remove the remote_file we added to index)
     fs::remove_file(&remote_file)?;

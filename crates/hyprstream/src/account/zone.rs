@@ -175,7 +175,9 @@ fn validate_zone_apex(apex: &str) -> Result<(), AccountZoneError> {
         return Err(bad("zone name must not have a trailing dot"));
     }
     if apex.to_ascii_lowercase() != apex {
-        return Err(bad("zone name must be lowercase (use the NFKC/ASCII-normalized form)"));
+        return Err(bad(
+            "zone name must be lowercase (use the NFKC/ASCII-normalized form)",
+        ));
     }
     if apex.len() > MAX_DNS_NAME_LEN {
         return Err(bad("zone name exceeds the 253-octet DNS text limit"));
@@ -206,8 +208,13 @@ fn validate_zone_apex(apex: &str) -> Result<(), AccountZoneError> {
         if label.len() > 63 {
             return Err(bad("a label exceeds 63 octets"));
         }
-        if !label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
-            return Err(bad("labels must be LDH (lowercase letters, digits, hyphens) only"));
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(bad(
+                "labels must be LDH (lowercase letters, digits, hyphens) only",
+            ));
         }
         if label.starts_with('-') || label.ends_with('-') {
             return Err(bad("labels must not start or end with a hyphen"));
@@ -238,7 +245,10 @@ mod tests {
         let z = AccountZone::new("acct.example.com").unwrap();
         assert_eq!(z.apex(), "acct.example.com");
         assert_eq!(z.wildcard_domain(), "*.acct.example.com");
-        assert_eq!(z.dns01_validation_name(), "_acme-challenge.acct.example.com");
+        assert_eq!(
+            z.dns01_validation_name(),
+            "_acme-challenge.acct.example.com"
+        );
     }
 
     #[test]
@@ -289,7 +299,10 @@ mod tests {
         // labels at exact total lengths.
         let apex_190 = format!("{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(62));
         assert_eq!(apex_190.len(), 190); // 63+1+63+1+62
-        assert!(AccountZone::new(&apex_190).is_err(), "190-char apex must be rejected");
+        assert!(
+            AccountZone::new(&apex_190).is_err(),
+            "190-char apex must be rejected"
+        );
 
         // An apex at the 189-char limit is accepted, and a max-length label
         // still fits: 63 + '.' + 189 = 253.

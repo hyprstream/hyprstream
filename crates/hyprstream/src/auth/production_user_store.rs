@@ -2,7 +2,7 @@
 //!
 //! `ProductionUserStore` is the only account-store handle accepted by OAuth,
 //! CLI, and bootstrap wiring. Its public constructor resolves deployment
-//! configuration and rejects plaintext-capable backends in a `credential-pds`
+//! configuration and rejects plaintext-capable backends in an encrypted-account-admission
 //! build before opening any account database.
 
 use super::UserStore;
@@ -75,8 +75,8 @@ impl ProductionUserStore {
     /// admission boundary.
     pub async fn open(credentials_dir: &Path) -> Result<Self> {
         let config = HyprConfig::load()
-            .map(|config| config.credentials)
-            .unwrap_or_default();
+            .context("failed to load production credential configuration")?
+            .credentials;
         Self::open_with_config(credentials_dir, &config).await
     }
 
@@ -86,6 +86,10 @@ impl ProductionUserStore {
         credentials_dir: &Path,
         config: &CredentialsConfig,
     ) -> Result<Self> {
+        // Metrics builds intentionally have no account provider. Keep the
+        // path consumed in the PGlite/default profile while allowing the
+        // provider-absence branch to compile without an unused argument.
+        let _ = credentials_dir;
         config.backend.ensure_allowed_for_build()?;
 
         match config.backend {
@@ -105,8 +109,19 @@ impl ProductionUserStore {
                     "credentials.backend = \"pglite\" but this binary lacks the pglite feature"
                 )
             }
+            CredentialsBackend::Postgres => {
+                #[cfg(feature = "postgres")]
+                {
+                    let store = super::PostgresUserStore::open_admitted(&Self::permit()).await?;
+                    Ok(Self::from_encrypted_backend(store))
+                }
+                #[cfg(not(feature = "postgres"))]
+                anyhow::bail!(
+                    "credentials.backend = \"postgres\" but this binary lacks the postgres feature"
+                )
+            }
             CredentialsBackend::Rocksdb => {
-                #[cfg(not(feature = "credential-pds"))]
+                #[cfg(all(not(feature = "encrypted-account-admission"), feature = "rocksdb"))]
                 {
                     let store =
                         super::RocksDbUserStore::open_admitted(credentials_dir, &Self::permit())
@@ -115,11 +130,17 @@ impl ProductionUserStore {
                         inner: Arc::new(store),
                     })
                 }
-                #[cfg(feature = "credential-pds")]
-                unreachable!("credential-pds backend guard admitted RocksDB")
+                #[cfg(all(not(feature = "encrypted-account-admission"), not(feature = "rocksdb")))]
+                {
+                    anyhow::bail!(
+                        "credentials.backend = \"rocksdb\" but this binary lacks the rocksdb feature"
+                    )
+                }
+                #[cfg(feature = "encrypted-account-admission")]
+                unreachable!("encrypted-account-admission policy admitted RocksDB")
             }
             CredentialsBackend::Valkey => {
-                #[cfg(all(not(feature = "credential-pds"), feature = "valkey"))]
+                #[cfg(all(not(feature = "encrypted-account-admission"), feature = "valkey"))]
                 {
                     let store = super::ValkeyUserStore::connect_admitted(
                         &config.valkey.url,
@@ -131,31 +152,31 @@ impl ProductionUserStore {
                         inner: Arc::new(store),
                     })
                 }
-                #[cfg(all(not(feature = "credential-pds"), not(feature = "valkey")))]
+                #[cfg(all(not(feature = "encrypted-account-admission"), not(feature = "valkey")))]
                 {
                     anyhow::bail!(
                         "credentials.backend = \"valkey\" but this binary lacks the valkey feature"
                     )
                 }
-                #[cfg(feature = "credential-pds")]
+                #[cfg(feature = "encrypted-account-admission")]
                 {
-                    unreachable!("credential-pds backend guard admitted Valkey")
+                    unreachable!("encrypted-account-admission policy admitted Valkey")
                 }
             }
         }
     }
 
     /// Open the admitted account store and the independent anonymous-device
-    /// store used by OAuth. Legacy non-credential builds that select RocksDB
-    /// share one handle so RocksDB's exclusive writer lock is not acquired
-    /// twice.
+    /// store used by OAuth. Builds without the encrypted-account admission
+    /// policy that select RocksDB share one handle so RocksDB's exclusive
+    /// writer lock is not acquired twice.
     pub(crate) async fn open_with_device_store(
         credentials_dir: &Path,
         config: &CredentialsConfig,
     ) -> Result<(Self, Option<Arc<dyn super::DeviceStore>>)> {
         config.backend.ensure_allowed_for_build()?;
 
-        #[cfg(not(feature = "credential-pds"))]
+        #[cfg(all(not(feature = "encrypted-account-admission"), feature = "rocksdb"))]
         if config.backend == CredentialsBackend::Rocksdb {
             let store = Arc::new(
                 super::RocksDbUserStore::open_admitted(credentials_dir, &Self::permit())
@@ -170,6 +191,10 @@ impl ProductionUserStore {
         }
 
         let account_store = Self::open_with_config(credentials_dir, config).await?;
+        // The anonymous-device store is the one RocksDB handle that every
+        // production posture shares; a build without the `rocksdb` feature
+        // has no device store (already tolerated as `None` downstream).
+        #[cfg(feature = "rocksdb")]
         let device_store = super::RocksDbUserStore::open_admitted(credentials_dir, &Self::permit())
             .map(|store| Arc::new(store) as Arc<dyn super::DeviceStore>)
             .map_err(|error| {
@@ -177,13 +202,14 @@ impl ProductionUserStore {
                 error
             })
             .ok();
+        #[cfg(not(feature = "rocksdb"))]
+        let device_store: Option<Arc<dyn super::DeviceStore>> = None;
         Ok((account_store, device_store))
     }
 
     /// Admit a backend whose implementation is structurally marked as
-    /// encrypted-at-rest. PGlite uses this today; #1401's Postgres backend must
-    /// implement the same crate-private marker when restacked.
-    #[allow(dead_code)] // #1401 consumes this marker when Postgres is restacked.
+    /// encrypted-at-rest. PGlite and Postgres are both explicit admission
+    /// providers.
     pub(crate) fn from_encrypted_backend<T>(store: T) -> Self
     where
         T: EncryptedUserStoreBackend + 'static,
@@ -213,18 +239,59 @@ impl Deref for ProductionUserStore {
 
 /// Crate-private admission marker for encrypted-at-rest account backends.
 ///
-/// Keeping the implementation list here makes adding Postgres an explicit
+/// Keeping the implementation list here makes adding a backend an explicit
 /// security decision rather than something any `UserStore` implementation
 /// inherits automatically.
-#[allow(dead_code)] // #1401 implements this when Postgres is restacked.
 pub(crate) trait EncryptedUserStoreBackend: UserStore {}
 
 #[cfg(feature = "pglite")]
 impl EncryptedUserStoreBackend for super::PgliteUserStore {}
 
-#[cfg(all(test, feature = "credential-pds"))]
+#[cfg(feature = "postgres")]
+impl EncryptedUserStoreBackend for super::PostgresUserStore {}
+
+#[cfg(all(test, feature = "encrypted-account-admission"))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_config_never_defaults_account_selection() -> Result<()> {
+        const CHILD: &str = "HYPRSTREAM_STORE_CONFIG_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir()?;
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("HYPRSTREAM__") {
+                    child.env_remove(key);
+                }
+            }
+            let status = child.args([
+                "--exact", "auth::production_user_store::tests::invalid_config_never_defaults_account_selection",
+                "--nocapture",
+            ])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("HYPRSTREAM__CREDENTIALS__BACKEND", "postgres")
+                .env("HYPRSTREAM__OAUTH__PORT", "invalid-port")
+                .status()?;
+            anyhow::ensure!(
+                status.success(),
+                "invalid credential configuration child failed"
+            );
+            return Ok(());
+        }
+        let credentials = tempfile::tempdir()?;
+        let error = match ProductionUserStore::open(credentials.path()).await {
+            Ok(_) => anyhow::bail!("invalid configuration opened an account store"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("failed to load production credential configuration"));
+        assert_eq!(std::fs::read_dir(credentials.path())?.count(), 0);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn production_boundary_rejects_plaintext_backends_before_opening_storage() -> Result<()> {
@@ -238,15 +305,13 @@ mod tests {
             let error = match ProductionUserStore::open_with_config(credentials_dir.path(), &config)
                 .await
             {
-                Ok(_) => panic!("credential-pds admitted a plaintext-capable account backend"),
+                Ok(_) => panic!("encrypted-account-admission policy admitted a plaintext-capable account backend"),
                 Err(error) => error,
             };
             assert!(
-                error
-                    .to_string()
-                    .contains(
-                        "encrypted credential storage requires credentials.backend = \"pglite\"",
-                    ),
+                error.to_string().contains(
+                    "encrypted credential storage requires credentials.backend = \"pglite\" or \"postgres\"",
+                ),
                 "unexpected admission error: {error:#}"
             );
         }
@@ -254,6 +319,38 @@ mod tests {
         assert!(
             !credentials_dir.path().join("users.db").exists(),
             "rejected backend must not open or create plaintext storage"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(feature = "pglite"))]
+    #[tokio::test]
+    async fn metrics_profile_rejects_missing_encrypted_provider_before_opening_storage(
+    ) -> Result<()> {
+        let credentials_dir = tempfile::tempdir()?;
+        let error = match ProductionUserStore::open_with_config(
+            credentials_dir.path(),
+            &CredentialsConfig::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("metrics profile admitted an unavailable PGlite provider"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains(
+                "credentials.backend = \"pglite\" but this binary lacks the pglite feature"
+            ),
+            "unexpected provider error: {error:#}"
+        );
+        assert!(
+            !credentials_dir.path().join("pglite").exists(),
+            "missing provider must not create PGlite storage"
+        );
+        assert!(
+            !credentials_dir.path().join("users.db").exists(),
+            "missing provider must not create plaintext storage"
         );
         Ok(())
     }

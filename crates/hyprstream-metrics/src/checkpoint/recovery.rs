@@ -34,7 +34,12 @@ pub enum RecoveryStatus {
 impl RecoveryStatus {
     /// Check if recovery was successful
     pub fn is_success(&self) -> bool {
-        matches!(self, RecoveryStatus::Recovered { .. } | RecoveryStatus::NoCheckpointFound | RecoveryStatus::Skipped { .. })
+        matches!(
+            self,
+            RecoveryStatus::Recovered { .. }
+                | RecoveryStatus::NoCheckpointFound
+                | RecoveryStatus::Skipped { .. }
+        )
     }
 }
 
@@ -79,11 +84,7 @@ impl RecoveryManager {
     ) -> RecoveryStatus {
         info!("Restoring from checkpoint");
 
-        match self
-            .checkpoint_mgr
-            .restore(checkpoint.id(), storage)
-            .await
-        {
+        match self.checkpoint_mgr.restore(checkpoint.id(), storage).await {
             Ok(()) => {
                 let tables_restored = checkpoint.tables().len();
                 info!(

@@ -540,6 +540,16 @@ impl StreamContext {
         self.reach_config
             .reach_with_relay(self.relay_choice.clone())
     }
+
+    /// The server accepted-state witness carried with this signed StreamInfo.
+    /// A missing witness decodes as the default and is rejected before a native
+    /// Iroh admission exchange; it does not affect Quinn/UDS consumers.
+    pub fn moql_server_identity(&self) -> crate::stream_info::MoqlServerIdentity {
+        self.reach_config
+            .moql_server_identity
+            .clone()
+            .unwrap_or_default()
+    }
 }
 
 // ============================================================================
@@ -732,7 +742,10 @@ impl StreamChannel {
     }
 
     /// Share a service-owned reach handle with this channel.
-    pub fn with_reach_config_handle(mut self, handle: crate::moq_stream::ProducerReachConfigHandle) -> Self {
+    pub fn with_reach_config_handle(
+        mut self,
+        handle: crate::moq_stream::ProducerReachConfigHandle,
+    ) -> Self {
         self.reach_config = handle;
         self
     }
@@ -743,7 +756,10 @@ impl StreamChannel {
     }
 
     /// Share a service-owned MoQ origin handle with this channel.
-    pub fn with_moq_origin_handle(mut self, handle: crate::moq_stream::MoqStreamOriginHandle) -> Self {
+    pub fn with_moq_origin_handle(
+        mut self,
+        handle: crate::moq_stream::MoqStreamOriginHandle,
+    ) -> Self {
         self.moq_origin = handle;
         self
     }
@@ -1510,6 +1526,8 @@ mod tests {
 
         let config = |port| -> Result<ProducerReachConfig> {
             Ok(ProducerReachConfig {
+                moql_server_identity: None,
+                relay_moql_server_identity: None,
                 iroh_node_id: None,
                 quic_reach: Some(NodeStreamReach {
                     addr: format!("127.0.0.1:{port}").parse()?,
@@ -1519,10 +1537,10 @@ mod tests {
                 relay: None,
             })
         };
-        let channel_a = StreamChannel::new(SigningKey::from_bytes(&[1; 32]))
-            .with_reach_config(config(4101)?);
-        let channel_b = StreamChannel::new(SigningKey::from_bytes(&[2; 32]))
-            .with_reach_config(config(4102)?);
+        let channel_a =
+            StreamChannel::new(SigningKey::from_bytes(&[1; 32])).with_reach_config(config(4101)?);
+        let channel_b =
+            StreamChannel::new(SigningKey::from_bytes(&[2; 32])).with_reach_config(config(4102)?);
         let (_, client_pub) = crate::crypto::generate_ephemeral_keypair();
 
         let stream_a = channel_a
@@ -1591,7 +1609,8 @@ mod tests {
     #[tokio::test]
     async fn stream_channel_uses_service_scoped_moq_origin() -> Result<()> {
         let scoped_origin = crate::moq_stream::MoqStreamOrigin::standalone().build();
-        let origin_handle = std::sync::Arc::new(parking_lot::RwLock::new(Some(scoped_origin.clone())));
+        let origin_handle =
+            std::sync::Arc::new(parking_lot::RwLock::new(Some(scoped_origin.clone())));
         let channel = StreamChannel::new(SigningKey::from_bytes(&[3; 32]))
             .with_moq_origin_handle(origin_handle);
         let (_, client_pub) = crate::crypto::generate_ephemeral_keypair();

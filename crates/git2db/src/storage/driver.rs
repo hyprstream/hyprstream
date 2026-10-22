@@ -6,15 +6,14 @@ use crate::references::IntoGitRef;
 use crate::repository_handle::RepositoryStatus;
 use async_trait::async_trait;
 use git2::{Oid, Signature};
+use inventory;
+use once_cell::sync::OnceCell;
+use parking_lot::Mutex;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use once_cell::sync::OnceCell;
-use parking_lot::Mutex;
-use inventory;
-
 
 /// Storage driver selection
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +95,6 @@ impl fmt::Debug for DriverOpts {
     }
 }
 
-
 /// Driver-specific errors
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
@@ -130,10 +128,7 @@ pub struct DriverFactory {
 impl DriverFactory {
     /// Create a new driver factory with const-compatible registration
     pub const fn new(name: &'static str, factory: fn() -> Box<dyn Driver>) -> Self {
-        Self {
-            name,
-            factory,
-        }
+        Self { name, factory }
     }
 
     /// Get the driver instance (wrapped in Arc for sharing)
@@ -181,11 +176,16 @@ pub trait Driver: Send + Sync {
     ///
     /// Returns the worktree handle if it exists and is managed by this driver,
     /// or None if the worktree doesn't exist or isn't managed by this driver.
-    async fn get_worktree(&self, base_repo: &Path, branch: &str) -> Git2DBResult<Option<WorktreeHandle>>;
+    async fn get_worktree(
+        &self,
+        base_repo: &Path,
+        branch: &str,
+    ) -> Git2DBResult<Option<WorktreeHandle>>;
 }
 
 /// Async cleanup function type
-pub type AsyncCleanupFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Git2DBResult<()>> + Send>> + Send>;
+pub type AsyncCleanupFn =
+    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Git2DBResult<()>> + Send>> + Send>;
 
 /// Handle to a created worktree
 ///
@@ -221,11 +221,7 @@ impl WorktreeHandle {
     }
 
     /// Create with async cleanup function
-    pub fn with_cleanup<F, Fut>(
-        path: PathBuf,
-        driver_name: String,
-        cleanup: F
-    ) -> Self
+    pub fn with_cleanup<F, Fut>(path: PathBuf, driver_name: String, cleanup: F) -> Self
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Git2DBResult<()>> + Send + 'static,
@@ -242,9 +238,13 @@ impl WorktreeHandle {
 
     /// Open the worktree as a git repository
     pub fn open_repository(&self) -> Git2DBResult<git2::Repository> {
-        git2::Repository::open(&self.path).map_err(|e| Git2DBError::internal(format!(
-            "Failed to open worktree at {}: {}", self.path.display(), e
-        )))
+        git2::Repository::open(&self.path).map_err(|e| {
+            Git2DBError::internal(format!(
+                "Failed to open worktree at {}: {}",
+                self.path.display(),
+                e
+            ))
+        })
     }
 
     /// Get the driver name
@@ -261,10 +261,12 @@ impl WorktreeHandle {
     ///
     /// Returns a kernel-enforced (Linux) or canonicalize-based (other) filesystem
     /// rooted at this worktree's path.
-    pub fn fs(&self) -> Result<&Arc<dyn hyprstream_containedfs::ContainedFs>, hyprstream_containedfs::FsError> {
-        self.contained_fs.get_or_try_init(|| {
-            hyprstream_containedfs::open(&self.path)
-        })
+    pub fn fs(
+        &self,
+    ) -> Result<&Arc<dyn hyprstream_containedfs::ContainedFs>, hyprstream_containedfs::FsError>
+    {
+        self.contained_fs
+            .get_or_try_init(|| hyprstream_containedfs::open(&self.path))
     }
 
     /// Get the git repository with lazy loading and caching
@@ -294,9 +296,7 @@ impl WorktreeHandle {
 
     /// Check if the worktree is valid and accessible
     pub fn is_valid(&self) -> bool {
-        self.path.exists() &&
-        self.path.join(".git").exists() &&
-        self.open_repository().is_ok()
+        self.path.exists() && self.path.join(".git").exists() && self.open_repository().is_ok()
     }
 
     /// Check if the worktree has uncommitted changes
@@ -379,7 +379,11 @@ impl WorktreeHandle {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn commit_as(&mut self, signature: &Signature<'_>, message: &str) -> Git2DBResult<Oid> {
+    pub async fn commit_as(
+        &mut self,
+        signature: &Signature<'_>,
+        message: &str,
+    ) -> Git2DBResult<Oid> {
         let repo = self.open_repository()?;
 
         // Get the current index
@@ -495,12 +499,7 @@ impl WorktreeHandle {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn merge(
-        &mut self,
-        branch: &str,
-        ff_only: bool,
-        no_ff: bool,
-    ) -> Git2DBResult<Oid> {
+    pub async fn merge(&mut self, branch: &str, ff_only: bool, no_ff: bool) -> Git2DBResult<Oid> {
         let repo = self.open_repository()?;
 
         // Resolve branch reference
@@ -508,22 +507,22 @@ impl WorktreeHandle {
             .find_reference(&format!("refs/heads/{branch}"))
             .or_else(|_| repo.find_reference(&format!("refs/remotes/origin/{branch}")))
             .or_else(|_| repo.find_reference(branch))
-            .map_err(|e| {
-                Git2DBError::reference(branch, format!("Branch not found: {e}"))
-            })?;
+            .map_err(|e| Git2DBError::reference(branch, format!("Branch not found: {e}")))?;
 
         let branch_commit = branch_ref.peel_to_commit().map_err(|e| {
             Git2DBError::reference(branch, format!("Failed to resolve commit: {e}"))
         })?;
 
-        let annotated_commit = repo.find_annotated_commit(branch_commit.id()).map_err(|e| {
-            Git2DBError::internal(format!("Failed to create annotated commit: {e}"))
-        })?;
+        let annotated_commit = repo
+            .find_annotated_commit(branch_commit.id())
+            .map_err(|e| {
+                Git2DBError::internal(format!("Failed to create annotated commit: {e}"))
+            })?;
 
         // Perform merge analysis
-        let (merge_analysis, _) = repo.merge_analysis(&[&annotated_commit]).map_err(|e| {
-            Git2DBError::internal(format!("Merge analysis failed: {e}"))
-        })?;
+        let (merge_analysis, _) = repo
+            .merge_analysis(&[&annotated_commit])
+            .map_err(|e| Git2DBError::internal(format!("Merge analysis failed: {e}")))?;
 
         // Already up-to-date
         if merge_analysis.is_up_to_date() {
@@ -539,23 +538,16 @@ impl WorktreeHandle {
 
         // Fast-forward merge (if possible and not --no-ff)
         if merge_analysis.is_fast_forward() && !no_ff {
-            let mut head_ref = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
-            })?;
+            let mut head_ref = repo
+                .head()
+                .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?;
 
             head_ref
                 .set_target(branch_commit.id(), "Fast-forward merge")
-                .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to update HEAD: {e}"))
-                })?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to update HEAD: {e}")))?;
 
-            repo.checkout_head(Some(
-                git2::build::CheckoutBuilder::default()
-                    .force()
-            ))
-            .map_err(|e| {
-                Git2DBError::internal(format!("Checkout failed: {e}"))
-            })?;
+            repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
+                .map_err(|e| Git2DBError::internal(format!("Checkout failed: {e}")))?;
 
             return Ok(branch_commit.id());
         }
@@ -592,9 +584,7 @@ impl WorktreeHandle {
             .head()
             .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?
             .peel_to_commit()
-            .map_err(|e| {
-                Git2DBError::internal(format!("Failed to resolve HEAD commit: {e}"))
-            })?;
+            .map_err(|e| Git2DBError::internal(format!("Failed to resolve HEAD commit: {e}")))?;
 
         let merge_oid = repo
             .commit(
@@ -644,9 +634,9 @@ impl WorktreeHandle {
             .map(std::borrow::ToOwned::to_owned);
         let head_oid = head.as_ref().and_then(git2::Reference::target);
 
-        let statuses = repo.statuses(None).map_err(|e| {
-            Git2DBError::internal(format!("Failed to get repository status: {e}"))
-        })?;
+        let statuses = repo
+            .statuses(None)
+            .map_err(|e| Git2DBError::internal(format!("Failed to get repository status: {e}")))?;
 
         let is_clean = statuses.is_empty();
         let modified_files: Vec<PathBuf> = statuses
@@ -744,9 +734,7 @@ impl WorktreeHandle {
             GitRef::Tag(ref tag_name) => {
                 let reference = repo
                     .find_reference(&format!("refs/tags/{tag_name}"))
-                    .map_err(|e| {
-                        Git2DBError::reference(tag_name, format!("Tag not found: {e}"))
-                    })?;
+                    .map_err(|e| Git2DBError::reference(tag_name, format!("Tag not found: {e}")))?;
                 reference
                     .target()
                     .ok_or_else(|| Git2DBError::reference(tag_name, "Tag has no target"))?
@@ -828,19 +816,23 @@ impl WorktreeHandle {
         let remote_name = remote.unwrap_or("origin");
 
         // Get current branch
-        let head = repo.head().map_err(|e| {
-            Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
-        })?;
-        let current_branch = head.shorthand().ok_or_else(|| {
-            Git2DBError::reference("HEAD", "HEAD is detached")
-        })?;
+        let head = repo
+            .head()
+            .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?;
+        let current_branch = head
+            .shorthand()
+            .ok_or_else(|| Git2DBError::reference("HEAD", "HEAD is detached"))?;
 
         // Get tracking branch (e.g., origin/main)
         let tracking_ref = format!("refs/remotes/{remote_name}/{current_branch}");
         let tracking_commit = repo
             .find_reference(&tracking_ref)
             .and_then(|r| r.peel_to_commit())
-            .map_err(|e| Git2DBError::internal(format!("Failed to find tracking branch {tracking_ref}: {e}")))?;
+            .map_err(|e| {
+                Git2DBError::internal(format!(
+                    "Failed to find tracking branch {tracking_ref}: {e}"
+                ))
+            })?;
 
         let annotated_commit = repo.find_annotated_commit(tracking_commit.id())?;
 
@@ -854,19 +846,19 @@ impl WorktreeHandle {
         if merge_analysis.is_fast_forward() {
             // Fast-forward
             let commit_id = annotated_commit.id();
-            let commit = repo.find_commit(commit_id).map_err(|e| Git2DBError::internal(format!("Failed to find commit: {e}")))?;
+            let commit = repo
+                .find_commit(commit_id)
+                .map_err(|e| Git2DBError::internal(format!("Failed to find commit: {e}")))?;
             repo.checkout_tree(commit.as_object(), None)
                 .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {e}")))?;
 
-            let mut head_ref = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
-            })?;
+            let mut head_ref = repo
+                .head()
+                .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?;
 
             head_ref
                 .set_target(tracking_commit.id(), "Fast-forward pull")
-                .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to update HEAD: {e}"))
-                })?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to update HEAD: {e}")))?;
         } else {
             // Merge (create merge commit)
             repo.merge(&[&annotated_commit], None, None)
@@ -943,9 +935,9 @@ impl WorktreeHandle {
             .find_remote(remote_name)
             .map_err(|e| Git2DBError::reference(remote_name, format!("Remote not found: {e}")))?;
 
-        remote_obj.push(&[] as &[&str], None).map_err(|e| {
-            Git2DBError::network(format!("Failed to push to {remote_name}: {e}"))
-        })?;
+        remote_obj
+            .push(&[] as &[&str], None)
+            .map_err(|e| Git2DBError::network(format!("Failed to push to {remote_name}: {e}")))?;
 
         Ok(())
     }
@@ -972,19 +964,23 @@ impl WorktreeHandle {
         let repo = self.open_repository()?;
 
         // Get current branch
-        let head = repo.head().map_err(|e| {
-            Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
-        })?;
-        let current_branch = head.shorthand().ok_or_else(|| {
-            Git2DBError::reference("HEAD", "HEAD is detached")
-        })?;
+        let head = repo
+            .head()
+            .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?;
+        let current_branch = head
+            .shorthand()
+            .ok_or_else(|| Git2DBError::reference("HEAD", "HEAD is detached"))?;
 
         // Get tracking branch
         let tracking_ref = format!("refs/remotes/origin/{current_branch}");
         let tracking_commit = repo
             .find_reference(&tracking_ref)
             .and_then(|r| r.peel_to_commit())
-            .map_err(|e| Git2DBError::internal(format!("Failed to find tracking branch {tracking_ref}: {e}")))?;
+            .map_err(|e| {
+                Git2DBError::internal(format!(
+                    "Failed to find tracking branch {tracking_ref}: {e}"
+                ))
+            })?;
 
         let annotated_commit = repo.find_annotated_commit(tracking_commit.id())?;
 
@@ -998,19 +994,19 @@ impl WorktreeHandle {
         if merge_analysis.is_fast_forward() {
             // Fast-forward only
             let commit_id = annotated_commit.id();
-            let commit = repo.find_commit(commit_id).map_err(|e| Git2DBError::internal(format!("Failed to find commit: {e}")))?;
+            let commit = repo
+                .find_commit(commit_id)
+                .map_err(|e| Git2DBError::internal(format!("Failed to find commit: {e}")))?;
             repo.checkout_tree(commit.as_object(), None)
                 .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {e}")))?;
 
-            let mut head_ref = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
-            })?;
+            let mut head_ref = repo
+                .head()
+                .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?;
 
             head_ref
                 .set_target(tracking_commit.id(), "Fast-forward update")
-                .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to update HEAD: {e}"))
-                })?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to update HEAD: {e}")))?;
         } else {
             return Err(Git2DBError::merge_conflict(
                 "Cannot update - branches have diverged. Use `pull()` to merge.",
@@ -1030,19 +1026,23 @@ impl WorktreeHandle {
         let repo = self.open_repository()?;
 
         // Get current branch
-        let head = repo.head().map_err(|e| {
-            Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
-        })?;
-        let current_branch = head.shorthand().ok_or_else(|| {
-            Git2DBError::reference("HEAD", "HEAD is detached")
-        })?;
+        let head = repo
+            .head()
+            .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?;
+        let current_branch = head
+            .shorthand()
+            .ok_or_else(|| Git2DBError::reference("HEAD", "HEAD is detached"))?;
 
         // Get tracking branch
         let tracking_ref = format!("refs/remotes/{remote}/{current_branch}");
         let tracking_commit = repo
             .find_reference(&tracking_ref)
             .and_then(|r| r.peel_to_commit())
-            .map_err(|e| Git2DBError::internal(format!("Failed to find tracking branch {tracking_ref}: {e}")))?;
+            .map_err(|e| {
+                Git2DBError::internal(format!(
+                    "Failed to find tracking branch {tracking_ref}: {e}"
+                ))
+            })?;
 
         let annotated_commit = repo.find_annotated_commit(tracking_commit.id())?;
 
@@ -1056,23 +1056,26 @@ impl WorktreeHandle {
         if merge_analysis.is_fast_forward() {
             // Fast-forward only
             let commit_id = annotated_commit.id();
-            let commit = repo.find_commit(commit_id).map_err(|e| Git2DBError::internal(format!("Failed to find commit: {e}")))?;
+            let commit = repo
+                .find_commit(commit_id)
+                .map_err(|e| Git2DBError::internal(format!("Failed to find commit: {e}")))?;
             repo.checkout_tree(commit.as_object(), None)
                 .map_err(|e| Git2DBError::internal(format!("Failed to checkout tree: {e}")))?;
 
-            let mut head_ref = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
-            })?;
+            let mut head_ref = repo
+                .head()
+                .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?;
 
             head_ref
-                .set_target(tracking_commit.id(), &format!("Fast-forward update from {remote}"))
-                .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to update HEAD: {e}"))
-                })?;
+                .set_target(
+                    tracking_commit.id(),
+                    &format!("Fast-forward update from {remote}"),
+                )
+                .map_err(|e| Git2DBError::internal(format!("Failed to update HEAD: {e}")))?;
         } else {
-            return Err(Git2DBError::merge_conflict(
-                format!("Cannot update from {remote} - branches have diverged. Use `pull()` to merge."),
-            ));
+            return Err(Git2DBError::merge_conflict(format!(
+                "Cannot update from {remote} - branches have diverged. Use `pull()` to merge."
+            )));
         }
 
         repo.cleanup_state()
@@ -1091,7 +1094,6 @@ pub struct WorktreeMetadata {
     pub is_dirty: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
-
 
 impl Drop for WorktreeHandle {
     fn drop(&mut self) {

@@ -3,13 +3,25 @@
 
 ARG VARIANT=cpu
 ARG DEBIAN_VERSION=trixie
-ARG LIBTORCH_VERSION=2.10.0
+ARG LIBTORCH_VERSION=2.11.0
 
 # LibTorch download URLs for manual installation
 ARG LIBTORCH_CUDA128_URL=https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcu128.zip
 ARG LIBTORCH_CUDA130_URL=https://download.pytorch.org/libtorch/cu130/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcu130.zip
 ARG LIBTORCH_ROCM_URL=https://download.pytorch.org/libtorch/rocm7.1/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Brocm7.1.zip
 ARG LIBTORCH_CPU_URL=https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip
+
+# Runtime base for every variant, pinned by multi-arch index digest so amd64 and
+# arm64 resolve from one immutable reference. This image ships no package
+# manager, runs as an unprivileged user, and provides glibc, libstdc++, libgcc,
+# libz, and a shell; only OpenSSL has to be carried over from the builder (see
+# the runtime stages). Bump by replacing the digest, never by moving to a tag.
+ARG RUNTIME_BASE=registry.access.redhat.com/hi/core-runtime@sha256:80bd4bd4e74c8ab4e372cf355b335dbd30d91e9e5669822283299e65c64788e2
+
+# Unprivileged runtime account provided by the runtime base. Declared here so
+# the USER instruction and any future ownership rules share one source.
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
 
 #############################################
 # Base Builder - Common for all variants
@@ -40,12 +52,17 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Keep container builds on the same compiler/components as local builds and CI.
+# Placing the override at / also covers the later /build working directory.
+COPY rust-toolchain.toml /rust-toolchain.toml
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+    && /root/.cargo/bin/rustup show active-toolchain
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install sccache for compilation caching (works with BuildKit cache mounts)
-RUN cargo install sccache --locked
+ARG HYPRSTREAM_BUILD_JOBS
+RUN if [ -n "$HYPRSTREAM_BUILD_JOBS" ]; then export CARGO_BUILD_JOBS="$HYPRSTREAM_BUILD_JOBS"; fi \
+    && cargo install sccache --locked
 ENV RUSTC_WRAPPER=sccache
 ENV SCCACHE_DIR=/sccache
 
@@ -80,9 +97,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+COPY rust-toolchain.toml /rust-toolchain.toml
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
+    && /root/.cargo/bin/rustup show active-toolchain
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN cargo install sccache --locked
+ARG HYPRSTREAM_BUILD_JOBS
+RUN if [ -n "$HYPRSTREAM_BUILD_JOBS" ]; then export CARGO_BUILD_JOBS="$HYPRSTREAM_BUILD_JOBS"; fi \
+    && cargo install sccache --locked
 ENV RUSTC_WRAPPER=sccache
 ENV SCCACHE_DIR=/sccache
 
@@ -201,7 +222,7 @@ FROM builder-base AS builder-cpu-arm64
 ARG LIBTORCH_VERSION
 
 # tch-rs's fork keys its ABI check to the exact libtorch version string; the pip
-# wheel reports the same 2.10.0 but bypass keeps us resilient to wheel-suffix skew.
+# wheel reports the same 2.11.0 but bypass keeps us resilient to wheel-suffix skew.
 ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
 # Python + pip to fetch the aarch64 torch wheel.
@@ -210,11 +231,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Install the CPU torch wheel (aarch64) and expose its bundled libtorch as
+# Install the CPU-only torch wheel (aarch64) and expose its bundled libtorch as
 # /opt/libtorch so the shared `builder` stage's LIBTORCH=/opt/libtorch just works.
+# The default PyPI torch artifact is CUDA-enabled on arm64 and pulls hundreds of
+# megabytes of CUDA .so files into this layer.  Use PyTorch's CPU index and
+# --no-cache-dir so the OCI publisher does not exhaust its small arm64 root disk
+# while committing the builder layer (the runtime smoke still runs below).
 # --break-system-packages: bookworm marks the system python PEP-668 externally-managed.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install --break-system-packages "torch==${LIBTORCH_VERSION}" \
+    pip3 install --break-system-packages --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        "torch==${LIBTORCH_VERSION}+cpu" \
     && TORCH_DIR="$(python3 -c 'import torch, os; print(os.path.dirname(torch.__file__))')" \
     && ln -s "$TORCH_DIR" /opt/libtorch \
     && ls -la /opt/libtorch/lib/libtorch_cpu.so /opt/libtorch/include >/dev/null
@@ -228,6 +255,13 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 #   - git-lfs: git2db's LFS worktree tests shell out to the git-lfs binary.
 #   - cargo-nextest: pinned + SHA-256 verified (never get.nexte.st/latest — a
 #     mutable fetch that would otherwise run in an AWS-credentialed container).
+#   - cargo-deny: pinned to an EmbarkStudios release tarball with a RECORDED
+#     SHA-256 (the upstream .sha256 sidecar verified against the download at
+#     pin time; the digest is baked here, never fetched at build time). The
+#     musl build runs on the bookworm glibc base. Prereq for migrating the
+#     arch-neutral rust.yml `deny` job onto this self-hosted builder image
+#     (native CI plan, evidence blocker B3) — the migrated job must install
+#     nothing ad hoc, matching this image's no-runtime-fetch rule.
 ARG NEXTEST_VERSION=0.9.140
 ARG NEXTEST_SHA256=8b3f4d4560b6b0f83774fecc6be07e47716dbad0eb0bb6c3890f478f4affe4b6
 RUN apt-get update && apt-get install -y --no-install-recommends git-lfs \
@@ -238,6 +272,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends git-lfs \
     && tar zxf /tmp/nextest.tar.gz -C /root/.cargo/bin \
     && rm -f /tmp/nextest.tar.gz \
     && cargo-nextest --version && git-lfs --version
+
+# cargo-deny from the pinned upstream release (see the tooling note above).
+# The recorded digest is the real integrity gate; the trailing version
+# assertion makes the baked tool's identity deterministic — comparing the
+# first two tokens survives a build-id/commit suffix while still pinning the
+# exact version, and a mismatch fails the image build rather than shipping a
+# wrong tool silently.
+ARG CARGO_DENY_VERSION=0.20.2
+ARG CARGO_DENY_SHA256=995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d
+RUN curl -fsSL -o /tmp/cargo-deny.tar.gz \
+        "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+    && echo "${CARGO_DENY_SHA256}  /tmp/cargo-deny.tar.gz" | sha256sum -c - \
+    && tar zxf /tmp/cargo-deny.tar.gz -C /root/.cargo/bin --strip-components=1 \
+        "cargo-deny-${CARGO_DENY_VERSION}-aarch64-unknown-linux-musl/cargo-deny" \
+    && rm -f /tmp/cargo-deny.tar.gz \
+    && test "$(cargo-deny --version | awk '{print $1, $2}')" = "cargo-deny ${CARGO_DENY_VERSION}"
+
+# cargo-hakari from the pinned upstream release (same pattern as cargo-deny
+# above). Baked because the deny job's container script runs the
+# workspace-hack regeneration-drift gate (scripts/hack_wasm_gate.py round
+# trip) — the gate must install nothing ad hoc at runtime, matching the
+# no-runtime-fetch rule. Upstream ships a single flat binary in the tarball
+# (no versioned directory, hence no --strip-components).
+ARG CARGO_HAKARI_VERSION=0.9.38
+ARG CARGO_HAKARI_SHA256=0076ddafb28c373125b30a8c04d6f4b7e4b59bf141fd51b6f47f89dc66922d34
+RUN curl -fsSL -o /tmp/cargo-hakari.tar.gz \
+        "https://github.com/guppy-rs/guppy/releases/download/cargo-hakari-${CARGO_HAKARI_VERSION}/cargo-hakari-${CARGO_HAKARI_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+    && echo "${CARGO_HAKARI_SHA256}  /tmp/cargo-hakari.tar.gz" | sha256sum -c - \
+    && tar zxf /tmp/cargo-hakari.tar.gz -C /root/.cargo/bin \
+    && rm -f /tmp/cargo-hakari.tar.gz \
+    && test "$(cargo-hakari --version | awk '{print $1, $2}')" = "cargo-hakari ${CARGO_HAKARI_VERSION}"
 
 # Pre-provision the repo's pinned Rust toolchain (channel + components + targets)
 # from rust-toolchain.toml so the merge gate does NOT rustup-download it at
@@ -250,14 +315,41 @@ RUN cd /tmp/tc \
     && rustup component add clippy rustfmt \
     && rustup target add wasm32-unknown-unknown wasm32-wasip1 \
     && rustup target list --installed | grep -qx wasm32-wasip1 \
-    && rm -rf /tmp/tc
+    && rm -rf /tmp/tc \
+    && chmod a+rx /root \
+    && chmod -R a+rwX /root/.cargo /root/.rustup
+
+# R4 (#1425): bake the merge-gate's per-run container setup so the `build`
+# job's container step stops paying it on every candidate (~150-215 s of
+# apt install + permission walks):
+#   - chromium + chromium-driver: the headless browser the wasm_browser_fetch
+#     conformance test launches. Mirrors .github/scripts/install-chromium.sh's
+#     exact package set; that script no-ops once `chromium` is on PATH, so the
+#     WASM job and the preflight keep working unchanged.
+#   - the non-root `ci` user the gate runs as (several fail-closed tests
+#     assert a write to a read-only dir is rejected, which only holds as
+#     non-root). This replaces the runtime useradd dance; the per-run
+#     `chown -R ci:ci /build` of the bind-mounted checkout stays in the
+#     workflow — the mount is per-run and cannot be baked.
+#
+# The toolchain chmod lives in the rustup RUN above, and it MUST stay there:
+# a metadata-only chmod in a later layer forces an overlay copy-up of the
+# whole /root/.cargo + /root/.rustup tree into that layer (~2-3 GB), which
+# exhausts the publisher's small root disk (observed: the standalone chmod
+# layer failed to commit with "no space left on device"). Same-RUN chmods
+# edit files already in the current layer and cost nothing.
+RUN apt-get update && apt-get install -y chromium chromium-driver \
+    && rm -rf /var/lib/apt/lists/* && apt-get clean \
+    && useradd -m ci \
+    && command -v chromium \
+    && command -v chromedriver
 
 #############################################
 # CUDA 13.0 Builder (aarch64 / arm64) — reconnaissance only
 #############################################
 #
 # NVIDIA CUDA supports arm64-sbsa, and PyTorch publishes aarch64 CUDA wheels.
-# This uses the project's pinned 2.10.0 libtorch release with the CUDA 13.0
+# This uses the project's pinned 2.11.0 libtorch release with the CUDA 13.0
 # aarch64 wheel. It remains dispatch-only until a GPU-equipped ARM runner
 # validates runtime execution.
 FROM builder-base AS builder-cuda130-arm64-spike
@@ -270,7 +362,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --break-system-packages \
         --extra-index-url https://download.pytorch.org/whl/cu130 \
-        'torch==2.10.0+cu130' \
+        'torch==2.11.0+cu130' \
     && TORCH_DIR="$(python3 -c 'import torch, os; print(os.path.dirname(torch.__file__))')" \
     && ln -s "$TORCH_DIR" /opt/libtorch \
     && python3 -c 'import torch; assert torch.version.cuda == "13.0"; print(torch.__version__, torch.version.cuda)' \
@@ -287,6 +379,22 @@ ENV LIBTORCH_BYPASS_VERSION_CHECK=1
 
 FROM builder-${VARIANT} AS builder
 
+# The pinned-disk reader invokes absolute /usr/bin/git with env_clear. Carry
+# the selected architecture's Git and its actual non-glibc dependency closure;
+# do not copy a host binary or replace the pinned runtime base's libc/loader.
+ARG RUNTIME_UID
+ARG RUNTIME_GID
+RUN set -eu; \
+    install -D -m 0755 /usr/bin/git /out/runtime/usr/bin/git; \
+    ldd /usr/bin/git > /out/git.ldd; \
+    if grep -q 'not found' /out/git.ldd; then exit 1; fi; \
+    mkdir -p /out/runtime/usr/lib64; \
+    awk '/=> \// { print $3 }' /out/git.ldd | while read -r library; do \
+      case "${library##*/}" in libc.so.*|ld-linux*) continue ;; esac; \
+      install -m 0644 "$library" "/out/runtime/usr/lib64/${library##*/}"; \
+    done; \
+    install -d -m 0700 -o "$RUNTIME_UID" -g "$RUNTIME_GID" /out/private-cache/hyprstream-pinned
+
 # Set working directory
 WORKDIR /build
 
@@ -298,6 +406,13 @@ WORKDIR /build
 COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY crates ./crates
+# workspace-hack sits at the workspace root and is referenced by member
+# manifests (cas-serve, ...), so the manifest graph cannot load without it
+# even for -p hyprstream. The .config/hakari.toml config is not needed here:
+# builds only consume the generated crate.
+COPY workspace-hack ./workspace-hack
+# Compile-time include_str! inputs for the pinned AT Protocol schema validator.
+COPY lexicons/upstream/atproto ./lexicons/upstream/atproto
 
 ENV LIBTORCH=/opt/libtorch
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib
@@ -306,34 +421,67 @@ ENV LD_LIBRARY_PATH=/opt/libtorch/lib
 # LIBTORCH is already set in the variant-specific builder stages
 # We do NOT use LIBTORCH_USE_PYTORCH since we're using manual downloads
 # Note: --no-default-features excludes systemd (not needed in containers).
-# credential-pds is mandatory for the production encrypted UserStore boundary.
+# CPU consumers support encrypted networked accounts AND pilot-local PGlite
+# accounts. Keep the standalone pglite feature (not the credential-pds umbrella)
+# alongside Postgres/replay; GPU publication explicitly selects its own profile.
 # Cache mounts:
 #   - /root/.cargo/registry: Cargo crate registry
 #   - /root/.cargo/git: Git dependencies
 #   - /sccache: Compiled artifacts (sccache)
+#
+# CI (oci-runtime-validate.yml) mounts the host cache volume and redirects the
+# target dir via `--build-arg CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream-oci`
+# so the tens of GB of intermediate objects land on the large cache disk rather
+# than the runner's small root disk. ARG reaches RUN as an environment variable,
+# so cargo reads it directly, and the cp below resolves the binary from it —
+# defaulting to the in-container /build/target for every other invocation
+# (docker-build.yml, build-image.yml).
+ARG CARGO_TARGET_DIR=/build/target
+ARG HYPRSTREAM_BUILD_JOBS
+ARG HYPRSTREAM_FEATURES=otel,gittorrent,xet,credential-pds-postgres,pds-postgres,rocksdb,postgres-replay,pglite
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/sccache \
     --mount=type=cache,target=/build/target,sharing=locked \
-    OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features otel,gittorrent,xet,credential-pds \
+    if [ -n "$HYPRSTREAM_BUILD_JOBS" ]; then export CARGO_BUILD_JOBS="$HYPRSTREAM_BUILD_JOBS"; fi \
+    && OPENSSL_NO_VENDOR=1 cargo build -p hyprstream --bin hyprstream --locked --release --no-default-features --features "${HYPRSTREAM_FEATURES}" \
     && mkdir -p /out \
-    && cp /build/target/release/hyprstream /out/hyprstream
+    && cp "${CARGO_TARGET_DIR:-/build/target}/release/hyprstream" /out/hyprstream
 
 #############################################
-# Runtime Stage Selection (Distroless)
+# Runtime Stage Selection
 #############################################
+#
+# The runtime base is a package-manager-free image whose default account is
+# unprivileged. Its library search path is /usr/lib64, NOT the Debian multiarch
+# directories the builder uses, so every system-library COPY lands in /usr/lib64
+# regardless of the builder's source path. The builder stays Debian-based: the
+# binary it produces requires no glibc/libstdc++ symbol newer than the runtime
+# base provides, and its ELF interpreter resolves through the base's /lib
+# symlink.
+#
+# Only OpenSSL genuinely has to be carried over — the runtime base supplies
+# libc, libm, libdl, libpthread, librt, libstdc++, libgcc_s, and libz. libgomp
+# and libz are copied anyway so the runtime keeps the exact implementations the
+# LibTorch build was validated against rather than silently adopting the base
+# image's; LD_LIBRARY_PATH puts LibTorch's own bundled copies first in any case.
+# libzstd is carried because Debian trixie's libcrypto links it transitively
+# and the runtime base does not ship it.
 
 #############################################
 # CUDA 12.8 Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian13 AS runtime-cuda128
+FROM ${RUNTIME_BASE} AS runtime-cuda128
 
-# Copy required system libraries
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
+# Copy required system libraries. libzstd is a transitive dependency of
+# OpenSSL on Debian trixie (libcrypto links libzstd); the runtime base
+# does not ship it.
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
 # Copy CUDA runtime libraries from builder (toolkit includes runtime)
 COPY --from=builder /usr/local/cuda-12.8/lib64/libcudart.so* /usr/local/cuda/lib64/
@@ -347,13 +495,14 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 # CUDA 13.0 Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian13 AS runtime-cuda130
+FROM ${RUNTIME_BASE} AS runtime-cuda130
 
 # Copy required system libraries
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
 # Copy CUDA runtime libraries from builder (toolkit includes runtime)
 COPY --from=builder /usr/local/cuda-13.0/lib64/libcudart.so* /usr/local/cuda/lib64/
@@ -367,13 +516,14 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 # ROCm 7.1 Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian13 AS runtime-rocm71
+FROM ${RUNTIME_BASE} AS runtime-rocm71
 
 # Copy required system libraries
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
 # Copy entire LibTorch lib directory (includes Tensile libraries for ROCm)
 COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
@@ -382,13 +532,14 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 # CPU Runtime
 #############################################
 
-FROM gcr.io/distroless/cc-debian13 AS runtime-cpu
+FROM ${RUNTIME_BASE} AS runtime-cpu
 
 # Copy required system libraries
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib/x86_64-linux-gnu/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libgomp.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libz.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libzstd.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so* /usr/lib64/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so* /usr/lib64/
 
 # Copy entire LibTorch lib directory
 COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
@@ -398,18 +549,22 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 #############################################
 #
 # Variant of runtime-cpu for the builder-cpu-arm64 toolchain (PyTorch aarch64
-# pip wheel's libtorch). Debian multilib lives under /usr/lib/aarch64-linux-gnu
-# on arm64, so the system-library COPYs cannot share the x86_64 runtime stage.
-# Selected via `FROM runtime-${VARIANT}` when VARIANT=cpu-arm64. gcr.io/distroless
-# cc-debian13 is multi-arch, so the base resolves to its arm64 variant natively.
+# pip wheel's libtorch). The Debian builder keeps its multiarch libraries under
+# /usr/lib/aarch64-linux-gnu, so the COPY SOURCE paths differ from the x86_64
+# stage and the two cannot be merged; the destination is /usr/lib64 on both.
+# Selected via `FROM runtime-${VARIANT}` when VARIANT=cpu-arm64. The runtime base
+# is a multi-arch index, so it resolves to its arm64 variant natively.
 
-FROM gcr.io/distroless/cc-debian13 AS runtime-cpu-arm64
+FROM ${RUNTIME_BASE} AS runtime-cpu-arm64
 
-# Copy required system libraries (arm64 multilib path)
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libgomp.so.1 /usr/lib/aarch64-linux-gnu/
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libz.so.1 /usr/lib/aarch64-linux-gnu/
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libssl.so* /usr/lib/aarch64-linux-gnu/
-COPY --from=builder /usr/lib/aarch64-linux-gnu/libcrypto.so* /usr/lib/aarch64-linux-gnu/
+# Copy required system libraries (arm64 multiarch source path).
+# libgomp and libz are NOT copied here: the runtime base provides libz, and
+# LibTorch bundles its own libgomp at /opt/libtorch/lib/ (which
+# LD_LIBRARY_PATH searches first). Removing them was deferred until a real
+# build confirmed the image — this is that build.
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libzstd.so.1 /usr/lib64/
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libssl.so* /usr/lib64/
+COPY --from=builder /usr/lib/aarch64-linux-gnu/libcrypto.so* /usr/lib64/
 
 # Copy entire LibTorch lib directory
 COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
@@ -420,16 +575,38 @@ COPY --from=builder /opt/libtorch/lib/ /opt/libtorch/lib/
 
 FROM runtime-${VARIANT} AS runtime
 
+ARG RUNTIME_UID
+ARG RUNTIME_GID
+
 # Copy only the final binary out of the builder. Cargo's target directory is a
 # cache mount, so tens of gigabytes of intermediate objects never enter an OCI
 # layer (critical on the Graviton publisher's small root filesystem).
 COPY --from=builder /out/hyprstream /hyprstream
+COPY --from=builder /out/runtime/ /
+# Only this private mutable cache belongs to the runtime account. Keep Git and
+# its libraries root-owned, and make ownership explicit across the stage COPY.
+COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /out/private-cache/ /var/cache/
+COPY --chmod=0555 .github/scripts/check-runtime-pinned-model.sh /usr/local/libexec/check-runtime-pinned-model
 
 # Set library paths
 ENV LD_LIBRARY_PATH=/opt/libtorch/lib:/usr/local/cuda/lib64
 
-# Expose default ports
+# Expose default ports. Both are above 1024, so the unprivileged runtime account
+# can bind them without any capability grant.
 EXPOSE 8080 50051
 
-# Run hyprstream (distroless uses absolute paths)
+# Run unprivileged. The runtime base already defaults to this account, but state
+# it explicitly so the image never silently reverts to root if the base changes,
+# and so `podman inspect` reports the account this image is supported on. The
+# binary and its libraries are root-owned and world-readable/executable, which
+# is what an immutable runtime wants: the service can execute them and cannot
+# rewrite them.
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+
+# Runs in every actual amd64/arm64 published image, as its default non-root
+# account, without inherited library/config environment in the Git child.
+RUN /bin/sh /usr/local/libexec/check-runtime-pinned-model
+
+# Run hyprstream (the runtime base has no working directory conventions of its
+# own, so use an absolute path)
 ENTRYPOINT ["/hyprstream"]

@@ -49,14 +49,17 @@ pub fn generate_portable_dispatch(
     // Identify which methods are streaming.
     // Top-level: response variant is "{name}Result" with type StreamInfo
     // Scoped: response variant matches request name directly (no "Result" suffix)
-    let is_streaming = |v: &UnionVariant, resp_variants: &[UnionVariant], is_scoped: bool| -> bool {
-        let result_name = if is_scoped {
-            v.name.clone()
-        } else {
-            format!("{}Result", v.name)
+    let is_streaming =
+        |v: &UnionVariant, resp_variants: &[UnionVariant], is_scoped: bool| -> bool {
+            let result_name = if is_scoped {
+                v.name.clone()
+            } else {
+                format!("{}Result", v.name)
+            };
+            resp_variants
+                .iter()
+                .any(|r| r.name == result_name && r.type_name == "StreamInfo")
         };
-        resp_variants.iter().any(|r| r.name == result_name && r.type_name == "StreamInfo")
-    };
 
     // Generate match arms for non-streaming, non-scoped methods
     let dispatch_arms: Vec<TokenStream> = resolved
@@ -77,7 +80,9 @@ pub fn generate_portable_dispatch(
         .filter(|v| !scoped_names.contains(&v.name.as_str()))
         .filter(|v| !v.cli_hidden)
         .filter(|v| is_streaming(v, &resolved.raw.response_variants, false))
-        .map(|v| generate_streaming_dispatch_arm(v, resolved, &capnp_mod, &req_type, &response_type))
+        .map(|v| {
+            generate_streaming_dispatch_arm(v, resolved, &capnp_mod, &req_type, &response_type)
+        })
         .collect();
 
     // Generate scoped dispatch arms (e.g., "ttt.init", "ttt.train")
@@ -331,7 +336,8 @@ pub fn generate_portable_dispatch(
         .iter()
         .flat_map(|sc| {
             let scope_snake = to_snake_case(&sc.factory_name);
-            sc.inner_request_variants.iter()
+            sc.inner_request_variants
+                .iter()
                 .filter(|v| !v.cli_hidden)
                 .map(move |v| format!("{}.{}", scope_snake, to_snake_case(&v.name)))
         })
@@ -450,15 +456,42 @@ fn generate_dispatch_arm(
                 return quote! { #method_name_str => Err(#err.to_owned()), };
             }
         }
-        _ => {
-            // Other primitives (Bool, UInt32, etc.)
+        CapnpType::Bool => {
             quote! {
+                let __value = args
+                    .get(#method_name_str)
+                    .or_else(|| args.get("value"))
+                    .cloned()
+                    .ok_or_else(|| format!("missing argument for {}", #method_name_str))?;
+                let value: bool = serde_json::from_value(__value)
+                    .map_err(|e| format!("deserialize {}: {e}", #method_name_str))?;
                 let payload = hyprstream_rpc::serialize_message(|msg| {
                     let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
                     req.set_id(request_id);
-                    req.#set_method(());
+                    req.#set_method(value);
                 }).map_err(|e| format!("serialize: {e}"))?;
             }
+        }
+        _ if ct.is_numeric() => {
+            let rust_ty = rust_type_tokens(&ct.rust_owned_type());
+            quote! {
+                let __value = args
+                    .get(#method_name_str)
+                    .or_else(|| args.get("value"))
+                    .cloned()
+                    .ok_or_else(|| format!("missing argument for {}", #method_name_str))?;
+                let value: #rust_ty = serde_json::from_value(__value)
+                    .map_err(|e| format!("deserialize {}: {e}", #method_name_str))?;
+                let payload = hyprstream_rpc::serialize_message(|msg| {
+                    let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
+                    req.set_id(request_id);
+                    req.#set_method(value);
+                }).map_err(|e| format!("serialize: {e}"))?;
+            }
+        }
+        _ => {
+            // Unsupported primitive shape — keep the diagnostic at runtime.
+            return quote! { #method_name_str => Err(format!("unsupported argument type for {}", #method_name_str)), };
         }
     };
 
@@ -497,10 +530,44 @@ fn generate_streaming_dispatch_arm(
                 req.#set_method(());
             }).map_err(|e| format!("serialize: {e}"))?;
         },
+        CapnpType::Bool => {
+            quote! {
+                let __value = args
+                    .get(#method_name_str)
+                    .or_else(|| args.get("value"))
+                    .cloned()
+                    .ok_or_else(|| format!("missing argument for {}", #method_name_str))?;
+                let value: bool = serde_json::from_value(__value)
+                    .map_err(|e| format!("deserialize {}: {e}", #method_name_str))?;
+                let payload = hyprstream_rpc::serialize_message(|msg| {
+                    let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
+                    req.set_id(request_id);
+                    req.#set_method(value);
+                }).map_err(|e| format!("serialize: {e}"))?;
+            }
+        }
+        _ if ct.is_numeric() => {
+            let rust_ty = rust_type_tokens(&ct.rust_owned_type());
+            quote! {
+                let __value = args
+                    .get(#method_name_str)
+                    .or_else(|| args.get("value"))
+                    .cloned()
+                    .ok_or_else(|| format!("missing argument for {}", #method_name_str))?;
+                let value: #rust_ty = serde_json::from_value(__value)
+                    .map_err(|e| format!("deserialize {}: {e}", #method_name_str))?;
+                let payload = hyprstream_rpc::serialize_message(|msg| {
+                    let mut req = msg.init_root::<#capnp_mod::#req_type::Builder>();
+                    req.set_id(request_id);
+                    req.#set_method(value);
+                }).map_err(|e| format!("serialize: {e}"))?;
+            }
+        }
         _ => {
             if let Some(sdef) = resolved.find_struct(&v.type_name) {
                 let nuf: Vec<_> = sdef.non_union_fields().collect();
-                let is_void_wrapper = nuf.is_empty() || (nuf.len() == 1 && nuf[0].type_name == "Void");
+                let is_void_wrapper =
+                    nuf.is_empty() || (nuf.len() == 1 && nuf[0].type_name == "Void");
                 if is_void_wrapper {
                     quote! {
                         let payload = hyprstream_rpc::serialize_message(|msg| {

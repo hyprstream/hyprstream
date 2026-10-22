@@ -271,7 +271,10 @@ mod tests {
     fn test_detect_model() -> std::io::Result<()> {
         let temp = TempDir::new()?;
         // Valid model config requires model_type or architectures field
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
+        fs::write(
+            temp.path().join("config.json"),
+            r#"{"model_type": "llama"}"#,
+        )?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -316,7 +319,10 @@ mod tests {
     fn test_detect_multiple() -> std::io::Result<()> {
         let temp = TempDir::new()?;
         // Both model and database
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
+        fs::write(
+            temp.path().join("config.json"),
+            r#"{"model_type": "llama"}"#,
+        )?;
         fs::write(temp.path().join("metrics.duckdb"), valid_duckdb_data())?;
 
         let registry = ArchetypeRegistry::new();
@@ -340,7 +346,10 @@ mod tests {
         assert!(detected.is_empty());
 
         // Add a valid model config
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
+        fs::write(
+            temp.path().join("config.json"),
+            r#"{"model_type": "llama"}"#,
+        )?;
 
         // Still cached as empty
         let detected = registry.detect(temp.path());
@@ -374,7 +383,10 @@ mod tests {
     fn test_detect_model_with_cag() -> std::io::Result<()> {
         let temp = TempDir::new()?;
         // Model + CAG context - model requires valid config
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
+        fs::write(
+            temp.path().join("config.json"),
+            r#"{"model_type": "llama"}"#,
+        )?;
         fs::write(
             temp.path().join("context.json"),
             r#"{"version": 1, "store": {"type": "duckdb", "path": "ctx.db"}, "embedding": {"dimension": 384, "model": "test"}}"#,
@@ -400,7 +412,10 @@ mod tests {
     #[test]
     fn test_detected_domains_type_safe_has() -> std::io::Result<()> {
         let temp = TempDir::new()?;
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
+        fs::write(
+            temp.path().join("config.json"),
+            r#"{"model_type": "llama"}"#,
+        )?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path());
@@ -419,7 +434,10 @@ mod tests {
     #[test]
     fn test_detected_domains_string_has() -> std::io::Result<()> {
         let temp = TempDir::new()?;
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
+        fs::write(
+            temp.path().join("config.json"),
+            r#"{"model_type": "llama"}"#,
+        )?;
 
         let registry = ArchetypeRegistry::new();
         let detected = registry.detect(temp.path()).to_detected_domains();
@@ -435,7 +453,10 @@ mod tests {
     #[test]
     fn test_detected_domains_display() -> std::io::Result<()> {
         let temp = TempDir::new()?;
-        fs::write(temp.path().join("config.json"), r#"{"model_type": "llama"}"#)?;
+        fs::write(
+            temp.path().join("config.json"),
+            r#"{"model_type": "llama"}"#,
+        )?;
         fs::write(
             temp.path().join("context.json"),
             r#"{"version": 1, "store": {"type": "duckdb", "path": "ctx.db"}, "embedding": {"dimension": 384, "model": "test"}}"#,

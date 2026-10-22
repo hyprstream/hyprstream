@@ -54,7 +54,12 @@ pub fn generate_data_structs(
     // For service schemas, only generate types referenced by variants.
     let is_data_only = resolved.raw.request_variants.is_empty();
     let list_struct_types = if is_data_only {
-        resolved.raw.structs.iter().map(|s| s.name.clone()).collect()
+        resolved
+            .raw
+            .structs
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
     } else {
         collect_list_struct_types(resolved.raw)
     };
@@ -92,10 +97,13 @@ pub fn generate_data_structs(
                     ("common", "hyprstream_rpc::common_types"),
                 ];
                 if origin != service_name {
-                    if let Some((_, rpc_mod)) = RPC_CRATE_MODULES.iter().find(|(name, _)| *name == origin) {
+                    if let Some((_, rpc_mod)) =
+                        RPC_CRATE_MODULES.iter().find(|(name, _)| *name == origin)
+                    {
                         let data_name = format_ident!("{}", type_name);
                         #[allow(clippy::expect_used)] // compile-time constant path
-                        let rpc_path: syn::Path = syn::parse_str(rpc_mod).expect("invalid RPC_CRATE_MODULES path");
+                        let rpc_path: syn::Path =
+                            syn::parse_str(rpc_mod).expect("invalid RPC_CRATE_MODULES path");
                         tokens.extend(quote! {
                             pub type #data_name = #rpc_path::#data_name;
                         });
@@ -104,25 +112,49 @@ pub fn generate_data_structs(
                 }
             }
 
-            let capnp_mod = resolve_capnp_mod(
-                s.origin_file.as_deref(),
-                service_name,
-                types_crate,
-            );
+            let capnp_mod = resolve_capnp_mod(s.origin_file.as_deref(), service_name, types_crate);
 
             // Pure tagged-union structs (a capnp `union { ... }` with no sibling
             // non-union fields) become native Rust enums — one variant per arm —
             // instead of an (empty) struct. Option<T> wrappers are handled above.
             if s.is_pure_union() && s.option_inner_type().is_none() {
                 tokens.extend(generate_union_enum(type_name, s, resolved));
-                tokens.extend(generate_union_to_capnp_impl(type_name, s, resolved, &capnp_mod, service_name, types_crate));
-                tokens.extend(generate_union_from_capnp_impl(type_name, s, resolved, &capnp_mod, service_name, types_crate));
+                tokens.extend(generate_union_to_capnp_impl(
+                    type_name,
+                    s,
+                    resolved,
+                    &capnp_mod,
+                    service_name,
+                    types_crate,
+                ));
+                tokens.extend(generate_union_from_capnp_impl(
+                    type_name,
+                    s,
+                    resolved,
+                    &capnp_mod,
+                    service_name,
+                    types_crate,
+                ));
                 continue;
             }
 
             tokens.extend(generate_data_struct(type_name, s, resolved));
-            tokens.extend(generate_to_capnp_impl(type_name, s, resolved, &capnp_mod, service_name, types_crate));
-            tokens.extend(generate_from_capnp_impl(type_name, s, resolved, &capnp_mod, service_name, types_crate));
+            tokens.extend(generate_to_capnp_impl(
+                type_name,
+                s,
+                resolved,
+                &capnp_mod,
+                service_name,
+                types_crate,
+            ));
+            tokens.extend(generate_from_capnp_impl(
+                type_name,
+                s,
+                resolved,
+                &capnp_mod,
+                service_name,
+                types_crate,
+            ));
         }
     }
 
@@ -156,11 +188,7 @@ fn generate_enum_type(e: &EnumDef, resolved: &ResolvedSchema) -> TokenStream {
     }
 }
 
-fn generate_data_struct(
-    type_name: &str,
-    s: &StructDef,
-    resolved: &ResolvedSchema,
-) -> TokenStream {
+fn generate_data_struct(type_name: &str, s: &StructDef, resolved: &ResolvedSchema) -> TokenStream {
     let data_name = format_ident!("{}", type_name);
     let doc = format!("Generated from Cap'n Proto struct {type_name}");
 
@@ -220,10 +248,7 @@ fn generate_data_struct(
     let (content_field, content_enum) = if s.has_union && !s.is_pure_union() {
         let content_enum_name = format_ident!("{}Content", type_name);
         let enum_def = generate_mixed_union_enum(type_name, s, resolved);
-        (
-            quote! { pub content: #content_enum_name, },
-            enum_def,
-        )
+        (quote! { pub content: #content_enum_name, }, enum_def)
     } else {
         (TokenStream::new(), TokenStream::new())
     };
@@ -288,25 +313,30 @@ fn generate_mixed_union_enum(
     let (derive_default, manual_default) = if default_is_unit {
         (quote! { Default, }, TokenStream::new())
     } else {
-        let manual = default_arm.map(|arm| {
-            let variant_ident = resolved.name(&arm.name).pascal_ident.clone();
-            let ctor = match &arm.payload {
-                ArmPayload::Void => quote! { Self::#variant_ident },
-                ArmPayload::Type(_) => quote! { Self::#variant_ident(Default::default()) },
-                ArmPayload::Group(leaves) => {
-                    let fields: Vec<TokenStream> = leaves.iter().map(|leaf| {
-                        let leaf_name = resolved.name(&leaf.name).snake_ident.clone();
-                        quote! { #leaf_name: Default::default() }
-                    }).collect();
-                    quote! { Self::#variant_ident { #(#fields,)* } }
+        let manual = default_arm
+            .map(|arm| {
+                let variant_ident = resolved.name(&arm.name).pascal_ident.clone();
+                let ctor = match &arm.payload {
+                    ArmPayload::Void => quote! { Self::#variant_ident },
+                    ArmPayload::Type(_) => quote! { Self::#variant_ident(Default::default()) },
+                    ArmPayload::Group(leaves) => {
+                        let fields: Vec<TokenStream> = leaves
+                            .iter()
+                            .map(|leaf| {
+                                let leaf_name = resolved.name(&leaf.name).snake_ident.clone();
+                                quote! { #leaf_name: Default::default() }
+                            })
+                            .collect();
+                        quote! { Self::#variant_ident { #(#fields,)* } }
+                    }
+                };
+                quote! {
+                    impl Default for #enum_name {
+                        fn default() -> Self { #ctor }
+                    }
                 }
-            };
-            quote! {
-                impl Default for #enum_name {
-                    fn default() -> Self { #ctor }
-                }
-            }
-        }).unwrap_or_default();
+            })
+            .unwrap_or_default();
         (TokenStream::new(), manual)
     };
 
@@ -334,11 +364,7 @@ fn arm_payload_type_tokens(type_name: &str, resolved: &ResolvedSchema) -> TokenS
 ///
 /// Each arm maps to a variant: Void → unit, single-type → tuple, group → struct.
 /// The discriminant-0 arm carries `#[default]`.
-fn generate_union_enum(
-    type_name: &str,
-    s: &StructDef,
-    resolved: &ResolvedSchema,
-) -> TokenStream {
+fn generate_union_enum(type_name: &str, s: &StructDef, resolved: &ResolvedSchema) -> TokenStream {
     let enum_name = format_ident!("{}", type_name);
     let doc = format!("Generated from Cap'n Proto union {type_name}");
 
@@ -384,25 +410,30 @@ fn generate_union_enum(
         (quote! { Default, }, TokenStream::new())
     } else {
         // Manual Default for a data-carrying @0 arm.
-        let manual = default_arm.map(|arm| {
-            let variant_ident = resolved.name(&arm.name).pascal_ident.clone();
-            let ctor = match &arm.payload {
-                ArmPayload::Void => quote! { Self::#variant_ident },
-                ArmPayload::Type(_) => quote! { Self::#variant_ident(Default::default()) },
-                ArmPayload::Group(leaves) => {
-                    let fields: Vec<TokenStream> = leaves.iter().map(|leaf| {
-                        let leaf_name = resolved.name(&leaf.name).snake_ident.clone();
-                        quote! { #leaf_name: Default::default() }
-                    }).collect();
-                    quote! { Self::#variant_ident { #(#fields,)* } }
+        let manual = default_arm
+            .map(|arm| {
+                let variant_ident = resolved.name(&arm.name).pascal_ident.clone();
+                let ctor = match &arm.payload {
+                    ArmPayload::Void => quote! { Self::#variant_ident },
+                    ArmPayload::Type(_) => quote! { Self::#variant_ident(Default::default()) },
+                    ArmPayload::Group(leaves) => {
+                        let fields: Vec<TokenStream> = leaves
+                            .iter()
+                            .map(|leaf| {
+                                let leaf_name = resolved.name(&leaf.name).snake_ident.clone();
+                                quote! { #leaf_name: Default::default() }
+                            })
+                            .collect();
+                        quote! { Self::#variant_ident { #(#fields,)* } }
+                    }
+                };
+                quote! {
+                    impl Default for #enum_name {
+                        fn default() -> Self { #ctor }
+                    }
                 }
-            };
-            quote! {
-                impl Default for #enum_name {
-                    fn default() -> Self { #ctor }
-                }
-            }
-        }).unwrap_or_default();
+            })
+            .unwrap_or_default();
         (TokenStream::new(), manual)
     };
 
@@ -433,9 +464,17 @@ fn union_arm_value_setter(
 ) -> TokenStream {
     let ct = resolved.resolve_type(type_name).capnp_type.clone();
     match ct {
-        CapnpType::Bool | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
-        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
-        | CapnpType::Float32 | CapnpType::Float64 => {
+        CapnpType::Bool
+        | CapnpType::UInt8
+        | CapnpType::UInt16
+        | CapnpType::UInt32
+        | CapnpType::UInt64
+        | CapnpType::Int8
+        | CapnpType::Int16
+        | CapnpType::Int32
+        | CapnpType::Int64
+        | CapnpType::Float32
+        | CapnpType::Float64 => {
             quote! { builder.#setter(*#value); }
         }
         CapnpType::Text => quote! { builder.#setter(#value.as_str()); },
@@ -449,10 +488,14 @@ fn union_arm_value_setter(
                 );
                 let enum_rust = format_ident!("{}", name);
                 let type_ident = format_ident!("{}", name);
-                let arms: Vec<TokenStream> = e.variants.iter().map(|(vname, _)| {
-                    let vp = resolved.name(vname).pascal_ident.clone();
-                    quote! { #enum_rust::#vp => #field_capnp_mod::#type_ident::#vp }
-                }).collect();
+                let arms: Vec<TokenStream> = e
+                    .variants
+                    .iter()
+                    .map(|(vname, _)| {
+                        let vp = resolved.name(vname).pascal_ident.clone();
+                        quote! { #enum_rust::#vp => #field_capnp_mod::#type_ident::#vp }
+                    })
+                    .collect();
                 quote! { builder.#setter(match #value { #(#arms,)* }); }
             } else {
                 TokenStream::new()
@@ -645,9 +688,10 @@ fn generate_to_capnp_impl(
     let data_name = format_ident!("{}", type_name);
     let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
 
-    let field_setters: Vec<TokenStream> = s.non_union_fields().map(|field| {
-        generate_data_field_setter(field, resolved, service_name, types_crate)
-    }).collect();
+    let field_setters: Vec<TokenStream> = s
+        .non_union_fields()
+        .map(|field| generate_data_field_setter(field, resolved, service_name, types_crate))
+        .collect();
 
     // Mixed struct: emit the anonymous-union setters by matching on `self.content`.
     let content_setter = if s.has_union && !s.is_pure_union() {
@@ -715,10 +759,7 @@ fn generate_to_capnp_impl(
 }
 
 /// Look up a referenced type's origin_file from the structs/enums lists.
-fn lookup_origin_file<'a>(
-    type_name: &str,
-    resolved: &'a ResolvedSchema,
-) -> Option<&'a str> {
+fn lookup_origin_file<'a>(type_name: &str, resolved: &'a ResolvedSchema) -> Option<&'a str> {
     if let Some(s) = resolved.find_struct(type_name) {
         return s.origin_file.as_deref();
     }
@@ -735,7 +776,8 @@ fn generate_data_field_setter(
     types_crate: Option<&syn::Path>,
 ) -> TokenStream {
     // Check for Option* wrapper struct field
-    if let Some(inner_type_name) = resolved.find_struct(&field.type_name)
+    if let Some(inner_type_name) = resolved
+        .find_struct(&field.type_name)
         .and_then(|s| s.option_inner_type())
     {
         let rust_name = resolved.name(&field.name).snake_ident.clone();
@@ -743,9 +785,17 @@ fn generate_data_field_setter(
         let init_name = format_ident!("init_{}", field_snake);
         let ct = resolved.resolve_type(inner_type_name).capnp_type.clone();
         let set_val = match ct {
-            CapnpType::Bool | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
-            | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
-            | CapnpType::Float32 | CapnpType::Float64 => {
+            CapnpType::Bool
+            | CapnpType::UInt8
+            | CapnpType::UInt16
+            | CapnpType::UInt32
+            | CapnpType::UInt64
+            | CapnpType::Int8
+            | CapnpType::Int16
+            | CapnpType::Int32
+            | CapnpType::Int64
+            | CapnpType::Float32
+            | CapnpType::Float64 => {
                 quote! { opt.set_some(*__v); }
             }
             CapnpType::Text => {
@@ -810,9 +860,17 @@ fn generate_data_field_setter_inner(
         CapnpType::Text | CapnpType::Data => {
             quote! { builder.#setter_name(#val_borrowed); }
         }
-        CapnpType::Bool | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
-        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
-        | CapnpType::Float32 | CapnpType::Float64 => {
+        CapnpType::Bool
+        | CapnpType::UInt8
+        | CapnpType::UInt16
+        | CapnpType::UInt32
+        | CapnpType::UInt64
+        | CapnpType::Int8
+        | CapnpType::Int16
+        | CapnpType::Int32
+        | CapnpType::Int64
+        | CapnpType::Float32
+        | CapnpType::Float64 => {
             quote! { builder.#setter_name(#val_owned); }
         }
         CapnpType::Enum(ref name) => {
@@ -932,9 +990,10 @@ fn generate_from_capnp_impl(
     let data_name = format_ident!("{}", type_name);
     let capnp_struct = format_ident!("{}", to_capnp_module_name(type_name));
 
-    let field_readers: Vec<TokenStream> = s.non_union_fields().map(|field| {
-        generate_data_field_reader(field, resolved, service_name, types_crate)
-    }).collect();
+    let field_readers: Vec<TokenStream> = s
+        .non_union_fields()
+        .map(|field| generate_data_field_reader(field, resolved, service_name, types_crate))
+        .collect();
 
     // Mixed struct: read the anonymous union via `which()` into `content`.
     let content_reader = if s.has_union && !s.is_pure_union() {
@@ -1041,8 +1100,41 @@ fn generate_data_field_reader(
         match ct {
             // Optional field-level `$domainType` newtype over `Text`: empty → None, else `Some(Type::new(..))`.
             CapnpType::Text if field.domain_type.is_some() => {
-                let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
-                quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(#dt::new(v.to_string())) } }, }
+                let dt =
+                    resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
+                match field.max_len {
+                    Some(n) => {
+                        let n_lit = proc_macro2::Literal::u64_unsuffixed(u64::from(n));
+                        quote! { #rust_name: {
+                            let v = reader.#getter_name()?.to_str()?;
+                            if v.is_empty() { None } else {
+                                anyhow::ensure!(v.len() <= #n_lit as usize, "text field exceeds $maxLen bound");
+                                Some(#dt::new(v.to_string()))
+                            }
+                        }, }
+                    }
+                    None => {
+                        quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(#dt::new(v.to_string())) } }, }
+                    }
+                }
+            }
+            CapnpType::Data if field.domain_type.is_some() => {
+                let dt =
+                    resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
+                // Bounded decode: the domain type enforces its own wire cap
+                // BEFORE any owned copy is materialized.
+                quote! { #rust_name: { let v = reader.#getter_name()?; if v.is_empty() { None } else { Some(<#dt as hyprstream_rpc::sensitive::BoundedWireBytes>::from_wire_bytes(v)?) } }, }
+            }
+            CapnpType::Text if field.max_len.is_some() => {
+                let n_lit =
+                    proc_macro2::Literal::u64_unsuffixed(u64::from(field.max_len.unwrap_or(0)));
+                quote! { #rust_name: {
+                    let v = reader.#getter_name()?.to_str()?;
+                    if v.is_empty() { None } else {
+                        anyhow::ensure!(v.len() <= #n_lit as usize, "text field exceeds $maxLen bound");
+                        Some(v.to_string())
+                    }
+                }, }
             }
             CapnpType::Text => {
                 quote! { #rust_name: { let v = reader.#getter_name()?.to_str()?; if v.is_empty() { None } else { Some(v.to_string()) } }, }
@@ -1116,8 +1208,14 @@ fn generate_data_field_reader(
                 let getter_name = format_ident!("get_{}", resolved.name(&field.name).snake);
                 quote! { #rust_name: { let v = reader.#getter_name(); if v != 0.0 { Some(v) } else { None } }, }
             }
-            CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
-            | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64 => {
+            CapnpType::UInt8
+            | CapnpType::UInt16
+            | CapnpType::UInt32
+            | CapnpType::UInt64
+            | CapnpType::Int8
+            | CapnpType::Int16
+            | CapnpType::Int32
+            | CapnpType::Int64 => {
                 // Integer $optional: 0 = None, non-zero = Some(val)
                 let getter_name = format_ident!("get_{}", resolved.name(&field.name).snake);
                 quote! { #rust_name: { let v = reader.#getter_name(); if v != 0 { Some(v) } else { None } }, }
@@ -1145,11 +1243,14 @@ fn generate_data_field_reader_inner(
     let ct = resolved.resolve_type(&field.type_name).capnp_type.clone();
 
     // Check for Option* wrapper struct field
-    if let Some(inner_type_name) = resolved.find_struct(&field.type_name)
+    if let Some(inner_type_name) = resolved
+        .find_struct(&field.type_name)
         .and_then(|s| s.option_inner_type())
     {
         let capnp_opt_mod = resolve_capnp_mod(
-            resolved.find_struct(&field.type_name).and_then(|s| s.origin_file.as_deref()),
+            resolved
+                .find_struct(&field.type_name)
+                .and_then(|s| s.origin_file.as_deref()),
             service_name,
             types_crate,
         );
@@ -1177,7 +1278,7 @@ fn generate_data_field_reader_inner(
                 } else {
                     quote! { Default::default() }
                 }
-            },
+            }
             _ => quote! { v },
         };
         return quote! {
@@ -1193,10 +1294,41 @@ fn generate_data_field_reader_inner(
 
     match ct {
         CapnpType::Void => quote! { #rust_name: (), },
+        // Field-level byte newtypes retain their redacted Debug implementation.
+        // Bounded decode: the domain type enforces its own wire cap BEFORE any
+        // owned copy is materialized (Sol finding: checkMediated evidence was
+        // copied ahead of the 64 KiB verification bound).
+        CapnpType::Data if field.domain_type.is_some() => {
+            let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
+            quote! { #rust_name: <#dt as hyprstream_rpc::sensitive::BoundedWireBytes>::from_wire_bytes(reader.#getter_name()?)?, }
+        }
         // Field-level `$domainType` newtype over `Text`: read via `Type::new(String)`.
+        // `$maxLen(N)` bounds the decoded value at the borrowed reader, before
+        // any owned String is allocated (bounded preallocation).
         CapnpType::Text if field.domain_type.is_some() => {
             let dt = resolve_field_domain_type(field.domain_type.as_deref().unwrap_or_default());
-            quote! { #rust_name: #dt::new(reader.#getter_name()?.to_str()?.to_string()), }
+            match field.max_len {
+                Some(n) => {
+                    let n_lit = proc_macro2::Literal::u64_unsuffixed(u64::from(n));
+                    quote! { #rust_name: {
+                        let v = reader.#getter_name()?.to_str()?;
+                        anyhow::ensure!(v.len() <= #n_lit as usize, "text field exceeds $maxLen bound");
+                        #dt::new(v.to_string())
+                    }, }
+                }
+                None => {
+                    quote! { #rust_name: #dt::new(reader.#getter_name()?.to_str()?.to_string()), }
+                }
+            }
+        }
+        CapnpType::Text if field.max_len.is_some() => {
+            let n = field.max_len.unwrap_or(0);
+            let n_lit = proc_macro2::Literal::u64_unsuffixed(u64::from(n));
+            quote! { #rust_name: {
+                let v = reader.#getter_name()?.to_str()?;
+                anyhow::ensure!(v.len() <= #n_lit as usize, "text field exceeds $maxLen bound");
+                v.to_string()
+            }, }
         }
         CapnpType::Text => quote! { #rust_name: reader.#getter_name()?.to_str()?.to_string(), },
         CapnpType::Data if field.fixed_size.is_some() => {
@@ -1208,15 +1340,24 @@ fn generate_data_field_reader_inner(
                 quote! {
                     #rust_name: {
                         let data = reader.#getter_name()?;
-                        if data.len() != #n_lit {
+                        // A null/empty Cap'n Proto pointer is the wire default
+                        // for an absent fixed-size field. Preserve that as the
+                        // all-zero Rust default so optional higher-level
+                        // evidence (such as a resolver witness) can fail closed
+                        // at its policy boundary instead of making unrelated
+                        // legacy records undecodable.
+                        if data.is_empty() {
+                            [0u8; #n_lit]
+                        } else if data.len() != #n_lit {
                             anyhow::bail!(
                                 "{}: expected {} bytes, got {}",
                                 #field_name_str, #n_lit, data.len()
                             );
+                        } else {
+                            let mut arr = [0u8; #n_lit];
+                            arr.copy_from_slice(data);
+                            arr
                         }
-                        let mut arr = [0u8; #n_lit];
-                        arr.copy_from_slice(data);
-                        arr
                     },
                 }
             } else {
@@ -1224,21 +1365,32 @@ fn generate_data_field_reader_inner(
                 quote! {
                     #rust_name: {
                         let data = reader.#getter_name()?;
-                        if data.len() != #n_lit {
+                        if data.is_empty() {
+                            Vec::new()
+                        } else if data.len() != #n_lit {
                             anyhow::bail!(
                                 "{}: expected {} bytes, got {}",
                                 #field_name_str, #n_lit, data.len()
                             );
+                        } else {
+                            data.to_vec()
                         }
-                        data.to_vec()
                     },
                 }
             }
         }
         CapnpType::Data => quote! { #rust_name: reader.#getter_name()?.to_vec(), },
-        CapnpType::Bool | CapnpType::UInt8 | CapnpType::UInt16 | CapnpType::UInt32 | CapnpType::UInt64
-        | CapnpType::Int8 | CapnpType::Int16 | CapnpType::Int32 | CapnpType::Int64
-        | CapnpType::Float32 | CapnpType::Float64 => {
+        CapnpType::Bool
+        | CapnpType::UInt8
+        | CapnpType::UInt16
+        | CapnpType::UInt32
+        | CapnpType::UInt64
+        | CapnpType::Int8
+        | CapnpType::Int16
+        | CapnpType::Int32
+        | CapnpType::Int64
+        | CapnpType::Float32
+        | CapnpType::Float64 => {
             quote! { #rust_name: reader.#getter_name(), }
         }
         CapnpType::Enum(ref name) => {
@@ -1341,6 +1493,7 @@ mod field_domain_type_tests {
             type_name: "Text".into(),
             description: String::new(),
             fixed_size: None,
+            max_len: None,
             optional: false,
             slot_offset: 0,
             section: FieldSection::Pointer,
@@ -1406,6 +1559,51 @@ mod field_domain_type_tests {
             out.contains("plain : String"),
             "expected plain Text field to remain String, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn data_domain_type_handles_required_and_optional_sensitive_bytes() {
+        for optional in [false, true] {
+            let mut field = text_field(
+                "evidence",
+                Some("hyprstream_rpc::sensitive::SensitiveBytes"),
+            );
+            field.type_name = "Data".into();
+            field.optional = optional;
+            let schema = data_only_schema(StructDef {
+                name: "Evidence".into(),
+                fields: vec![field],
+                has_union: false,
+                domain_type: None,
+                origin_file: None,
+                data_words: 0,
+                pointer_words: 1,
+                discriminant_count: 0,
+                discriminant_offset: 0,
+                union_arms: vec![],
+            });
+            let out =
+                generate_data_structs(&ResolvedSchema::from(&schema), "policy", None).to_string();
+            let expected = if optional {
+                "evidence : Option < hyprstream_rpc :: sensitive :: SensitiveBytes >"
+            } else {
+                "evidence : hyprstream_rpc :: sensitive :: SensitiveBytes"
+            };
+            assert!(out.contains(expected), "wrong field type: {out}");
+            // The generated reader now decodes Data domain types through the
+            // BoundedWireBytes cap (owned copy only after the bound check).
+            assert!(
+                out.contains("BoundedWireBytes") && out.contains("from_wire_bytes"),
+                "missing bounded wire decode: {out}"
+            );
+            assert!(out.contains("set_evidence"), "missing wire writer: {out}");
+            if optional {
+                assert!(
+                    out.contains("is_empty"),
+                    "missing absent-data sentinel: {out}"
+                );
+            }
+        }
     }
 
     /// Struct-level `$domainType` must keep its existing behavior (it does not turn the

@@ -6,26 +6,27 @@
 // encoder + grammar; the deprecation is enforced at the ModelRef type definition.
 #![allow(deprecated)]
 
-use crate::runtime::GenerationRequest;
-use crate::services::generated::inference_client::ChatMessage;
-use crate::services::generated::model_client::ChatTemplateRequest;
-use hyprstream_rpc::events::EventSubscriber;
-use hyprstream_rpc::moq_event::ensure_event_client_origin;
-use hyprstream_rpc::paths;
-use crate::services::generated::registry_client::{
-    BranchRequest, CheckoutRequest, CloneRequest, CreateWorktreeRequest,
-    RemoveWorktreeRequest, UpdateRequest,
-};
-use crate::services::RegistryClient;
-use crate::services::generated::model_client::{ModelClient, LoadModelRequest, UnloadModelRequest, StatusRequest};
-#[cfg(feature = "experimental")]
-use crate::services::generated::registry_client::FileChangeType;
-use crate::storage::ModelRef;
+use crate::services::event_network::ensure_event_origin_for_profile;
 #[cfg(feature = "experimental")]
 use crate::storage::GitRef;
+use crate::storage::ModelRef;
 use anyhow::{bail, Result};
+use hyprstream_rpc::events::EventSubscriber;
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::streaming::StreamPayload;
+use hyprstream_rpc_std::inference_client::ChatMessage;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::model_client::ChatTemplateRequest;
+use hyprstream_rpc_std::model_client::{
+    LoadModelRequest, ModelClient, StatusRequest, UnloadModelRequest,
+};
+#[cfg(feature = "experimental")]
+use hyprstream_rpc_std::registry_client::FileChangeType;
+use hyprstream_rpc_std::registry_client::RegistryClient;
+use hyprstream_rpc_std::registry_client::{
+    BranchRequest, CheckoutRequest, CloneRequest, CreateWorktreeRequest, RemoveWorktreeRequest,
+    UpdateRequest,
+};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -40,15 +41,19 @@ pub async fn handle_branch(
 ) -> Result<()> {
     info!("Creating branch {} for model {}", branch_name, model);
 
-    let tracked = registry.get_by_name(model).await
+    let tracked = registry
+        .get_by_name(model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
     // Create branch via service
-    repo_client.create_branch(&BranchRequest {
-        branch_name: branch_name.to_owned(),
-        start_point: from_ref.as_deref().unwrap_or("").to_owned(),
-    }).await
+    repo_client
+        .create_branch(&BranchRequest {
+            branch_name: branch_name.to_owned(),
+            start_point: from_ref.as_deref().unwrap_or("").to_owned(),
+        })
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to create branch '{}': {}", branch_name, e))?;
 
     println!("✓ Created branch {branch_name}");
@@ -58,9 +63,11 @@ pub async fn handle_branch(
     }
 
     // Create worktree for the branch via service
-    repo_client.create_worktree(&CreateWorktreeRequest {
-        branch: branch_name.to_owned(),
-    }).await
+    repo_client
+        .create_worktree(&CreateWorktreeRequest {
+            branch: branch_name.to_owned(),
+        })
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
     println!("✓ Created worktree for branch {branch_name}");
 
@@ -95,13 +102,17 @@ pub async fn handle_checkout(
     );
 
     // Get repository client
-    let tracked = registry.get_by_name(&model_ref.model).await
+    let tracked = registry
+        .get_by_name(&model_ref.model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
     // Check for uncommitted changes if not forcing
     if !force {
-        let status = repo_client.status().await
+        let status = repo_client
+            .status()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to get status: {}", e))?;
         if !status.is_clean {
             println!("Warning: Model has uncommitted changes");
@@ -111,7 +122,10 @@ pub async fn handle_checkout(
     }
 
     // Get previous HEAD for result display
-    let previous_oid = repo_client.get_head().await.unwrap_or_else(|_| "unknown".to_owned());
+    let previous_oid = repo_client
+        .get_head()
+        .await
+        .unwrap_or_else(|_| "unknown".to_owned());
 
     // Convert GitRef to string for checkout
     let ref_spec = match &model_ref.git_ref {
@@ -125,10 +139,12 @@ pub async fn handle_checkout(
     // If create_branch, create branch first
     if create_branch {
         if let crate::storage::GitRef::Branch(name) = &model_ref.git_ref {
-            repo_client.create_branch(&BranchRequest {
-                branch_name: name.to_owned(),
-                start_point: previous_oid.clone(),
-            }).await
+            repo_client
+                .create_branch(&BranchRequest {
+                    branch_name: name.to_owned(),
+                    start_point: previous_oid.clone(),
+                })
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to create branch: {}", e))?;
         }
     }
@@ -139,18 +155,28 @@ pub async fn handle_checkout(
         crate::storage::GitRef::Branch(name) => name.clone(),
         _ => tracked.tracking_ref.clone(),
     };
-    repo_client.worktree(&worktree_name).checkout(&CheckoutRequest {
-        ref_name: ref_spec.clone(),
-        create_branch: false,
-    }).await
+    repo_client
+        .worktree(&worktree_name)
+        .checkout(&CheckoutRequest {
+            ref_name: ref_spec.clone(),
+            create_branch: false,
+        })
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to checkout '{}': {}", ref_spec, e))?;
 
     // Get new HEAD
-    let new_oid = repo_client.get_head().await.unwrap_or_else(|_| "unknown".to_owned());
+    let new_oid = repo_client
+        .get_head()
+        .await
+        .unwrap_or_else(|_| "unknown".to_owned());
 
     // Display checkout results
     let ref_display = model_ref.git_ref.to_string();
-    println!("✓ Switched to {} ({})", ref_display, &new_oid[..8.min(new_oid.len())]);
+    println!(
+        "✓ Switched to {} ({})",
+        ref_display,
+        &new_oid[..8.min(new_oid.len())]
+    );
 
     if force {
         println!("  ⚠️ Forced checkout - local changes discarded");
@@ -168,15 +194,21 @@ pub async fn handle_status(
     if let Some(model_ref_str) = model {
         // Status for specific model with full ModelRef support
         let model_ref = ModelRef::parse(&model_ref_str)?;
-        let tracked = registry.get_by_name(&model_ref.model).await
+        let tracked = registry
+            .get_by_name(&model_ref.model)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
         let repo_client = registry.repo(&tracked.id);
-        let status = repo_client.status().await
+        let status = repo_client
+            .status()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to get status: {}", e))?;
         print_model_status(&model_ref.model, &status, verbose);
     } else {
         // Status for all models - get list from registry
-        let repos = registry.list().await
+        let repos = registry
+            .list()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to list repositories: {}", e))?;
 
         if repos.is_empty() {
@@ -238,17 +270,19 @@ pub async fn handle_commit(
     let model_ref = ModelRef::parse(model_ref_str)?;
 
     // Get repository client
-    let tracked = registry.get_by_name(&model_ref.model).await
+    let tracked = registry
+        .get_by_name(&model_ref.model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
     // Determine which branch to commit to
     let branch_name = match &model_ref.git_ref {
         crate::storage::GitRef::Branch(name) => name.clone(),
-        crate::storage::GitRef::DefaultBranch => {
-            repo_client.get_head().await
-                .map_err(|e| anyhow::anyhow!("Failed to get default branch: {}", e))?
-        }
+        crate::storage::GitRef::DefaultBranch => repo_client
+            .get_head()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get default branch: {}", e))?,
         crate::storage::GitRef::Tag(tag) => {
             anyhow::bail!(
                 "Cannot commit to a tag reference. Tags are immutable.\nTag: {}\nUse a branch instead: {}:main",
@@ -283,7 +317,10 @@ pub async fn handle_commit(
     let has_changes = !detailed_status.files.is_empty();
 
     if !allow_empty && !amend && !has_changes && !all_untracked {
-        println!("No changes to commit for {}:{}", model_ref.model, branch_name);
+        println!(
+            "No changes to commit for {}:{}",
+            model_ref.model, branch_name
+        );
         println!("\nUse --allow-empty to create a commit without changes");
         return Ok(());
     }
@@ -295,11 +332,20 @@ pub async fn handle_commit(
         if all || all_untracked {
             // Show all working tree changes
             for file in &detailed_status.files {
-                println!("  {}{} {}", status_char(file.index_status), status_char(file.worktree_status), file.path);
+                println!(
+                    "  {}{} {}",
+                    status_char(file.index_status),
+                    status_char(file.worktree_status),
+                    file.path
+                );
             }
         } else {
             // Show only staged files (index)
-            for file in detailed_status.files.iter().filter(|f| !matches!(f.index_status, FileChangeType::None)) {
+            for file in detailed_status
+                .files
+                .iter()
+                .filter(|f| !matches!(f.index_status, FileChangeType::None))
+            {
                 println!("  {}  {}", status_char(file.index_status), file.path);
             }
         }
@@ -315,9 +361,11 @@ pub async fn handle_commit(
         if let Some(ref auth) = author {
             println!("Author: {}", auth);
         } else if author_name.is_some() || author_email.is_some() {
-            println!("Author: {} <{}>",
+            println!(
+                "Author: {} <{}>",
                 author_name.as_deref().unwrap_or("default"),
-                author_email.as_deref().unwrap_or("default"));
+                author_email.as_deref().unwrap_or("default")
+            );
         }
 
         if amend {
@@ -350,12 +398,18 @@ pub async fn handle_commit(
         let (name, email) = if let Some(author_str) = author {
             let re = regex::Regex::new(r"^(.+?)\s*<(.+?)>$")?;
             if let Some(captures) = re.captures(&author_str) {
-                let name = captures.get(1)
+                let name = captures
+                    .get(1)
                     .ok_or_else(|| anyhow::anyhow!("Invalid author format: missing name"))?
-                    .as_str().trim().to_owned();
-                let email = captures.get(2)
+                    .as_str()
+                    .trim()
+                    .to_owned();
+                let email = captures
+                    .get(2)
                     .ok_or_else(|| anyhow::anyhow!("Invalid author format: missing email"))?
-                    .as_str().trim().to_owned();
+                    .as_str()
+                    .trim()
+                    .to_owned();
                 (name, email)
             } else {
                 anyhow::bail!(
@@ -364,10 +418,12 @@ pub async fn handle_commit(
                 );
             }
         } else {
-            let name = author_name
-                .ok_or_else(|| anyhow::anyhow!("--author-name required when using --author-email"))?;
-            let email = author_email
-                .ok_or_else(|| anyhow::anyhow!("--author-email required when using --author-name"))?;
+            let name = author_name.ok_or_else(|| {
+                anyhow::anyhow!("--author-name required when using --author-email")
+            })?;
+            let email = author_email.ok_or_else(|| {
+                anyhow::anyhow!("--author-email required when using --author-name")
+            })?;
             (name, email)
         };
 
@@ -416,7 +472,9 @@ pub async fn handle_promote(
     info!("Promoting {} (branch {})", model_ref_str, branch);
 
     let model_ref = ModelRef::parse(model_ref_str)?;
-    let tracked = registry.get_by_name(&model_ref.model).await
+    let tracked = registry
+        .get_by_name(&model_ref.model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
     let wt = repo_client.worktree(branch);
@@ -441,7 +499,11 @@ pub async fn handle_promote(
             Ok(())
         }
         Err(PromoteError::LeaseHeld(_)) => {
-            anyhow::bail!("another promote is in progress for {}/{}", model_ref.model, branch)
+            anyhow::bail!(
+                "another promote is in progress for {}/{}",
+                model_ref.model,
+                branch
+            )
         }
         Err(PromoteError::LocalCommit(e)) => {
             anyhow::bail!("promote failed during local commit: {e}")
@@ -452,7 +514,10 @@ pub async fn handle_promote(
                 model = %model_ref.model, branch, error = %e,
                 "promote: content committed but atproto pointer is stale; next promote will advance it"
             );
-            println!("⚠ Promoted {} ({}) — content committed, pointer stale", model_ref_str, branch);
+            println!(
+                "⚠ Promoted {} ({}) — content committed, pointer stale",
+                model_ref_str, branch
+            );
             println!("  The atproto pointer will advance on the next successful promote.");
             Ok(())
         }
@@ -460,7 +525,11 @@ pub async fn handle_promote(
 }
 
 /// Print model status in a nice format using generated RepositoryStatus
-fn print_model_status(model_name: &str, status: &crate::services::GenRepositoryStatus, verbose: bool) {
+fn print_model_status(
+    model_name: &str,
+    status: &hyprstream_rpc_std::registry_client::RepositoryStatus,
+    verbose: bool,
+) {
     println!("Model: {model_name}");
 
     // Show current branch/commit
@@ -478,10 +547,7 @@ fn print_model_status(model_name: &str, status: &crate::services::GenRepositoryS
 
     // Show ahead/behind if tracking a remote
     if status.ahead > 0 || status.behind > 0 {
-        println!(
-            "Tracking: ahead {}, behind {}",
-            status.ahead, status.behind
-        );
+        println!("Tracking: ahead {}, behind {}", status.ahead, status.behind);
     }
 
     // Show dirty/clean status
@@ -510,9 +576,9 @@ pub fn parse_filters(raw: &[String]) -> Result<Vec<(String, regex::Regex)>> {
     const VALID_KEYS: &[&str] = &["name", "domains", "access", "ref", "commit", "size"];
     let mut out = Vec::with_capacity(raw.len());
     for s in raw {
-        let (k, v) = s.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("--filter '{}': expected KEY=REGEX format", s)
-        })?;
+        let (k, v) = s
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--filter '{}': expected KEY=REGEX format", s))?;
         let key = k.to_lowercase();
         if key == "status" {
             anyhow::bail!(
@@ -523,7 +589,9 @@ pub fn parse_filters(raw: &[String]) -> Result<Vec<(String, regex::Regex)>> {
         if !VALID_KEYS.contains(&key.as_str()) {
             anyhow::bail!(
                 "--filter '{}': unknown column '{}'. Valid columns: {}",
-                s, key, VALID_KEYS.join(", ")
+                s,
+                key,
+                VALID_KEYS.join(", ")
             );
         }
         let re = regex::Regex::new(v).map_err(|e| {
@@ -546,11 +614,15 @@ pub fn parse_status_filter(raw: &[String]) -> Result<std::collections::HashSet<S
     for s in raw {
         for part in s.split(',') {
             let val = part.trim().to_lowercase();
-            if val.is_empty() { continue; }
+            if val.is_empty() {
+                continue;
+            }
             if !VALID.contains(&val.as_str()) {
                 anyhow::bail!(
                     "--status '{}': unknown status '{}'. Valid values: {}",
-                    s, val, VALID.join(", ")
+                    s,
+                    val,
+                    VALID.join(", ")
                 );
             }
             out.insert(val);
@@ -568,14 +640,13 @@ pub async fn handle_list(
     info!("Listing models");
 
     // Fetch registry list and model service status in parallel
-    let all_status_req = StatusRequest { model_ref: String::new() };
-    let (repos_result, status_result) = tokio::join!(
-        registry.list(),
-        model_client.status(&all_status_req),
-    );
+    let all_status_req = StatusRequest {
+        model_ref: String::new(),
+    };
+    let (repos_result, status_result) =
+        tokio::join!(registry.list(), model_client.status(&all_status_req),);
 
-    let repos = repos_result
-        .map_err(|e| anyhow::anyhow!("Failed to list repositories: {}", e))?;
+    let repos = repos_result.map_err(|e| anyhow::anyhow!("Failed to list repositories: {}", e))?;
 
     if repos.is_empty() {
         println!("No models found.");
@@ -585,7 +656,10 @@ pub async fn handle_list(
 
     // Build status lookup: model_ref -> status string
     let status_map: std::collections::HashMap<String, String> = match status_result {
-        Ok(entries) => entries.into_iter().map(|e| (e.model_ref, e.status)).collect(),
+        Ok(entries) => entries
+            .into_iter()
+            .map(|e| (e.model_ref, e.status))
+            .collect(),
         Err(e) => {
             warn!("Model service unavailable for status: {}", e);
             std::collections::HashMap::new()
@@ -605,11 +679,17 @@ pub async fn handle_list(
     let mut rows = Vec::new();
 
     for tracked in repos {
-        if tracked.name.is_empty() { continue; }
+        if tracked.name.is_empty() {
+            continue;
+        }
         let name = &tracked.name;
 
         for wt in &tracked.worktrees {
-            let branch_name = if wt.branch_name.is_empty() { "detached".to_owned() } else { wt.branch_name.clone() };
+            let branch_name = if wt.branch_name.is_empty() {
+                "detached".to_owned()
+            } else {
+                wt.branch_name.clone()
+            };
             let display_name = format!("{}:{}", name, branch_name);
             let commit = wt.head_oid.chars().take(7).collect::<String>();
 
@@ -653,20 +733,23 @@ pub async fn handle_list(
     };
 
     // Apply --filter predicates (AND semantics, unanchored regex match)
-    let rows: Vec<_> = rows.into_iter().filter(|r| {
-        filters.iter().all(|(key, re)| {
-            let haystack = match key.as_str() {
-                "name"    => &r.display_name,
-                "domains" => &r.domains_str,
-                "access"  => &r.access_str,
-                "ref"     => &r.git_ref,
-                "commit"  => &r.commit,
-                "size"    => &r.size_str,
-                _         => return true,
-            };
-            re.is_match(haystack)
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|r| {
+            filters.iter().all(|(key, re)| {
+                let haystack = match key.as_str() {
+                    "name" => &r.display_name,
+                    "domains" => &r.domains_str,
+                    "access" => &r.access_str,
+                    "ref" => &r.git_ref,
+                    "commit" => &r.commit,
+                    "size" => &r.size_str,
+                    _ => return true,
+                };
+                re.is_match(haystack)
+            })
         })
-    }).collect();
+        .collect();
 
     if rows.is_empty() {
         println!("No models match the given filters.");
@@ -729,7 +812,8 @@ pub async fn handle_clone(
             .split('/')
             .next_back()
             .unwrap_or("")
-            .trim_end_matches(".git").to_owned();
+            .trim_end_matches(".git")
+            .to_owned();
 
         if extracted.is_empty() {
             anyhow::bail!(
@@ -745,25 +829,42 @@ pub async fn handle_clone(
     let clone_depth = if full { 0 } else { depth };
 
     // Try streaming clone with progress display
-    let clone_result = clone_with_streaming(registry, repo_url, &model_name, shallow, clone_depth, branch.as_deref(), quiet, verbose).await;
+    let clone_result = clone_with_streaming(
+        registry,
+        repo_url,
+        &model_name,
+        shallow,
+        clone_depth,
+        branch.as_deref(),
+        quiet,
+        verbose,
+    )
+    .await;
 
     // If streaming fails, fall back to non-streaming clone
     if let Err(e) = clone_result {
         if verbose {
-            warn!("Streaming clone failed, falling back to non-streaming: {}", e);
+            warn!(
+                "Streaming clone failed, falling back to non-streaming: {}",
+                e
+            );
         }
-        registry.clone(&CloneRequest {
-            url: repo_url.to_owned(),
-            name: model_name.clone(),
-            shallow,
-            depth: clone_depth,
-            branch: branch.as_deref().unwrap_or("").to_owned(),
-        }).await
+        registry
+            .clone(&CloneRequest {
+                url: repo_url.to_owned(),
+                name: model_name.clone(),
+                shallow,
+                depth: clone_depth,
+                branch: branch.as_deref().unwrap_or("").to_owned(),
+            })
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to clone model: {}", e))?;
     }
 
     // Get repo client for worktree creation
-    let tracked = registry.get_by_name(&model_name).await
+    let tracked = registry
+        .get_by_name(&model_name)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
@@ -780,9 +881,11 @@ pub async fn handle_clone(
     if !quiet {
         println!("   Creating worktree for branch: {worktree_branch}");
     }
-    repo_client.create_worktree(&CreateWorktreeRequest {
-        branch: worktree_branch.clone(),
-    }).await
+    repo_client
+        .create_worktree(&CreateWorktreeRequest {
+            branch: worktree_branch.clone(),
+        })
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to create worktree: {}", e))?;
 
     if !quiet {
@@ -812,16 +915,19 @@ async fn clone_with_streaming(
     quiet: bool,
     verbose: bool,
 ) -> Result<()> {
-    use crate::services::generated::registry_client::RegistryRpc;
-    let mut stream_handle = RegistryRpc::clone_stream(registry, &CloneRequest {
+    use hyprstream_rpc_std::registry_client::RegistryRpc;
+    let mut stream_handle = RegistryRpc::clone_stream(
+        registry,
+        &CloneRequest {
             url: repo_url.to_owned(),
             name: model_name.to_owned(),
             shallow,
             depth,
             branch: branch.unwrap_or("").to_owned(),
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to start streaming clone: {}", e))?;
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to start streaming clone: {}", e))?;
 
     if !quiet {
         print!("   Progress: ");
@@ -927,7 +1033,9 @@ pub async fn handle_info(
     let model_ref = ModelRef::parse(model)?;
 
     // Get repository client from service layer
-    let tracked_repo = registry.get_by_name(&model_ref.model).await
+    let tracked_repo = registry
+        .get_by_name(&model_ref.model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked_repo.id);
 
@@ -954,16 +1062,18 @@ pub async fn handle_info(
 
     // Find the worktree matching the requested branch/ref
     let branch_name = match &model_ref.git_ref {
-        crate::storage::GitRef::DefaultBranch => {
-            repo_client.get_head().await.unwrap_or_else(|_| "main".to_owned())
-        }
+        crate::storage::GitRef::DefaultBranch => repo_client
+            .get_head()
+            .await
+            .unwrap_or_else(|_| "main".to_owned()),
         crate::storage::GitRef::Branch(b) => b.clone(),
         _ => "main".to_owned(),
     };
 
     // Resolve worktree path locally (not from RPC response)
     let storage_paths = crate::storage::StoragePaths::new()?;
-    let model_path = storage_paths.worktree_path(&model_ref.model, &branch_name)
+    let model_path = storage_paths
+        .worktree_path(&model_ref.model, &branch_name)
         .unwrap_or_else(|_| PathBuf::from("."));
 
     // If adapters_only is true, skip the general model info
@@ -986,9 +1096,10 @@ pub async fn handle_info(
 
         // Get display ref using RepositoryClient
         let display_ref = match &model_ref.git_ref {
-            crate::storage::GitRef::DefaultBranch => {
-                repo_client.get_head().await.unwrap_or_else(|_| "unknown".to_owned())
-            }
+            crate::storage::GitRef::DefaultBranch => repo_client
+                .get_head()
+                .await
+                .unwrap_or_else(|_| "unknown".to_owned()),
             _ => model_ref.git_ref.to_string(),
         };
 
@@ -1037,8 +1148,10 @@ pub async fn handle_info(
     }
 
     // Size calculation - derive bare repo path locally from models_dir
-    let bare_repo_path = storage_paths.models_dir().ok()
-        .map(|d| d.join(&model_ref.model).join(format!("{}.git", model_ref.model)));
+    let bare_repo_path = storage_paths.models_dir().ok().map(|d| {
+        d.join(&model_ref.model)
+            .join(format!("{}.git", model_ref.model))
+    });
 
     if let Some(ref bare_repo_path) = bare_repo_path {
         if bare_repo_path.exists() {
@@ -1057,7 +1170,10 @@ pub async fn handle_info(
                             }
                         }
                     }
-                    println!("  Repository size: {:.2} MB", total_size as f64 / 1_048_576.0);
+                    println!(
+                        "  Repository size: {:.2} MB",
+                        total_size as f64 / 1_048_576.0
+                    );
                 }
             }
         }
@@ -1070,11 +1186,18 @@ pub async fn handle_info(
         Ok(status) => {
             println!(
                 "  Current branch/ref: {}",
-                if status.branch.is_empty() { "detached" } else { &status.branch }
+                if status.branch.is_empty() {
+                    "detached"
+                } else {
+                    &status.branch
+                }
             );
 
             if !status.head_oid.is_empty() {
-                println!("  HEAD commit: {}", &status.head_oid[..8.min(status.head_oid.len())]);
+                println!(
+                    "  HEAD commit: {}",
+                    &status.head_oid[..8.min(status.head_oid.len())]
+                );
             }
 
             if !status.is_clean {
@@ -1141,9 +1264,7 @@ pub async fn handle_info(
 
                     // Show config info if available and verbose mode is on
                     if let (true, Some(config_path)) = (verbose, adapter.config_path.as_ref()) {
-                        if let Ok(config_content) =
-                            std::fs::read_to_string(config_path)
-                        {
+                        if let Ok(config_content) = std::fs::read_to_string(config_path) {
                             if let Ok(config) = serde_json::from_str::<crate::storage::AdapterConfig>(
                                 &config_content,
                             ) {
@@ -1219,7 +1340,9 @@ pub async fn apply_policy_template_to_model(
         ))?;
 
     // Validate model exists in registry
-    let _tracked = registry.get_by_name(model).await
+    let _tracked = registry
+        .get_by_name(model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository: {}", e))?;
 
     // Derive models_dir from StoragePaths (not from RPC response)
@@ -1254,7 +1377,8 @@ pub async fn apply_policy_template_to_model(
     let new_content = format!("{}\n{}", existing_content.trim_end(), rules);
 
     // Write the updated policy with restrictive permissions
-    crate::auth::write_policy_file(&policy_path, &new_content).await
+    crate::auth::write_policy_file(&policy_path, &new_content)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to write policy: {}", e))?;
 
     // Validate the new policy
@@ -1336,7 +1460,8 @@ pub async fn handle_infer(
     let _ = ModelRef::parse(model_ref_str)?;
 
     // ModelService is already running (started by main.rs in inproc mode, or by systemd in ipc-systemd mode).
-    let model_client = ModelClient::from_resolver(
+    let model_client = ModelClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider,
         signing_key.clone(),
         None,
     )?;
@@ -1349,14 +1474,18 @@ pub async fn handle_infer(
         tool_call_id: String::new(),
     }];
 
-    let formatted_prompt = match model_client.infer(model_ref_str).apply_chat_template(&ChatTemplateRequest {
-        messages: messages.clone(),
-        add_generation_prompt: true,
-        tools_json: Some(String::new()),
-        max_tokens: None,
-        enable_thinking: None,
-        template_vars_json: None,
-    }).await {
+    let formatted_prompt = match model_client
+        .infer(model_ref_str)
+        .apply_chat_template(&ChatTemplateRequest {
+            messages: messages.clone(),
+            add_generation_prompt: true,
+            tools_json: Some(String::new()),
+            max_tokens: None,
+            enable_thinking: None,
+            template_vars_json: None,
+        })
+        .await
+    {
         Ok(prompt_str) => crate::config::TemplatedPrompt::new(prompt_str),
         Err(e) => {
             tracing::warn!("Could not apply chat template: {}. Using raw prompt.", e);
@@ -1392,8 +1521,9 @@ pub async fn handle_infer(
     // Generate via ModelService (handles model loading, adapter loading, training collection, auth)
     if !sync {
         // Start stream with E2E authenticated handle (DH key exchange)
-        use crate::services::generated::model_client::InferRpc;
-        let mut stream_handle = InferRpc::generate_stream(&model_client.infer(model_ref_str), &request).await?;
+        use hyprstream_rpc_std::model_client::InferRpc;
+        let mut stream_handle =
+            InferRpc::generate_stream(&model_client.infer(model_ref_str), &request).await?;
 
         println!();
 
@@ -1428,8 +1558,9 @@ pub async fn handle_infer(
         println!();
     } else {
         // Non-streaming: collect stream into full response
-        use crate::services::generated::model_client::InferRpc;
-        let mut handle = InferRpc::generate_stream(&model_client.infer(model_ref_str), &request).await?;
+        use hyprstream_rpc_std::model_client::InferRpc;
+        let mut handle =
+            InferRpc::generate_stream(&model_client.infer(model_ref_str), &request).await?;
 
         let mut text = String::new();
         loop {
@@ -1447,15 +1578,21 @@ pub async fn handle_infer(
                         println!("\n{}", text);
                         info!(
                             "Generated {} tokens in {}ms ({:.2} tokens/sec overall)",
-                            stats.tokens_generated, stats.generation_time_ms, stats.tokens_per_second
+                            stats.tokens_generated,
+                            stats.generation_time_ms,
+                            stats.tokens_per_second
                         );
                         info!(
                             "  Prefill: {} tokens in {}ms ({:.2} tokens/sec)",
-                            stats.prefill_tokens, stats.prefill_time_ms, stats.prefill_tokens_per_sec
+                            stats.prefill_tokens,
+                            stats.prefill_time_ms,
+                            stats.prefill_tokens_per_sec
                         );
                         info!(
                             "  Inference: {} tokens in {}ms ({:.2} tokens/sec)",
-                            stats.inference_tokens, stats.inference_time_ms, stats.inference_tokens_per_sec
+                            stats.inference_tokens,
+                            stats.inference_time_ms,
+                            stats.inference_tokens_per_sec
                         );
                         break;
                     }
@@ -1481,7 +1618,7 @@ pub async fn handle_infer(
 pub async fn handle_load(
     model_ref_str: &str,
     max_context: Option<usize>,
-    kv_quant: crate::runtime::KVQuantType,
+    kv_quant: hyprstream_rpc_std::model_client::KVQuantType,
     wait: Option<u64>,
     signing_key: SigningKey,
 ) -> Result<()> {
@@ -1490,24 +1627,38 @@ pub async fn handle_load(
     info!("Loading model: {}", model_ref_str);
     let _model_ref = ModelRef::parse(model_ref_str)?;
     let load_max_context = max_context.map(|v| v as u32);
-    let load_kv_quant = if kv_quant == crate::runtime::KVQuantType::None { None } else { Some(kv_quant) };
+    let load_kv_quant = if kv_quant == hyprstream_rpc_std::model_client::KVQuantType::None {
+        None
+    } else {
+        Some(kv_quant)
+    };
 
     // Issue the load RPC directly (returns immediately - Continuation pattern).
-    let model_client = ModelClient::from_resolver(
-        signing_key.clone(), None,
+    let model_client = ModelClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider,
+        signing_key.clone(),
+        None,
     )?;
-    match model_client.load(&LoadModelRequest {
-        model_ref: model_ref_str.to_owned(),
-        max_context: load_max_context,
-        kv_quant: load_kv_quant.filter(|q| *q != crate::runtime::KVQuantType::None),
-    }).await {
+    match model_client
+        .load(&LoadModelRequest {
+            model_ref: model_ref_str.to_owned(),
+            max_context: load_max_context,
+            kv_quant: load_kv_quant
+                .filter(|q| *q != hyprstream_rpc_std::model_client::KVQuantType::None),
+        })
+        .await
+    {
         Ok(_) => debug!("Load RPC accepted for {}", model_ref_str),
         Err(e) => warn!("Load RPC failed for {}: {}", model_ref_str, e),
     }
 
     println!("Load initiated for model: {}", model_ref_str);
-    if let Some(max_ctx) = max_context { println!("  Max context: {}", max_ctx); }
-    if kv_quant != crate::runtime::KVQuantType::None { println!("  KV quantization: {:?}", kv_quant); }
+    if let Some(max_ctx) = max_context {
+        println!("  Max context: {}", max_ctx);
+    }
+    if kv_quant != hyprstream_rpc_std::model_client::KVQuantType::None {
+        println!("  KV quantization: {:?}", kv_quant);
+    }
 
     // If --wait, block on EventService model.lifecycle events until loaded/failed.
     // EV7/#649: latched shape via `read_then_subscribe`. A `load --wait` issued
@@ -1522,21 +1673,23 @@ pub async fn handle_load(
     // plaintext-plane `AllowAllTerminalAuthz` and no group-key join is needed.
     if let Some(timeout_secs) = wait {
         println!("Waiting for model to load (timeout: {}s)...", timeout_secs);
-        ensure_event_client_origin(paths::event_socket());
+        ensure_event_origin_for_profile()?;
         let mut subscriber = EventSubscriber::new()?;
         subscriber.subscribe("model")?;
 
-        use hyprstream_rpc::latch::{
-            AllowAllTerminalAuthz, Terminal, TerminalStore, read_then_subscribe,
-        };
         use crate::services::model::ModelLoadTerminal;
+        use hyprstream_rpc::latch::{
+            read_then_subscribe, AllowAllTerminalAuthz, Terminal, TerminalStore,
+        };
 
         // Local retain-store for this load-wait invocation. Pre-seed from a
         // status probe so a late arrival (model already loaded) fast-paths.
         let store: TerminalStore<String, ModelLoadTerminal> = TerminalStore::new();
         let mut fast_path = false;
         match model_client
-            .status(&StatusRequest { model_ref: model_ref_str.to_owned() })
+            .status(&StatusRequest {
+                model_ref: model_ref_str.to_owned(),
+            })
             .await
         {
             Ok(entries) => {
@@ -1552,7 +1705,9 @@ pub async fn handle_load(
                     let _ = store.latch(
                         model_ref_str.to_owned(),
                         Terminal {
-                            value: ModelLoadTerminal::Loaded { endpoint: String::new() },
+                            value: ModelLoadTerminal::Loaded {
+                                endpoint: String::new(),
+                            },
                             latched_by: "cli-status".to_owned(),
                         },
                     );
@@ -1572,15 +1727,21 @@ pub async fn handle_load(
                 Err(_) => return None,
             };
             match &event.payload {
-                EventPayload::ModelLoaded { model_ref: mr, endpoint }
-                    if mr.contains(classify_ref.as_str()) || classify_ref.contains(mr.as_str()) =>
-                {
-                    Some(ModelLoadTerminal::Loaded { endpoint: endpoint.clone() })
+                EventPayload::ModelLoaded {
+                    model_ref: mr,
+                    endpoint,
+                } if mr.contains(classify_ref.as_str()) || classify_ref.contains(mr.as_str()) => {
+                    Some(ModelLoadTerminal::Loaded {
+                        endpoint: endpoint.clone(),
+                    })
                 }
-                EventPayload::ModelFailed { model_ref: mr, error }
-                    if mr.contains(classify_ref.as_str()) || classify_ref.contains(mr.as_str()) =>
-                {
-                    Some(ModelLoadTerminal::LoadFailed { error: error.clone() })
+                EventPayload::ModelFailed {
+                    model_ref: mr,
+                    error,
+                } if mr.contains(classify_ref.as_str()) || classify_ref.contains(mr.as_str()) => {
+                    Some(ModelLoadTerminal::LoadFailed {
+                        error: error.clone(),
+                    })
                 }
                 _ => None,
             }
@@ -1608,15 +1769,21 @@ pub async fn handle_load(
             Ok(Err(e)) => Err(anyhow::anyhow!("Model load wait failed: {e}")),
             Ok(Ok(terminal)) => match terminal.value {
                 ModelLoadTerminal::Loaded { endpoint } => {
-                    println!("\u{2713} Model {} loaded{}", model_ref_str, if fast_path { " (already loaded)" } else { "" });
+                    println!(
+                        "\u{2713} Model {} loaded{}",
+                        model_ref_str,
+                        if fast_path { " (already loaded)" } else { "" }
+                    );
                     if !endpoint.is_empty() {
                         println!("  Endpoint: {}", endpoint);
                     }
                     Ok(())
                 }
-                ModelLoadTerminal::LoadFailed { error } => {
-                    Err(anyhow::anyhow!("Model {} failed to load: {}", model_ref_str, error))
-                }
+                ModelLoadTerminal::LoadFailed { error } => Err(anyhow::anyhow!(
+                    "Model {} failed to load: {}",
+                    model_ref_str,
+                    error
+                )),
             },
         };
         outcome?;
@@ -1632,9 +1799,18 @@ pub async fn handle_notify_command(
     use crate::cli::quick::NotifyCommand;
 
     match command {
-        NotifyCommand::Subscribe { pattern, json, timeout, count } => {
-            handle_notify_subscribe(&pattern, json, timeout, count, signing_key).await
+        NotifyCommand::Probe { timeout } => {
+            crate::services::event_network::probe_event_network(std::time::Duration::from_secs(
+                timeout,
+            ))
+            .await
         }
+        NotifyCommand::Subscribe {
+            pattern,
+            json,
+            timeout,
+            count,
+        } => handle_notify_subscribe(&pattern, json, timeout, count, signing_key).await,
     }
 }
 
@@ -1653,7 +1829,7 @@ async fn handle_notify_subscribe(
     // flip deferred to #555); the per-publish unlinkability of the old NotificationService
     // is consciously dropped per the epic's group-level-confidentiality decision.
     // notify subscribe is now a streaming subscribe (not a one-shot deliver).
-    ensure_event_client_origin(paths::event_socket());
+    ensure_event_origin_for_profile()?;
     let mut subscriber = EventSubscriber::new()?;
     subscriber.subscribe(pattern)?;
 
@@ -1661,33 +1837,56 @@ async fn handle_notify_subscribe(
 
     let deadline = if timeout_secs > 0 {
         Some(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs))
-    } else { None };
+    } else {
+        None
+    };
     let mut received = 0u64;
 
     loop {
-        if max_count > 0 && received >= max_count { break; }
+        if max_count > 0 && received >= max_count {
+            break;
+        }
         let (topic, payload) = if let Some(dl) = deadline {
             match tokio::time::timeout_at(dl, subscriber.recv()).await {
                 Ok(Ok(tp)) => tp,
-                Ok(Err(e)) => { debug!("event recv: {e}"); break; }
-                Err(_) => { eprintln!("Timeout reached"); break; }
+                Ok(Err(e)) => {
+                    debug!("event recv: {e}");
+                    break;
+                }
+                Err(_) => {
+                    eprintln!("Timeout reached");
+                    break;
+                }
             }
         } else {
             match subscriber.recv().await {
                 Ok(tp) => tp,
-                Err(e) => { debug!("event recv: {e}"); break; }
+                Err(e) => {
+                    debug!("event recv: {e}");
+                    break;
+                }
             }
         };
         if json_output {
-            if let Ok(s) = String::from_utf8(payload) { println!("{}", s); }
+            if let Ok(s) = String::from_utf8(payload) {
+                println!("{}", s);
+            }
         } else {
             match serde_json::from_slice::<EventEnvelope>(&payload) {
                 Ok(event) => {
-                    println!("[{}] {} (source: {})",
-                        event.timestamp.format("%H:%M:%S"), topic, event.source);
+                    println!(
+                        "[{}] {} (source: {})",
+                        event.timestamp.format("%H:%M:%S"),
+                        topic,
+                        event.source
+                    );
                     println!("  {:?}", event.payload);
                 }
-                Err(_) => { if let Ok(s) = String::from_utf8(payload) { println!("{}", s); } }
+                Err(_) => {
+                    if let Ok(s) = String::from_utf8(payload) {
+                        println!("{}", s);
+                    }
+                }
             }
         }
         received += 1;
@@ -1697,18 +1896,23 @@ async fn handle_notify_subscribe(
 }
 
 /// Handle unload command - unload a model from memory
-pub async fn handle_unload(
-    model_ref_str: &str,
-    signing_key: SigningKey,
-) -> Result<()> {
+pub async fn handle_unload(model_ref_str: &str, signing_key: SigningKey) -> Result<()> {
     info!("Unloading model: {}", model_ref_str);
 
     // Validate model reference format
     let _ = ModelRef::parse(model_ref_str)?;
 
-    let model_client = ModelClient::from_resolver(signing_key, None)?;
+    let model_client = ModelClient::from_provider(
+        &hyprstream_discovery::ProductionRpcClientProvider,
+        signing_key,
+        None,
+    )?;
 
-    model_client.unload(&UnloadModelRequest { model_ref: model_ref_str.to_owned() }).await?;
+    model_client
+        .unload(&UnloadModelRequest {
+            model_ref: model_ref_str.to_owned(),
+        })
+        .await?;
 
     println!("✓ Model {} unloaded", model_ref_str);
 
@@ -1733,7 +1937,9 @@ pub async fn handle_push(
     let model_ref = ModelRef::new(model.to_string());
 
     // Get repository client from service layer
-    let tracked = registry.get_by_name(&model_ref.model).await
+    let tracked = registry
+        .get_by_name(&model_ref.model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
@@ -1783,18 +1989,24 @@ pub async fn handle_pull(
     let model_ref = ModelRef::new(model.to_owned());
 
     // Get repository client from service layer
-    let tracked = registry.get_by_name(&model_ref.model).await
+    let tracked = registry
+        .get_by_name(&model_ref.model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
     // Build refspec for fetch
-    let refspec = branch.as_ref().map(|branch_name| format!("refs/heads/{branch_name}"));
+    let refspec = branch
+        .as_ref()
+        .map(|branch_name| format!("refs/heads/{branch_name}"));
 
     // Use RepositoryClient.update() to fetch and merge
     // Note: This does a basic fetch+merge, doesn't expose merge analysis or fast-forward control
-    repo_client.update(&UpdateRequest {
-        refspec: refspec.as_deref().unwrap_or("").to_owned(),
-    }).await?;
+    repo_client
+        .update(&UpdateRequest {
+            refspec: refspec.as_deref().unwrap_or("").to_owned(),
+        })
+        .await?;
 
     println!("✓ Pulled latest changes for model {model}");
     println!("  Remote: {remote_name}");
@@ -1859,7 +2071,9 @@ pub async fn handle_merge(
     }
 
     // Get repository client from service layer
-    let tracked = registry.get_by_name(&target_ref.model).await
+    let tracked = registry
+        .get_by_name(&target_ref.model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
@@ -1873,13 +2087,18 @@ pub async fn handle_merge(
     // Determine target branch for worktree-scoped merge
     let target_branch = match &target_ref.git_ref {
         crate::storage::GitRef::Branch(b) => b.clone(),
-        crate::storage::GitRef::DefaultBranch => repo_client.get_head().await
+        crate::storage::GitRef::DefaultBranch => repo_client
+            .get_head()
+            .await
             .unwrap_or_else(|_| "main".to_owned()),
         _ => anyhow::bail!("Merge target must be a branch reference"),
     };
 
     // Perform merge via worktree-scoped service layer
-    let merge_result = repo_client.worktree(&target_branch).merge(source, message).await;
+    let merge_result = repo_client
+        .worktree(&target_branch)
+        .merge(source, message)
+        .await;
 
     match merge_result {
         Ok(merge_oid) => {
@@ -1904,7 +2123,7 @@ pub async fn handle_merge(
             }
 
             Ok(())
-        },
+        }
         Err(e) => {
             // Check if it's a merge conflict
             let err_msg = e.to_string();
@@ -1935,7 +2154,9 @@ async fn handle_merge_conflict_resolution(
     let target_ref = ModelRef::parse(target)?;
 
     // Get repository client from service layer
-    let tracked = registry.get_by_name(&target_ref.model).await
+    let tracked = registry
+        .get_by_name(&target_ref.model)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
     let repo_client = registry.repo(&tracked.id);
 
@@ -2021,18 +2242,25 @@ pub async fn handle_remove(
         let branch = model_ref.git_ref.display_name();
         info!("Removing worktree {} for model {}", branch, model_ref.model);
 
-        let tracked = registry.get_by_name(&model_ref.model).await
+        let tracked = registry
+            .get_by_name(&model_ref.model)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to get repository client: {}", e))?;
         let repo_client = registry.repo(&tracked.id);
 
         // Check if the worktree exists via service
-        let worktrees = repo_client.list_worktrees().await
+        let worktrees = repo_client
+            .list_worktrees()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
         let wt = match worktrees.iter().find(|wt| wt.branch_name == branch) {
             Some(wt) => wt,
             None => {
-                println!("❌ Worktree '{}' not found for model '{}'", branch, model_ref.model);
+                println!(
+                    "❌ Worktree '{}' not found for model '{}'",
+                    branch, model_ref.model
+                );
                 return Ok(());
             }
         };
@@ -2043,7 +2271,10 @@ pub async fn handle_remove(
 
         // Confirmation prompt unless forced
         if !force {
-            print!("Are you sure you want to remove worktree '{}:{}'? [y/N]: ", model_ref.model, branch);
+            print!(
+                "Are you sure you want to remove worktree '{}:{}'? [y/N]: ",
+                model_ref.model, branch
+            );
             io::stdout().flush()?;
 
             let mut input = String::new();
@@ -2057,13 +2288,18 @@ pub async fn handle_remove(
         }
 
         // Remove the worktree via service (pass branch name, not path)
-        repo_client.remove_worktree(&RemoveWorktreeRequest {
-            branch: wt.branch_name.clone(),
-            force: false,
-        }).await
+        repo_client
+            .remove_worktree(&RemoveWorktreeRequest {
+                branch: wt.branch_name.clone(),
+                force: false,
+            })
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to remove worktree: {}", e))?;
 
-        println!("✓ Worktree '{}:{}' removed successfully", model_ref.model, branch);
+        println!(
+            "✓ Worktree '{}:{}' removed successfully",
+            model_ref.model, branch
+        );
         return Ok(());
     }
 
@@ -2087,7 +2323,10 @@ pub async fn handle_remove(
 
     // Confirmation prompt unless forced
     if !force {
-        print!("Are you sure you want to remove model '{}'? [y/N]: ", model_ref.model);
+        print!(
+            "Are you sure you want to remove model '{}'? [y/N]: ",
+            model_ref.model
+        );
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -2101,7 +2340,9 @@ pub async fn handle_remove(
     }
 
     // Remove via service - service handles registry and file cleanup
-    registry.remove(&tracked.id).await
+    registry
+        .remove(&tracked.id)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to remove model: {}", e))?;
 
     println!("✓ Model '{}' removed successfully", model_ref.model);

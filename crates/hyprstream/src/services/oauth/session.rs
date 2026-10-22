@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use rand::RngCore;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand::RngCore;
 use tokio::sync::RwLock;
 
 /// A server-side session for an authenticated user.
@@ -58,16 +58,15 @@ impl SessionStore {
             expires_at: Instant::now() + self.ttl,
         };
 
-        self.sessions.write().await.insert(session_id.clone(), session);
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
         session_id
     }
 
     /// Create a browser session from a server-verified ATProto identity.
-    pub async fn create_atproto(
-        &self,
-        did: String,
-        verified_tenant: Option<String>,
-    ) -> String {
+    pub async fn create_atproto(&self, did: String, verified_tenant: Option<String>) -> String {
         let mut id_bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut id_bytes);
         let session_id = URL_SAFE_NO_PAD.encode(id_bytes);
@@ -79,7 +78,10 @@ impl SessionStore {
             authenticated_at: Instant::now(),
             expires_at: Instant::now() + self.ttl,
         };
-        self.sessions.write().await.insert(session_id.clone(), session);
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
         session_id
     }
 
@@ -103,7 +105,10 @@ impl SessionStore {
     /// Sweep expired sessions.
     pub async fn sweep(&self) {
         let now = Instant::now();
-        self.sessions.write().await.retain(|_, s| s.expires_at > now);
+        self.sessions
+            .write()
+            .await
+            .retain(|_, s| s.expires_at > now);
     }
 }
 
@@ -139,7 +144,5 @@ pub fn session_cookie(session_id: &str, secure: bool) -> String {
 
 /// Build a Set-Cookie header that clears the session.
 pub fn clear_session_cookie() -> String {
-    format!(
-        "{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
-    )
+    format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
 }

@@ -6,12 +6,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -106,7 +101,8 @@ pub async fn register_client(
                 "error": "invalid_client_metadata",
                 "error_description": "At least one redirect_uri is required"
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     if req.redirect_uris.len() > DCR_MAX_REDIRECT_URIS {
@@ -118,7 +114,8 @@ pub async fn register_client(
                     "Too many redirect_uris (max {DCR_MAX_REDIRECT_URIS})"
                 ),
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Validate redirect URIs: loopback only, bounded length.
@@ -130,7 +127,8 @@ pub async fn register_client(
                     "error": "invalid_redirect_uri",
                     "error_description": format!("redirect_uri exceeds {DCR_MAX_URI_LEN} chars"),
                 })),
-            ).into_response();
+            )
+                .into_response();
         }
         if !is_loopback_uri(uri) {
             return (
@@ -152,7 +150,8 @@ pub async fn register_client(
                     "error": "invalid_client_metadata",
                     "error_description": format!("client_name exceeds {DCR_MAX_NAME_LEN} chars"),
                 })),
-            ).into_response();
+            )
+                .into_response();
         }
     }
 
@@ -164,12 +163,16 @@ pub async fn register_client(
                 "error": "invalid_client_metadata",
                 "error_description": "jwks and jwks_uri are mutually exclusive (RFC 7591 §2.1)"
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // If token_endpoint_auth_method requires a key, enforce key presence.
-    if matches!(req.token_endpoint_auth_method.as_deref(), Some("private_key_jwt"))
-        && req.jwks.is_none() && req.jwks_uri.is_none()
+    if matches!(
+        req.token_endpoint_auth_method.as_deref(),
+        Some("private_key_jwt")
+    ) && req.jwks.is_none()
+        && req.jwks_uri.is_none()
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -177,7 +180,8 @@ pub async fn register_client(
                 "error": "invalid_client_metadata",
                 "error_description": "private_key_jwt requires jwks or jwks_uri"
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Validate host identity metadata before persisting it. Invalid did:key
@@ -190,7 +194,8 @@ pub async fn register_client(
                     "error": "invalid_client_metadata",
                     "error_description": "hyprstream_node_did must be an Ed25519 did:key"
                 })),
-            ).into_response();
+            )
+                .into_response();
         }
     }
 
@@ -230,7 +235,8 @@ pub async fn register_client(
                          Operator must rotate stale clients or migrate to CIMD."
                     ),
                 })),
-            ).into_response();
+            )
+                .into_response();
         }
         clients.insert(client_id.clone(), client);
     }
@@ -247,7 +253,8 @@ pub async fn register_client(
         jwks: req.jwks,
         jwks_uri: req.jwks_uri,
         scope: req.scope,
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// Client ID Metadata Document (draft-ietf-oauth-client-id-metadata-document-00 §4).
@@ -404,7 +411,7 @@ pub(crate) async fn check_federation_register_for_client_auth(
 /// PolicyService outage → reject, with operator-visible error. Security
 /// posture is preserved over availability of new federation registrations.
 async fn check_federation_register(state: &OAuthState, origin: &str) -> Result<(), String> {
-    use crate::services::generated::policy_client::PolicyCheck;
+    use hyprstream_rpc_std::policy_client::PolicyCheck;
     let resource = crate::auth::federation_registration_resource(origin)
         .map_err(|error| format!("invalid federation origin policy resource: {error}"))?;
     match state
@@ -478,7 +485,8 @@ pub async fn fetch_client_metadata(
         }
     }
 
-    let response = state.http_client
+    let response = state
+        .http_client
         .get(client_id_url)
         .header("Accept", "application/json")
         .send()
@@ -516,16 +524,16 @@ pub async fn fetch_client_metadata(
         return Err("CIMD must not declare both jwks and jwks_uri".to_owned());
     }
 
-    if matches!(doc.token_endpoint_auth_method.as_deref(), Some("private_key_jwt"))
-        && doc.jwks.is_none() && doc.jwks_uri.is_none()
+    if matches!(
+        doc.token_endpoint_auth_method.as_deref(),
+        Some("private_key_jwt")
+    ) && doc.jwks.is_none()
+        && doc.jwks_uri.is_none()
     {
         return Err("CIMD declares token_endpoint_auth_method=private_key_jwt but provides no jwks/jwks_uri".to_owned());
     }
 
-    Ok((
-        registered_client_from_cimd_doc(client_id_url, doc),
-        max_age,
-    ))
+    Ok((registered_client_from_cimd_doc(client_id_url, doc), max_age))
 }
 
 /// Check if a redirect URI is a loopback address.
@@ -535,7 +543,10 @@ pub(crate) fn is_loopback_uri(uri: &str) -> bool {
         if url.scheme() != "http" && url.scheme() != "https" {
             return false;
         }
-        matches!(url.host_str(), Some("127.0.0.1") | Some("localhost") | Some("[::1]"))
+        matches!(
+            url.host_str(),
+            Some("127.0.0.1") | Some("localhost") | Some("[::1]")
+        )
     } else {
         false
     }
@@ -572,7 +583,8 @@ fn is_private_host(host: &str) -> bool {
 
     // url::Url::host_str() returns IPv6 without surrounding brackets, but
     // be tolerant in case a caller passes a bracketed form.
-    let stripped = host.strip_prefix('[')
+    let stripped = host
+        .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(host);
 
@@ -666,7 +678,10 @@ mod tests {
         });
         let doc: ClientIdMetadataDocument = serde_json::from_value(json).unwrap();
         assert_eq!(doc.client_uri.as_deref(), Some("https://app.example.com"));
-        assert_eq!(doc.logo_uri.as_deref(), Some("https://app.example.com/logo.png"));
+        assert_eq!(
+            doc.logo_uri.as_deref(),
+            Some("https://app.example.com/logo.png")
+        );
         assert_eq!(doc.grant_types, vec!["authorization_code", "refresh_token"]);
         assert_eq!(doc.response_types, vec!["code"]);
         assert_eq!(doc.token_endpoint_auth_method.as_deref(), Some("none"));
@@ -696,8 +711,7 @@ mod tests {
             "dpop_bound_access_tokens": true,
         });
         let doc: ClientIdMetadataDocument = serde_json::from_value(json).unwrap();
-        let client =
-            registered_client_from_cimd_doc("https://app.example.com/client.json", doc);
+        let client = registered_client_from_cimd_doc("https://app.example.com/client.json", doc);
         assert!(client.is_cimd);
         assert_eq!(client.scope.as_deref(), Some("atproto"));
         assert_eq!(client.declared_scopes(), vec!["atproto".to_owned()]);
@@ -716,8 +730,7 @@ mod tests {
         let doc: ClientIdMetadataDocument = serde_json::from_value(json).unwrap();
         assert!(doc.scope.is_none());
         assert!(doc.dpop_bound_access_tokens.is_none());
-        let client =
-            registered_client_from_cimd_doc("https://app.example.com/client.json", doc);
+        let client = registered_client_from_cimd_doc("https://app.example.com/client.json", doc);
         assert!(client.scope.is_none());
         assert!(client.declared_scopes().is_empty());
     }
@@ -775,7 +788,10 @@ mod tests {
         assert_eq!(extract_max_age(&h), Some(Duration::from_secs(3600)));
 
         let mut h = HeaderMap::new();
-        h.insert(CACHE_CONTROL, HeaderValue::from_static("public, max-age=600, must-revalidate"));
+        h.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=600, must-revalidate"),
+        );
         assert_eq!(extract_max_age(&h), Some(Duration::from_secs(600)));
 
         // no-store / no-cache / private force a None result (we fall back to min_ttl).
@@ -784,7 +800,10 @@ mod tests {
         assert!(extract_max_age(&h).is_none());
 
         let mut h = HeaderMap::new();
-        h.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=300, no-cache"));
+        h.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("max-age=300, no-cache"),
+        );
         assert!(extract_max_age(&h).is_none());
 
         // Missing header → None.
@@ -831,7 +850,10 @@ mod tests {
     #[test]
     fn extract_origin_rejects_malformed() {
         assert!(extract_origin("not a url").is_none());
-        assert!(extract_origin("https://").is_none(), "URL without host must reject");
+        assert!(
+            extract_origin("https://").is_none(),
+            "URL without host must reject"
+        );
     }
 
     #[test]

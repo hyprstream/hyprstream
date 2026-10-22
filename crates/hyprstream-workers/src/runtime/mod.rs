@@ -1,4 +1,4 @@
-//! CRI RuntimeClient implementation
+//! CRI runtime service implementation
 //!
 //! Provides Kubernetes CRI-aligned APIs for managing pod sandboxes (Kata VMs)
 //! and containers. PodSandbox maps to a Kata VM, Container to an OCI container
@@ -9,7 +9,7 @@
 //! ```text
 //! WorkerService (RequestService)
 //!     │
-//!     ├── RuntimeClient trait (client-side interface)
+//!     ├── canonical RuntimeClient contract (`hyprstream-rpc-std`)
 //!     │     ├── run_pod_sandbox()    → Creates Kata VM
 //!     │     ├── create_container()   → Creates container in VM
 //!     │     ├── start_container()    → Starts container
@@ -25,8 +25,8 @@
 // substrate. Consumed by `pool::SandboxPool::acquire`.
 mod admission;
 pub mod backend;
-mod client;
 mod container;
+mod status;
 // CRI-client sandbox backend (#510) — gated behind `cri`. A tonic gRPC
 // client of an external, already-running CRI runtime service (containerd's
 // CRI plugin, or CRI-O) — the kubelet role, not an embedded runtime. Sibling
@@ -88,43 +88,9 @@ pub mod spawner;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod wanix_workload;
 
-// Generated wire types — canonical OCI/CRI-aligned names (no Gen*/Wire/Enum aliases)
-pub use client::{
-    // Generated client
-    WorkerClient,
-    // Response types
-    VersionInfo, RuntimeStatus, RuntimeCondition,
-    PodSandboxStatusResponse, ContainerStatusResponse,
-    ExecSyncResult,
-    // Stats types
-    PodSandboxStats, PodSandboxAttributes, LinuxPodSandboxStats,
-    ContainerStats, ContainerAttributes,
-    CpuUsage, MemoryUsage, NetworkUsage, NetworkInterfaceUsage,
-    ProcessUsage, FilesystemUsage, FilesystemIdentifier,
-    Timestamp,
-    // Info types
-    PodSandboxInfo, ContainerInfo,
-    // State enums (generated, with Hash + serde)
-    PodSandboxState, ContainerState,
-    // Config/request DTOs
-    ImageSpec, PodSandboxConfig, PodSandboxStatus, PodSandboxNetworkStatus,
-    ContainerConfig, ContainerStatus,
-    PodSandboxMetadata, ContainerMetadata,
-    DNSConfig, PortMapping, LinuxPodSandboxConfig,
-    LinuxSandboxSecurityContext,
-    Mount, Device, LinuxContainerConfig,
-    LinuxContainerSecurityContext, Capability,
-    AuthConfig, StreamInfo,
-    ImageInfo, ImageStatusResult,
-    LinuxContainerResources,
-    // Filter types (generated)
-    PodSandboxFilter, ContainerFilter,
-    PodSandboxStatsFilter, ContainerStatsFilter,
-    // Common types
-    KeyValue,
-    // Local composite
-    StatusResponse,
-};
+// Wire clients and data types are intentionally not re-exported from this
+// service crate. `StatusResponse` is the one local composite retained here.
+pub use status::StatusResponse;
 // Backend trait and implementations
 pub use backend::{SandboxBackend, SandboxHandle};
 #[cfg(feature = "cri")]
@@ -160,14 +126,14 @@ pub use admission::{
 pub use sandbox_fs::{
     InjectedMounts, SandboxFs, SandboxFsLocalMount, SandboxFsServer, VFS_SOCKET_NAME,
 };
+pub use service::WorkerService;
 #[cfg(not(target_arch = "wasm32"))]
 pub use wanix_workload::{
     import_guest_namespace, inject_9p_socket, ImportedGuestNamespace, Injected9pServer,
     WanixGuestConfig, WanixInjection, ANN_WANIX_COMMAND, ENV_9P_SOCK, ENV_GUEST_EXPORT_SOCK,
 };
-pub use service::WorkerService;
 // Re-export service infrastructure from hyprstream-rpc for convenience
-pub use hyprstream_rpc::service::{EnvelopeContext, ServiceHandle, RequestService};
+pub use hyprstream_rpc::service::{EnvelopeContext, RequestService, ServiceHandle};
 
 /// CRI runtime version
 pub const RUNTIME_VERSION: &str = "0.1.0";

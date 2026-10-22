@@ -37,7 +37,11 @@ async fn test_transaction_commit_clone() -> Result<(), Box<dyn std::error::Error
 
     // Now repository should exist
     let repos: Vec<_> = registry.list().collect();
-    assert_eq!(repos.len(), baseline + 1, "Repository should exist after commit");
+    assert_eq!(
+        repos.len(),
+        baseline + 1,
+        "Repository should exist after commit"
+    );
     assert!(repos.iter().any(|r| r.id == id), "ID should match");
     assert!(
         repos.iter().any(|r| r.name.as_deref() == Some("git")),
@@ -134,9 +138,7 @@ async fn test_transaction_ensure_idempotent() -> Result<(), Box<dyn std::error::
         .start_transaction_with_mode(IsolationMode::Optimistic)
         .await?;
 
-    let id1 = tx1
-        .ensure("git", "https://github.com/git/git.git")
-        .await?;
+    let id1 = tx1.ensure("git", "https://github.com/git/git.git").await?;
 
     tx1.commit_to(&mut registry).await?;
 
@@ -145,9 +147,7 @@ async fn test_transaction_ensure_idempotent() -> Result<(), Box<dyn std::error::
         .start_transaction_with_mode(IsolationMode::Optimistic)
         .await?;
 
-    let id2 = tx2
-        .ensure("git", "https://github.com/git/git.git")
-        .await?;
+    let id2 = tx2.ensure("git", "https://github.com/git/git.git").await?;
 
     // Should return the existing ID without cloning again
     assert_eq!(id1, id2, "ensure() should return existing repository ID");

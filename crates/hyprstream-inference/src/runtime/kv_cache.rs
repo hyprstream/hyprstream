@@ -1,0 +1,3527 @@
+//! Key-Value cache implementation for efficient autoregressive generation
+//!
+//! This module implements KV caching to avoid recomputing past key and value
+//! states during inference, providing 10-50x speedup for long sequences.
+//!
+//! ## Memory Optimization
+//!
+//! The cache uses a chunked growth strategy instead of pre-allocating the full
+//! max_seq_len. This saves ~4GB+ VRAM for models with large context windows.
+//!
+//! ## Quantization Support
+//!
+//! Supports optional quantization via bitsandbytes:
+//! - `None`: Full precision (FP16/BF16) - default
+//! - `Int8`: 8-bit quantization
+//! - `Nf4`: 4-bit NormalFloat (best quality for 4-bit)
+//! - `Fp4`: 4-bit FloatingPoint
+//!
+//! Quantization uses a hybrid approach:
+//! - Historical tokens are stored quantized (memory savings)
+//! - Recent tokens stay in a full-precision buffer (fast updates)
+//! - Dequantized view is cached across layers (avoids repeated dequantization)
+
+use anyhow::{anyhow, Result};
+use dashmap::DashMap;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(any(feature = "bnb", test))]
+use tch::Device;
+use tch::{Kind as DType, Tensor};
+
+use super::kv_compat::{decide_cache_reuse, CacheReuseDecision, KvCompatFingerprint};
+use super::torch_utils::{estimate_tensor_size_mb, safe_zeros};
+use hyprstream_rpc_std::model_client::KVQuantType;
+
+// ============================================================================
+// Cache Owner and Registry Types (for multi-session support)
+// ============================================================================
+
+/// Identifies the owner of a KV cache instance for session isolation.
+///
+/// Each owner gets their own isolated cache, enabling concurrent inference
+/// without interference between different conversations/sessions.
+#[derive(Clone, Hash, Eq, PartialEq, Debug)]
+pub enum CacheOwner {
+    /// Session-based inference - multiple requests share cache for context continuity.
+    /// Use this for conversational AI where context should persist across requests.
+    Session(String),
+
+    /// Stateless inference - one-off completions where cache is discarded after use.
+    /// Use this for standard OpenAI-compatible API requests without session tracking.
+    Stateless(u64),
+
+    /// Training validation inference - for evaluating model during training.
+    Training { adapter: String, run_id: u64 },
+}
+
+impl CacheOwner {
+    /// Create a new stateless owner with a random ID
+    pub fn new_stateless() -> Self {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        CacheOwner::Stateless(id)
+    }
+
+    /// Create a session owner
+    pub fn session(session_id: impl Into<String>) -> Self {
+        CacheOwner::Session(session_id.into())
+    }
+
+    /// Create a training owner
+    pub fn training(adapter: impl Into<String>, run_id: u64) -> Self {
+        CacheOwner::Training {
+            adapter: adapter.into(),
+            run_id,
+        }
+    }
+}
+
+/// Configuration for KV cache instances
+#[derive(Clone, Debug)]
+pub struct CacheConfig {
+    /// Number of transformer layers
+    pub num_layers: usize,
+    /// Maximum sequence length (context window)
+    pub max_seq_len: usize,
+    /// Quantization type for memory efficiency
+    pub quant_type: KVQuantType,
+    /// Use paged block storage (PagedAttention-style) instead of contiguous tensors.
+    /// Requires a BlockPool to be initialized on the registry.
+    pub paged: bool,
+}
+
+impl CacheConfig {
+    /// Create a new cache configuration
+    pub fn new(num_layers: usize, max_seq_len: usize) -> Self {
+        Self {
+            num_layers,
+            max_seq_len,
+            quant_type: KVQuantType::None,
+            paged: false,
+        }
+    }
+
+    /// Set quantization type
+    pub fn with_quant_type(mut self, quant_type: KVQuantType) -> Self {
+        self.quant_type = quant_type;
+        self
+    }
+
+    /// Enable paged block storage (requires BlockPool on the registry)
+    pub fn with_paged(mut self, paged: bool) -> Self {
+        self.paged = paged;
+        self
+    }
+}
+
+/// Registry managing multiple KV cache instances for concurrent sessions.
+///
+/// Each `CacheOwner` gets their own isolated `KVCacheManager` wrapped in a Mutex.
+/// The registry uses DashMap for lock-free access to different sessions, while
+/// each individual cache uses Mutex for thread-safe layer access (required because
+/// tch-rs Tensor contains raw pointers that aren't `Sync`).
+///
+/// # Concurrency Model
+///
+/// ```text
+/// Request A ──► Registry.get_or_create(Session("abc")) ──► Cache A (Mutex)
+/// Request B ──► Registry.get_or_create(Session("xyz")) ──► Cache B (Mutex)
+///                                                          ↑
+///                                                No contention between A and B!
+/// ```
+pub struct KVCacheRegistry {
+    /// Active caches indexed by owner (lock-free access to different owners)
+    caches: DashMap<CacheOwner, Arc<Mutex<KVCacheManager>>>,
+    /// Default configuration for new caches
+    default_config: CacheConfig,
+    /// Memory budget in bytes (None = unlimited)
+    memory_budget_bytes: Option<usize>,
+    /// Maps cache owners to the subject delta that was active when the cache was computed.
+    /// The value is `(tenant_id, weight_epoch)`: the tenant whose delta contributed to
+    /// the KV, plus the delta's weight epoch at compute time. When a delta is evicted
+    /// or reset, dependent caches must be invalidated; when the epoch has advanced
+    /// (in-place re-adaptation under the same tenant), the cached KV is weight-stale.
+    delta_dependencies: DashMap<CacheOwner, Option<(String, u64)>>,
+    /// Shared block pool for paged KV cache storage (None if paged mode not enabled)
+    block_pool: Option<Arc<Mutex<BlockPool>>>,
+}
+
+impl KVCacheRegistry {
+    /// Create a new KV cache registry
+    pub fn new(default_config: CacheConfig, memory_budget: Option<usize>) -> Self {
+        tracing::info!(
+            "[KVCacheRegistry::new] Creating registry with {} layers, max_seq_len={}, quant={:?}, budget={:?}, paged={}",
+            default_config.num_layers,
+            default_config.max_seq_len,
+            default_config.quant_type,
+            memory_budget,
+            default_config.paged
+        );
+
+        Self {
+            caches: DashMap::new(),
+            default_config,
+            memory_budget_bytes: memory_budget,
+            delta_dependencies: DashMap::new(),
+            block_pool: None,
+        }
+    }
+
+    /// Initialize the shared block pool for paged KV cache storage.
+    ///
+    /// Must be called before any paged caches are created. `num_blocks` determines
+    /// the total KV cache capacity across all sessions. `num_kv_heads` and `head_dim`
+    /// must match the model's attention configuration.
+    pub fn init_block_pool(
+        &mut self,
+        num_blocks: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        device: tch::Device,
+        dtype: DType,
+    ) -> Result<()> {
+        let pool = BlockPool::new(num_blocks, num_kv_heads, head_dim, device, dtype)?;
+        self.block_pool = Some(Arc::new(Mutex::new(pool)));
+        Ok(())
+    }
+
+    /// Get the shared block pool (for metrics/debugging).
+    pub fn block_pool(&self) -> Option<&Arc<Mutex<BlockPool>>> {
+        self.block_pool.as_ref()
+    }
+
+    /// Get or create a cache for the given owner.
+    ///
+    /// If the cache doesn't exist, creates a new one with the default config.
+    /// Returns `Arc<Mutex<KVCacheManager>>` - caller must lock() to use.
+    pub fn get_or_create(&self, owner: CacheOwner) -> Arc<Mutex<KVCacheManager>> {
+        // Try to get existing cache first (fast path)
+        if let Some(cache) = self.caches.get(&owner) {
+            let mut guard = cache.lock();
+            guard.touch();
+
+            // Transparently restore CPU-offloaded caches back to GPU
+            if guard.location() == CacheLocation::Cpu {
+                // Determine the GPU device from the engine config
+                let device = tch::Device::cuda_if_available();
+                guard.restore_to_gpu(device);
+            }
+
+            drop(guard);
+            return cache.clone();
+        }
+
+        // Slow path: create new cache (paged or contiguous based on config)
+        let cache = if self.default_config.paged {
+            if let Some(pool) = &self.block_pool {
+                Arc::new(Mutex::new(KVCacheManager::new_paged(
+                    self.default_config.num_layers,
+                    self.default_config.max_seq_len,
+                    pool.clone(),
+                    owner.clone(),
+                )))
+            } else {
+                tracing::warn!("Paged mode requested but block pool not initialized, falling back to contiguous");
+                Arc::new(Mutex::new(KVCacheManager::new(
+                    self.default_config.num_layers,
+                    self.default_config.max_seq_len,
+                    self.default_config.quant_type,
+                )))
+            }
+        } else {
+            Arc::new(Mutex::new(KVCacheManager::new(
+                self.default_config.num_layers,
+                self.default_config.max_seq_len,
+                self.default_config.quant_type,
+            )))
+        };
+
+        // Insert and return (handles race condition - returns existing if another thread inserted)
+        self.caches.entry(owner).or_insert(cache.clone()).clone()
+    }
+
+    /// Release a cache when the session is done.
+    ///
+    /// For `Stateless` owners, this removes the cache immediately.
+    /// For `Session` owners, the cache is kept for potential reuse.
+    pub fn release(&self, owner: &CacheOwner) {
+        match owner {
+            CacheOwner::Stateless(_) => {
+                // Stateless caches (and their delta dependency) are removed immediately.
+                self.caches.remove(owner);
+                self.delta_dependencies.remove(owner);
+                tracing::debug!("Released stateless cache: {:?}", owner);
+            }
+            CacheOwner::Session(_) | CacheOwner::Training { .. } => {
+                // Session and training caches are kept for reuse; their delta
+                // dependency is retained so a later tenant-delta eviction can
+                // still invalidate them. They fall to LRU eviction under memory pressure.
+                tracing::debug!("Marked session cache for potential reuse: {:?}", owner);
+            }
+        }
+    }
+
+    /// Evict least-recently-used caches to stay within memory budget.
+    pub fn evict_to_budget(&self) {
+        let budget = match self.memory_budget_bytes {
+            Some(b) => b,
+            None => return, // No budget = no eviction
+        };
+
+        let current_usage = self.total_memory_usage();
+        if current_usage <= budget {
+            return;
+        }
+
+        // Collect eviction candidates. `CacheOwner::Training` caches are exempt
+        // from eviction by rule — they hold validation/eval state for an active
+        // training run and must survive memory pressure (the run owns their
+        // lifecycle). All other owners (Stateless/Session) are evictable.
+        let mut candidates: Vec<(CacheOwner, u64, usize)> = self
+            .caches
+            .iter()
+            .filter_map(|entry| {
+                let owner = entry.key().clone();
+
+                // Skip training caches (exempt by rule — see comment above).
+                if matches!(owner, CacheOwner::Training { .. }) {
+                    return None;
+                }
+
+                let guard = entry.value().lock();
+                let last_access = guard.last_access();
+                let memory = guard.memory_usage();
+                Some((owner, last_access, memory))
+            })
+            .collect();
+
+        // Sort by last access (oldest first)
+        candidates.sort_by_key(|(_, last_access, _)| *last_access);
+
+        // Two-tier eviction: first offload to CPU, then remove if still over budget.
+        let mut freed = 0;
+
+        // Tier 1: Offload GPU caches to CPU (frees GPU memory, preserves data)
+        for (owner, _, size) in &candidates {
+            if current_usage - freed <= budget {
+                break;
+            }
+            if let Some(cache) = self.caches.get(owner) {
+                let mut guard = cache.lock();
+                if guard.location() == CacheLocation::Gpu {
+                    guard.offload_to_cpu();
+                    freed += size;
+                    tracing::info!(
+                        "Offloaded cache {:?} to CPU, freed {} GPU bytes",
+                        owner,
+                        size
+                    );
+                }
+            }
+        }
+
+        // Tier 2: If still over budget, remove offloaded caches entirely
+        if current_usage - freed > budget {
+            for (owner, _, size) in candidates {
+                if current_usage - freed <= budget {
+                    break;
+                }
+                if let Some(cache) = self.caches.get(&owner) {
+                    let guard = cache.lock();
+                    if guard.location() == CacheLocation::Cpu {
+                        drop(guard);
+                        self.caches.remove(&owner);
+                        self.delta_dependencies.remove(&owner);
+                        freed += size;
+                        tracing::info!("Evicted CPU cache {:?}, freed {} bytes", owner, size);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get total memory usage across all caches in bytes
+    pub fn total_memory_usage(&self) -> usize {
+        self.caches
+            .iter()
+            .map(|entry| entry.value().lock().memory_usage())
+            .sum()
+    }
+
+    /// Get number of active caches
+    pub fn cache_count(&self) -> usize {
+        self.caches.len()
+    }
+
+    /// Clear all caches (useful for cleanup)
+    pub fn clear_all(&self) {
+        self.caches.clear();
+        self.delta_dependencies.clear();
+        tracing::info!("Cleared all KV caches from registry");
+    }
+
+    /// Register the tenant delta that produced a cache owner's KV.
+    ///
+    /// Records `(tenant_id, weight_epoch)` as the effective tenant whose delta
+    /// contributed to the cache's weights, along with that delta's weight epoch
+    /// at compute time — pass `None` when no tenant delta contributes (bare
+    /// base model or base-delta-only inference; the epoch is then irrelevant).
+    /// When that tenant's delta is later evicted, reset, or removed,
+    /// [`Self::invalidate_for_tenant`] clears every cache recorded under it.
+    ///
+    /// **Stale-weight guard:** if the effective `(tenant_id, weight_epoch)`
+    /// differs from the value recorded the last time this owner's cache was
+    /// computed, the existing KV was produced under different weights and is
+    /// cleared in place (cached token IDs + every layer cache) before the new
+    /// dependency is recorded, so generation can never reuse it. Returns `true`
+    /// when such a stale cache was cleared. This is the barrier that stops a
+    /// session cache from crossing a weight boundary — no-delta↔delta,
+    /// tenant-A↔tenant-B, *and* same-tenant in-place re-adaptation (the epoch
+    /// advances while the tenant id stays the same): the next request
+    /// re-`register`s with the now-effective tenant and epoch, the mismatch is
+    /// detected, and the stale KV is dropped, forcing a full recompute. Both
+    /// the bump (at adapt/train/rollback/reset time) and this comparison are
+    /// O(1) — no per-adaptation scan of the dependency map. A cache with no
+    /// prior record (fresh, or just invalidated) is never treated as stale.
+    pub fn register_delta_dependency(
+        &self,
+        owner: &CacheOwner,
+        tenant_id: Option<String>,
+        weight_epoch: u64,
+    ) -> bool {
+        let dependency = tenant_id.map(|t| (t, weight_epoch));
+        let stale = match self.delta_dependencies.get(owner) {
+            Some(prev) => *prev != dependency,
+            None => false,
+        };
+        self.delta_dependencies.insert(owner.clone(), dependency);
+
+        if stale {
+            if let Some(cache) = self.caches.get(owner) {
+                let mut guard = cache.lock();
+                // Mirror invalidate_for_tenant's cleanup: wipe both the prefix
+                // tokens and the layer caches so neither prefix-matching nor a
+                // retained tensor can resurrect the stale values.
+                guard.set_cached_tokens(Vec::new());
+                guard.clear_all();
+                tracing::info!(
+                    "Cleared stale KV cache for {:?}: effective tenant or weight epoch changed since last compute",
+                    owner
+                );
+            }
+        }
+
+        stale
+    }
+
+    /// Invalidate all KV caches that depend on a specific subject's delta.
+    ///
+    /// Called when a subject's delta is evicted, reset, or significantly modified.
+    /// Returns the number of caches invalidated.
+    pub fn invalidate_for_tenant(&self, tenant_id: &str) -> usize {
+        let mut invalidated = 0;
+        let to_remove: Vec<CacheOwner> = self
+            .delta_dependencies
+            .iter()
+            .filter_map(|entry| {
+                if entry.value().as_ref().map(|(t, _)| t.as_str()) == Some(tenant_id) {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for owner in to_remove {
+            // Clear cached token IDs before removing — ensures prefix matching
+            // won't reuse stale KV values if the cache is somehow retained.
+            if let Some(cache) = self.caches.get(&owner) {
+                let mut guard = cache.lock();
+                guard.set_cached_tokens(Vec::new());
+                guard.clear_all();
+            }
+            self.caches.remove(&owner);
+            self.delta_dependencies.remove(&owner);
+            invalidated += 1;
+        }
+
+        if invalidated > 0 {
+            // Never log the raw tenant subject (#1253/#1261 review): emit the
+            // same opaque keyed-hash id used for metric attributes.
+            let opaque =
+                crate::runtime::token_metrics::opaque_tenant_id(&Some(tenant_id.to_owned()));
+            tracing::info!(
+                "Invalidated {} KV caches dependent on subject delta (tenant {})",
+                invalidated,
+                opaque.map_or_else(|| "anonymous".to_owned(), |h| format!("tenant:{h:016x}"))
+            );
+        }
+
+        invalidated
+    }
+}
+
+// ============================================================================
+// Paged Block Pool (PagedAttention-style memory management)
+// ============================================================================
+
+/// Number of tokens per block in the paged KV cache.
+/// 256 balances fragmentation overhead vs block reuse granularity.
+pub const BLOCK_SIZE: usize = 256;
+
+/// Opaque handle to a block in the pool.
+pub type BlockId = usize;
+
+/// Failure to allocate a block from the shared pool because no free blocks remain.
+///
+/// This is a *fail-soft* signal — distinct from a real error — so a scheduler can
+/// turn it into admission-defer (retry the sequence on a later step once other
+/// sequences release blocks) rather than failing the request outright. Callers
+/// that receive an [`anyhow::Error`] from cache `update` can recover the typed
+/// reason via `err.downcast_ref::<BlockPoolExhausted>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockPoolExhausted {
+    /// Number of blocks the pool can hold in total.
+    pub total_blocks: usize,
+}
+
+impl std::fmt::Display for BlockPoolExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "block pool exhausted (all {} blocks in use)",
+            self.total_blocks
+        )
+    }
+}
+
+impl std::error::Error for BlockPoolExhausted {}
+
+/// Shared pool of fixed-size GPU tensor blocks for KV cache storage.
+///
+/// All KV cache memory is pre-allocated in this pool at startup. Sessions
+/// allocate and free blocks from the pool — no per-session `cudaMalloc` calls,
+/// zero fragmentation, and instant block reuse across sessions.
+///
+/// Each block stores `BLOCK_SIZE` tokens of K or V for a single attention layer.
+/// Shape: `[1, BLOCK_SIZE, num_kv_heads, head_dim]`.
+pub struct BlockPool {
+    /// Pre-allocated tensor blocks on GPU (one per block ID).
+    /// Each tensor has shape [1, BLOCK_SIZE, num_kv_heads, head_dim].
+    blocks: Vec<Tensor>,
+    /// Free block IDs available for allocation (LIFO stack for cache locality).
+    free_list: Vec<BlockId>,
+    /// Current owner of each block (indexed by `BlockId`); `None` when free.
+    ///
+    /// Enforces tenant isolation in the shared pool: a block allocated by one
+    /// [`CacheOwner`] cannot be freed or used by another (see [`BlockPool::free`]).
+    block_owner: Vec<Option<CacheOwner>>,
+    /// Block tensor shape: [1, BLOCK_SIZE, num_kv_heads, head_dim]
+    block_shape: [i64; 4],
+    /// Device the blocks are allocated on
+    device: tch::Device,
+    /// Data type of the blocks
+    dtype: DType,
+    /// Total number of blocks in the pool
+    total_blocks: usize,
+}
+
+impl BlockPool {
+    /// Create a new block pool with `num_blocks` pre-allocated blocks.
+    ///
+    /// All blocks are allocated on `device` with dtype `dtype`.
+    /// `num_kv_heads` and `head_dim` define the per-head tensor dimensions.
+    pub fn new(
+        num_blocks: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        device: tch::Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let block_shape = [1, BLOCK_SIZE as i64, num_kv_heads as i64, head_dim as i64];
+
+        tracing::info!(
+            "Allocating block pool: {} blocks x {:?} ({:.1} MB total)",
+            num_blocks,
+            block_shape,
+            (num_blocks as f64
+                * BLOCK_SIZE as f64
+                * num_kv_heads as f64
+                * head_dim as f64
+                * match dtype {
+                    DType::Half | DType::BFloat16 => 2.0,
+                    _ => 4.0,
+                })
+                / (1024.0 * 1024.0),
+        );
+
+        let mut blocks = Vec::with_capacity(num_blocks);
+        let mut free_list = Vec::with_capacity(num_blocks);
+
+        for id in 0..num_blocks {
+            let block = safe_zeros(&block_shape, (dtype, device))?;
+            blocks.push(block);
+            free_list.push(id);
+        }
+
+        Ok(Self {
+            blocks,
+            free_list,
+            block_owner: vec![None; num_blocks],
+            block_shape,
+            device,
+            dtype,
+            total_blocks: num_blocks,
+        })
+    }
+
+    /// Allocate a block from the pool on behalf of `owner`.
+    ///
+    /// Returns [`BlockPoolExhausted`] (a fail-soft signal a scheduler can turn
+    /// into admission-defer) when no free blocks remain. The allocated block is
+    /// tagged with `owner` so it can only be freed/used by that same owner.
+    pub fn allocate(&mut self, owner: &CacheOwner) -> Result<BlockId, BlockPoolExhausted> {
+        match self.free_list.pop() {
+            Some(id) => {
+                self.block_owner[id] = Some(owner.clone());
+                Ok(id)
+            }
+            None => Err(BlockPoolExhausted {
+                total_blocks: self.total_blocks,
+            }),
+        }
+    }
+
+    /// Return a block to the pool.
+    ///
+    /// Panics (in debug) / logs and refuses (in release) if `owner` does not
+    /// match the owner the block was allocated to — this enforces tenant
+    /// isolation: one [`CacheOwner`] can never free another's block.
+    pub fn free(&mut self, owner: &CacheOwner, id: BlockId) {
+        debug_assert!(id < self.total_blocks, "Invalid block ID: {}", id);
+        if id >= self.total_blocks {
+            return;
+        }
+        match &self.block_owner[id] {
+            Some(current) if current == owner => {
+                self.block_owner[id] = None;
+                self.free_list.push(id);
+            }
+            Some(current) => {
+                debug_assert!(
+                    false,
+                    "cross-owner block free rejected: block {} owned by {:?}, freed by {:?}",
+                    id, current, owner
+                );
+                tracing::error!(
+                    "cross-owner block free rejected: block {} owned by {:?}, freed by {:?}",
+                    id,
+                    current,
+                    owner
+                );
+            }
+            None => {
+                debug_assert!(false, "double-free of block {}", id);
+                tracing::error!("double-free of block {} (already in free list)", id);
+            }
+        }
+    }
+
+    /// Owner currently holding `id`, if any (for tests/metrics).
+    pub fn owner_of(&self, id: BlockId) -> Option<&CacheOwner> {
+        self.block_owner.get(id).and_then(|o| o.as_ref())
+    }
+
+    /// Get a reference to a block's tensor.
+    pub fn get_block(&self, id: BlockId) -> &Tensor {
+        &self.blocks[id]
+    }
+
+    /// Number of blocks currently in use.
+    pub fn used_blocks(&self) -> usize {
+        self.total_blocks - self.free_list.len()
+    }
+
+    /// Number of blocks available for allocation.
+    pub fn free_block_count(&self) -> usize {
+        self.free_list.len()
+    }
+
+    /// Total number of blocks in the pool.
+    pub fn total_blocks(&self) -> usize {
+        self.total_blocks
+    }
+
+    /// Memory used by allocated blocks (approximate, in bytes).
+    pub fn used_memory(&self) -> usize {
+        let elem_size = match self.dtype {
+            DType::Half | DType::BFloat16 => 2,
+            _ => 4,
+        };
+        let per_block =
+            BLOCK_SIZE * self.block_shape[2] as usize * self.block_shape[3] as usize * elem_size;
+        self.used_blocks() * per_block
+    }
+
+    /// Block shape: [1, BLOCK_SIZE, num_kv_heads, head_dim]
+    pub fn block_shape(&self) -> &[i64; 4] {
+        &self.block_shape
+    }
+
+    /// Device the pool is allocated on.
+    pub fn device(&self) -> tch::Device {
+        self.device
+    }
+
+    /// Data type of the pool's tensors.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
+impl std::fmt::Debug for BlockPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockPool")
+            .field("total_blocks", &self.total_blocks)
+            .field("used_blocks", &self.used_blocks())
+            .field("free_blocks", &self.free_block_count())
+            .field("block_shape", &self.block_shape)
+            .field("device", &self.device)
+            .field("dtype", &self.dtype)
+            .finish()
+    }
+}
+
+// ============================================================================
+// Original KV Cache Implementation
+// ============================================================================
+
+/// Default chunk size for KV cache growth (in tokens)
+const DEFAULT_CHUNK_SIZE: usize = 1024;
+
+/// Default blocksize for bitsandbytes quantization
+#[cfg(feature = "bnb")]
+const QUANT_BLOCKSIZE: usize = 64;
+
+/// Number of tokens to accumulate before flushing to quantized storage
+#[cfg(feature = "bnb")]
+const BUFFER_FLUSH_THRESHOLD: usize = 64;
+
+/// Get byte size per element for a dtype
+fn dtype_element_size(dtype: DType) -> usize {
+    match dtype {
+        DType::Half | DType::BFloat16 => 2,
+        _ => 4, // Float, Double, Int, etc.
+    }
+}
+
+/// Quantized tensor storage - stores a contiguous quantized tensor
+#[cfg(feature = "bnb")]
+#[derive(Debug)]
+struct QuantizedTensor {
+    /// Quantized data bytes
+    data: Vec<u8>,
+    /// Quantization state (codebook, absmax, etc.)
+    state: bitsandbytes_sys::QuantState,
+    /// Original tensor shape for reconstruction
+    shape: Vec<i64>,
+    /// Original dtype for reconstruction
+    dtype: DType,
+    /// Target device for reconstruction
+    device: Device,
+}
+
+#[cfg(feature = "bnb")]
+impl QuantizedTensor {
+    /// Quantize a tensor using the specified quantization type.
+    ///
+    /// If the tensor is on a GPU (CUDA/ROCm) and is BF16 or FP16, uses the
+    /// GPU-native bitsandbytes kernels directly — no CPU round-trip. For CPU
+    /// tensors or f32 dtype, falls back to the CPU quantization path.
+    fn from_tensor(tensor: &Tensor, quant_type: KVQuantType) -> Result<Self> {
+        let shape = tensor.size();
+        let dtype = tensor.kind();
+        let device = tensor.device();
+
+        if quant_type == KVQuantType::None {
+            return Err(anyhow!(
+                "Cannot create QuantizedTensor with KVQuantType::None"
+            ));
+        }
+
+        // GPU-native path: BF16/FP16 on CUDA/ROCm → quantize directly on GPU
+        let use_gpu_path = device != Device::Cpu
+            && (dtype == DType::BFloat16 || dtype == DType::Half)
+            && quant_type == KVQuantType::Int8;
+
+        if use_gpu_path {
+            return Self::from_tensor_gpu(tensor, &shape, dtype, device);
+        }
+
+        // CPU fallback path: copy to CPU, convert to f32, quantize
+        let cpu_tensor = tensor
+            .to_device(Device::Cpu)
+            .to_kind(DType::Float)
+            .contiguous();
+        let numel = cpu_tensor.numel();
+
+        let mut f32_data = vec![0.0f32; numel];
+        cpu_tensor
+            .f_copy_data(&mut f32_data, numel)
+            .map_err(|e| anyhow!("Failed to copy tensor data: {:?}", e))?;
+
+        let (data, state) = match quant_type {
+            KVQuantType::Int8 => {
+                bitsandbytes_sys::quantize_blockwise_fp32(&f32_data, QUANT_BLOCKSIZE)
+                    .map_err(|e| anyhow!("Int8 quantization failed: {:?}", e))?
+            }
+            KVQuantType::Nf4 => {
+                bitsandbytes_sys::quantize_4bit_nf4_fp32(&f32_data, QUANT_BLOCKSIZE)
+                    .map_err(|e| anyhow!("NF4 quantization failed: {:?}", e))?
+            }
+            KVQuantType::Fp4 => {
+                bitsandbytes_sys::quantize_4bit_fp4_fp32(&f32_data, QUANT_BLOCKSIZE)
+                    .map_err(|e| anyhow!("FP4 quantization failed: {:?}", e))?
+            }
+            KVQuantType::None => unreachable!(),
+        };
+
+        tracing::trace!(
+            "Quantized tensor (CPU path): {} elements, shape {:?} -> {} bytes ({:.1}% of f32)",
+            numel,
+            shape,
+            data.len(),
+            (data.len() as f64 / (numel * 4) as f64) * 100.0
+        );
+
+        Ok(Self {
+            data,
+            state,
+            shape,
+            dtype,
+            device,
+        })
+    }
+
+    /// GPU-native quantization: operates directly on GPU BF16/FP16 tensors.
+    ///
+    /// Uses bitsandbytes CUDA/HIP kernels. The code/absmax arrays are created
+    /// as CPU Vecs (they're small metadata), while the quantization kernel reads
+    /// from GPU input and writes to a GPU-resident output tensor. We then copy
+    /// the small quantized result back to CPU for storage (the quantized data
+    /// is ~8x smaller than the original, so this copy is cheap).
+    fn from_tensor_gpu(
+        tensor: &Tensor,
+        shape: &[i64],
+        dtype: DType,
+        device: Device,
+    ) -> Result<Self> {
+        let numel = tensor.numel();
+        let contiguous = tensor.contiguous();
+
+        // Create quantization state (CPU — small metadata)
+        let mut state = bitsandbytes_sys::QuantState::new_8bit(numel, QUANT_BLOCKSIZE);
+
+        // Allocate GPU output tensor for quantized data
+        let output_tensor = Tensor::zeros([numel as i64], (DType::Uint8, device));
+
+        // Allocate GPU tensors for code and absmax
+        let code_tensor = Tensor::from_slice(&state.code).to_device(device);
+        let absmax_tensor = Tensor::zeros([state.absmax.len() as i64], (DType::Float, device));
+
+        // Call GPU-native kernel
+        unsafe {
+            let input_ptr = contiguous.data_ptr() as *mut std::ffi::c_void;
+            let code_ptr = code_tensor.data_ptr() as *mut f32;
+            let absmax_ptr = absmax_tensor.data_ptr() as *mut f32;
+            let output_ptr = output_tensor.data_ptr() as *mut u8;
+
+            match dtype {
+                DType::BFloat16 => bitsandbytes_sys::quantize_blockwise_bf16_gpu(
+                    code_ptr,
+                    input_ptr,
+                    absmax_ptr,
+                    output_ptr,
+                    QUANT_BLOCKSIZE as i32,
+                    numel as i32,
+                ),
+                DType::Half => bitsandbytes_sys::quantize_blockwise_fp16_gpu(
+                    code_ptr,
+                    input_ptr,
+                    absmax_ptr,
+                    output_ptr,
+                    QUANT_BLOCKSIZE as i32,
+                    numel as i32,
+                ),
+                _ => unreachable!("GPU path only for BF16/FP16"),
+            }
+        }
+
+        // Copy small results back to CPU for storage
+        // quantized data: numel bytes (8x smaller than BF16 input)
+        // absmax: n_blocks * 4 bytes (tiny)
+        let mut data = vec![0u8; numel];
+        output_tensor
+            .to_device(Device::Cpu)
+            .f_copy_data(&mut data, numel)
+            .map_err(|e| anyhow!("Failed to copy quantized data: {:?}", e))?;
+
+        let mut absmax = vec![0.0f32; state.absmax.len()];
+        absmax_tensor
+            .to_device(Device::Cpu)
+            .f_copy_data(&mut absmax, state.absmax.len())
+            .map_err(|e| anyhow!("Failed to copy absmax: {:?}", e))?;
+        state.absmax = absmax;
+
+        tracing::trace!(
+            "Quantized tensor (GPU path, {:?}): {} elements -> {} bytes ({:.1}% of original)",
+            dtype,
+            numel,
+            data.len(),
+            (data.len() as f64 / (numel as f64 * dtype_element_size(dtype) as f64)) * 100.0
+        );
+
+        Ok(Self {
+            data,
+            state,
+            shape: shape.to_vec(),
+            dtype,
+            device,
+        })
+    }
+
+    /// Dequantize back to a tensor.
+    ///
+    /// If the target device is GPU and dtype is BF16/FP16, uses GPU-native
+    /// dequantization to avoid the CPU→f32→GPU round-trip.
+    fn to_tensor(&self) -> Result<Tensor> {
+        // GPU-native dequant path
+        let use_gpu_path = self.device != Device::Cpu
+            && (self.dtype == DType::BFloat16 || self.dtype == DType::Half)
+            && !self.state.is_4bit;
+
+        if use_gpu_path {
+            return self.to_tensor_gpu();
+        }
+
+        // CPU fallback path
+        let f32_data = if self.state.is_4bit {
+            match self.state.quant_type {
+                Some(bitsandbytes_sys::QuantType::Nf4) => {
+                    bitsandbytes_sys::dequantize_4bit_nf4_fp32(&self.data, &self.state)
+                        .map_err(|e| anyhow!("NF4 dequantization failed: {:?}", e))?
+                }
+                Some(bitsandbytes_sys::QuantType::Fp4) => {
+                    bitsandbytes_sys::dequantize_4bit_fp4_fp32(&self.data, &self.state)
+                        .map_err(|e| anyhow!("FP4 dequantization failed: {:?}", e))?
+                }
+                _ => {
+                    return Err(anyhow!("Unknown 4-bit quantization type"));
+                }
+            }
+        } else {
+            bitsandbytes_sys::dequantize_blockwise_fp32(&self.data, &self.state)
+                .map_err(|e| anyhow!("Int8 dequantization failed: {:?}", e))?
+        };
+
+        // Create tensor from f32 data
+        let cpu_tensor = Tensor::from_slice(&f32_data).reshape(&self.shape);
+
+        // Convert to original dtype and move to original device
+        let tensor = cpu_tensor.to_kind(self.dtype).to_device(self.device);
+
+        Ok(tensor)
+    }
+
+    /// GPU-native dequantization: produces BF16/FP16 tensor directly on GPU.
+    ///
+    /// Copies the small quantized data + absmax to GPU, then calls the
+    /// bitsandbytes BF16/FP16 dequant kernel. Output is GPU-resident in the
+    /// original dtype — no f32 intermediate, no CPU→GPU dtype conversion.
+    fn to_tensor_gpu(&self) -> Result<Tensor> {
+        let numel = self.state.n_elements;
+
+        // Copy quantized data and absmax to GPU (small: ~numel bytes + n_blocks*4 bytes)
+        let quant_tensor = Tensor::from_slice(&self.data).to_device(self.device);
+        let code_tensor = Tensor::from_slice(&self.state.code).to_device(self.device);
+        let absmax_tensor = Tensor::from_slice(&self.state.absmax).to_device(self.device);
+
+        // Allocate output tensor on GPU in original dtype
+        let output_tensor = Tensor::zeros([numel as i64], (self.dtype, self.device));
+
+        unsafe {
+            let quant_ptr = quant_tensor.data_ptr() as *mut u8;
+            let code_ptr = code_tensor.data_ptr() as *mut f32;
+            let absmax_ptr = absmax_tensor.data_ptr() as *mut f32;
+            let output_ptr = output_tensor.data_ptr() as *mut std::ffi::c_void;
+
+            match self.dtype {
+                DType::BFloat16 => bitsandbytes_sys::dequantize_blockwise_bf16_gpu(
+                    code_ptr,
+                    quant_ptr,
+                    absmax_ptr,
+                    output_ptr,
+                    self.state.blocksize as i32,
+                    numel as i32,
+                ),
+                DType::Half => bitsandbytes_sys::dequantize_blockwise_fp16_gpu(
+                    code_ptr,
+                    quant_ptr,
+                    absmax_ptr,
+                    output_ptr,
+                    self.state.blocksize as i32,
+                    numel as i32,
+                ),
+                _ => unreachable!("GPU dequant path only for BF16/FP16"),
+            }
+        }
+
+        // Reshape to original shape
+        let result = output_tensor.reshape(&self.shape);
+
+        tracing::trace!(
+            "Dequantized tensor (GPU path, {:?}): {} bytes -> {} elements",
+            self.dtype,
+            self.data.len(),
+            numel
+        );
+
+        Ok(result)
+    }
+
+    /// Get memory usage in bytes
+    fn memory_usage(&self) -> usize {
+        self.data.len() + self.state.code.len() * 4 + self.state.absmax.len() * 4
+    }
+}
+
+/// Storage for KV cache - either full precision tensors or quantized
+#[derive(Debug)]
+enum KVStorage {
+    /// Full precision tensor storage
+    FullPrecision {
+        keys: Option<Tensor>,
+        values: Option<Tensor>,
+    },
+    /// Quantized storage with buffer for recent tokens (requires `bnb` feature)
+    #[cfg(feature = "bnb")]
+    Quantized {
+        /// Quantized historical keys (contiguous)
+        keys_quantized: Option<QuantizedTensor>,
+        /// Quantized historical values (contiguous)
+        values_quantized: Option<QuantizedTensor>,
+        /// Number of tokens in quantized storage
+        quantized_len: usize,
+
+        /// Buffer for recent tokens (full precision) - not yet quantized
+        keys_buffer: Option<Tensor>,
+        /// Buffer for recent values (full precision)
+        values_buffer: Option<Tensor>,
+        /// Number of tokens in buffer
+        buffer_len: usize,
+
+        /// Cached dequantized view (valid for current forward pass)
+        /// This avoids re-dequantizing for each layer
+        dequant_keys: Option<Tensor>,
+        dequant_values: Option<Tensor>,
+        /// Position up to which dequant cache is valid
+        dequant_valid_len: usize,
+
+        /// Quantization type
+        quant_type: KVQuantType,
+        /// Template info for tensor creation
+        dtype: Option<DType>,
+        device: Option<Device>,
+    },
+    /// Paged block storage — fixed-size blocks from a shared pool.
+    ///
+    /// Eliminates GPU memory fragmentation by allocating from a pre-allocated
+    /// pool of fixed-size blocks. `get()` assembles blocks into a contiguous
+    /// view via `torch.cat`. Inspired by PagedAttention (vLLM, SOSP 2023).
+    Paged {
+        /// Owner of the blocks held here (for pool ownership assertions).
+        owner: CacheOwner,
+        /// Block IDs for key tensors (one per BLOCK_SIZE tokens)
+        key_blocks: Vec<BlockId>,
+        /// Block IDs for value tensors
+        value_blocks: Vec<BlockId>,
+        /// Reference to the shared block pool
+        pool: Arc<Mutex<BlockPool>>,
+        /// Cached contiguous view (invalidated on update)
+        cached_keys: Option<Tensor>,
+        cached_values: Option<Tensor>,
+        /// Position up to which the cached view is valid
+        cached_valid_len: usize,
+    },
+}
+
+/// KV cache for a single attention layer
+#[derive(Debug)]
+pub struct LayerKVCache {
+    /// Storage for keys and values
+    storage: KVStorage,
+    /// Current sequence position (number of cached tokens)
+    pub seq_pos: usize,
+    /// Maximum sequence length
+    pub max_seq_len: usize,
+    /// Currently allocated capacity (grows in chunks up to max_seq_len)
+    allocated_capacity: usize,
+    /// Quantization type
+    quant_type: KVQuantType,
+}
+
+impl LayerKVCache {
+    /// Create a new layer KV cache
+    #[cfg(feature = "bnb")]
+    pub fn new(max_seq_len: usize, quant_type: KVQuantType) -> Self {
+        let storage = match quant_type {
+            KVQuantType::None => KVStorage::FullPrecision {
+                keys: None,
+                values: None,
+            },
+            _ => KVStorage::Quantized {
+                keys_quantized: None,
+                values_quantized: None,
+                quantized_len: 0,
+                keys_buffer: None,
+                values_buffer: None,
+                buffer_len: 0,
+                dequant_keys: None,
+                dequant_values: None,
+                dequant_valid_len: 0,
+                quant_type,
+                dtype: None,
+                device: None,
+            },
+        };
+
+        Self {
+            storage,
+            seq_pos: 0,
+            max_seq_len,
+            allocated_capacity: 0,
+            quant_type,
+        }
+    }
+
+    /// Create a new layer KV cache (without bnb feature - quantization disabled)
+    #[cfg(not(feature = "bnb"))]
+    pub fn new(max_seq_len: usize, quant_type: KVQuantType) -> Self {
+        if quant_type != KVQuantType::None {
+            tracing::warn!(
+                "KV cache quantization requested ({:?}) but 'bnb' feature not enabled. Falling back to full precision.",
+                quant_type
+            );
+        }
+
+        Self {
+            storage: KVStorage::FullPrecision {
+                keys: None,
+                values: None,
+            },
+            seq_pos: 0,
+            max_seq_len,
+            allocated_capacity: 0,
+            quant_type: KVQuantType::None,
+        }
+    }
+
+    /// Create a new layer KV cache using paged block storage owned by `owner`.
+    pub fn new_paged(max_seq_len: usize, pool: Arc<Mutex<BlockPool>>, owner: CacheOwner) -> Self {
+        Self {
+            storage: KVStorage::Paged {
+                owner,
+                key_blocks: Vec::new(),
+                value_blocks: Vec::new(),
+                pool,
+                cached_keys: None,
+                cached_values: None,
+                cached_valid_len: 0,
+            },
+            seq_pos: 0,
+            max_seq_len,
+            allocated_capacity: 0,
+            quant_type: KVQuantType::None,
+        }
+    }
+
+    /// Release any paged blocks held by this layer back to the shared pool.
+    ///
+    /// Shared by [`LayerKVCache::clear`] and the [`Drop`] impl so that blocks
+    /// always return to the [`BlockPool`] free list — even when the cache is
+    /// dropped via registry eviction (`caches.remove`) without an explicit
+    /// `clear()` (the source of the original paged-pool leak).
+    fn release_paged_blocks(&mut self) {
+        if let KVStorage::Paged {
+            owner,
+            key_blocks,
+            value_blocks,
+            pool,
+            ..
+        } = &mut self.storage
+        {
+            if key_blocks.is_empty() && value_blocks.is_empty() {
+                return;
+            }
+            let mut pool_guard = pool.lock();
+            for &id in key_blocks.iter() {
+                pool_guard.free(owner, id);
+            }
+            for &id in value_blocks.iter() {
+                pool_guard.free(owner, id);
+            }
+            key_blocks.clear();
+            value_blocks.clear();
+        }
+    }
+
+    /// Ensure cache has capacity for required_len tokens (full precision only)
+    fn ensure_capacity_fp(&mut self, required_len: usize, template: &Tensor) -> Result<()> {
+        if required_len <= self.allocated_capacity {
+            return Ok(());
+        }
+
+        // Round up to chunk boundary
+        let new_capacity = required_len.div_ceil(DEFAULT_CHUNK_SIZE) * DEFAULT_CHUNK_SIZE;
+        let new_capacity = new_capacity.min(self.max_seq_len);
+
+        let shape = template.size();
+        if shape.len() != 4 {
+            return Err(anyhow!("Expected 4D tensor, got {:?}", shape));
+        }
+        let (batch_size, num_heads, head_dim) = (shape[0], shape[2], shape[3]);
+
+        let device = template.device();
+        let dtype = template.kind();
+        let new_shape = [batch_size, new_capacity as i64, num_heads, head_dim];
+
+        let cache_size_mb = estimate_tensor_size_mb(&new_shape, dtype);
+        tracing::debug!(
+            "Growing KV cache: {} -> {} tokens ({:.1} MB per tensor)",
+            self.allocated_capacity,
+            new_capacity,
+            cache_size_mb
+        );
+
+        let new_keys = safe_zeros(&new_shape, (dtype, device))?;
+        let new_values = safe_zeros(&new_shape, (dtype, device))?;
+
+        // Copy existing data if any
+        if let KVStorage::FullPrecision {
+            keys: Some(old_keys),
+            values: Some(old_values),
+        } = &self.storage
+        {
+            if self.seq_pos > 0 {
+                new_keys
+                    .narrow(1, 0, self.seq_pos as i64)
+                    .copy_(&old_keys.narrow(1, 0, self.seq_pos as i64));
+                new_values
+                    .narrow(1, 0, self.seq_pos as i64)
+                    .copy_(&old_values.narrow(1, 0, self.seq_pos as i64));
+            }
+        }
+
+        self.storage = KVStorage::FullPrecision {
+            keys: Some(new_keys),
+            values: Some(new_values),
+        };
+        self.allocated_capacity = new_capacity;
+
+        Ok(())
+    }
+
+    /// Flush buffer to quantized storage
+    #[cfg(feature = "bnb")]
+    fn flush_buffer(&mut self) -> Result<()> {
+        if let KVStorage::Quantized {
+            keys_quantized,
+            values_quantized,
+            quantized_len,
+            keys_buffer,
+            values_buffer,
+            buffer_len,
+            dequant_keys,
+            dequant_values,
+            dequant_valid_len,
+            quant_type,
+            ..
+        } = &mut self.storage
+        {
+            if *buffer_len == 0 {
+                return Ok(());
+            }
+
+            let kb = keys_buffer
+                .as_ref()
+                .ok_or_else(|| anyhow!("Buffer keys missing"))?;
+            let vb = values_buffer
+                .as_ref()
+                .ok_or_else(|| anyhow!("Buffer values missing"))?;
+
+            // Get just the valid portion of the buffer
+            let keys_to_quantize = kb.narrow(1, 0, *buffer_len as i64);
+            let values_to_quantize = vb.narrow(1, 0, *buffer_len as i64);
+
+            if let (Some(kq), Some(vq)) = (keys_quantized.as_ref(), values_quantized.as_ref()) {
+                // Merge: dequantize existing + concat buffer + requantize
+                let existing_keys = kq.to_tensor()?;
+                let existing_values = vq.to_tensor()?;
+
+                let merged_keys = Tensor::cat(&[existing_keys, keys_to_quantize], 1);
+                let merged_values = Tensor::cat(&[existing_values, values_to_quantize], 1);
+
+                *keys_quantized = Some(QuantizedTensor::from_tensor(&merged_keys, *quant_type)?);
+                *values_quantized =
+                    Some(QuantizedTensor::from_tensor(&merged_values, *quant_type)?);
+
+                tracing::debug!(
+                    "Flushed buffer: merged {} + {} = {} tokens",
+                    *quantized_len,
+                    *buffer_len,
+                    *quantized_len + *buffer_len
+                );
+            } else {
+                // First flush - just quantize the buffer
+                *keys_quantized = Some(QuantizedTensor::from_tensor(
+                    &keys_to_quantize,
+                    *quant_type,
+                )?);
+                *values_quantized = Some(QuantizedTensor::from_tensor(
+                    &values_to_quantize,
+                    *quant_type,
+                )?);
+
+                tracing::debug!("Initial quantization: {} tokens", *buffer_len);
+            }
+
+            *quantized_len += *buffer_len;
+            *buffer_len = 0;
+
+            // Invalidate dequant cache since quantized data changed
+            *dequant_keys = None;
+            *dequant_values = None;
+            *dequant_valid_len = 0;
+        }
+
+        Ok(())
+    }
+
+    /// Update cache with new keys and values
+    pub fn update(
+        &mut self,
+        new_keys: &Tensor,
+        new_values: &Tensor,
+        start_pos: usize,
+    ) -> Result<()> {
+        let k_size = new_keys.size();
+        if k_size.len() != 4 {
+            return Err(anyhow!("Expected 4D tensor for keys, got {:?}", k_size));
+        }
+        let seq_len = k_size[1] as usize;
+
+        // Check bounds against hard limit
+        let end_pos = start_pos + seq_len;
+        if end_pos > self.max_seq_len {
+            return Err(anyhow!(
+                "Cache overflow: trying to cache {} tokens starting at position {}, but max_seq_len is {}",
+                seq_len, start_pos, self.max_seq_len
+            ));
+        }
+
+        match &mut self.storage {
+            KVStorage::FullPrecision { .. } => {
+                // Grow cache if needed (chunked allocation)
+                self.ensure_capacity_fp(end_pos, new_keys)?;
+
+                // Re-borrow after potential reallocation
+                if let KVStorage::FullPrecision {
+                    keys: Some(cached_keys),
+                    values: Some(cached_values),
+                } = &self.storage
+                {
+                    cached_keys
+                        .narrow(1, start_pos as i64, seq_len as i64)
+                        .copy_(new_keys);
+                    cached_values
+                        .narrow(1, start_pos as i64, seq_len as i64)
+                        .copy_(new_values);
+                }
+            }
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized {
+                keys_quantized,
+                values_quantized,
+                quantized_len,
+                keys_buffer,
+                values_buffer,
+                buffer_len,
+                dequant_keys,
+                dequant_values,
+                dequant_valid_len,
+                dtype,
+                device,
+                ..
+            } => {
+                // Store template info on first update
+                if dtype.is_none() {
+                    *dtype = Some(new_keys.kind());
+                    *device = Some(new_keys.device());
+                }
+
+                // Invalidate dequant cache
+                *dequant_keys = None;
+                *dequant_values = None;
+                *dequant_valid_len = 0;
+
+                if start_pos == 0 {
+                    // Fresh prompt - put everything in buffer, will be quantized on flush
+                    *keys_quantized = None;
+                    *values_quantized = None;
+                    *quantized_len = 0;
+
+                    *keys_buffer = Some(new_keys.shallow_clone());
+                    *values_buffer = Some(new_values.shallow_clone());
+                    *buffer_len = seq_len;
+
+                    // Flush immediately if large prompt
+                    if seq_len >= BUFFER_FLUSH_THRESHOLD {
+                        self.flush_buffer()?;
+                    }
+                } else {
+                    // Incremental update - append to buffer
+                    let dt = dtype.ok_or_else(|| anyhow!("dtype not set"))?;
+                    let dev = device.ok_or_else(|| anyhow!("device not set"))?;
+
+                    // Ensure buffer exists and has capacity
+                    let shape = new_keys.size();
+                    let (batch_size, num_heads, head_dim) = (shape[0], shape[2], shape[3]);
+
+                    if keys_buffer.is_none() {
+                        // Create buffer with capacity for threshold + some extra
+                        let buf_capacity = (BUFFER_FLUSH_THRESHOLD + 64) as i64;
+                        *keys_buffer = Some(Tensor::zeros(
+                            [batch_size, buf_capacity, num_heads, head_dim],
+                            (dt, dev),
+                        ));
+                        *values_buffer = Some(Tensor::zeros(
+                            [batch_size, buf_capacity, num_heads, head_dim],
+                            (dt, dev),
+                        ));
+                    }
+
+                    let kb = keys_buffer.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("Internal error: keys buffer not initialized")
+                    })?;
+
+                    // Check if buffer needs to grow
+                    let buf_capacity = kb.size()[1] as usize;
+                    if *buffer_len + seq_len > buf_capacity {
+                        // Flush current buffer first
+                        self.flush_buffer()?;
+
+                        // Re-borrow after flush
+                        if let KVStorage::Quantized {
+                            keys_buffer,
+                            values_buffer,
+                            buffer_len,
+                            ..
+                        } = &mut self.storage
+                        {
+                            // Create fresh buffer
+                            let buf_capacity = (BUFFER_FLUSH_THRESHOLD + 64) as i64;
+                            *keys_buffer = Some(Tensor::zeros(
+                                [batch_size, buf_capacity, num_heads, head_dim],
+                                (dt, dev),
+                            ));
+                            *values_buffer = Some(Tensor::zeros(
+                                [batch_size, buf_capacity, num_heads, head_dim],
+                                (dt, dev),
+                            ));
+                            *buffer_len = 0;
+                        }
+                    }
+
+                    // Re-borrow for the actual copy
+                    if let KVStorage::Quantized {
+                        keys_buffer: Some(kb),
+                        values_buffer: Some(vb),
+                        buffer_len,
+                        ..
+                    } = &mut self.storage
+                    {
+                        // Copy new data into buffer
+                        kb.narrow(1, *buffer_len as i64, seq_len as i64)
+                            .copy_(new_keys);
+                        vb.narrow(1, *buffer_len as i64, seq_len as i64)
+                            .copy_(new_values);
+                        *buffer_len += seq_len;
+                    }
+
+                    // Check if we should flush
+                    if let KVStorage::Quantized { buffer_len, .. } = &self.storage {
+                        if *buffer_len >= BUFFER_FLUSH_THRESHOLD {
+                            self.flush_buffer()?;
+                        }
+                    }
+                }
+            }
+            KVStorage::Paged {
+                owner,
+                key_blocks,
+                value_blocks,
+                pool,
+                cached_keys,
+                cached_values,
+                cached_valid_len,
+            } => {
+                // Invalidate cached contiguous view
+                *cached_keys = None;
+                *cached_values = None;
+                *cached_valid_len = 0;
+
+                let mut pool_guard = pool.lock();
+
+                // Write K/V into blocks, allocating new blocks as needed
+                let mut pos = start_pos;
+                let mut token_offset = 0;
+                while token_offset < seq_len {
+                    let block_idx = pos / BLOCK_SIZE;
+                    let offset_in_block = pos % BLOCK_SIZE;
+                    let tokens_this_block =
+                        (BLOCK_SIZE - offset_in_block).min(seq_len - token_offset);
+
+                    // Ensure we have enough blocks allocated. Allocation failure
+                    // surfaces as the typed `BlockPoolExhausted` (fail-soft) so a
+                    // scheduler can admission-defer this sequence rather than fail it.
+                    while key_blocks.len() <= block_idx {
+                        let kid = pool_guard.allocate(owner)?;
+                        let vid = match pool_guard.allocate(owner) {
+                            Ok(vid) => vid,
+                            Err(e) => {
+                                // Roll back the just-allocated key block so the pair
+                                // stays balanced and the key block isn't leaked.
+                                pool_guard.free(owner, kid);
+                                return Err(e.into());
+                            }
+                        };
+                        key_blocks.push(kid);
+                        value_blocks.push(vid);
+                    }
+
+                    // Copy K/V slice into the block at the right offset
+                    let k_block = pool_guard.get_block(key_blocks[block_idx]);
+                    let v_block = pool_guard.get_block(value_blocks[block_idx]);
+
+                    k_block
+                        .narrow(1, offset_in_block as i64, tokens_this_block as i64)
+                        .copy_(&new_keys.narrow(1, token_offset as i64, tokens_this_block as i64));
+                    v_block
+                        .narrow(1, offset_in_block as i64, tokens_this_block as i64)
+                        .copy_(&new_values.narrow(
+                            1,
+                            token_offset as i64,
+                            tokens_this_block as i64,
+                        ));
+
+                    pos += tokens_this_block;
+                    token_offset += tokens_this_block;
+                }
+            }
+        }
+
+        // Update position
+        self.seq_pos = end_pos;
+
+        Ok(())
+    }
+
+    /// Get cached keys and values up to current position
+    pub fn get(&mut self) -> Result<(Tensor, Tensor)> {
+        if self.seq_pos == 0 {
+            return Err(anyhow!("Cache is empty"));
+        }
+
+        match &mut self.storage {
+            KVStorage::FullPrecision {
+                keys: Some(cached_keys),
+                values: Some(cached_values),
+            } => {
+                // Return views only - the .contiguous() in attention (after transposes)
+                // will handle memory layout. Avoids double-copying K/V per layer.
+                let keys_slice = cached_keys.narrow(1, 0, self.seq_pos as i64);
+                let values_slice = cached_values.narrow(1, 0, self.seq_pos as i64);
+                Ok((keys_slice, values_slice))
+            }
+            KVStorage::FullPrecision { .. } => Err(anyhow!("Keys/values cache not initialized")),
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized {
+                keys_quantized,
+                values_quantized,
+                quantized_len,
+                keys_buffer,
+                values_buffer,
+                buffer_len,
+                dequant_keys,
+                dequant_values,
+                dequant_valid_len,
+                ..
+            } => {
+                let total_len = *quantized_len + *buffer_len;
+
+                // Check if we have a valid cached dequantized view
+                if let (true, Some(dk), Some(dv)) = (
+                    *dequant_valid_len == total_len,
+                    dequant_keys.as_ref(),
+                    dequant_values.as_ref(),
+                ) {
+                    return Ok((dk.shallow_clone(), dv.shallow_clone()));
+                }
+
+                // Need to build the full view
+                let mut key_parts: Vec<Tensor> = Vec::new();
+                let mut value_parts: Vec<Tensor> = Vec::new();
+
+                // Part 1: Dequantized historical data
+                if let (Some(kq), Some(vq)) = (keys_quantized.as_ref(), values_quantized.as_ref()) {
+                    key_parts.push(kq.to_tensor()?);
+                    value_parts.push(vq.to_tensor()?);
+                }
+
+                // Part 2: Buffer data
+                if *buffer_len > 0 {
+                    if let Some(kb) = keys_buffer.as_ref() {
+                        key_parts.push(kb.narrow(1, 0, *buffer_len as i64));
+                    }
+                    if let Some(vb) = values_buffer.as_ref() {
+                        value_parts.push(vb.narrow(1, 0, *buffer_len as i64));
+                    }
+                }
+
+                let (keys, values) = if key_parts.is_empty() {
+                    return Err(anyhow!("No data in cache"));
+                } else if key_parts.len() == 1 {
+                    (key_parts.remove(0), value_parts.remove(0))
+                } else {
+                    (Tensor::cat(&key_parts, 1), Tensor::cat(&value_parts, 1))
+                };
+
+                // Cache the dequantized view
+                let keys_clone = keys.shallow_clone();
+                let values_clone = values.shallow_clone();
+
+                *dequant_keys = Some(keys_clone);
+                *dequant_values = Some(values_clone);
+                *dequant_valid_len = total_len;
+
+                Ok((keys, values))
+            }
+            KVStorage::Paged {
+                key_blocks,
+                value_blocks,
+                pool,
+                cached_keys,
+                cached_values,
+                cached_valid_len,
+                ..
+            } => {
+                // Return cached view if still valid
+                if *cached_valid_len == self.seq_pos {
+                    if let (Some(ck), Some(cv)) = (cached_keys.as_ref(), cached_values.as_ref()) {
+                        return Ok((ck.shallow_clone(), cv.shallow_clone()));
+                    }
+                }
+
+                let pool_guard = pool.lock();
+                let num_full_blocks = self.seq_pos / BLOCK_SIZE;
+                let remainder = self.seq_pos % BLOCK_SIZE;
+                let total_blocks_used = if remainder > 0 {
+                    num_full_blocks + 1
+                } else {
+                    num_full_blocks
+                };
+
+                if total_blocks_used == 0 || key_blocks.is_empty() {
+                    return Err(anyhow!("No data in paged cache"));
+                }
+
+                // Gather block tensors
+                let mut key_parts: Vec<Tensor> = Vec::with_capacity(total_blocks_used);
+                let mut value_parts: Vec<Tensor> = Vec::with_capacity(total_blocks_used);
+
+                for i in 0..total_blocks_used {
+                    let k = pool_guard.get_block(key_blocks[i]);
+                    let v = pool_guard.get_block(value_blocks[i]);
+
+                    if i == total_blocks_used - 1 && remainder > 0 {
+                        // Last block: narrow to actual token count
+                        key_parts.push(k.narrow(1, 0, remainder as i64));
+                        value_parts.push(v.narrow(1, 0, remainder as i64));
+                    } else {
+                        key_parts.push(k.shallow_clone());
+                        value_parts.push(v.shallow_clone());
+                    }
+                }
+
+                let keys = if key_parts.len() == 1 {
+                    key_parts.remove(0)
+                } else {
+                    Tensor::cat(&key_parts, 1)
+                };
+                let values = if value_parts.len() == 1 {
+                    value_parts.remove(0)
+                } else {
+                    Tensor::cat(&value_parts, 1)
+                };
+
+                // Cache the assembled view
+                *cached_keys = Some(keys.shallow_clone());
+                *cached_values = Some(values.shallow_clone());
+                *cached_valid_len = self.seq_pos;
+
+                Ok((keys, values))
+            }
+        }
+    }
+
+    /// Clear the cache
+    pub fn clear(&mut self) {
+        match &mut self.storage {
+            KVStorage::FullPrecision { keys, values } => {
+                *keys = None;
+                *values = None;
+            }
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized {
+                keys_quantized,
+                values_quantized,
+                quantized_len,
+                keys_buffer,
+                values_buffer,
+                buffer_len,
+                dequant_keys,
+                dequant_values,
+                dequant_valid_len,
+                dtype,
+                device,
+                ..
+            } => {
+                *keys_quantized = None;
+                *values_quantized = None;
+                *quantized_len = 0;
+                *keys_buffer = None;
+                *values_buffer = None;
+                *buffer_len = 0;
+                *dequant_keys = None;
+                *dequant_values = None;
+                *dequant_valid_len = 0;
+                *dtype = None;
+                *device = None;
+            }
+            KVStorage::Paged { .. } => {
+                // Return all blocks to the pool, then reset the cached view.
+                self.release_paged_blocks();
+                if let KVStorage::Paged {
+                    cached_keys,
+                    cached_values,
+                    cached_valid_len,
+                    ..
+                } = &mut self.storage
+                {
+                    *cached_keys = None;
+                    *cached_values = None;
+                    *cached_valid_len = 0;
+                }
+            }
+        }
+        self.seq_pos = 0;
+        self.allocated_capacity = 0;
+    }
+
+    /// Truncate cache to keep only tokens at positions 0..pos.
+    ///
+    /// For FullPrecision and Paged, this adjusts position markers — allocated
+    /// capacity/blocks remain and will be reused. For Paged, excess blocks
+    /// beyond the last needed block are freed back to the pool.
+    ///
+    /// For Quantized, this falls back to a full clear since truncation within
+    /// quantized blocks is complex.
+    pub fn truncate_to(&mut self, pos: usize) {
+        if pos >= self.seq_pos {
+            return; // Nothing to truncate
+        }
+        match &mut self.storage {
+            KVStorage::FullPrecision { .. } => {
+                // Just move the position marker back. Allocated capacity stays.
+                self.seq_pos = pos;
+            }
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized { .. } => {
+                // Truncation within quantized storage is complex — clear and recompute.
+                self.clear();
+            }
+            KVStorage::Paged {
+                owner,
+                key_blocks,
+                value_blocks,
+                pool,
+                cached_keys,
+                cached_values,
+                cached_valid_len,
+            } => {
+                // Free blocks beyond the last needed block
+                let blocks_needed = if pos == 0 {
+                    0
+                } else {
+                    (pos - 1) / BLOCK_SIZE + 1
+                };
+                if key_blocks.len() > blocks_needed {
+                    let mut pool_guard = pool.lock();
+                    for &id in &key_blocks[blocks_needed..] {
+                        pool_guard.free(owner, id);
+                    }
+                    for &id in &value_blocks[blocks_needed..] {
+                        pool_guard.free(owner, id);
+                    }
+                    key_blocks.truncate(blocks_needed);
+                    value_blocks.truncate(blocks_needed);
+                }
+                // Invalidate cached view
+                *cached_keys = None;
+                *cached_values = None;
+                *cached_valid_len = 0;
+                self.seq_pos = pos;
+            }
+        }
+    }
+
+    /// Check if cache is initialized
+    pub fn is_initialized(&self) -> bool {
+        match &self.storage {
+            KVStorage::FullPrecision { keys, values } => keys.is_some() && values.is_some(),
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized {
+                quantized_len,
+                buffer_len,
+                ..
+            } => *quantized_len > 0 || *buffer_len > 0,
+            KVStorage::Paged { key_blocks, .. } => !key_blocks.is_empty(),
+        }
+    }
+
+    /// Get memory usage in bytes (approximate)
+    pub fn memory_usage(&self) -> usize {
+        match &self.storage {
+            KVStorage::FullPrecision { keys, values } => {
+                let mut total = 0;
+                if let Some(k) = keys {
+                    total += k.numel() * dtype_element_size(k.kind());
+                }
+                if let Some(v) = values {
+                    total += v.numel() * dtype_element_size(v.kind());
+                }
+                total
+            }
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized {
+                keys_quantized,
+                values_quantized,
+                keys_buffer,
+                values_buffer,
+                buffer_len,
+                ..
+            } => {
+                let mut total = 0;
+
+                // Quantized storage
+                if let Some(kq) = keys_quantized {
+                    total += kq.memory_usage();
+                }
+                if let Some(vq) = values_quantized {
+                    total += vq.memory_usage();
+                }
+
+                // Buffer (only count used portion)
+                if let Some(kb) = keys_buffer {
+                    if *buffer_len > 0 {
+                        let shape = kb.size();
+                        let per_token = shape[0] * shape[2] * shape[3];
+                        total += (*buffer_len as i64 * per_token) as usize
+                            * dtype_element_size(kb.kind());
+                    }
+                }
+                if let Some(vb) = values_buffer {
+                    if *buffer_len > 0 {
+                        let shape = vb.size();
+                        let per_token = shape[0] * shape[2] * shape[3];
+                        total += (*buffer_len as i64 * per_token) as usize
+                            * dtype_element_size(vb.kind());
+                    }
+                }
+
+                // Note: dequant cache is temporary and not counted
+                total
+            }
+            KVStorage::Paged {
+                key_blocks, pool, ..
+            } => {
+                // Count blocks owned by this layer (K + V)
+                let pool_guard = pool.lock();
+                let elem_size = match pool_guard.dtype() {
+                    DType::Half | DType::BFloat16 => 2,
+                    _ => 4,
+                };
+                let shape = pool_guard.block_shape();
+                let per_block = BLOCK_SIZE * shape[2] as usize * shape[3] as usize * elem_size;
+                key_blocks.len() * 2 * per_block // K + V blocks
+            }
+        }
+    }
+
+    /// Move tensors to a different device (for CPU offload/restore).
+    ///
+    /// For FullPrecision: moves K/V tensors via `Tensor::to_device()`.
+    /// For Paged: no-op (blocks are managed by the pool).
+    /// For Quantized: no-op (quantized data is already on CPU).
+    pub fn to_device(&mut self, device: tch::Device) {
+        match &mut self.storage {
+            KVStorage::FullPrecision { keys, values } => {
+                if let Some(k) = keys {
+                    *k = k.to_device(device);
+                }
+                if let Some(v) = values {
+                    *v = v.to_device(device);
+                }
+            }
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized { .. } => {
+                // Quantized data lives on CPU already; dequant cache will be
+                // regenerated on next get(). No action needed.
+            }
+            KVStorage::Paged { .. } => {
+                // Paged blocks are managed by the pool. Offloading individual
+                // layers is not supported — use block pool eviction instead.
+            }
+        }
+    }
+
+    /// Get the quantization type
+    pub fn quant_type(&self) -> KVQuantType {
+        self.quant_type
+    }
+}
+
+// Backwards compatibility: expose keys/values for code that accesses them directly
+impl LayerKVCache {
+    /// Get keys tensor (only for full precision mode)
+    pub fn keys(&self) -> Option<&Tensor> {
+        match &self.storage {
+            KVStorage::FullPrecision { keys, .. } => keys.as_ref(),
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized { .. } => None,
+            KVStorage::Paged { .. } => None, // Use get() for paged mode
+        }
+    }
+
+    /// Get values tensor (only for full precision mode)
+    pub fn values(&self) -> Option<&Tensor> {
+        match &self.storage {
+            KVStorage::FullPrecision { values, .. } => values.as_ref(),
+            #[cfg(feature = "bnb")]
+            KVStorage::Quantized { .. } => None,
+            KVStorage::Paged { .. } => None, // Use get() for paged mode
+        }
+    }
+}
+
+impl Drop for LayerKVCache {
+    /// Return paged blocks to the shared pool when the cache is dropped.
+    ///
+    /// Without this, registry eviction (`caches.remove`) would drop paged caches
+    /// without returning their blocks, leaking pool capacity until restart.
+    /// Non-paged storage owns its own tensors and needs no special handling.
+    fn drop(&mut self) {
+        self.release_paged_blocks();
+    }
+}
+
+/// Get current timestamp in milliseconds since UNIX_EPOCH
+fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Where a KV cache's tensors are currently stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheLocation {
+    /// Tensors are on GPU (active, ready for inference)
+    Gpu,
+    /// Tensors have been offloaded to CPU RAM (idle, must restore before use)
+    Cpu,
+}
+
+/// KV cache manager for all layers in a model
+pub struct KVCacheManager {
+    /// Backend and tenant ownership retained for lazily added auxiliary layers.
+    paged_backend: Option<(Arc<Mutex<BlockPool>>, CacheOwner)>,
+    /// Cache for each layer (lock-free concurrent access)
+    layer_caches: DashMap<usize, LayerKVCache>,
+    /// Maximum sequence length
+    max_seq_len: usize,
+    /// Whether caching is enabled
+    enabled: bool,
+    /// Quantization type
+    quant_type: KVQuantType,
+    /// Last access timestamp in milliseconds (for LRU eviction)
+    last_access_ms: AtomicU64,
+    /// Access count (for metrics)
+    access_count: AtomicU64,
+    /// Token IDs this cache was computed for (for prefix matching across turns)
+    cached_token_ids: Vec<i64>,
+    /// Recurrent-state (SSM conv/rec) snapshot for hybrid models (Qwen3.5 GDN),
+    /// captured at the end of the prefill that produced `cached_token_ids`.
+    ///
+    /// Unlike KV, recurrent state is Markovian and cannot be truncated to an
+    /// arbitrary prefix position — a prefix hit is only exact when the FULL
+    /// cached token sequence matched and this snapshot is restored alongside
+    /// the KV truncation. One snapshot per cache, overwritten each turn;
+    /// `None` for pure-attention models. Tensors are deep copies, independent
+    /// of subsequent forward-pass mutations of the live model state.
+    ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
+    /// Owning device per snapshot slot (per layer, index-aligned with the
+    /// conv/rec lists), recorded from the slots' own tensors when the
+    /// snapshot is stored. A CPU-offloaded cache restores each slot to this
+    /// device instead of `restore_to_gpu`'s single argument: under a multi-GPU
+    /// `LayerDeviceMap` the recurrent state belongs to its layer's device,
+    /// and moving every slot to one device (normally CUDA 0) makes the next
+    /// GDN forward fail on a device mismatch. Layers without slots record the
+    /// CPU fallback; a snapshot-less cache records nothing.
+    ssm_slot_devices: Vec<tch::Device>,
+    /// Where this cache's tensors currently reside
+    location: CacheLocation,
+    /// Compatibility fingerprint under which this cache's KV was produced
+    /// (#1277). `None` until the cache is first populated; the engine stamps it
+    /// at reuse time and rejects (clears + recomputes) on mismatch against the
+    /// current expected fingerprint.
+    compat_fingerprint: Option<KvCompatFingerprint>,
+}
+
+impl KVCacheManager {
+    /// Create a new KV cache manager
+    pub fn new(num_layers: usize, max_seq_len: usize, quant_type: KVQuantType) -> Self {
+        tracing::info!(
+            "[KVCacheManager::new] Creating cache for {} layers, max_seq_len={}, quant={:?}",
+            num_layers,
+            max_seq_len,
+            quant_type
+        );
+
+        let layer_caches = DashMap::new();
+        for layer_idx in 0..num_layers {
+            layer_caches.insert(layer_idx, LayerKVCache::new(max_seq_len, quant_type));
+        }
+
+        Self {
+            layer_caches,
+            max_seq_len,
+            enabled: true,
+            quant_type,
+            paged_backend: None,
+            last_access_ms: AtomicU64::new(current_timestamp_ms()),
+            access_count: AtomicU64::new(0),
+            cached_token_ids: Vec::new(),
+            ssm_snapshot: None,
+            ssm_slot_devices: Vec::new(),
+            location: CacheLocation::Gpu,
+            compat_fingerprint: None,
+        }
+    }
+
+    /// Create a new KV cache manager using paged block storage.
+    ///
+    /// All layers share the same `BlockPool` for zero-fragmentation memory management.
+    pub fn new_paged(
+        num_layers: usize,
+        max_seq_len: usize,
+        pool: Arc<Mutex<BlockPool>>,
+        owner: CacheOwner,
+    ) -> Self {
+        tracing::info!(
+            "[KVCacheManager::new_paged] Creating paged cache for {} layers, max_seq_len={}, owner={:?}",
+            num_layers, max_seq_len, owner,
+        );
+
+        let layer_caches = DashMap::new();
+        for layer_idx in 0..num_layers {
+            layer_caches.insert(
+                layer_idx,
+                LayerKVCache::new_paged(max_seq_len, pool.clone(), owner.clone()),
+            );
+        }
+
+        Self {
+            layer_caches,
+            max_seq_len,
+            enabled: true,
+            quant_type: KVQuantType::None,
+            paged_backend: Some((pool, owner)),
+            last_access_ms: AtomicU64::new(current_timestamp_ms()),
+            access_count: AtomicU64::new(0),
+            cached_token_ids: Vec::new(),
+            ssm_snapshot: None,
+            ssm_slot_devices: Vec::new(),
+            location: CacheLocation::Gpu,
+            compat_fingerprint: None,
+        }
+    }
+
+    /// Get cache for a specific layer with a closure
+    pub fn with_layer_cache<F, R>(&self, layer_idx: usize, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut LayerKVCache) -> R,
+    {
+        if !self.enabled {
+            return None;
+        }
+        self.layer_caches
+            .get_mut(&layer_idx)
+            .map(|mut cache_ref| f(&mut cache_ref))
+    }
+
+    /// Borrow a layer's cache directly as a `RefMut` (for the batched decode path,
+    /// which needs to hold one mutable layer-cache borrow per sequence across a
+    /// batched attention call). Each sequence has its own manager, so the borrows
+    /// never alias. Returns `None` when caching is disabled or the layer is absent.
+    pub fn layer_cache_ref(
+        &self,
+        layer_idx: usize,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, usize, LayerKVCache>> {
+        if !self.enabled {
+            return None;
+        }
+        self.layer_caches.get_mut(&layer_idx)
+    }
+
+    /// Check if a layer cache exists (for testing)
+    #[cfg(test)]
+    #[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
+    fn get_layer_cache(&self, layer_idx: usize) -> Option<()> {
+        if !self.enabled {
+            return None;
+        }
+        self.layer_caches.contains_key(&layer_idx).then_some(())
+    }
+
+    /// Clear all KV tensors together with the metadata that describes them.
+    ///
+    /// `cached_token_ids`, the SSM snapshot, and its slot-device record only
+    /// have meaning alongside the layer tensors they were computed with. A
+    /// cleared cache that retained them would let a later extending prompt
+    /// claim a `prefix_len` — or restore a stale snapshot — against KV that
+    /// no longer exists (e.g. a session turn cancelled before its first
+    /// prefill: the set-up clear runs at generation setup, and the drop
+    /// records nothing new).
+    pub fn clear_all(&mut self) {
+        self.cached_token_ids = Vec::new();
+        self.ssm_snapshot = None;
+        self.ssm_slot_devices = Vec::new();
+        for mut cache_ref in self.layer_caches.iter_mut() {
+            cache_ref.clear();
+        }
+    }
+
+    /// Insert a fresh cache for `layer_idx` if none exists yet.
+    ///
+    /// Architectures with auxiliary KV-consuming modules beyond the main
+    /// decoder layers (the Qwen3.5 MTP draft head, whose slot sits at index
+    /// `num_hidden_layers`) call this when a session cache is swapped in: the
+    /// registry may have created the manager with only the main layer count.
+    pub fn ensure_layer_cache(&self, layer_idx: usize) {
+        self.layer_caches
+            .entry(layer_idx)
+            .or_insert_with(|| match &self.paged_backend {
+                Some((pool, owner)) => {
+                    LayerKVCache::new_paged(self.max_seq_len, Arc::clone(pool), owner.clone())
+                }
+                None => LayerKVCache::new(self.max_seq_len, self.quant_type),
+            });
+    }
+
+    /// Maximum sequence length every layer cache is bounded by
+    /// (`LayerKVCache::update` errors past it).
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    /// The compatibility fingerprint stamped on this cache, or `None` until the
+    /// cache is first populated (#1277).
+    pub fn compat_fingerprint(&self) -> Option<KvCompatFingerprint> {
+        self.compat_fingerprint
+    }
+
+    /// Stamp (or re-stamp) the compatibility fingerprint under which this
+    /// cache's KV is being produced. Called by the engine at reuse time: a fresh
+    /// cache is stamped with the current config; an incompatible cache is
+    /// cleared and re-stamped after its stale KV is discarded.
+    pub fn set_compat_fingerprint(&mut self, fp: KvCompatFingerprint) {
+        self.compat_fingerprint = Some(fp);
+    }
+
+    /// Apply the fail-closed KV compatibility policy to this real cache.
+    ///
+    /// This is the production state-transition boundary for #1277. A compatible
+    /// stamped cache is retained. A fresh empty cache is stamped before prefill.
+    /// Every incompatible or unproven cache has both its token IDs and layer
+    /// tensors discarded, then is re-stamped only when an authoritative expected
+    /// fingerprint is available.
+    pub fn apply_reuse_policy(
+        &mut self,
+        expected: Option<KvCompatFingerprint>,
+    ) -> CacheReuseDecision {
+        let stored = self.compat_fingerprint();
+        let cache_is_empty = self.cached_token_count() == 0;
+        let decision = decide_cache_reuse(expected.as_ref(), stored.as_ref(), cache_is_empty);
+
+        match decision {
+            CacheReuseDecision::Reuse => {
+                tracing::debug!(target: "kv_compat", "KV cache reuse: compatible");
+            }
+            CacheReuseDecision::StampFresh => {
+                if let Some(expected) = expected {
+                    self.set_compat_fingerprint(expected);
+                }
+            }
+            CacheReuseDecision::DiscardAndRecompute => {
+                let reason = match stored {
+                    Some(stored) => format!(
+                        "stamp mismatch (stored={}, expected={})",
+                        stored.to_hex(),
+                        expected
+                            .map(|fingerprint| fingerprint.to_hex())
+                            .unwrap_or_else(|| "<none>".to_owned())
+                    ),
+                    None if !cache_is_empty => {
+                        "populated cache with no compatibility stamp".to_owned()
+                    }
+                    None => "no authoritative compatibility identity".to_owned(),
+                };
+                tracing::info!(
+                    target: "kv_compat",
+                    reason = %reason,
+                    "KV cache not reusable: discarding and recomputing (fail-closed)"
+                );
+
+                self.set_cached_tokens(Vec::new());
+                self.clear_all();
+                if let Some(expected) = expected {
+                    self.set_compat_fingerprint(expected);
+                }
+            }
+        }
+
+        decision
+    }
+
+    /// Enable or disable caching
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.clear_all();
+        }
+    }
+
+    /// Get total memory usage in bytes (approximate)
+    pub fn memory_usage(&self) -> usize {
+        if !self.enabled {
+            return 0;
+        }
+
+        // Include the SSM snapshot (Qwen3.5 GDN conv/rec state): it holds
+        // device tensors and must count toward the eviction budget, or
+        // `evict_to_budget` undercounts and skips offloading.
+        let ssm_bytes: usize = self
+            .ssm_snapshot
+            .as_ref()
+            .map(|(conv, rec)| {
+                conv.iter()
+                    .chain(rec.iter())
+                    .flatten()
+                    .map(|t| t.numel() * dtype_element_size(t.kind()))
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        self.layer_caches
+            .iter()
+            .map(|c| c.memory_usage())
+            .sum::<usize>()
+            + ssm_bytes
+    }
+
+    /// Get the quantization type
+    pub fn quant_type(&self) -> KVQuantType {
+        self.quant_type
+    }
+
+    /// Update last access timestamp (for LRU eviction)
+    pub fn touch(&self) {
+        self.last_access_ms
+            .store(current_timestamp_ms(), Ordering::Relaxed);
+        self.access_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get last access timestamp in milliseconds
+    pub fn last_access(&self) -> u64 {
+        self.last_access_ms.load(Ordering::Relaxed)
+    }
+
+    /// Get access count
+    pub fn access_count(&self) -> u64 {
+        self.access_count.load(Ordering::Relaxed)
+    }
+
+    /// Find the length of the common prefix between cached tokens and new tokens.
+    ///
+    /// Returns the number of tokens whose KV values can be reused from the cache.
+    /// A return value of 0 means no prefix match (full recomputation needed).
+    pub fn prefix_match_len(&self, new_tokens: &[i64]) -> usize {
+        self.cached_token_ids
+            .iter()
+            .zip(new_tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
+    /// Record which tokens this cache was computed for.
+    ///
+    /// Called after generation completes so the next turn can detect prefix overlap.
+    /// Any prior SSM snapshot is dropped: tokens recorded without a known
+    /// recurrent state must not resurrect a stale one.
+    pub fn set_cached_tokens(&mut self, tokens: Vec<i64>) {
+        self.set_cached_tokens_with_ssm(tokens, None);
+    }
+
+    /// Record which tokens this cache was computed for, together with the
+    /// recurrent-state (SSM conv/rec) snapshot as of the end of the prefill
+    /// that produced them (hybrid models only; `None` for pure attention).
+    ///
+    /// The snapshot is what makes a later prefix hit rewindable for recurrent
+    /// layers: KV truncates to the matched prefix, the snapshot restores the
+    /// GDN conv/rec state to the end of the cached sequence.
+    pub fn set_cached_tokens_with_ssm(
+        &mut self,
+        tokens: Vec<i64>,
+        ssm_snapshot: Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)>,
+    ) {
+        self.cached_token_ids = tokens;
+        // Record each slot's owning device from its own tensor: the snapshot
+        // is what a later CPU-offload/restore round trip must reproduce
+        // device-wise (per-layer under a multi-GPU LayerDeviceMap). Layers
+        // with no slots record the CPU fallback (irrelevant — nothing to
+        // move); a snapshot-less recording clears the devices with it.
+        self.ssm_slot_devices = match &ssm_snapshot {
+            Some((conv, rec)) => conv
+                .iter()
+                .zip(rec.iter())
+                .map(|(c, r)| {
+                    c.as_ref()
+                        .or(r.as_ref())
+                        .map(Tensor::device)
+                        .unwrap_or(tch::Device::Cpu)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        self.ssm_snapshot = ssm_snapshot;
+    }
+
+    /// Deep-copied SSM snapshot for restore on a prefix hit.
+    ///
+    /// Returns deep copies (same `.copy()` discipline as
+    /// `Qwen3_5Model::snapshot_ssm_states`) so that restoring into the live
+    /// model state never aliases — and cannot mutate — the stored snapshot.
+    pub fn ssm_snapshot(&self) -> Option<(Vec<Option<Tensor>>, Vec<Option<Tensor>>)> {
+        self.ssm_snapshot.as_ref().map(|(conv, rec)| {
+            (
+                conv.iter()
+                    .map(|opt| opt.as_ref().map(Tensor::copy))
+                    .collect(),
+                rec.iter()
+                    .map(|opt| opt.as_ref().map(Tensor::copy))
+                    .collect(),
+            )
+        })
+    }
+
+    /// Get the cached token IDs (for debugging/metrics).
+    pub fn cached_token_count(&self) -> usize {
+        self.cached_token_ids.len()
+    }
+
+    /// Truncate the cache to a given token position.
+    ///
+    /// Keeps KV values for tokens 0..pos and discards everything after.
+    /// Used when a prefix matches but the suffix has changed (new turn).
+    pub fn truncate_to(&self, pos: usize) {
+        for mut cache_ref in self.layer_caches.iter_mut() {
+            cache_ref.truncate_to(pos);
+        }
+    }
+
+    /// Current storage location of this cache's tensors.
+    pub fn location(&self) -> CacheLocation {
+        self.location
+    }
+
+    /// Offload all layer caches from GPU to CPU RAM.
+    ///
+    /// Frees GPU memory while preserving the cached data for later restore.
+    /// Only works for FullPrecision storage — Paged caches free blocks to the
+    /// pool instead (handled by evict_to_budget), and Quantized data is already
+    /// partially on CPU.
+    pub fn offload_to_cpu(&mut self) {
+        if self.location == CacheLocation::Cpu {
+            return; // Already offloaded
+        }
+        for mut cache_ref in self.layer_caches.iter_mut() {
+            cache_ref.to_device(tch::Device::Cpu);
+        }
+        // Carry the SSM snapshot with the cache so a later restore + prefix
+        // hit still finds matching-device state.
+        if let Some((conv, rec)) = &mut self.ssm_snapshot {
+            for t in conv.iter_mut().chain(rec.iter_mut()).flatten() {
+                *t = t.to_device(tch::Device::Cpu);
+            }
+        }
+        self.location = CacheLocation::Cpu;
+        tracing::debug!(
+            "Offloaded KV cache to CPU ({} tokens, {} layers)",
+            self.cached_token_ids.len(),
+            self.layer_caches.len()
+        );
+    }
+
+    /// Restore all layer caches from CPU back to GPU.
+    ///
+    /// Must be called before using the cache for inference.
+    pub fn restore_to_gpu(&mut self, device: tch::Device) {
+        if self.location == CacheLocation::Gpu {
+            return; // Already on GPU
+        }
+        for mut cache_ref in self.layer_caches.iter_mut() {
+            cache_ref.to_device(device);
+        }
+        if let Some((conv, rec)) = &mut self.ssm_snapshot {
+            // Each slot returns to its recorded owning device (its layer's
+            // device under a multi-GPU LayerDeviceMap), falling back to the
+            // argument only when a snapshot predates recording. Restoring
+            // every slot to one device would leave states on the wrong side
+            // of a device boundary and break the next GDN forward.
+            let slot_devices = self.ssm_slot_devices.clone();
+            let restore_slot = |t: &mut Option<Tensor>, i: usize| {
+                if let Some(t) = t {
+                    let dst = slot_devices.get(i).copied().unwrap_or(device);
+                    *t = t.to_device(dst);
+                }
+            };
+            for (i, t) in conv.iter_mut().enumerate() {
+                restore_slot(t, i);
+            }
+            for (i, t) in rec.iter_mut().enumerate() {
+                restore_slot(t, i);
+            }
+        }
+        self.location = CacheLocation::Gpu;
+        tracing::debug!(
+            "Restored KV cache to GPU ({} tokens, {} layers)",
+            self.cached_token_ids.len(),
+            self.layer_caches.len()
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_layer_kv_cache_unquantized() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+
+        let mut cache = LayerKVCache::new(100, KVQuantType::None);
+
+        let batch_size = 2;
+        let seq_len = 10;
+        let num_heads = 8;
+        let head_dim = 64;
+
+        let keys = Tensor::randn(
+            [batch_size, seq_len as i64, num_heads, head_dim],
+            (dtype, device),
+        );
+        let values = Tensor::randn(
+            [batch_size, seq_len as i64, num_heads, head_dim],
+            (dtype, device),
+        );
+
+        cache.update(&keys, &values, 0)?;
+        assert_eq!(cache.seq_pos, 10);
+
+        let (cached_keys, cached_values) = cache.get()?;
+        assert_eq!(
+            cached_keys.size(),
+            vec![batch_size, 10, num_heads, head_dim]
+        );
+        assert_eq!(
+            cached_values.size(),
+            vec![batch_size, 10, num_heads, head_dim]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "bnb")]
+    fn test_layer_kv_cache_quantized_int8() -> Result<()> {
+        // Skip if bitsandbytes library is not available (stub mode)
+        if !bitsandbytes_sys::is_available() {
+            eprintln!("Skipping quantized test: bitsandbytes library not available");
+            return Ok(());
+        }
+
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+
+        let mut cache = LayerKVCache::new(1000, KVQuantType::Int8);
+
+        let batch_size: i64 = 1;
+        let seq_len: i64 = 100; // Large enough to trigger flush
+        let num_heads: i64 = 2;
+        let head_dim: i64 = 64;
+
+        let keys = Tensor::randn([batch_size, seq_len, num_heads, head_dim], (dtype, device));
+        let values = Tensor::randn([batch_size, seq_len, num_heads, head_dim], (dtype, device));
+
+        // Initial prompt
+        cache.update(&keys, &values, 0)?;
+        assert_eq!(cache.seq_pos, seq_len as usize);
+
+        // Get should work
+        let (cached_keys, cached_values) = cache.get()?;
+        assert_eq!(
+            cached_keys.size(),
+            vec![batch_size, seq_len, num_heads, head_dim]
+        );
+        assert_eq!(
+            cached_values.size(),
+            vec![batch_size, seq_len, num_heads, head_dim]
+        );
+
+        // Second get should use cache
+        let (cached_keys2, _) = cache.get()?;
+        assert_eq!(cached_keys2.size(), cached_keys.size());
+
+        // Add more tokens
+        let new_keys = Tensor::randn([batch_size, 1, num_heads, head_dim], (dtype, device));
+        let new_values = Tensor::randn([batch_size, 1, num_heads, head_dim], (dtype, device));
+        cache.update(&new_keys, &new_values, seq_len as usize)?;
+
+        let (final_keys, _) = cache.get()?;
+        assert_eq!(
+            final_keys.size(),
+            vec![batch_size, seq_len + 1, num_heads, head_dim]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_kv_cache_manager() {
+        let num_layers = 32;
+        let max_seq_len = 2048;
+
+        let mut manager = KVCacheManager::new(num_layers, max_seq_len, KVQuantType::None);
+
+        for layer_idx in 0..num_layers {
+            assert!(manager.get_layer_cache(layer_idx).is_some());
+        }
+
+        manager.set_enabled(false);
+        assert!(manager.get_layer_cache(0).is_none());
+
+        manager.set_enabled(true);
+        assert!(manager.get_layer_cache(0).is_some());
+    }
+
+    #[test]
+    fn test_kv_cache_manager_quantized() {
+        let num_layers = 4;
+        let max_seq_len = 512;
+
+        let manager = KVCacheManager::new(num_layers, max_seq_len, KVQuantType::Nf4);
+
+        assert_eq!(manager.quant_type(), KVQuantType::Nf4);
+    }
+
+    /// The SSM snapshot (Qwen3.5 GDN conv/rec state) holds device tensors and
+    /// must count toward the eviction budget: `memory_usage` grows when a
+    /// snapshot is recorded and shrinks back when it is dropped.
+    #[test]
+    fn test_memory_usage_includes_ssm_snapshot() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        let baseline = manager.memory_usage();
+
+        let opt = (DType::Float, Device::Cpu);
+        let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+        let rec = vec![Some(Tensor::zeros([4], opt)), None];
+        let expected = (2 * 3 + 4) * dtype_element_size(DType::Float);
+
+        manager.set_cached_tokens_with_ssm(vec![1, 2, 3], Some((conv, rec)));
+        assert_eq!(manager.memory_usage(), baseline + expected);
+
+        // Recording tokens without a snapshot drops it (no stale state) and
+        // the budget accounting shrinks back.
+        manager.set_cached_tokens(vec![1, 2, 3, 4]);
+        assert_eq!(manager.memory_usage(), baseline);
+    }
+
+    /// Storing an SSM snapshot must record each slot's owning device from its
+    /// own tensor — the record a later CPU-offload/restore round trip uses to
+    /// put slots back on their layer devices (multi-GPU LayerDeviceMap).
+    /// Token-only recording drops the snapshot and its device record with it.
+    #[test]
+    fn test_ssm_snapshot_records_owning_devices() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        assert!(
+            manager.ssm_slot_devices.is_empty(),
+            "fresh cache records nothing"
+        );
+
+        let opt = (DType::Float, Device::Cpu);
+        let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+        let rec = vec![Some(Tensor::zeros([4], opt)), None];
+        manager.set_cached_tokens_with_ssm(vec![1, 2], Some((conv, rec)));
+        // One record per layer; layers without slots record the fallback.
+        assert_eq!(manager.ssm_slot_devices.len(), 2);
+        assert_eq!(manager.ssm_slot_devices, vec![Device::Cpu, Device::Cpu]);
+
+        // Token-only recording clears the device record with the snapshot.
+        manager.set_cached_tokens(vec![3]);
+        assert!(manager.ssm_slot_devices.is_empty());
+    }
+
+    /// Restore must send each SSM snapshot slot back to its recorded owning
+    /// device — NOT `restore_to_gpu`'s single argument. Mixed Cuda(0)/Cpu
+    /// owning devices reproduce the multi-GPU LayerDeviceMap hazard: the
+    /// registry restores an offloaded cache with one device (normally CUDA 0),
+    /// and moving every slot there leaves layer-1 recurrent state on the wrong
+    /// device for the next GDN forward. Gated on a CUDA build (a CPU-only host
+    /// has no second device to discriminate).
+    #[test]
+    fn test_restore_moves_snapshot_slots_to_owning_devices() {
+        let cuda = Device::cuda_if_available();
+        if cuda == Device::Cpu {
+            // No CUDA on this host: single-device restore is trivially
+            // correct, and the mixed-device fixture cannot be constructed.
+            return;
+        }
+
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        // Layer 0 owns CUDA state, layer 1 owns CPU state (as a pipeline
+        // split places each layer's stage-local state on its own device).
+        let conv = vec![
+            Some(Tensor::ones([2, 3], (DType::Float, cuda)) * 7.0),
+            Some(Tensor::ones([2, 3], (DType::Float, Device::Cpu)) * 9.0),
+        ];
+        let rec = vec![
+            Some(Tensor::ones([4], (DType::Float, cuda)) * 11.0),
+            Some(Tensor::ones([4], (DType::Float, Device::Cpu)) * 13.0),
+        ];
+        manager.set_cached_tokens_with_ssm(vec![1, 2, 3], Some((conv, rec)));
+
+        manager.offload_to_cpu();
+        // The registry's single-device restore call (`cuda_if_available`,
+        // normally CUDA 0) — the exact pre-fix call shape.
+        manager.restore_to_gpu(cuda);
+
+        let (conv_restored, rec_restored) = manager.ssm_snapshot().unwrap();
+        for (layer, expected) in [(0usize, cuda), (1, Device::Cpu)] {
+            if let Some(c) = &conv_restored[layer] {
+                assert_eq!(
+                    c.device(),
+                    expected,
+                    "conv slot {layer} must return to its owning device"
+                );
+            }
+            if let Some(r) = &rec_restored[layer] {
+                assert_eq!(
+                    r.device(),
+                    expected,
+                    "rec slot {layer} must return to its owning device"
+                );
+            }
+        }
+        // Values survived the offload/restore round trip.
+        assert_eq!(
+            conv_restored[0].as_ref().unwrap().double_value(&[1, 2]),
+            7.0
+        );
+        assert_eq!(
+            conv_restored[1].as_ref().unwrap().double_value(&[1, 2]),
+            9.0
+        );
+        assert_eq!(rec_restored[0].as_ref().unwrap().double_value(&[3]), 11.0);
+        assert_eq!(rec_restored[1].as_ref().unwrap().double_value(&[3]), 13.0);
+    }
+
+    /// `clear_all` must drop the cached token IDs, the SSM snapshot, and its
+    /// slot-device record together with the layer tensors: metadata that
+    /// survives a tensor clear lets a later extending prompt claim a prefix
+    /// — or restore a stale snapshot — against KV that no longer exists
+    /// (set-up clear on an exact hit/miss, then cancellation before the
+    /// first poll leaves nothing to re-record over it).
+    #[test]
+    fn clear_all_drops_cached_token_and_ssm_metadata() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        let opt = (DType::Float, Device::Cpu);
+        let conv = vec![Some(Tensor::zeros([2, 3], opt)), None];
+        let rec = vec![Some(Tensor::zeros([4], opt)), None];
+        manager.set_cached_tokens_with_ssm(vec![9, 9, 9], Some((conv, rec)));
+        assert_eq!(manager.cached_token_count(), 3);
+        assert!(manager.ssm_snapshot().is_some());
+
+        manager.clear_all();
+
+        assert_eq!(
+            manager.cached_token_count(),
+            0,
+            "token IDs must go with the tensors"
+        );
+        assert!(
+            manager.ssm_snapshot().is_none(),
+            "stale snapshot must not survive a clear"
+        );
+        assert!(
+            manager.ssm_slot_devices.is_empty(),
+            "slot-device record must go with the snapshot"
+        );
+        assert_eq!(
+            manager.prefix_match_len(&[9, 9, 9, 4]),
+            0,
+            "an extending prompt must not claim a prefix over cleared KV"
+        );
+    }
+
+    #[test]
+    fn test_prefix_match_len() {
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+
+        // No cached tokens — no match
+        assert_eq!(manager.prefix_match_len(&[1, 2, 3]), 0);
+
+        // Set cached tokens
+        manager.set_cached_tokens(vec![1, 2, 3, 4, 5]);
+
+        // Full prefix match
+        assert_eq!(manager.prefix_match_len(&[1, 2, 3, 4, 5, 6, 7]), 5);
+
+        // Partial prefix match
+        assert_eq!(manager.prefix_match_len(&[1, 2, 3, 99, 100]), 3);
+
+        // No match (different first token)
+        assert_eq!(manager.prefix_match_len(&[99, 2, 3]), 0);
+
+        // Exact match (entire prompt is cached)
+        assert_eq!(manager.prefix_match_len(&[1, 2, 3, 4, 5]), 5);
+
+        // Empty input
+        assert_eq!(manager.prefix_match_len(&[]), 0);
+    }
+
+    #[test]
+    fn test_truncate_to_full_precision() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        let mut cache = LayerKVCache::new(100, KVQuantType::None);
+
+        let batch_size = 1;
+        let num_heads = 4;
+        let head_dim = 8;
+
+        // Write 10 tokens
+        let keys = Tensor::ones([batch_size, 10, num_heads, head_dim], (dtype, device));
+        let values = Tensor::ones([batch_size, 10, num_heads, head_dim], (dtype, device)) * 2.0;
+        cache.update(&keys, &values, 0)?;
+        assert_eq!(cache.seq_pos, 10);
+
+        // Truncate to 5
+        cache.truncate_to(5);
+        assert_eq!(cache.seq_pos, 5);
+
+        // get() should return only 5 tokens
+        let (k, v) = cache.get()?;
+        assert_eq!(k.size()[1], 5);
+        assert_eq!(v.size()[1], 5);
+
+        // Writing new tokens at position 5 should work
+        let new_keys = Tensor::ones([batch_size, 3, num_heads, head_dim], (dtype, device)) * 3.0;
+        let new_values = Tensor::ones([batch_size, 3, num_heads, head_dim], (dtype, device)) * 4.0;
+        cache.update(&new_keys, &new_values, 5)?;
+        assert_eq!(cache.seq_pos, 8);
+
+        let (k, _v) = cache.get()?;
+        assert_eq!(k.size()[1], 8);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_pool_allocate_free() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        let mut pool = BlockPool::new(4, 2, 8, device, dtype)?;
+        let owner = CacheOwner::Stateless(1);
+
+        assert_eq!(pool.total_blocks(), 4);
+        assert_eq!(pool.free_block_count(), 4);
+        assert_eq!(pool.used_blocks(), 0);
+
+        // Allocate 3 blocks
+        let b0 = pool.allocate(&owner).expect("should allocate");
+        let b1 = pool.allocate(&owner).expect("should allocate");
+        let b2 = pool.allocate(&owner).expect("should allocate");
+        assert_eq!(pool.used_blocks(), 3);
+        assert_eq!(pool.free_block_count(), 1);
+
+        // Allocate last block
+        let _b3 = pool.allocate(&owner).expect("should allocate");
+        assert_eq!(pool.free_block_count(), 0);
+
+        // Pool exhausted — fail-soft typed error, not a generic failure
+        let exhausted = pool.allocate(&owner);
+        assert_eq!(exhausted, Err(BlockPoolExhausted { total_blocks: 4 }));
+
+        // Free a block — now one available
+        pool.free(&owner, b1);
+        assert_eq!(pool.free_block_count(), 1);
+
+        let reused = pool.allocate(&owner).expect("should allocate freed block");
+        assert_eq!(reused, b1); // LIFO: should get back the same block
+
+        // Free all
+        pool.free(&owner, b0);
+        pool.free(&owner, reused);
+        pool.free(&owner, b2);
+        pool.free(&owner, _b3);
+        assert_eq!(pool.free_block_count(), 4);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_paged_kv_cache_update_and_get() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+
+        // Create pool with enough blocks for the test
+        let pool = Arc::new(Mutex::new(BlockPool::new(
+            8,
+            num_kv_heads,
+            head_dim,
+            device,
+            dtype,
+        )?));
+
+        let mut cache = LayerKVCache::new_paged(1024, pool.clone(), CacheOwner::Stateless(1));
+
+        // Write 10 tokens (less than one block of 256)
+        let keys = Tensor::ones(
+            [1, 10, num_kv_heads as i64, head_dim as i64],
+            (dtype, device),
+        );
+        let values = Tensor::ones(
+            [1, 10, num_kv_heads as i64, head_dim as i64],
+            (dtype, device),
+        ) * 2.0;
+        cache.update(&keys, &values, 0)?;
+        assert_eq!(cache.seq_pos, 10);
+
+        // Get should return 10 tokens
+        let (k, v) = cache.get()?;
+        assert_eq!(k.size()[1], 10);
+        assert_eq!(v.size()[1], 10);
+
+        // Append 5 more tokens
+        let more_keys = Tensor::ones(
+            [1, 5, num_kv_heads as i64, head_dim as i64],
+            (dtype, device),
+        ) * 3.0;
+        let more_values = Tensor::ones(
+            [1, 5, num_kv_heads as i64, head_dim as i64],
+            (dtype, device),
+        ) * 4.0;
+        cache.update(&more_keys, &more_values, 10)?;
+        assert_eq!(cache.seq_pos, 15);
+
+        let (k, _v) = cache.get()?;
+        assert_eq!(k.size()[1], 15);
+
+        // Clear should free blocks back to pool
+        let used_before = pool.lock().used_blocks();
+        assert!(used_before > 0);
+        cache.clear();
+        assert_eq!(pool.lock().used_blocks(), used_before - 2); // 2 blocks freed (K + V)
+        assert_eq!(cache.seq_pos, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cpu_offload_restore() -> Result<()> {
+        let device = Device::Cpu; // Use CPU as "GPU" for test
+        let dtype = DType::Float;
+
+        let mut manager = KVCacheManager::new(2, 100, KVQuantType::None);
+        assert_eq!(manager.location(), CacheLocation::Gpu);
+
+        // Write some data via with_layer_cache
+        manager.with_layer_cache(0, |cache| {
+            let keys = Tensor::ones([1, 5, 4, 8], (dtype, device));
+            let values = Tensor::ones([1, 5, 4, 8], (dtype, device)) * 2.0;
+            cache.update(&keys, &values, 0).unwrap();
+        });
+
+        // Offload to CPU (no-op on CPU device, but tests the state machine)
+        manager.offload_to_cpu();
+        assert_eq!(manager.location(), CacheLocation::Cpu);
+
+        // Restore back
+        manager.restore_to_gpu(device);
+        assert_eq!(manager.location(), CacheLocation::Gpu);
+
+        // Data should still be accessible
+        let result = manager.with_layer_cache(0, |cache| {
+            let (k, _v) = cache.get().unwrap();
+            k.size()[1]
+        });
+        assert_eq!(result, Some(5));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_eviction_with_budget() {
+        let config = CacheConfig::new(2, 100);
+        let registry = KVCacheRegistry::new(config, Some(1)); // 1 byte budget = always evict
+
+        // Create two session caches
+        let _cache_a = registry.get_or_create(CacheOwner::Session("a".into()));
+        let _cache_b = registry.get_or_create(CacheOwner::Session("b".into()));
+        assert_eq!(registry.cache_count(), 2);
+
+        // Eviction should try to free caches (offload first, then remove)
+        registry.evict_to_budget();
+
+        // With a 1-byte budget and no actual GPU memory, both should be offloaded/removed
+        // The exact behavior depends on memory_usage() returning >0 for non-empty caches
+    }
+
+    // ========================================================================
+    // Multi-turn prefix matching simulation tests
+    // ========================================================================
+
+    #[test]
+    fn test_prefix_match_multi_turn_simulation() {
+        let mut manager = KVCacheManager::new(2, 1024, KVQuantType::None);
+
+        // Simulate tokenized prompts growing across conversation turns.
+        // Each turn's prompt includes all prior history + new message.
+
+        // Turn 1: [sys sys sys user1 user1]
+        let turn1_tokens = vec![10, 20, 30, 100, 101];
+        manager.set_cached_tokens(turn1_tokens.clone());
+
+        // Turn 2: [sys sys sys user1 user1 asst1 asst1 user2]
+        // The first 5 tokens match turn 1
+        let turn2_tokens = vec![10, 20, 30, 100, 101, 200, 201, 102];
+        assert_eq!(manager.prefix_match_len(&turn2_tokens), 5);
+
+        // After turn 2 completes, update cached tokens
+        manager.set_cached_tokens(turn2_tokens.clone());
+
+        // Turn 3: [sys sys sys user1 user1 asst1 asst1 user2 asst2 user3]
+        // The first 8 tokens match turn 2
+        let turn3_tokens = vec![10, 20, 30, 100, 101, 200, 201, 102, 202, 103];
+        assert_eq!(manager.prefix_match_len(&turn3_tokens), 8);
+
+        // Verify no match if conversation diverges at the start
+        let divergent = vec![99, 20, 30, 100, 101];
+        manager.set_cached_tokens(turn3_tokens);
+        assert_eq!(manager.prefix_match_len(&divergent), 0);
+    }
+
+    #[test]
+    fn test_prefix_match_with_tool_call_in_history() {
+        let mut manager = KVCacheManager::new(2, 1024, KVQuantType::None);
+
+        // Turn 1: [sys user1_ask_weather]
+        let turn1_tokens = vec![10, 100, 101];
+        manager.set_cached_tokens(turn1_tokens);
+
+        // Turn 2 includes tool call and response in history:
+        // [sys user1_ask_weather asst_toolcall tool_resp user2_followup]
+        // Prefix match = 3 (sys + user1 tokens)
+        let turn2_tokens = vec![10, 100, 101, 200, 201, 202, 300, 301, 110, 111];
+        assert_eq!(manager.prefix_match_len(&turn2_tokens), 3);
+
+        // After turn 2, cache the full sequence
+        manager.set_cached_tokens(turn2_tokens.clone());
+
+        // Turn 3: same prefix as turn 2 + new user message
+        // [sys user1_ask_weather asst_toolcall tool_resp user2_followup asst2 user3]
+        let turn3_tokens = vec![10, 100, 101, 200, 201, 202, 300, 301, 110, 111, 210, 120];
+        assert_eq!(manager.prefix_match_len(&turn3_tokens), 10);
+    }
+
+    // ========================================================================
+    // PR-0: paged-pool correctness (free-on-drop, fail-soft, ownership)
+    // ========================================================================
+
+    /// Dropping a paged cache (e.g. via registry eviction) must return its
+    /// blocks to the pool free list — the original leak was no `Drop` impl.
+    #[test]
+    fn test_paged_cache_frees_blocks_on_drop() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        let pool = Arc::new(Mutex::new(BlockPool::new(8, 2, 4, device, dtype)?));
+        assert_eq!(pool.lock().used_blocks(), 0);
+
+        {
+            let mut cache = LayerKVCache::new_paged(1024, pool.clone(), CacheOwner::Stateless(7));
+            let keys = Tensor::ones([1, 10, 2, 4], (dtype, device));
+            let values = Tensor::ones([1, 10, 2, 4], (dtype, device));
+            cache.update(&keys, &values, 0)?;
+            assert_eq!(pool.lock().used_blocks(), 2); // 1 K + 1 V block
+                                                      // `cache` dropped here WITHOUT an explicit clear()
+        }
+
+        // Drop must have returned both blocks to the pool.
+        assert_eq!(pool.lock().used_blocks(), 0);
+        assert_eq!(pool.lock().free_block_count(), 8);
+        Ok(())
+    }
+
+    /// A `KVCacheManager` dropped via the registry (`caches.remove`) must not
+    /// leak its layers' blocks.
+    #[test]
+    fn test_paged_manager_frees_blocks_on_drop() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        let pool = Arc::new(Mutex::new(BlockPool::new(16, 2, 4, device, dtype)?));
+
+        {
+            let manager =
+                KVCacheManager::new_paged(3, 1024, pool.clone(), CacheOwner::Session("s".into()));
+            for layer in 0..3 {
+                manager.with_layer_cache(layer, |c| {
+                    let k = Tensor::ones([1, 5, 2, 4], (dtype, device));
+                    let v = Tensor::ones([1, 5, 2, 4], (dtype, device));
+                    c.update(&k, &v, 0).unwrap();
+                });
+            }
+            assert_eq!(pool.lock().used_blocks(), 6); // 3 layers x (1 K + 1 V)
+        }
+
+        assert_eq!(pool.lock().used_blocks(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn mtp_auxiliary_cache_retains_paged_pool_and_owner() -> Result<()> {
+        for main_layers in [0, 1] {
+            let pool = Arc::new(Mutex::new(BlockPool::new(
+                2,
+                2,
+                4,
+                Device::Cpu,
+                DType::Float,
+            )?));
+            let alice = CacheOwner::Session("mtp-alice".into());
+            let manager = KVCacheManager::new_paged(main_layers, 64, pool.clone(), alice.clone());
+            let keys = Tensor::ones([1, 1, 2, 4], (DType::Float, Device::Cpu));
+            manager.ensure_layer_cache(main_layers);
+            manager
+                .with_layer_cache(main_layers, |cache| cache.update(&keys, &keys, 0))
+                .expect("auxiliary slot")?;
+            assert_eq!(pool.lock().used_blocks(), 2);
+            for block in 0..2 {
+                assert_eq!(pool.lock().owner_of(block), Some(&alice));
+            }
+            // Re-admission must retain the existing cache and its blocks.
+            manager.ensure_layer_cache(main_layers);
+            assert_eq!(pool.lock().used_blocks(), 2);
+            manager.ensure_layer_cache(main_layers + 1);
+            let error = manager
+                .with_layer_cache(main_layers + 1, |cache| cache.update(&keys, &keys, 0))
+                .expect("second auxiliary slot")
+                .expect_err("shared pool is full");
+            assert!(error.downcast_ref::<BlockPoolExhausted>().is_some());
+            assert_eq!(pool.lock().used_blocks(), 2);
+            let bob = CacheOwner::Session("mtp-bob".into());
+            let other = KVCacheManager::new_paged(0, 64, pool.clone(), bob.clone());
+            other.ensure_layer_cache(0);
+            assert!(other
+                .with_layer_cache(0, |cache| cache.update(&keys, &keys, 0))
+                .expect("other owner's auxiliary slot")
+                .is_err());
+            drop(manager);
+            assert_eq!(pool.lock().used_blocks(), 0);
+            other
+                .with_layer_cache(0, |cache| cache.update(&keys, &keys, 0))
+                .expect("other owner's auxiliary slot")?;
+            for block in 0..2 {
+                assert_eq!(pool.lock().owner_of(block), Some(&bob));
+            }
+            drop(other);
+            assert_eq!(pool.lock().used_blocks(), 0);
+        }
+        Ok(())
+    }
+
+    /// Exhaustion surfaces as the typed, downcastable `BlockPoolExhausted`
+    /// (fail-soft) rather than an opaque error — a scheduler can admission-defer.
+    #[test]
+    fn test_paged_update_exhaustion_is_fail_soft() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        // Only 1 block: cannot satisfy even a single (K + V) pair.
+        let pool = Arc::new(Mutex::new(BlockPool::new(1, 2, 4, device, dtype)?));
+        let mut cache = LayerKVCache::new_paged(1024, pool.clone(), CacheOwner::Stateless(1));
+
+        let keys = Tensor::ones([1, 10, 2, 4], (dtype, device));
+        let values = Tensor::ones([1, 10, 2, 4], (dtype, device));
+        let err = cache
+            .update(&keys, &values, 0)
+            .expect_err("should fail-soft on exhaustion");
+
+        let exhausted = err.downcast_ref::<BlockPoolExhausted>();
+        assert!(
+            exhausted.is_some(),
+            "expected BlockPoolExhausted, got: {err:?}"
+        );
+        assert_eq!(exhausted.unwrap().total_blocks, 1);
+
+        // The key block allocated before the value alloc failed must be rolled
+        // back so the pool is not partially consumed by a failed admission.
+        assert_eq!(pool.lock().used_blocks(), 0);
+        Ok(())
+    }
+
+    /// A block allocated by one owner cannot be freed by another (tenant
+    /// isolation). In debug builds the impl panics via `debug_assert!`; in
+    /// release builds it logs and silently returns without mutating pool state.
+    /// Both cases must leave block ownership and used-count unchanged.
+    #[test]
+    fn test_cross_owner_free_is_rejected() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::Float;
+        let mut pool = BlockPool::new(4, 2, 4, device, dtype)?;
+
+        let alice = CacheOwner::Session("alice".into());
+        let bob = CacheOwner::Session("bob".into());
+
+        let block = pool.allocate(&alice).expect("alice allocates");
+        assert_eq!(pool.owner_of(block), Some(&alice));
+
+        // In debug builds, `debug_assert!` fires and the call panics.
+        // In release builds, the impl logs and returns without changing state.
+        // Either way, the security invariant must hold: ownership is preserved
+        // and the block stays in use. Use catch_unwind so the test body can
+        // continue in both profiles to verify the post-condition.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.free(&bob, block);
+        }));
+
+        // Security invariant: block is still owned by Alice and still in use
+        // regardless of whether a panic occurred.
+        assert_eq!(
+            pool.owner_of(block),
+            Some(&alice),
+            "cross-owner free must not transfer or clear block ownership"
+        );
+        assert_eq!(
+            pool.used_blocks(),
+            1,
+            "cross-owner free must not return block to free list"
+        );
+
+        // Alice can free her own block.
+        pool.free(&alice, block);
+        assert_eq!(pool.used_blocks(), 0);
+        assert_eq!(pool.owner_of(block), None);
+        Ok(())
+    }
+
+    fn compat_test_fingerprint(base_revision: &str) -> KvCompatFingerprint {
+        use crate::runtime::kv_compat::{
+            KvCompatDescriptor, WeightIdentity, KV_COMPAT_FORMAT_VERSION,
+        };
+
+        KvCompatDescriptor {
+            format_version: KV_COMPAT_FORMAT_VERSION,
+            weights: WeightIdentity::base_only(base_revision),
+            tokenizer_hash: Some("deadbeef".to_owned()),
+            ..Default::default()
+        }
+        .fingerprint()
+    }
+
+    /// Populate both reuse signals on a real manager: token IDs used by prefix
+    /// matching and layer tensors used by attention.
+    fn populate_compat_test_cache(manager: &mut KVCacheManager) {
+        manager.set_cached_tokens(vec![1, 2, 3, 4]);
+        let updated = manager.with_layer_cache(0, |cache| {
+            let keys = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
+            let values = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
+            cache
+                .update(&keys, &values, 0)
+                .expect("populate layer cache");
+        });
+        assert_eq!(updated, Some(()));
+    }
+
+    fn compat_test_layer_seq_pos(manager: &KVCacheManager) -> usize {
+        manager
+            .with_layer_cache(0, |cache| cache.seq_pos)
+            .expect("layer 0 exists")
+    }
+
+    #[test]
+    fn apply_reuse_policy_retains_compatible_real_cache() {
+        let expected = compat_test_fingerprint("sha256:base");
+        let mut manager = KVCacheManager::new(2, 64, KVQuantType::None);
+
+        assert_eq!(
+            manager.apply_reuse_policy(Some(expected)),
+            CacheReuseDecision::StampFresh
+        );
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
+
+        populate_compat_test_cache(&mut manager);
+        assert_eq!(
+            manager.apply_reuse_policy(Some(expected)),
+            CacheReuseDecision::Reuse
+        );
+        assert_eq!(manager.cached_token_count(), 4);
+        assert_eq!(compat_test_layer_seq_pos(&manager), 4);
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
+    }
+
+    #[test]
+    fn apply_reuse_policy_discards_and_restamps_incompatible_real_cache() {
+        let original = compat_test_fingerprint("sha256:old");
+        let expected = compat_test_fingerprint("sha256:new");
+        let mut manager = KVCacheManager::new(2, 64, KVQuantType::None);
+
+        assert_eq!(
+            manager.apply_reuse_policy(Some(original)),
+            CacheReuseDecision::StampFresh
+        );
+        populate_compat_test_cache(&mut manager);
+
+        assert_eq!(
+            manager.apply_reuse_policy(Some(expected)),
+            CacheReuseDecision::DiscardAndRecompute
+        );
+        assert_eq!(manager.cached_token_count(), 0);
+        assert_eq!(compat_test_layer_seq_pos(&manager), 0);
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
+    }
+
+    #[test]
+    fn apply_reuse_policy_discards_populated_unstamped_real_cache() {
+        let expected = compat_test_fingerprint("sha256:base");
+        let mut manager = KVCacheManager::new(2, 64, KVQuantType::None);
+        populate_compat_test_cache(&mut manager);
+        assert!(manager.compat_fingerprint().is_none());
+
+        assert_eq!(
+            manager.apply_reuse_policy(Some(expected)),
+            CacheReuseDecision::DiscardAndRecompute
+        );
+        assert_eq!(manager.cached_token_count(), 0);
+        assert_eq!(compat_test_layer_seq_pos(&manager), 0);
+        assert_eq!(manager.compat_fingerprint(), Some(expected));
+    }
+
+    // ========================================================================
+    // TTT → KV invalidation wiring (#1254, epic #1246)
+    // ========================================================================
+
+    /// Write 4 cached token IDs + a 4-token KV entry into layer 0 of a cache,
+    /// so "cleared" is observable as both empty token IDs (cached_token_count)
+    /// and an empty layer (seq_pos == 0).
+    fn populate_cache(cache: &Arc<Mutex<KVCacheManager>>) {
+        let mut g = cache.lock();
+        g.set_cached_tokens(vec![10, 20, 30, 40]);
+        g.with_layer_cache(0, |c| {
+            let k = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
+            let v = Tensor::ones([1, 4, 2, 4], (DType::Float, Device::Cpu));
+            c.update(&k, &v, 0).expect("layer 0 update");
+        });
+    }
+
+    /// seq_pos of layer 0 (None when caching disabled / layer absent).
+    fn layer0_seq_pos(cache: &Arc<Mutex<KVCacheManager>>) -> Option<usize> {
+        cache.lock().with_layer_cache(0, |c| c.seq_pos)
+    }
+
+    /// Invalidating one tenant's delta clears that tenant's cache while every
+    /// other tenant's cache is left intact — the core cross-tenant isolation
+    /// invariant the missing `register_delta_dependency` call broke (#1254).
+    #[test]
+    fn test_invalidate_for_tenant_isolates_tenants() {
+        let registry = KVCacheRegistry::new(CacheConfig::new(2, 128), None);
+
+        let owner_a = CacheOwner::Session("session-a".into());
+        let owner_b = CacheOwner::Session("session-b".into());
+
+        let cache_a = registry.get_or_create(owner_a.clone());
+        let cache_b = registry.get_or_create(owner_b.clone());
+        populate_cache(&cache_a);
+        populate_cache(&cache_b);
+
+        // Register each cache under its own tenant delta.
+        registry.register_delta_dependency(&owner_a, Some("tenant-a".into()), 1);
+        registry.register_delta_dependency(&owner_b, Some("tenant-b".into()), 1);
+
+        assert_eq!(registry.cache_count(), 2);
+        assert_eq!(cache_a.lock().cached_token_count(), 4);
+        assert_eq!(cache_b.lock().cached_token_count(), 4);
+
+        // Evict tenant-a's delta: only A's cache is invalidated; B is untouched.
+        let invalidated = registry.invalidate_for_tenant("tenant-a");
+        assert_eq!(invalidated, 1);
+        assert_eq!(
+            registry.cache_count(),
+            1,
+            "only tenant-a's cache is removed"
+        );
+
+        // A's cache (Arc still held by the test) was cleared in place.
+        assert_eq!(
+            cache_a.lock().cached_token_count(),
+            0,
+            "tenant-a cache cleared"
+        );
+        assert_eq!(
+            layer0_seq_pos(&cache_a),
+            Some(0),
+            "tenant-a layer KV cleared"
+        );
+
+        // B's cache survives with its KV intact.
+        assert_eq!(
+            cache_b.lock().cached_token_count(),
+            4,
+            "tenant-b cache intact"
+        );
+        assert_eq!(
+            layer0_seq_pos(&cache_b),
+            Some(4),
+            "tenant-b layer KV intact"
+        );
+    }
+
+    /// A session cache must not survive a weight-version change: no-delta↔delta
+    /// and tenant-A↔tenant-B transitions all clear the stale KV; re-registering
+    /// the SAME tenant preserves it. This is the stale-cache-crossing-weight-
+    /// versions guard the serving path now enforces via register_delta_dependency.
+    #[test]
+    fn test_register_clears_stale_kv_on_tenant_transition() {
+        let registry = KVCacheRegistry::new(CacheConfig::new(2, 128), None);
+        let owner = CacheOwner::Session("session-x".into());
+        let cache = registry.get_or_create(owner.clone());
+        populate_cache(&cache);
+
+        // 1. First compute under NO tenant delta — fresh, nothing stale.
+        assert!(
+            !registry.register_delta_dependency(&owner, None, 0),
+            "fresh cache is not stale"
+        );
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            4,
+            "KV preserved on first register"
+        );
+
+        // 2. no-delta → tenant delta: weights changed, KV is stale and cleared.
+        assert!(
+            registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
+            "no-delta → delta must clear stale KV"
+        );
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            0,
+            "KV cleared across weight version"
+        );
+        assert_eq!(layer0_seq_pos(&cache), Some(0));
+
+        // Repopulate to simulate a fresh compute under tenant-1.
+        populate_cache(&cache);
+        assert_eq!(cache.lock().cached_token_count(), 4);
+
+        // 3. Same tenant, same weight epoch — NOT stale, KV preserved.
+        assert!(
+            !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
+            "same tenant at the same epoch is not stale"
+        );
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            4,
+            "KV preserved for same tenant"
+        );
+
+        // 4. delta → no-delta: weights changed again, stale and cleared.
+        assert!(
+            registry.register_delta_dependency(&owner, None, 0),
+            "delta → no-delta must clear stale KV"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 0);
+
+        // 5. Repopulate, then switch tenants (tenant-1 effective → tenant-2): stale.
+        populate_cache(&cache);
+        assert!(
+            registry.register_delta_dependency(&owner, Some("tenant-2".into()), 1),
+            "tenant change must clear stale KV"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 0);
+
+        // 6. After a clear, the recorded tenant is tenant-2; invalidating
+        //    tenant-2 still finds (and removes) the owner entry.
+        assert_eq!(registry.invalidate_for_tenant("tenant-2"), 1);
+    }
+
+    /// Same-tenant in-place re-adaptation (adapt_tenant/train_step/rollback/reset
+    /// bumps the delta's weight epoch while the tenant id stays the same) must
+    /// clear the stale KV on the next reuse; reusing at the SAME epoch (no
+    /// re-adaptation) must preserve it. This is the F1 regression test: the
+    /// recorded `(tenant_id, weight_epoch)` pair detects weight staleness that a
+    /// tenant-id-only comparison cannot (#1254).
+    #[test]
+    fn test_register_clears_stale_kv_on_weight_epoch_advance() {
+        let registry = KVCacheRegistry::new(CacheConfig::new(2, 128), None);
+        let owner = CacheOwner::Session("session-ttt".into());
+        let cache = registry.get_or_create(owner.clone());
+        populate_cache(&cache);
+
+        // Compute under tenant-1 at weight epoch 1 — fresh, nothing stale.
+        assert!(
+            !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
+            "fresh cache is not stale"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 4);
+
+        // No re-adaptation: same tenant, same epoch → KV preserved.
+        assert!(
+            !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 1),
+            "same tenant at the same epoch must preserve KV"
+        );
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            4,
+            "KV preserved within a weight epoch"
+        );
+        assert_eq!(layer0_seq_pos(&cache), Some(4));
+
+        // In-place re-adaptation: tenant id unchanged, epoch bumped 1 → 2.
+        // The cached KV was computed under the old weights → stale, cleared.
+        assert!(
+            registry.register_delta_dependency(&owner, Some("tenant-1".into()), 2),
+            "same tenant at an advanced epoch must clear stale KV"
+        );
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            0,
+            "weight-stale KV cleared"
+        );
+        assert_eq!(layer0_seq_pos(&cache), Some(0));
+
+        // Repopulate under the new weights; the new epoch is now recorded.
+        populate_cache(&cache);
+        assert!(
+            !registry.register_delta_dependency(&owner, Some("tenant-1".into()), 2),
+            "post-clear reuse at the recorded epoch is not stale"
+        );
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            4,
+            "KV preserved after recompute"
+        );
+
+        // A reset/rollback bumps the epoch again → stale again.
+        assert!(
+            registry.register_delta_dependency(&owner, Some("tenant-1".into()), 3),
+            "further epoch advance (reset/rollback) must clear stale KV"
+        );
+        assert_eq!(cache.lock().cached_token_count(), 0);
+    }
+
+    /// Releasing or evicting a cache must drop its delta dependency so the map
+    /// has no orphan entries that a later invalidation would chase. Covers the
+    /// Stateless release path; evict_to_budget mirrors the same removal.
+    #[test]
+    fn test_release_clears_delta_dependency() {
+        let registry = KVCacheRegistry::new(CacheConfig::new(2, 128), None);
+
+        let owner = CacheOwner::Stateless(42);
+        let _cache = registry.get_or_create(owner.clone());
+        registry.register_delta_dependency(&owner, Some("tenant-s".into()), 1);
+        assert!(registry.delta_dependencies.contains_key(&owner));
+
+        // Releasing a stateless cache removes both the cache and its dependency.
+        registry.release(&owner);
+        assert!(
+            !registry.caches.contains_key(&owner),
+            "stateless cache removed"
+        );
+        assert!(
+            !registry.delta_dependencies.contains_key(&owner),
+            "delta dependency removed on release"
+        );
+
+        // No orphan dependency → a later invalidation finds nothing.
+        assert_eq!(registry.invalidate_for_tenant("tenant-s"), 0);
+    }
+
+    /// A no-tenant cache (registered `None`) must NOT be cleared by any tenant's
+    /// invalidation — it carries no tenant dependency.
+    #[test]
+    fn test_no_tenant_cache_survives_any_invalidation() {
+        let registry = KVCacheRegistry::new(CacheConfig::new(2, 128), None);
+        let owner = CacheOwner::Session("base-only".into());
+        let cache = registry.get_or_create(owner.clone());
+        populate_cache(&cache);
+        registry.register_delta_dependency(&owner, None, 0);
+
+        // Invalidating any tenant leaves the no-tenant cache untouched.
+        assert_eq!(registry.invalidate_for_tenant("anyone"), 0);
+        assert_eq!(registry.cache_count(), 1);
+        assert_eq!(
+            cache.lock().cached_token_count(),
+            4,
+            "no-tenant cache intact"
+        );
+    }
+}

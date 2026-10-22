@@ -63,7 +63,8 @@ pub fn passthrough_layer(root: &Path) -> Result<Arc<BoxedLayer>, MountError> {
         ..Default::default()
     };
     let fs = PassthroughFs::<()>::new(cfg).map_err(|e| map_io(e, "PassthroughFs::new"))?;
-    fs.import().map_err(|e| map_io(e, "PassthroughFs::import"))?;
+    fs.import()
+        .map_err(|e| map_io(e, "PassthroughFs::import"))?;
     Ok(layer_from_fs(fs))
 }
 

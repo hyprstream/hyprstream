@@ -1,9 +1,9 @@
 //! CLI handlers for adaptive ML inference server
 
-use crate::services::RegistryClient;
-use crate::services::generated::registry_client::CreateTagRequest;
 use crate::training::{CheckpointManager, WeightFormat, WeightSnapshot};
 use ::config::{Config, File};
+use hyprstream_rpc_std::registry_client::CreateTagRequest;
+use hyprstream_rpc_std::registry_client::RegistryClient;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -188,10 +188,7 @@ pub async fn create_lora_via_api(
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        Err(format!(
-            "Failed to create LoRA: HTTP {status_code} - {error_text}"
-        )
-        .into())
+        Err(format!("Failed to create LoRA: HTTP {status_code} - {error_text}").into())
     }
 }
 
@@ -208,10 +205,7 @@ pub async fn list_lora_via_api(base_url: &str) -> Result<Value, Box<dyn std::err
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        Err(format!(
-            "Failed to list LoRA adapters: HTTP {status_code} - {error_text}"
-        )
-        .into())
+        Err(format!("Failed to list LoRA adapters: HTTP {status_code} - {error_text}").into())
     }
 }
 
@@ -231,10 +225,7 @@ pub async fn get_lora_info_via_api(
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        Err(format!(
-            "Failed to get LoRA info: HTTP {status_code} - {error_text}"
-        )
-        .into())
+        Err(format!("Failed to get LoRA info: HTTP {status_code} - {error_text}").into())
     }
 }
 
@@ -266,10 +257,7 @@ pub async fn chat_completion_via_api(
     } else {
         let status_code = response.status();
         let error_text = response.text().await?;
-        Err(format!(
-            "Failed to perform chat completion: HTTP {status_code} - {error_text}"
-        )
-        .into())
+        Err(format!("Failed to perform chat completion: HTTP {status_code} - {error_text}").into())
     }
 }
 
@@ -310,7 +298,12 @@ pub async fn handle_write_checkpoint(
     };
     let worktrees = repo_client.list_worktrees().await?;
     if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
-        return Err(format!("worktree for {}:{} not found", model_ref.name(), branch_name).into());
+        return Err(format!(
+            "worktree for {}:{} not found",
+            model_ref.name(),
+            branch_name
+        )
+        .into());
     }
     // Derive worktree path locally
     let storage_paths = crate::storage::StoragePaths::new()?;
@@ -377,7 +370,10 @@ pub async fn handle_commit_checkpoint(
     let repo_client = match registry.get_by_name(&model_name).await {
         Ok(tracked) => Some(registry.repo(&tracked.id)),
         Err(e) => {
-            error!("Could not get RepositoryClient for '{}': {} — git commit disabled", model_name, e);
+            error!(
+                "Could not get RepositoryClient for '{}': {} — git commit disabled",
+                model_name, e
+            );
             None
         }
     };
@@ -400,10 +396,16 @@ pub async fn handle_commit_checkpoint(
     // Create tag if requested
     if let Some(tag_name) = tag {
         if let Some(client) = &repo_client {
-            client.create_tag(&CreateTagRequest { name: tag_name.clone(), target: String::new() }).await.map_err(|e| {
-                error!("Failed to create tag '{}': {}", tag_name, e);
-                e
-            })?;
+            client
+                .create_tag(&CreateTagRequest {
+                    name: tag_name.clone(),
+                    target: String::new(),
+                })
+                .await
+                .map_err(|e| {
+                    error!("Failed to create tag '{}': {}", tag_name, e);
+                    e
+                })?;
             info!("✅ Tag created: {}", tag_name);
         } else {
             error!("Cannot create tag: no RepositoryClient available");

@@ -6,8 +6,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::input::KeyPress;
 use super::WidgetResult;
+use crate::input::KeyPress;
 
 /// Whether the field holds an integer or a float.
 #[derive(Clone, Copy, Debug)]
@@ -111,7 +111,9 @@ impl NumericField {
             None => self.none_label.to_owned(),
             Some(v) => match self.kind {
                 NumericKind::Integer => format!("{}", v as i64),
-                NumericKind::Float { decimals } => format!("{:.prec$}", v, prec = decimals as usize),
+                NumericKind::Float { decimals } => {
+                    format!("{:.prec$}", v, prec = decimals as usize)
+                }
             },
         }
     }
@@ -141,7 +143,11 @@ impl NumericField {
             None => {
                 let s = self.display_value();
                 self.edit_cursor = s.len();
-                if self.value.is_none() { String::new() } else { s }
+                if self.value.is_none() {
+                    String::new()
+                } else {
+                    s
+                }
             }
         };
     }
@@ -164,9 +170,7 @@ impl NumericField {
     }
 
     fn is_valid_edit_char(&self, b: u8) -> bool {
-        b.is_ascii_digit()
-            || b == b'.'
-            || b == b'-'
+        b.is_ascii_digit() || b == b'.' || b == b'-'
     }
 
     /// Handle a key press. Returns `Confirmed` when Enter is pressed in browse mode,
@@ -258,13 +262,22 @@ impl NumericField {
     /// Render the field on a single row.
     pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         let label_style = Style::default().fg(Color::Rgb(112, 128, 160)); // DIM
-        let focus_style = Style::default().fg(Color::Rgb(0, 232, 252)).add_modifier(Modifier::BOLD); // CYAN
-        let value_style = if focused { Style::default().fg(Color::White) } else { label_style };
+        let focus_style = Style::default()
+            .fg(Color::Rgb(0, 232, 252))
+            .add_modifier(Modifier::BOLD); // CYAN
+        let value_style = if focused {
+            Style::default().fg(Color::White)
+        } else {
+            label_style
+        };
 
         let cursor_marker = if focused { "\u{25b6} " } else { "  " };
 
         let mut spans: Vec<Span> = vec![
-            Span::styled(cursor_marker, if focused { focus_style } else { label_style }),
+            Span::styled(
+                cursor_marker,
+                if focused { focus_style } else { label_style },
+            ),
             Span::styled(format!("{:<16}", self.label), label_style),
         ];
 
@@ -416,7 +429,10 @@ mod tests {
     #[test]
     fn test_browse_enter_confirms() {
         let mut f = int_field();
-        assert_eq!(f.handle_key(&KeyPress::Enter), WidgetResult::Confirmed(Some(2048.0)));
+        assert_eq!(
+            f.handle_key(&KeyPress::Enter),
+            WidgetResult::Confirmed(Some(2048.0))
+        );
     }
 
     #[test]

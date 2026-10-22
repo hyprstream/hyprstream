@@ -1,0 +1,67 @@
+[package]
+name = "hyprstream-inference"
+version = "0.5.0"
+edition.workspace = true
+description = "Torch inference engine and training pipeline: PyTorch runtime, architectures, KV cache, TTT/LoRA training"
+license = "AGPL-3.0-only"
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+fastrand.workspace = true
+futures.workspace = true
+hex.workspace = true
+image.workspace = true
+json-threat-protection.workspace = true
+libc.workspace = true
+memmap2.workspace = true
+minijinja.workspace = true
+once_cell.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokenizers.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+git2db = { path = "../git2db", features = ["overlayfs"] }
+hyprstream-rpc = { path = "../hyprstream-rpc" }
+hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }
+
+# Torch backend. CPU/CUDA/ROCm is selected by the LIBTORCH environment (tch-rs),
+# not by cargo features; see the root Cargo.toml comments.
+tch = { git = "https://github.com/hyprstream/tch-rs", branch = "hyprstream-libtorch-211" }
+reflink-copy = "0.1" # COW file copying for training checkpoints (reflink when available)
+
+bitsandbytes-sys = { path = "../bitsandbytes-sys", optional = true } # KV cache quantization
+
+# OpenTelemetry token-burn metering (#1305 pattern): the SDK family is not
+# wasm32-compatible, so the optional `otel` deps are native-only and all otel
+# code is gated `#[cfg(all(feature = "otel", not(target_arch = "wasm32")))]`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+opentelemetry = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[features]
+default = []
+cuda = []
+bnb = ["dep:bitsandbytes-sys"] # Enable bitsandbytes KV cache quantization (requires compatible ROCm/CUDA)
+xet = ["git2db/xet-storage"] # Enable XET large file storage
+otel = ["opentelemetry"] # OpenTelemetry token-burn metering (native-only, see target gate above)
+download-libtorch = ["tch/download-libtorch"]
+
+[lints]
+workspace = true

@@ -103,16 +103,13 @@ become a silent fallback (#547 zero-standing-privilege model).
 ```
 crates/hyprstream-workers/
 ├── Cargo.toml
-├── build.rs                      # Cap'n Proto schema compilation
-├── schema/
-│   ├── worker.capnp              # CRI-aligned RuntimeService + ImageService
-│   └── workflow.capnp            # WorkflowService
+├── build.rs                      # stages canonical rpc-std CGRs
 ├── src/
 │   ├── lib.rs
 │   ├── config.rs                 # WorkerConfig (incl. `backend`), PoolConfig, WorkflowConfig
 │   ├── error.rs                  # WorkerError enum
 │   ├── paths.rs                  # Worker-specific dirs on top of hyprstream_rpc::paths
-│   ├── generated.rs              # generate_rpc_service! output
+│   ├── generated.rs              # generate_rpc_server! output + client re-exports
 │   │
 │   ├── runtime/                  # CRI RuntimeClient (PodSandbox + Container)
 │   │   ├── service.rs            # WorkerService (RequestService impl)

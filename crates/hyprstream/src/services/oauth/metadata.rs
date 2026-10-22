@@ -91,25 +91,44 @@ pub async fn authorization_server_metadata(
 /// Superset of RFC 8414 metadata with OIDC-specific fields:
 /// userinfo_endpoint, id_token_signing_alg_values_supported,
 /// subject_types_supported, claims_supported.
-pub async fn openid_configuration(
-    State(state): State<Arc<OAuthState>>,
-) -> impl IntoResponse {
+pub async fn openid_configuration(State(state): State<Arc<OAuthState>>) -> impl IntoResponse {
     let issuer = &state.issuer_url;
-    let mut meta = base_metadata(issuer, &state.default_scopes, state.require_pushed_authorization_requests);
+    let mut meta = base_metadata(
+        issuer,
+        &state.default_scopes,
+        state.require_pushed_authorization_requests,
+    );
 
     // OIDC-specific fields
     let obj = meta.as_object_mut().unwrap_or_else(|| unreachable!());
-    obj.insert("userinfo_endpoint".into(),
-        serde_json::Value::String(format!("{}/oauth/userinfo", issuer.trim_end_matches('/'))));
-    obj.insert("id_token_signing_alg_values_supported".into(),
-        serde_json::json!(["EdDSA", "RS256"]));
-    obj.insert("subject_types_supported".into(),
-        serde_json::json!(["public"]));
-    obj.insert("claims_supported".into(),
+    obj.insert(
+        "userinfo_endpoint".into(),
+        serde_json::Value::String(format!("{}/oauth/userinfo", issuer.trim_end_matches('/'))),
+    );
+    obj.insert(
+        "id_token_signing_alg_values_supported".into(),
+        serde_json::json!(["EdDSA", "RS256"]),
+    );
+    obj.insert(
+        "subject_types_supported".into(),
+        serde_json::json!(["public"]),
+    );
+    obj.insert(
+        "claims_supported".into(),
         serde_json::json!([
-            "sub", "iss", "aud", "exp", "iat", "nonce", "auth_time",
-            "name", "email", "email_verified", "preferred_username"
-        ]));
+            "sub",
+            "iss",
+            "aud",
+            "exp",
+            "iat",
+            "nonce",
+            "auth_time",
+            "name",
+            "email",
+            "email_verified",
+            "preferred_username"
+        ]),
+    );
 
     Json(meta)
 }
@@ -137,7 +156,10 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(advertised.contains(&"atproto"), "scopes_supported missing atproto: {advertised:?}");
+        assert!(
+            advertised.contains(&"atproto"),
+            "scopes_supported missing atproto: {advertised:?}"
+        );
         assert!(
             advertised.contains(&"transition:generic"),
             "scopes_supported missing transition:generic: {advertised:?}"
@@ -149,7 +171,10 @@ mod tests {
     #[test]
     fn authorization_server_metadata_requires_par_when_configured() {
         let meta = base_metadata("https://pds.example.com", &[], true);
-        assert_eq!(meta["require_pushed_authorization_requests"].as_bool(), Some(true));
+        assert_eq!(
+            meta["require_pushed_authorization_requests"].as_bool(),
+            Some(true)
+        );
         assert_eq!(
             meta["pushed_authorization_request_endpoint"].as_str(),
             Some("https://pds.example.com/oauth/par")
@@ -178,7 +203,10 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(auth_methods.contains(&"none"), "public clients (PKCE) must be accepted");
+        assert!(
+            auth_methods.contains(&"none"),
+            "public clients (PKCE) must be accepted"
+        );
         assert!(
             auth_methods.contains(&"private_key_jwt"),
             "private_key_jwt must be advertised"
@@ -230,7 +258,10 @@ mod tests {
         let configured = "https://as.example/tenant";
         let generic = base_metadata(configured, &["read:*:*".to_owned()], false);
         assert_eq!(generic["issuer"], configured);
-        assert_eq!(generic["token_endpoint"], "https://as.example/tenant/oauth/token");
+        assert_eq!(
+            generic["token_endpoint"],
+            "https://as.example/tenant/oauth/token"
+        );
 
         let atproto = atproto_metadata(configured, &["atproto".to_owned()], true);
         assert_eq!(atproto["issuer"], "https://as.example");

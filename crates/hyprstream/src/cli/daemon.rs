@@ -62,17 +62,13 @@ pub fn maybe_daemonize(
     {
         use daemonize::Daemonize;
 
-        let pid_path = pid_file
-            .map(PathBuf::from)
-            .unwrap_or_else(default_pid_file);
+        let pid_path = pid_file.map(PathBuf::from).unwrap_or_else(default_pid_file);
 
         // Ensure runtime directory exists with correct permissions
         hyprstream_workers::paths::ensure_runtime_dir()
             .with_context(|| "Failed to create runtime directory")?;
 
-        let mut daemon = Daemonize::new()
-            .pid_file(&pid_path)
-            .chown_pid_file(true);
+        let mut daemon = Daemonize::new().pid_file(&pid_path).chown_pid_file(true);
 
         // Set working directory if specified
         if let Some(ref dir) = working_dir {
@@ -96,7 +92,9 @@ pub fn maybe_daemonize(
 
     #[cfg(not(unix))]
     {
-        anyhow::bail!("Daemonization is only supported on Unix systems. Use a service manager on Windows.");
+        anyhow::bail!(
+            "Daemonization is only supported on Unix systems. Use a service manager on Windows."
+        );
     }
 }
 
@@ -110,9 +108,7 @@ pub fn maybe_daemonize(
 ///
 /// `Some(pid)` if the process is running, `None` if not running or PID file doesn't exist.
 pub fn check_running(pid_file: Option<String>) -> Option<u32> {
-    let pid_path = pid_file
-        .map(PathBuf::from)
-        .unwrap_or_else(default_pid_file);
+    let pid_path = pid_file.map(PathBuf::from).unwrap_or_else(default_pid_file);
 
     let pid_str = std::fs::read_to_string(&pid_path).ok()?;
     let pid: u32 = pid_str.trim().parse().ok()?;
@@ -149,9 +145,7 @@ pub fn check_running(pid_file: Option<String>) -> Option<u32> {
 /// `Ok(())` if the daemon was stopped or wasn't running.
 /// `Err` if stopping failed.
 pub fn stop_daemon(pid_file: Option<String>) -> Result<()> {
-    let pid_path = pid_file
-        .map(PathBuf::from)
-        .unwrap_or_else(default_pid_file);
+    let pid_path = pid_file.map(PathBuf::from).unwrap_or_else(default_pid_file);
 
     let pid_str = std::fs::read_to_string(&pid_path)
         .with_context(|| format!("No PID file found at: {}", pid_path.display()))?;

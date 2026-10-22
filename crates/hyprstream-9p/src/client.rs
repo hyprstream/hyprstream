@@ -179,13 +179,23 @@ impl<T: P9Transport> P9Client<T> {
         let msg = msg::tgetattr(tag, fid, 0x7ff);
         let resp = self.rpc(&msg).await?;
         match resp {
-            Response::Getattr { qid, mode, size, mtime_sec } => Ok((qid, mode, size, mtime_sec)),
+            Response::Getattr {
+                qid,
+                mode,
+                size,
+                mtime_sec,
+            } => Ok((qid, mode, size, mtime_sec)),
             _ => anyhow::bail!("unexpected response to Tgetattr"),
         }
     }
 
     /// Read directory entries.
-    pub async fn readdir(&self, fid: u32, offset: u64, count: u32) -> anyhow::Result<Vec<msg::DirEntryP9>> {
+    pub async fn readdir(
+        &self,
+        fid: u32,
+        offset: u64,
+        count: u32,
+    ) -> anyhow::Result<Vec<msg::DirEntryP9>> {
         let tag = self.alloc_tag();
         let msg = msg::treaddir(tag, fid, offset, count);
         let resp = self.rpc(&msg).await?;

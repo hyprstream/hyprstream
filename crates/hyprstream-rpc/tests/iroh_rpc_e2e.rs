@@ -71,11 +71,21 @@ impl EchoService {
 
 #[async_trait(?Send)]
 impl RequestService for EchoService {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+            signed_body.to_vec(),
+        ))
+    }
+
     async fn handle_request(
         &self,
         _ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> Result<(Vec<u8>, Option<Continuation>)> {
+        let payload = body.bytes();
         if let Some(invocations) = &self.invocations {
             invocations.fetch_add(1, Ordering::SeqCst);
         }
@@ -375,9 +385,7 @@ async fn hykem_encrypted_envelope_round_trip_over_iroh() -> Result<()> {
 /// before the echo handler runs. No attacker-triggered signed error is emitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
-    use hyprstream_rpc::envelope::{
-        current_timestamp, generate_nonce, Authorization, RequestEnvelope,
-    };
+    use hyprstream_rpc::envelope::{current_timestamp, Authorization, RequestEnvelope};
 
     // ─── Server side ──────────────────────────────────────────────────────
     let server_signing = fresh_signing_key();
@@ -426,7 +434,7 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
         request_id: 99,
         payload: b"ping-payload".to_vec(),
         iat: current_timestamp(),
-        nonce: generate_nonce(),
+        nonce: hyprstream_rpc::envelope::generate_nonce(),
         authorization: Authorization::None,
         delegation_token: None,
         wth: None,
@@ -434,6 +442,8 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
         client_kem_public: None,
         response_kem_recipient: None,
         service_domain: None,
+        proof_cwt: None,
+        authorization_witness: None,
     };
     let signed = SignedEnvelope::new_signed_hybrid(envelope, &client_signing, &client_pq_sk);
     let mut wire = Vec::new();
@@ -475,9 +485,7 @@ async fn cleartext_envelope_rejected_on_iroh_receive() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Result<()> {
     use bytes::Bytes;
-    use hyprstream_rpc::envelope::{
-        current_timestamp, generate_nonce, Authorization, RequestEnvelope,
-    };
+    use hyprstream_rpc::envelope::{current_timestamp, Authorization, RequestEnvelope};
 
     let invocations = Arc::new(AtomicUsize::new(0));
     let invoked = Arc::clone(&invocations);
@@ -512,7 +520,7 @@ async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Re
             request_id: 31337,
             payload: b"visible-cleartext-sentinel".to_vec(),
             iat: current_timestamp(),
-            nonce: generate_nonce(),
+            nonce: hyprstream_rpc::envelope::generate_nonce(),
             authorization: Authorization::None,
             delegation_token: None,
             wth: None,
@@ -520,6 +528,8 @@ async fn false_encrypted_marker_never_reaches_custom_processor_over_iroh() -> Re
             client_kem_public: None,
             response_kem_recipient: None,
             service_domain: None,
+            proof_cwt: None,
+            authorization_witness: None,
         },
         &signer,
         &pq_signer,

@@ -137,20 +137,35 @@ pub trait FsMount: Mount {
     ///
     /// Only the populated fields of [`SetAttr`] are applied. A `size` change on
     /// a lower-layer file forces copy-up.
-    async fn setattr(&self, path: &[&str], attr: &SetAttr, caller: &Subject) -> Result<(), MountError>;
+    async fn setattr(
+        &self,
+        path: &[&str],
+        attr: &SetAttr,
+        caller: &Subject,
+    ) -> Result<(), MountError>;
 
     /// Create a symbolic link at `path` whose target is `target`.
     ///
     /// `target` is stored verbatim (it may be absolute or relative and is *not*
     /// resolved by this call).
-    async fn symlink(&self, path: &[&str], target: &str, caller: &Subject) -> Result<(), MountError>;
+    async fn symlink(
+        &self,
+        path: &[&str],
+        target: &str,
+        caller: &Subject,
+    ) -> Result<(), MountError>;
 
     /// Read the target of the symbolic link at `path`.
     async fn readlink(&self, path: &[&str], caller: &Subject) -> Result<String, MountError>;
 
     /// Create a hard link at `new_path` referring to the same inode as
     /// `existing`.
-    async fn link(&self, existing: &[&str], new_path: &[&str], caller: &Subject) -> Result<(), MountError>;
+    async fn link(
+        &self,
+        existing: &[&str],
+        new_path: &[&str],
+        caller: &Subject,
+    ) -> Result<(), MountError>;
 
     // ── Overlay / copy-on-write hooks ───────────────────────────────────────
     //
@@ -177,7 +192,9 @@ pub trait FsMount: Mount {
     /// Default: [`MountError::NotSupported`] — a backend with no layering cannot
     /// honour opacity and must say so rather than silently no-op (fail-closed).
     async fn set_opaque(&self, _path: &[&str], _caller: &Subject) -> Result<(), MountError> {
-        Err(MountError::NotSupported("set_opaque: backend is not an overlay".into()))
+        Err(MountError::NotSupported(
+            "set_opaque: backend is not an overlay".into(),
+        ))
     }
 
     /// Stat a `path` directly (without holding a fid), returning its metadata.

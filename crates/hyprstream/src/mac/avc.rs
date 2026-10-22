@@ -40,8 +40,10 @@
 //! [`TokenScope`]; the mandatory lattice floor + TE matrix are still evaluated independently
 //! by the PDP (a token can only narrow — design §10).
 
-use crate::mac::te::{Action, Decision, ObjectCtx, ObjectType, SubjectCtx, SubjectType, TeEvaluator};
 use crate::mac::lattice::SecurityLabel;
+use crate::mac::te::{
+    Action, Decision, ObjectCtx, ObjectType, SubjectCtx, SubjectType, TeEvaluator,
+};
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -273,10 +275,16 @@ mod tests {
     }
 
     fn subj(t: u32, clr: SecurityLabel) -> SubjectCtx {
-        SubjectCtx { subject_type: SubjectType(t), clearance: clr }
+        SubjectCtx {
+            subject_type: SubjectType(t),
+            clearance: clr,
+        }
     }
     fn obj(t: u32, lbl: SecurityLabel) -> ObjectCtx {
-        ObjectCtx { object_type: ObjectType(t), label: lbl }
+        ObjectCtx {
+            object_type: ObjectType(t),
+            label: lbl,
+        }
     }
 
     fn avc() -> CachingAvc<LatticeTeEvaluator> {
@@ -289,16 +297,32 @@ mod tests {
     #[test]
     fn hit_returns_cached_decision() {
         let a = avc();
-        assert_eq!(a.decide(subj(1, high()), obj(1, low()), Action(1)), Decision::Permit);
-        assert_eq!(a.decide(subj(1, high()), obj(1, low()), Action(1)), Decision::Permit);
-        assert_eq!(a.len(), 1, "second call must hit the cache, not add a new entry");
+        assert_eq!(
+            a.decide(subj(1, high()), obj(1, low()), Action(1)),
+            Decision::Permit
+        );
+        assert_eq!(
+            a.decide(subj(1, high()), obj(1, low()), Action(1)),
+            Decision::Permit
+        );
+        assert_eq!(
+            a.len(),
+            1,
+            "second call must hit the cache, not add a new entry"
+        );
     }
 
     #[test]
     fn default_deny_cached_too() {
         let a = avc();
-        assert_eq!(a.decide(subj(1, high()), obj(1, low()), Action(9)), Decision::Deny);
-        assert_eq!(a.decide(subj(1, high()), obj(1, low()), Action(9)), Decision::Deny);
+        assert_eq!(
+            a.decide(subj(1, high()), obj(1, low()), Action(9)),
+            Decision::Deny
+        );
+        assert_eq!(
+            a.decide(subj(1, high()), obj(1, low()), Action(9)),
+            Decision::Deny
+        );
     }
 
     /// The evaluator must be consulted exactly ONCE per distinct key — proving the cache
@@ -321,13 +345,20 @@ mod tests {
         let mut allow = HashSet::new();
         allow.insert(rule(1, 1, 1));
         let inner = LatticeTeEvaluator::new(TeMatrix::from_allow(allow), lattice());
-        let counting = Arc::new(Counting { inner, calls: AtomicU32::new(0) });
+        let counting = Arc::new(Counting {
+            inner,
+            calls: AtomicU32::new(0),
+        });
         let a = CachingAvc::new(counting.clone());
 
         for _ in 0..10 {
             a.decide(subj(1, high()), obj(1, low()), Action(1));
         }
-        assert_eq!(counting.calls.load(Ordering::SeqCst), 1, "PDP must be hit once, then cached");
+        assert_eq!(
+            counting.calls.load(Ordering::SeqCst),
+            1,
+            "PDP must be hit once, then cached"
+        );
     }
 
     #[test]

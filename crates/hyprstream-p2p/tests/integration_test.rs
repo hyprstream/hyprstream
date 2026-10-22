@@ -5,13 +5,10 @@
 
 #[cfg(test)]
 mod tests {
-    use hyprstream_p2p::{
-        types::GitTorrentUrl,
-        git::objects::*,
-    };
+    use hyprstream_p2p::{git::objects::*, types::GitTorrentUrl};
 
-    use tempfile::TempDir;
     use git2::Repository;
+    use tempfile::TempDir;
 
     #[test]
     fn test_url_parsing_commit_format() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,7 +31,10 @@ mod tests {
             GitTorrentUrl::CommitWithRefs { ref hash } => {
                 assert_eq!(hash.as_str(), test_hash);
                 assert!(url_with_refs.includes_refs());
-                assert_eq!(url_with_refs.to_string(), format!("gittorrent://{test_hash}?refs"));
+                assert_eq!(
+                    url_with_refs.to_string(),
+                    format!("gittorrent://{test_hash}?refs")
+                );
             }
             _ => panic!("Expected CommitWithRefs variant"),
         }
@@ -59,14 +59,7 @@ mod tests {
         let tree = repo.find_tree(tree_id)?;
         let sig = git2::Signature::now("Test", "test@example.com")?;
 
-        let _commit_id = repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            "Initial commit",
-            &tree,
-            &[],
-        )?;
+        let _commit_id = repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])?;
 
         // Test object extraction
         let objects = extract_objects(temp_dir.path()).await?;
@@ -99,20 +92,15 @@ mod tests {
         let tree = repo.find_tree(tree_id)?;
         let sig = git2::Signature::now("Test Parser", "parser@example.com")?;
 
-        let _commit_id = repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            "Test parsing commit",
-            &tree,
-            &[],
-        )?;
+        let _commit_id =
+            repo.commit(Some("HEAD"), &sig, &sig, "Test parsing commit", &tree, &[])?;
 
         // Extract objects
         let objects = extract_objects(temp_dir.path()).await?;
 
         // Find and parse the commit object
-        let commit_obj = objects.iter()
+        let commit_obj = objects
+            .iter()
             .find(|obj| obj.object_type == GitObjectType::Commit)
             .ok_or("No commit object found")?;
         let parsed_commit = parse_commit_object(&commit_obj.data)?;
@@ -122,7 +110,8 @@ mod tests {
         assert!(!parsed_commit.tree_hash.to_hex().is_empty());
 
         // Find and parse the tree object
-        let tree_obj = objects.iter()
+        let tree_obj = objects
+            .iter()
             .find(|obj| obj.object_type == GitObjectType::Tree)
             .ok_or("No tree object found")?;
         // The tree uses the same object format as the commit that references it.
@@ -134,7 +123,8 @@ mod tests {
         assert_eq!(parsed_tree.entries[0].mode, TreeEntryMode::File);
 
         // Find and parse the blob object
-        let blob_obj = objects.iter()
+        let blob_obj = objects
+            .iter()
             .find(|obj| obj.object_type == GitObjectType::Blob)
             .ok_or("No blob object found")?;
         let parsed_blob = parse_blob_object(&blob_obj.data)?;
@@ -161,14 +151,7 @@ mod tests {
         let tree = repo.find_tree(tree_id)?;
         let sig = git2::Signature::now("Test", "test@example.com")?;
 
-        let commit_id = repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            "Initial commit",
-            &tree,
-            &[],
-        )?;
+        let commit_id = repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])?;
 
         // Create a branch
         let commit = repo.find_commit(commit_id)?;
@@ -178,7 +161,10 @@ mod tests {
         let refs = extract_git_refs(temp_dir.path()).await?;
 
         assert!(!refs.refs.is_empty());
-        assert!(refs.refs.contains_key("refs/heads/main") || refs.refs.contains_key("refs/heads/master"));
+        assert!(
+            refs.refs.contains_key("refs/heads/main")
+                || refs.refs.contains_key("refs/heads/master")
+        );
         assert!(refs.refs.contains_key("refs/heads/feature-branch"));
         assert!(!refs.head.is_empty());
         assert!(refs.created_at > 0);

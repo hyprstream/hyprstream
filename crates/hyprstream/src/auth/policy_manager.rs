@@ -31,13 +31,14 @@
 //! g, alice, trainer
 //! ```
 
-use crate::auth::policy_templates::{base_policies_to_csv, base_policies_to_vec, ServiceGrouping, ServicePolicyRule};
+use crate::auth::policy_file_adapter::PolicyFileAdapter;
+use crate::auth::policy_templates::{
+    base_policies_to_csv, base_policies_to_vec, ServiceGrouping, ServicePolicyRule,
+};
 use crate::auth::Operation;
 use casbin::function_map::{dynamic_to_str, OperatorFunction};
 use casbin::rhai::Dynamic;
-use casbin::{
-    CoreApi, DefaultModel, Enforcer, FileAdapter, MemoryAdapter, MgmtApi, RbacApi,
-};
+use casbin::{CoreApi, DefaultModel, Enforcer, MemoryAdapter, MgmtApi, RbacApi};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
@@ -304,8 +305,7 @@ fn default_policy_csv() -> String {
 /// - Global role lines (g, ...): 3 fields (g, user, role)
 /// - Domain role lines (g2, ...): 4 fields (g2, user, role, domain)
 fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
-    let content = std::fs::read_to_string(policy_path)
-        .map_err(PolicyError::IoError)?;
+    let content = std::fs::read_to_string(policy_path).map_err(PolicyError::IoError)?;
 
     for (line_num, line) in content.lines().enumerate() {
         let line = line.trim();
@@ -316,7 +316,8 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
         // Check policy lines (p, ...)
         if line.starts_with("p,") || line.starts_with("p ") {
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-            if fields.len() != 6 {  // "p" + 5 fields
+            if fields.len() != 6 {
+                // "p" + 5 fields
                 return Err(PolicyError::ValidationError(format!(
                     "Invalid policy format at line {}:\n\
                     Found:    {}\n\
@@ -324,7 +325,10 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
                     Example:  p, alice, *, *, *, allow\n\n\
                     Your policy has {} fields but 6 are required.\n\
                     Edit {} to fix the format.",
-                    line_num + 1, line, fields.len(), policy_path.display()
+                    line_num + 1,
+                    line,
+                    fields.len(),
+                    policy_path.display()
                 )));
             }
         }
@@ -332,13 +336,15 @@ fn validate_policy_csv(policy_path: &Path) -> Result<(), PolicyError> {
         // Check role lines (g, ...)
         if line.starts_with("g,") || line.starts_with("g ") {
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-            if fields.len() != 3 {  // "g" + 2 fields
+            if fields.len() != 3 {
+                // "g" + 2 fields
                 return Err(PolicyError::ValidationError(format!(
                     "Invalid role format at line {}:\n\
                     Found:    {}\n\
                     Expected: g, user, role\n\
                     Example:  g, alice, trainer",
-                    line_num + 1, line
+                    line_num + 1,
+                    line
                 )));
             }
         }
@@ -429,23 +435,21 @@ async fn ensure_domain_role_model(model_path: &Path) -> Result<(), PolicyError> 
 }
 
 fn is_legacy_federation_origin_subject(subject: &str) -> bool {
-    subject == "*"
-        || subject.starts_with("https://")
-        || subject.starts_with("http://")
+    subject == "*" || subject.starts_with("https://") || subject.starts_with("http://")
 }
 
 /// Move pre-hardening federation rules from the caller identity slot into the
 /// resource slot. This preserves existing per-origin allow/deny lists without
 /// making an HTTPS origin a trusted envelope subject.
-async fn migrate_federation_origin_policies(
-    enforcer: &mut Enforcer,
-) -> Result<bool, PolicyError> {
+async fn migrate_federation_origin_policies(enforcer: &mut Enforcer) -> Result<bool, PolicyError> {
     let legacy: Vec<Vec<String>> = enforcer
         .get_policy()
         .into_iter()
         .filter(|rule| {
             rule.len() == 5
-                && rule.get(2).is_some_and(|resource| resource == "federation:register")
+                && rule
+                    .get(2)
+                    .is_some_and(|resource| resource == "federation:register")
                 && rule
                     .first()
                     .is_some_and(|subject| is_legacy_federation_origin_subject(subject))
@@ -506,7 +510,8 @@ impl PolicyManager {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                tokio::fs::set_permissions(&policies_dir, std::fs::Permissions::from_mode(0o750)).await?;
+                tokio::fs::set_permissions(&policies_dir, std::fs::Permissions::from_mode(0o750))
+                    .await?;
             }
         }
 
@@ -536,7 +541,7 @@ impl PolicyManager {
             .map_err(|e| PolicyError::ModelLoadError(e.to_string()))?;
 
         // Create enforcer with file adapter
-        let adapter = FileAdapter::new(policy_path.to_string_lossy().to_string());
+        let adapter = PolicyFileAdapter::new(policy_path.clone());
         let mut enforcer = Enforcer::new(model, adapter)
             .await
             .map_err(|e| PolicyError::PolicyLoadError(e.to_string()))?;
@@ -599,11 +604,11 @@ impl PolicyManager {
         // Add permissive default rule: anyone can do anything in any domain
         enforcer
             .add_policy(vec![
-                "*".to_owned(),      // subject
-                "*".to_owned(),      // domain
-                "*".to_owned(),      // resource
-                "*".to_owned(),      // action
-                "allow".to_owned(),  // effect
+                "*".to_owned(),     // subject
+                "*".to_owned(),     // domain
+                "*".to_owned(),     // resource
+                "*".to_owned(),     // action
+                "allow".to_owned(), // effect
             ])
             .await
             .map_err(PolicyError::CasbinError)?;
@@ -650,13 +655,9 @@ impl PolicyManager {
     ///
     /// # Returns
     /// `true` if access is allowed, `false` otherwise
-    pub async fn check(
-        &self,
-        user: &str,
-        resource: &str,
-        operation: Operation,
-    ) -> bool {
-        self.check_with_domain(user, "*", resource, operation.as_str()).await
+    pub async fn check(&self, user: &str, resource: &str, operation: Operation) -> bool {
+        self.check_with_domain(user, "*", resource, operation.as_str())
+            .await
     }
 
     /// Check if a user is allowed to perform an operation on a resource in a specific domain
@@ -706,9 +707,7 @@ impl PolicyManager {
         // Try to use existing runtime, or create a temporary one
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             // We're in an async context, use block_in_place
-            tokio::task::block_in_place(|| {
-                handle.block_on(self.check(user, resource, operation))
-            })
+            tokio::task::block_in_place(|| handle.block_on(self.check(user, resource, operation)))
         } else {
             // No runtime, create a temporary one (less efficient)
             let rt = tokio::runtime::Runtime::new().ok();
@@ -718,11 +717,7 @@ impl PolicyManager {
     }
 
     /// Check multiple operations at once, returning a bitmask
-    pub async fn check_all(
-        &self,
-        user: &str,
-        resource: &str,
-    ) -> u32 {
+    pub async fn check_all(&self, user: &str, resource: &str) -> u32 {
         let mut mask = 0u32;
         for op in Operation::all() {
             if self.check(user, resource, *op).await {
@@ -858,11 +853,7 @@ impl PolicyManager {
     /// Add a role for a user
     ///
     /// All inputs are validated for security.
-    pub async fn add_role_for_user(
-        &self,
-        user: &str,
-        role: &str,
-    ) -> Result<bool, PolicyError> {
+    pub async fn add_role_for_user(&self, user: &str, role: &str) -> Result<bool, PolicyError> {
         // Validate all inputs
         validate_policy_component(user, "user")?;
         validate_policy_component(role, "role")?;
@@ -877,11 +868,7 @@ impl PolicyManager {
     /// Remove a role from a user
     ///
     /// All inputs are validated for security.
-    pub async fn remove_role_for_user(
-        &self,
-        user: &str,
-        role: &str,
-    ) -> Result<bool, PolicyError> {
+    pub async fn remove_role_for_user(&self, user: &str, role: &str) -> Result<bool, PolicyError> {
         // Validate all inputs
         validate_policy_component(user, "user")?;
         validate_policy_component(role, "role")?;
@@ -1034,12 +1021,15 @@ impl PolicyManager {
         let mut enforcer = self.enforcer.write().await;
 
         // Add policy rules
+        let existing_policies = enforcer.get_policy();
         let policy_vecs: Vec<Vec<String>> = policies
             .iter()
             .map(ServicePolicyRule::to_vec)
+            .filter(|rule| !existing_policies.contains(rule))
             .collect();
         if !policy_vecs.is_empty() {
-            enforcer.add_policies(policy_vecs)
+            enforcer
+                .add_policies(policy_vecs)
                 .await
                 .map_err(PolicyError::CasbinError)?;
         }
@@ -1050,25 +1040,34 @@ impl PolicyManager {
         // the verified request domain itself is `*`.
         if let Some(groupings) = template.groupings {
             if let Some(domain) = tenant_domains.first() {
+                let existing_groupings = enforcer.get_named_grouping_policy("g2");
                 for grouping in groupings {
+                    let grouping = vec![
+                        grouping.user.to_owned(),
+                        grouping.role.to_owned(),
+                        (*domain).to_owned(),
+                    ];
+                    if existing_groupings.contains(&grouping) {
+                        continue;
+                    }
                     enforcer
-                        .add_named_grouping_policy(
-                            "g2",
-                            vec![
-                                grouping.user.to_owned(),
-                                grouping.role.to_owned(),
-                                (*domain).to_owned(),
-                            ],
-                        )
+                        .add_named_grouping_policy("g2", grouping)
                         .await
                         .map_err(PolicyError::CasbinError)?;
                 }
             } else {
-                let grouping_vecs: Vec<Vec<String>> = groupings.iter().map(ServiceGrouping::to_vec).collect();
-                enforcer
-                    .add_grouping_policies(grouping_vecs)
-                    .await
-                    .map_err(PolicyError::CasbinError)?;
+                let existing_groupings = enforcer.get_grouping_policy();
+                let grouping_vecs: Vec<Vec<String>> = groupings
+                    .iter()
+                    .map(ServiceGrouping::to_vec)
+                    .filter(|grouping| !existing_groupings.contains(grouping))
+                    .collect();
+                if !grouping_vecs.is_empty() {
+                    enforcer
+                        .add_grouping_policies(grouping_vecs)
+                        .await
+                        .map_err(PolicyError::CasbinError)?;
+                }
             }
         }
 
@@ -1164,14 +1163,18 @@ mod tests {
 
         // Default policy is deny-all — no access until explicitly configured
         assert!(!pm.check("user", "model:test", Operation::Infer).await);
-        assert!(!pm.check("local:alice", "model:test", Operation::Infer).await);
+        assert!(
+            !pm.check("local:alice", "model:test", Operation::Infer)
+                .await
+        );
 
         // Verify files were created
         assert!(policies_dir.join("model.conf").exists());
         assert!(policies_dir.join("policy.csv").exists());
 
         // After adding explicit policy, access should work
-        pm.add_policy("user", "model:test", "infer.generate").await?;
+        pm.add_policy("user", "model:test", "infer.generate")
+            .await?;
         assert!(pm.check("user", "model:test", Operation::Infer).await);
         Ok(())
     }
@@ -1187,7 +1190,8 @@ mod tests {
         assert!(!pm.check("user", "model:test", Operation::Infer).await);
 
         // Add specific policy
-        pm.add_policy("user", "model:test", "infer.generate").await?;
+        pm.add_policy("user", "model:test", "infer.generate")
+            .await?;
 
         // Now this specific access should work
         assert!(pm.check("user", "model:test", Operation::Infer).await);
@@ -1204,7 +1208,8 @@ mod tests {
         pm.remove_policy("*", "*", "*").await?;
 
         // Add role-based policies
-        pm.add_policy("trainer", "model:*", "infer.generate").await?;
+        pm.add_policy("trainer", "model:*", "infer.generate")
+            .await?;
         pm.add_policy("trainer", "model:*", "ttt.train").await?;
 
         // Assign role to user
@@ -1223,14 +1228,8 @@ mod tests {
     async fn cross_tenant_global_role_mutation_is_denied() -> Result<(), PolicyError> {
         let pm = PolicyManager::new_in_memory().await?;
         for tenant in ["tenant-a", "tenant-b"] {
-            pm.add_policy_with_domain(
-                "trainer",
-                tenant,
-                "model:*",
-                "infer.generate",
-                "allow",
-            )
-            .await?;
+            pm.add_policy_with_domain("trainer", tenant, "model:*", "infer.generate", "allow")
+                .await?;
         }
 
         pm.add_role_for_user_in_domain("alice", "trainer", "tenant-a")
@@ -1274,14 +1273,8 @@ mod tests {
     async fn legacy_global_role_grant_is_inert_in_tenant_domains() -> Result<(), PolicyError> {
         let pm = PolicyManager::new_in_memory().await?;
         for tenant in ["tenant-a", "tenant-b"] {
-            pm.add_policy_with_domain(
-                "operator",
-                tenant,
-                "model:*",
-                "ttt.writeback",
-                "allow",
-            )
-            .await?;
+            pm.add_policy_with_domain("operator", tenant, "model:*", "ttt.writeback", "allow")
+                .await?;
         }
 
         // Simulate a pre-#1196 g(user, role) row already present in policy.csv.
@@ -1360,8 +1353,7 @@ mod tests {
 
         let pm = PolicyManager::new(&policies_dir).await?;
         let allowed = federation_registration_resource("https://allowed.example")?;
-        let wildcard_allowed =
-            federation_registration_resource("https://app.partner.example")?;
+        let wildcard_allowed = federation_registration_resource("https://app.partner.example")?;
         let blocked = federation_registration_resource("https://blocked.example")?;
 
         assert!(
@@ -1382,17 +1374,17 @@ mod tests {
 
         let policies = pm.get_policy().await;
         assert!(policies.iter().any(|rule| {
-            rule
-                == &vec![
-                    "*".to_owned(),
-                    "*".to_owned(),
-                    allowed.clone(),
-                    "check".to_owned(),
-                    "allow".to_owned(),
-                ]
+            rule == &vec![
+                "*".to_owned(),
+                "*".to_owned(),
+                allowed.clone(),
+                "check".to_owned(),
+                "allow".to_owned(),
+            ]
         }));
         assert!(!policies.iter().any(|rule| {
-            rule.first().is_some_and(|subject| subject.starts_with("https://"))
+            rule.first()
+                .is_some_and(|subject| subject.starts_with("https://"))
                 && rule
                     .get(2)
                     .is_some_and(|resource| resource == "federation:register")
@@ -1485,7 +1477,9 @@ mod tests {
         let pm = PolicyManager::permissive().await?;
 
         // Line breaks should be rejected (CSV injection)
-        let result = pm.add_policy("user\np, evil, *, *", "model:test", "infer").await;
+        let result = pm
+            .add_policy("user\np, evil, *, *", "model:test", "infer")
+            .await;
         assert!(matches!(result, Err(PolicyError::ValidationError(_))));
 
         let result = pm.add_role_for_user("user\revil", "operator").await;
@@ -1509,7 +1503,10 @@ mod tests {
         let pm = PolicyManager::permissive().await?;
 
         // Valid inputs should work
-        assert!(pm.add_policy("user-123", "model:qwen3-*", "infer").await.is_ok());
+        assert!(pm
+            .add_policy("user-123", "model:qwen3-*", "infer")
+            .await
+            .is_ok());
         assert!(pm.add_role_for_user("alice_test", "trainer").await.is_ok());
         Ok(())
     }
@@ -1518,12 +1515,23 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     async fn test_act_wildcard_keymatch() {
         let pm = PolicyManager::new_in_memory().await.unwrap();
-        pm.add_policy_with_domain("alice", "*", "model:qwen3-small:main", "ttt.*", "allow").await.unwrap();
+        pm.add_policy_with_domain("alice", "*", "model:qwen3-small:main", "ttt.*", "allow")
+            .await
+            .unwrap();
         // Specific action should match the wildcard
-        assert!(pm.check_with_domain("alice", "*", "model:qwen3-small:main", "ttt.writeback").await);
-        assert!(pm.check_with_domain("alice", "*", "model:qwen3-small:main", "ttt.evict").await);
+        assert!(
+            pm.check_with_domain("alice", "*", "model:qwen3-small:main", "ttt.writeback")
+                .await
+        );
+        assert!(
+            pm.check_with_domain("alice", "*", "model:qwen3-small:main", "ttt.evict")
+                .await
+        );
         // Different namespace should NOT match
-        assert!(!pm.check_with_domain("alice", "*", "model:qwen3-small:main", "infer.generate").await);
+        assert!(
+            !pm.check_with_domain("alice", "*", "model:qwen3-small:main", "infer.generate")
+                .await
+        );
     }
 
     #[tokio::test]
@@ -1532,29 +1540,57 @@ mod tests {
         let pm = PolicyManager::new_in_memory().await.unwrap();
 
         // Grant alice manage (ttt.writeback) on the model resource
-        pm.add_policy_with_domain("alice", "*", "model:qwen3:main", "ttt.writeback", "allow").await.unwrap();
+        pm.add_policy_with_domain("alice", "*", "model:qwen3:main", "ttt.writeback", "allow")
+            .await
+            .unwrap();
 
         // Initially bob cannot infer
-        assert!(!pm.check_with_domain("bob", "*", "model:qwen3:main", "infer.generate").await);
+        assert!(
+            !pm.check_with_domain("bob", "*", "model:qwen3:main", "infer.generate")
+                .await
+        );
 
         // Make public: add wildcard infer + query rules
-        pm.add_policy_with_domain("*", "*", "model:qwen3:main", "infer.generate", "allow").await.unwrap();
-        pm.add_policy_with_domain("*", "*", "model:qwen3:main", "query.status", "allow").await.unwrap();
+        pm.add_policy_with_domain("*", "*", "model:qwen3:main", "infer.generate", "allow")
+            .await
+            .unwrap();
+        pm.add_policy_with_domain("*", "*", "model:qwen3:main", "query.status", "allow")
+            .await
+            .unwrap();
 
         // After making public, any user can infer and query
-        assert!(pm.check_with_domain("bob", "*", "model:qwen3:main", "infer.generate").await);
-        assert!(pm.check_with_domain("carol", "*", "model:qwen3:main", "query.status").await);
+        assert!(
+            pm.check_with_domain("bob", "*", "model:qwen3:main", "infer.generate")
+                .await
+        );
+        assert!(
+            pm.check_with_domain("carol", "*", "model:qwen3:main", "query.status")
+                .await
+        );
 
         // Make private: remove wildcard rules
-        pm.remove_policy_with_domain("*", "*", "model:qwen3:main", "infer.generate", "allow").await.unwrap();
-        pm.remove_policy_with_domain("*", "*", "model:qwen3:main", "query.status", "allow").await.unwrap();
+        pm.remove_policy_with_domain("*", "*", "model:qwen3:main", "infer.generate", "allow")
+            .await
+            .unwrap();
+        pm.remove_policy_with_domain("*", "*", "model:qwen3:main", "query.status", "allow")
+            .await
+            .unwrap();
 
         // After making private, unauthenticated users are denied again
-        assert!(!pm.check_with_domain("bob", "*", "model:qwen3:main", "infer.generate").await);
-        assert!(!pm.check_with_domain("carol", "*", "model:qwen3:main", "query.status").await);
+        assert!(
+            !pm.check_with_domain("bob", "*", "model:qwen3:main", "infer.generate")
+                .await
+        );
+        assert!(
+            !pm.check_with_domain("carol", "*", "model:qwen3:main", "query.status")
+                .await
+        );
 
         // Alice still has manage access (her rule was not removed)
-        assert!(pm.check_with_domain("alice", "*", "model:qwen3:main", "ttt.writeback").await);
+        assert!(
+            pm.check_with_domain("alice", "*", "model:qwen3:main", "ttt.writeback")
+                .await
+        );
     }
 
     /// Verify that SERVICE_BASE_POLICIES are injected on init and allow
@@ -1571,23 +1607,80 @@ mod tests {
         // The dispatch codegen now passes resource="policy:ResolveServiceKey"
         // for struct-type RPCs. Base rules use "policy:*" which keyMatch matches.
         assert!(
-            pm.check_with_domain("service:oauth", "*", "policy:ResolveServiceKey", "query").await,
+            pm.check_with_domain("service:oauth", "*", "policy:ResolveServiceKey", "query")
+                .await,
             "service:oauth should be able to query policy:ResolveServiceKey via base rules"
         );
 
+        // OAuth's public browser-provisioning route uses its own resolver to
+        // project only Registry and Model accepted-current reach.
+        for service in ["registry", "model"] {
+            assert!(
+                pm.check_with_domain(
+                    "service:oauth",
+                    "*",
+                    &format!("discovery:{service}"),
+                    "query"
+                )
+                .await,
+                "service:oauth must resolve {service} for browser provisioning"
+            );
+        }
+        assert!(
+            !pm.check_with_domain("service:oauth", "*", "discovery:policy", "query")
+                .await,
+            "browser provisioning must not grant arbitrary Discovery queries"
+        );
+
         // Other service grants from SERVICE_BASE_POLICIES
-        assert!(pm.check_with_domain("service:policy", "*", "policy:IssueToken", "manage").await);
+        assert!(
+            pm.check_with_domain("service:policy", "*", "policy:IssueToken", "manage")
+                .await
+        );
         // The OAuth token issuance path: service:oauth must be able to issue tokens via
-        // the wildcard rule (service:*,*,policy:IssueToken,manage,allow). Action must be
+        // its exact service grant. Action must be
         // "manage" (not Operation::Manage.as_str() which returns "ttt.writeback").
-        assert!(pm.check_with_domain("service:oauth", "*", "policy:IssueToken", "manage").await,
-            "service:oauth must be allowed to issue tokens (service:* wildcard rule)");
-        assert!(pm.check_with_domain("service:model", "*", "policy:Check", "check").await);
-        assert!(pm.check_with_domain("service:model", "*", "registry:ListModels", "infer").await);
-        assert!(pm.check_with_domain("service:oai", "*", "model:Generate", "infer.generate").await);
+        assert!(
+            pm.check_with_domain("service:oauth", "*", "policy:IssueToken", "manage")
+                .await,
+            "service:oauth must be allowed to issue tokens"
+        );
+        for caller in [
+            "service:discovery",
+            "service:model",
+            "service:registry",
+            "service:unknown",
+        ] {
+            assert!(
+                !pm.check_with_domain(caller, "*", "policy:IssueToken", "manage")
+                    .await,
+                "ordinary workload {caller} must not mint arbitrary credentials"
+            );
+            for resource in ["oauth:AddPubkey", "oauth:RemoveUser"] {
+                assert!(
+                    !pm.check_with_domain(caller, "*", resource, "manage").await,
+                    "ordinary workload {caller} must not administer accounts"
+                );
+            }
+        }
+        assert!(
+            pm.check_with_domain("service:model", "*", "policy:Check", "check")
+                .await
+        );
+        assert!(
+            pm.check_with_domain("service:model", "*", "registry:ListModels", "infer")
+                .await
+        );
+        assert!(
+            pm.check_with_domain("service:oai", "*", "model:Generate", "infer.generate")
+                .await
+        );
 
         // Non-granted service should be denied
-        assert!(!pm.check_with_domain("service:unknown", "*", "policy:ResolveServiceKey", "query").await);
+        assert!(
+            !pm.check_with_domain("service:unknown", "*", "policy:ResolveServiceKey", "query")
+                .await
+        );
     }
 
     /// Reproduce the exact server failure: load from the production policy.csv
@@ -1595,7 +1688,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::print_stderr)]
     async fn test_production_policy_csv_oauth_query() {
-        let prod_path = std::path::Path::new("/home/birdetta/.local/share/hyprstream/models/.registry/policies");
+        let prod_path = std::path::Path::new(
+            "/home/birdetta/.local/share/hyprstream/models/.registry/policies",
+        );
         if !prod_path.exists() {
             eprintln!("Skipping: production policy dir not found");
             return;
@@ -1605,19 +1700,34 @@ mod tests {
         let temp = TempDir::new().map_err(PolicyError::IoError).unwrap();
         let temp_policies = temp.path().join("policies");
         tokio::fs::create_dir_all(&temp_policies).await.unwrap();
-        tokio::fs::copy(prod_path.join("model.conf"), temp_policies.join("model.conf")).await.unwrap();
-        tokio::fs::copy(prod_path.join("policy.csv"), temp_policies.join("policy.csv")).await.unwrap();
+        tokio::fs::copy(
+            prod_path.join("model.conf"),
+            temp_policies.join("model.conf"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::copy(
+            prod_path.join("policy.csv"),
+            temp_policies.join("policy.csv"),
+        )
+        .await
+        .unwrap();
 
         let pm = PolicyManager::new(&temp_policies).await.unwrap();
 
         let all_policies = pm.get_policy().await;
-        eprintln!("Loaded {} policies from production CSV:", all_policies.len());
+        eprintln!(
+            "Loaded {} policies from production CSV:",
+            all_policies.len()
+        );
         for p in &all_policies {
             eprintln!("  p, {}", p.join(", "));
         }
 
         // The exact failing check from the server
-        let allowed = pm.check_with_domain("service:oauth", "*", "policy:ResolveServiceKey", "query").await;
+        let allowed = pm
+            .check_with_domain("service:oauth", "*", "policy:ResolveServiceKey", "query")
+            .await;
         eprintln!("service:oauth query policy:ResolveServiceKey = {}", allowed);
 
         // List all rules that match oauth
@@ -1627,7 +1737,10 @@ mod tests {
             }
         }
 
-        assert!(allowed, "service:oauth should be able to query policy:ResolveServiceKey");
+        assert!(
+            allowed,
+            "service:oauth should be able to query policy:ResolveServiceKey"
+        );
     }
 
     // ========================================================================
@@ -1679,7 +1792,8 @@ mod tests {
             .await
             .expect("add_policy must succeed (domain=* is the legitimate global domain)");
         assert!(
-            pm.check("alice", &model_resource("qwen3", "main"), Operation::Infer).await,
+            pm.check("alice", &model_resource("qwen3", "main"), Operation::Infer)
+                .await,
             "the rule add_policy created must take effect"
         );
     }
@@ -1699,14 +1813,26 @@ mod tests {
             .unwrap();
 
         // Each identity reaches its own namespace.
-        assert!(pm.check_with_domain("alice", "*", "user:alice:model1", "ttt.writeback").await);
-        assert!(pm.check_with_domain("bob", "*", "user:bob:model1", "ttt.writeback").await);
+        assert!(
+            pm.check_with_domain("alice", "*", "user:alice:model1", "ttt.writeback")
+                .await
+        );
+        assert!(
+            pm.check_with_domain("bob", "*", "user:bob:model1", "ttt.writeback")
+                .await
+        );
 
         // Neither identity may reach the other's namespace.
-        assert!(!pm.check_with_domain("alice", "*", "user:bob:model1", "infer.generate").await,
-            "alice must not access bob's namespace");
-        assert!(!pm.check_with_domain("bob", "*", "user:alice:model1", "ttt.writeback").await,
-            "bob must not access alice's namespace");
+        assert!(
+            !pm.check_with_domain("alice", "*", "user:bob:model1", "infer.generate")
+                .await,
+            "alice must not access bob's namespace"
+        );
+        assert!(
+            !pm.check_with_domain("bob", "*", "user:alice:model1", "ttt.writeback")
+                .await,
+            "bob must not access alice's namespace"
+        );
     }
 
     /// P1a — deny-by-default and least-privilege: an unknown subject is denied,
@@ -1719,22 +1845,42 @@ mod tests {
         let resource = model_resource("qwen3", "main");
 
         // Deny-by-default: nobody is authorized until granted.
-        assert!(!pm.check_with_domain("mallory", "*", &resource, "infer.generate").await);
+        assert!(
+            !pm.check_with_domain("mallory", "*", &resource, "infer.generate")
+                .await
+        );
 
         // Grant alice exactly infer on this model.
         pm.add_policy_with_domain("alice", "*", &resource, "infer.generate", "allow")
             .await
             .unwrap();
 
-        assert!(pm.check_with_domain("alice", "*", &resource, "infer.generate").await);
+        assert!(
+            pm.check_with_domain("alice", "*", &resource, "infer.generate")
+                .await
+        );
         // Grant does not leak to other actions...
-        assert!(!pm.check_with_domain("alice", "*", &resource, "ttt.writeback").await,
-            "infer grant must not confer manage");
+        assert!(
+            !pm.check_with_domain("alice", "*", &resource, "ttt.writeback")
+                .await,
+            "infer grant must not confer manage"
+        );
         // ...nor to other resources...
-        assert!(!pm.check_with_domain("alice", "*", &model_resource("llama", "main"), "infer.generate").await,
-            "grant on one model must not confer another");
+        assert!(
+            !pm.check_with_domain(
+                "alice",
+                "*",
+                &model_resource("llama", "main"),
+                "infer.generate"
+            )
+            .await,
+            "grant on one model must not confer another"
+        );
         // ...nor to other subjects.
-        assert!(!pm.check_with_domain("mallory", "*", &resource, "infer.generate").await);
+        assert!(
+            !pm.check_with_domain("mallory", "*", &resource, "infer.generate")
+                .await
+        );
     }
 
     /// P2a — moq subscribe-prefix isolation: a subscribe grant on one event
@@ -1745,17 +1891,37 @@ mod tests {
     async fn test_subscribe_prefix_isolation() {
         let pm = PolicyManager::new_in_memory().await.unwrap();
         // alice may subscribe under the "public" prefix only.
-        pm.add_policy_with_domain("alice", "*", &subscribe_scope("public"), "subscribe", "allow")
-            .await
-            .unwrap();
+        pm.add_policy_with_domain(
+            "alice",
+            "*",
+            &subscribe_scope("public"),
+            "subscribe",
+            "allow",
+        )
+        .await
+        .unwrap();
 
-        assert!(pm.check_with_domain("alice", "*", "subscribe:events:public.metrics", "subscribe").await,
-            "alice may subscribe within her granted prefix");
+        assert!(
+            pm.check_with_domain("alice", "*", "subscribe:events:public.metrics", "subscribe")
+                .await,
+            "alice may subscribe within her granted prefix"
+        );
         // A private prefix is NOT covered by the public-prefix grant.
-        assert!(!pm.check_with_domain("alice", "*", "subscribe:events:private.secrets", "subscribe").await,
-            "public-prefix grant must not leak to a private prefix");
+        assert!(
+            !pm.check_with_domain(
+                "alice",
+                "*",
+                "subscribe:events:private.secrets",
+                "subscribe"
+            )
+            .await,
+            "public-prefix grant must not leak to a private prefix"
+        );
         // An ungranted subject is denied entirely.
-        assert!(!pm.check_with_domain("bob", "*", "subscribe:events:public.metrics", "subscribe").await);
+        assert!(
+            !pm.check_with_domain("bob", "*", "subscribe:events:public.metrics", "subscribe")
+                .await
+        );
     }
 
     // ========================================================================
@@ -1799,6 +1965,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn cyberdione_staging_ui_template_allows_only_its_exact_origin() {
+        let pm = PolicyManager::new_in_memory().await.unwrap();
+        apply_template(&pm, "cyberdione-staging-ui").await;
+
+        let allowed =
+            federation_registration_resource("https://www.staging.lab.hyprstream.com").unwrap();
+        assert!(
+            pm.check_with_domain("service:oauth", "*", &allowed, "check")
+                .await
+        );
+
+        for denied_origin in [
+            "https://staging-amp.hyprstream.com",
+            "https://evil.www.staging.lab.hyprstream.com",
+            "https://www.staging.lab.hyprstream.com.evil.example",
+            "http://www.staging.lab.hyprstream.com",
+        ] {
+            let denied = federation_registration_resource(denied_origin).unwrap();
+            assert!(
+                !pm.check_with_domain("service:oauth", "*", &denied, "check")
+                    .await,
+                "staging policy must deny {denied_origin}"
+            );
+        }
+
+        let policies = pm.get_policy().await;
+        assert_eq!(
+            policies
+                .iter()
+                .filter(|rule| rule
+                    .get(2)
+                    .is_some_and(|resource| resource.starts_with("federation:register:")))
+                .count(),
+            1
+        );
+        assert!(policies
+            .iter()
+            .any(|rule| rule.get(2).is_some_and(|resource| resource == &allowed)));
+    }
+
     /// #319 invariant — the mesh authority actions are NEVER reachable by a
     /// wildcard (`*`) or `anonymous` subject, even when a `federation-open`-style
     /// wildcard rule AND the public-inference template are both loaded. Only a
@@ -1821,18 +2029,21 @@ mod tests {
                 "wildcard subject must NEVER match mesh authority action {action}"
             );
             assert!(
-                !pm.check_with_domain("anonymous", "acme", &job, action).await,
+                !pm.check_with_domain("anonymous", "acme", &job, action)
+                    .await,
                 "anonymous must NEVER match mesh authority action {action}"
             );
             // A non-enrolled host subject is likewise denied.
             assert!(
-                !pm.check_with_domain(&mesh_host("99"), "acme", &job, action).await,
+                !pm.check_with_domain(&mesh_host("99"), "acme", &job, action)
+                    .await,
                 "un-enrolled host must be denied mesh authority action {action}"
             );
         }
         // Positive control: an enrolled host CAN stage within its tenant.
         assert!(
-            pm.check_with_domain(&mesh_host("1"), "acme", &job, "infer.stage").await,
+            pm.check_with_domain(&mesh_host("1"), "acme", &job, "infer.stage")
+                .await,
             "enrolled host-1 must be able to infer.stage in its tenant"
         );
     }
@@ -1849,20 +2060,33 @@ mod tests {
 
         // In its own tenant: allowed.
         assert!(
-            pm.check_with_domain(&mesh_host("1"), "acme", &mesh_job("acme", "j7"), "infer.stage").await
+            pm.check_with_domain(
+                &mesh_host("1"),
+                "acme",
+                &mesh_job("acme", "j7"),
+                "infer.stage"
+            )
+            .await
         );
         // Cross-tenant (domain beta): denied for every action, even though the
         // host holds the same grant in acme.
         for action in ["infer.stage", "delta.submit", "mesh.rpc", "query.status"] {
             assert!(
-                !pm.check_with_domain(&mesh_host("1"), "beta", &mesh_job("beta", "j7"), action).await,
+                !pm.check_with_domain(&mesh_host("1"), "beta", &mesh_job("beta", "j7"), action)
+                    .await,
                 "acme-scoped host-1 must NOT reach tenant beta for {action}"
             );
         }
         // Even pointing the resource path at beta while claiming the acme domain
         // must not match the acme rule (resource prefix differs).
         assert!(
-            !pm.check_with_domain(&mesh_host("1"), "acme", &mesh_job("beta", "j7"), "infer.stage").await,
+            !pm.check_with_domain(
+                &mesh_host("1"),
+                "acme",
+                &mesh_job("beta", "j7"),
+                "infer.stage"
+            )
+            .await,
             "acme-domain rule must not match a beta resource path"
         );
     }
@@ -1879,19 +2103,22 @@ mod tests {
         let job = mesh_job("acme", "j7");
         // host-1 inherits the group read grant.
         assert!(
-            pm.check_with_domain(&mesh_host("1"), "acme", &job, "query.status").await,
+            pm.check_with_domain(&mesh_host("1"), "acme", &job, "query.status")
+                .await,
             "grouped host must inherit the read ability"
         );
         // But the group does NOT confer authority.
         for action in ["infer.stage", "delta.submit", "mesh.rpc"] {
             assert!(
-                !pm.check_with_domain(&mesh_host("1"), "acme", &job, action).await,
+                !pm.check_with_domain(&mesh_host("1"), "acme", &job, action)
+                    .await,
                 "read group must NOT confer authority action {action}"
             );
         }
         // A host NOT in the group gets nothing.
         assert!(
-            !pm.check_with_domain(&mesh_host("3"), "acme", &job, "query.status").await,
+            !pm.check_with_domain(&mesh_host("3"), "acme", &job, "query.status")
+                .await,
             "un-grouped host must not inherit the read ability"
         );
     }
@@ -1905,7 +2132,8 @@ mod tests {
         let job = mesh_job("acme", "j7");
         for action in ["infer.stage", "delta.submit", "mesh.rpc", "query.status"] {
             assert!(
-                !pm.check_with_domain(&mesh_host("1"), "acme", &job, action).await,
+                !pm.check_with_domain(&mesh_host("1"), "acme", &job, action)
+                    .await,
                 "un-granted host must be denied {action} (deny-by-default)"
             );
         }

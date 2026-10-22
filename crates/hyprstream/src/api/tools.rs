@@ -4,12 +4,12 @@
 //! is passed to the template engine). This module handles the *output* side:
 //! detecting and parsing tool calls from model responses in various formats.
 
-use serde_json::Value;
-use regex::Regex;
 use once_cell::sync::Lazy;
+use regex::Regex;
+use serde_json::Value;
 
-use super::openai_compat::{ToolCall, ToolCallFunction};
 use crate::runtime::model_config::ModelArchitecture;
+use hyprstream_rpc_std::inference_client::{ToolCall, ToolCallFunction};
 
 // =============================================================================
 // ToolCallFormat — enum-dispatched per-model parsing
@@ -42,7 +42,9 @@ impl ToolCallFormat {
             ModelArchitecture::Qwen3_5 => Self::Qwen35XmlParam,
             ModelArchitecture::Llama => Self::LlamaJson,
             ModelArchitecture::Mistral => Self::MistralJson,
-            ModelArchitecture::Gemma | ModelArchitecture::Janus | ModelArchitecture::Unknown(_) => Self::None,
+            ModelArchitecture::Gemma | ModelArchitecture::Janus | ModelArchitecture::Unknown(_) => {
+                Self::None
+            }
         }
     }
 
@@ -62,7 +64,11 @@ impl ToolCallFormat {
     /// Uses substring matching against known model family names. Falls back to `None`
     /// if the model family cannot be determined from the name.
     pub fn from_model_ref(model_ref: &str) -> Self {
-        let name = model_ref.split(':').next().unwrap_or(model_ref).to_lowercase();
+        let name = model_ref
+            .split(':')
+            .next()
+            .unwrap_or(model_ref)
+            .to_lowercase();
         if name.contains("qwen3.5") || name.contains("qwen3_5") {
             Self::Qwen35XmlParam
         } else if name.contains("qwen") {
@@ -93,7 +99,10 @@ pub fn has_tool_calls_for_format(format: ToolCallFormat, text: &str) -> bool {
 }
 
 /// Parse tool calls from model output using the given format.
-pub fn parse_tool_calls_for_format(format: ToolCallFormat, text: &str) -> Result<Vec<ToolCall>, anyhow::Error> {
+pub fn parse_tool_calls_for_format(
+    format: ToolCallFormat,
+    text: &str,
+) -> Result<Vec<ToolCall>, anyhow::Error> {
     match format {
         ToolCallFormat::Qwen3Xml => parse_qwen3_tool_calls(text),
         ToolCallFormat::Qwen35XmlParam => parse_qwen35_xml_tool_calls(text),
@@ -273,8 +282,8 @@ pub fn parse_qwen35_xml_tool_calls(text: &str) -> Result<Vec<ToolCall>, anyhow::
                 }
                 // Try to parse value as JSON first (numbers, booleans, objects,
                 // arrays).  Fall back to a plain JSON string on failure.
-                let json_val = serde_json::from_str::<Value>(&value)
-                    .unwrap_or(Value::String(value));
+                let json_val =
+                    serde_json::from_str::<Value>(&value).unwrap_or(Value::String(value));
                 args.insert(key, json_val);
             }
 
@@ -432,22 +441,58 @@ mod tests {
 
     #[test]
     fn test_format_from_architecture() {
-        assert_eq!(ToolCallFormat::from_architecture(&ModelArchitecture::Qwen), ToolCallFormat::Qwen3Xml);
-        assert_eq!(ToolCallFormat::from_architecture(&ModelArchitecture::Qwen3_5), ToolCallFormat::Qwen35XmlParam);
-        assert_eq!(ToolCallFormat::from_architecture(&ModelArchitecture::Llama), ToolCallFormat::LlamaJson);
-        assert_eq!(ToolCallFormat::from_architecture(&ModelArchitecture::Mistral), ToolCallFormat::MistralJson);
-        assert_eq!(ToolCallFormat::from_architecture(&ModelArchitecture::Gemma), ToolCallFormat::None);
+        assert_eq!(
+            ToolCallFormat::from_architecture(&ModelArchitecture::Qwen),
+            ToolCallFormat::Qwen3Xml
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture(&ModelArchitecture::Qwen3_5),
+            ToolCallFormat::Qwen35XmlParam
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture(&ModelArchitecture::Llama),
+            ToolCallFormat::LlamaJson
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture(&ModelArchitecture::Mistral),
+            ToolCallFormat::MistralJson
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture(&ModelArchitecture::Gemma),
+            ToolCallFormat::None
+        );
     }
 
     #[test]
     fn test_format_from_architecture_str() {
-        assert_eq!(ToolCallFormat::from_architecture_str("qwen"), ToolCallFormat::Qwen3Xml);
-        assert_eq!(ToolCallFormat::from_architecture_str("qwen3"), ToolCallFormat::Qwen3Xml);
-        assert_eq!(ToolCallFormat::from_architecture_str("qwen3_5"), ToolCallFormat::Qwen35XmlParam);
-        assert_eq!(ToolCallFormat::from_architecture_str("qwen3_5_moe"), ToolCallFormat::Qwen35XmlParam);
-        assert_eq!(ToolCallFormat::from_architecture_str("llama3"), ToolCallFormat::LlamaJson);
-        assert_eq!(ToolCallFormat::from_architecture_str("mistral"), ToolCallFormat::MistralJson);
-        assert_eq!(ToolCallFormat::from_architecture_str("unknown"), ToolCallFormat::None);
+        assert_eq!(
+            ToolCallFormat::from_architecture_str("qwen"),
+            ToolCallFormat::Qwen3Xml
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture_str("qwen3"),
+            ToolCallFormat::Qwen3Xml
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture_str("qwen3_5"),
+            ToolCallFormat::Qwen35XmlParam
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture_str("qwen3_5_moe"),
+            ToolCallFormat::Qwen35XmlParam
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture_str("llama3"),
+            ToolCallFormat::LlamaJson
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture_str("mistral"),
+            ToolCallFormat::MistralJson
+        );
+        assert_eq!(
+            ToolCallFormat::from_architecture_str("unknown"),
+            ToolCallFormat::None
+        );
     }
 
     // --- Qwen3 XML tests (existing, preserved) ---
@@ -622,9 +667,10 @@ def hello():
 
         let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["data"]["key"], "value");
-        assert_eq!(args["data"]["nested"], Value::Array(vec![
-            Value::from(1), Value::from(2), Value::from(3),
-        ]));
+        assert_eq!(
+            args["data"]["nested"],
+            Value::Array(vec![Value::from(1), Value::from(2), Value::from(3),])
+        );
     }
 
     #[test]
@@ -728,8 +774,12 @@ I'll have the results shortly."#;
     #[test]
     fn test_qwen35_xml_detection_distinguishes_from_qwen3() {
         // Qwen3 format (JSON inside tool_call) should NOT match the Qwen3.5 detector
-        let qwen3 = "<tool_call>\n{\"name\": \"search\", \"arguments\": {\"q\": \"hello\"}}\n</tool_call>";
-        assert!(!has_qwen35_xml_tool_calls(qwen3), "Qwen3 JSON format should not trigger Qwen3.5 detector");
+        let qwen3 =
+            "<tool_call>\n{\"name\": \"search\", \"arguments\": {\"q\": \"hello\"}}\n</tool_call>";
+        assert!(
+            !has_qwen35_xml_tool_calls(qwen3),
+            "Qwen3 JSON format should not trigger Qwen3.5 detector"
+        );
 
         // Qwen3.5 format should match
         let qwen35 = "<tool_call>\n<function=search>\n<parameter=q>hello</parameter>\n</function>\n</tool_call>";
@@ -747,10 +797,14 @@ I'll have the results shortly."#;
             </tool_call>";
 
         // 1. Detect
-        assert!(has_tool_calls_for_format(ToolCallFormat::Qwen35XmlParam, model_output));
+        assert!(has_tool_calls_for_format(
+            ToolCallFormat::Qwen35XmlParam,
+            model_output
+        ));
 
         // 2. Parse
-        let calls = parse_tool_calls_for_format(ToolCallFormat::Qwen35XmlParam, model_output).unwrap();
+        let calls =
+            parse_tool_calls_for_format(ToolCallFormat::Qwen35XmlParam, model_output).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
         assert!(calls[0].id.starts_with("call_"));
@@ -768,8 +822,14 @@ I'll have the results shortly."#;
     #[test]
     fn test_qwen35_xml_dispatch_has_tool_calls() {
         let qwen35_text = "<tool_call>\n<function=test>\n</function>\n</tool_call>";
-        assert!(has_tool_calls_for_format(ToolCallFormat::Qwen35XmlParam, qwen35_text));
-        assert!(!has_tool_calls_for_format(ToolCallFormat::None, qwen35_text));
+        assert!(has_tool_calls_for_format(
+            ToolCallFormat::Qwen35XmlParam,
+            qwen35_text
+        ));
+        assert!(!has_tool_calls_for_format(
+            ToolCallFormat::None,
+            qwen35_text
+        ));
         // Qwen3Xml also matches on <tool_call> but that's by design (format is
         // selected at request time from the model architecture, not auto-detected).
     }
@@ -801,7 +861,8 @@ I'll have the results shortly."#;
 
     #[test]
     fn test_parse_llama_tool_calls() {
-        let text = "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"London\"}}";
+        let text =
+            "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"London\"}}";
 
         let calls = parse_llama_tool_calls(text).unwrap();
         assert_eq!(calls.len(), 1);
@@ -812,8 +873,14 @@ I'll have the results shortly."#;
 
     #[test]
     fn test_llama_has_tool_calls() {
-        assert!(has_tool_calls_for_format(ToolCallFormat::LlamaJson, "text <|python_tag|>{...}"));
-        assert!(!has_tool_calls_for_format(ToolCallFormat::LlamaJson, "no tool calls here"));
+        assert!(has_tool_calls_for_format(
+            ToolCallFormat::LlamaJson,
+            "text <|python_tag|>{...}"
+        ));
+        assert!(!has_tool_calls_for_format(
+            ToolCallFormat::LlamaJson,
+            "no tool calls here"
+        ));
     }
 
     #[test]
@@ -836,8 +903,14 @@ I'll have the results shortly."#;
 
     #[test]
     fn test_mistral_has_tool_calls() {
-        assert!(has_tool_calls_for_format(ToolCallFormat::MistralJson, "[TOOL_CALLS] [...]"));
-        assert!(!has_tool_calls_for_format(ToolCallFormat::MistralJson, "no tools"));
+        assert!(has_tool_calls_for_format(
+            ToolCallFormat::MistralJson,
+            "[TOOL_CALLS] [...]"
+        ));
+        assert!(!has_tool_calls_for_format(
+            ToolCallFormat::MistralJson,
+            "no tools"
+        ));
     }
 
     #[test]
@@ -851,8 +924,14 @@ I'll have the results shortly."#;
 
     #[test]
     fn test_dispatch_has_tool_calls() {
-        assert!(has_tool_calls_for_format(ToolCallFormat::Qwen3Xml, "<tool_call>...</tool_call>"));
-        assert!(!has_tool_calls_for_format(ToolCallFormat::None, "<tool_call>...</tool_call>"));
+        assert!(has_tool_calls_for_format(
+            ToolCallFormat::Qwen3Xml,
+            "<tool_call>...</tool_call>"
+        ));
+        assert!(!has_tool_calls_for_format(
+            ToolCallFormat::None,
+            "<tool_call>...</tool_call>"
+        ));
     }
 
     // --- Tool call round-trip tests ---
@@ -863,13 +942,19 @@ I'll have the results shortly."#;
         let model_output = "I'll check the weather for you.\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"NYC\"}}\n</tool_call>";
 
         // 1. Detect tool calls
-        assert!(has_tool_calls_for_format(ToolCallFormat::Qwen3Xml, model_output));
+        assert!(has_tool_calls_for_format(
+            ToolCallFormat::Qwen3Xml,
+            model_output
+        ));
 
         // 2. Parse tool calls
         let calls = parse_tool_calls_for_format(ToolCallFormat::Qwen3Xml, model_output).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
-        assert!(calls[0].id.starts_with("call_"), "ID should be auto-generated");
+        assert!(
+            calls[0].id.starts_with("call_"),
+            "ID should be auto-generated"
+        );
         let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["location"], "NYC");
 
@@ -897,7 +982,10 @@ I'll have the results shortly."#;
         // Llama 3.1 uses <|python_tag|> format with "parameters" field
         let model_output = "<|python_tag|>\n{\"name\": \"get_weather\", \"parameters\": {\"location\": \"Tokyo\"}}";
 
-        assert!(has_tool_calls_for_format(ToolCallFormat::LlamaJson, model_output));
+        assert!(has_tool_calls_for_format(
+            ToolCallFormat::LlamaJson,
+            model_output
+        ));
 
         let calls = parse_tool_calls_for_format(ToolCallFormat::LlamaJson, model_output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -913,7 +1001,10 @@ I'll have the results shortly."#;
         // Mistral uses [TOOL_CALLS] JSON array format
         let model_output = "Let me check.\n[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"location\": \"London\"}}]";
 
-        assert!(has_tool_calls_for_format(ToolCallFormat::MistralJson, model_output));
+        assert!(has_tool_calls_for_format(
+            ToolCallFormat::MistralJson,
+            model_output
+        ));
 
         let calls = parse_tool_calls_for_format(ToolCallFormat::MistralJson, model_output).unwrap();
         assert_eq!(calls.len(), 1);
@@ -949,7 +1040,10 @@ I'll have the results shortly."#;
         // Even if the text contains tool call markers, ToolCallFormat::None should not detect them
         let text_with_markers = "Here's an example: <tool_call>{\"name\": \"test\"}</tool_call>";
 
-        assert!(!has_tool_calls_for_format(ToolCallFormat::None, text_with_markers));
+        assert!(!has_tool_calls_for_format(
+            ToolCallFormat::None,
+            text_with_markers
+        ));
 
         // parse should return empty or error
         let result = parse_tool_calls_for_format(ToolCallFormat::None, text_with_markers);
@@ -962,14 +1056,41 @@ I'll have the results shortly."#;
 
     #[test]
     fn test_from_model_ref() {
-        assert_eq!(ToolCallFormat::from_model_ref("qwen3.5-9b:main"), ToolCallFormat::Qwen35XmlParam);
-        assert_eq!(ToolCallFormat::from_model_ref("Qwen3.5-9B-FP8:main"), ToolCallFormat::Qwen35XmlParam);
-        assert_eq!(ToolCallFormat::from_model_ref("qwen3-8b:main"), ToolCallFormat::Qwen3Xml);
-        assert_eq!(ToolCallFormat::from_model_ref("qwen2.5-72b:main"), ToolCallFormat::Qwen3Xml);
-        assert_eq!(ToolCallFormat::from_model_ref("llama-3.1-8b:main"), ToolCallFormat::LlamaJson);
-        assert_eq!(ToolCallFormat::from_model_ref("mistral-7b:main"), ToolCallFormat::MistralJson);
-        assert_eq!(ToolCallFormat::from_model_ref("mixtral-8x7b:main"), ToolCallFormat::MistralJson);
-        assert_eq!(ToolCallFormat::from_model_ref("gemma-2b:main"), ToolCallFormat::None);
-        assert_eq!(ToolCallFormat::from_model_ref("unknown-model"), ToolCallFormat::None);
+        assert_eq!(
+            ToolCallFormat::from_model_ref("qwen3.5-9b:main"),
+            ToolCallFormat::Qwen35XmlParam
+        );
+        assert_eq!(
+            ToolCallFormat::from_model_ref("Qwen3.5-9B-FP8:main"),
+            ToolCallFormat::Qwen35XmlParam
+        );
+        assert_eq!(
+            ToolCallFormat::from_model_ref("qwen3-8b:main"),
+            ToolCallFormat::Qwen3Xml
+        );
+        assert_eq!(
+            ToolCallFormat::from_model_ref("qwen2.5-72b:main"),
+            ToolCallFormat::Qwen3Xml
+        );
+        assert_eq!(
+            ToolCallFormat::from_model_ref("llama-3.1-8b:main"),
+            ToolCallFormat::LlamaJson
+        );
+        assert_eq!(
+            ToolCallFormat::from_model_ref("mistral-7b:main"),
+            ToolCallFormat::MistralJson
+        );
+        assert_eq!(
+            ToolCallFormat::from_model_ref("mixtral-8x7b:main"),
+            ToolCallFormat::MistralJson
+        );
+        assert_eq!(
+            ToolCallFormat::from_model_ref("gemma-2b:main"),
+            ToolCallFormat::None
+        );
+        assert_eq!(
+            ToolCallFormat::from_model_ref("unknown-model"),
+            ToolCallFormat::None
+        );
     }
 }

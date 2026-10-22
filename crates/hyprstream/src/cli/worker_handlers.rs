@@ -8,19 +8,32 @@ use anyhow::{bail, Result};
 use std::io::{self, Write};
 use tracing::info;
 
-use crate::services::worker::{
-    ContainerConfig, ContainerFilter, ContainerStatsFilter,
-    ContainerState, ContainerStats, KeyValue, Timestamp,
-    ImageSpec, PodSandboxConfig, PodSandboxFilter,
-    PodSandboxState, PodSandboxStats,
+use hyprstream_rpc_std::worker_client::ContainerMetadata;
+use hyprstream_rpc_std::worker_client::{
+    ContainerConfig,
+    ContainerFilter,
+    ContainerState,
+    ContainerStats,
+    ContainerStatsFilter,
+    ContainerStatusRequest,
+    CreateContainerRequest,
+    ExecSyncRequest,
+    ImageFilter,
+    ImageSpec,
+    ImageStatusRequest,
+    KeyValue,
+    PodSandboxConfig,
+    PodSandboxFilter,
+    PodSandboxState,
+    PodSandboxStats,
     // Request types for scoped client calls
-    PodSandboxStatusRequest, CreateContainerRequest, StopContainerRequest,
-    ContainerStatusRequest, ExecSyncRequest,
-    ImageFilter, ImageStatusRequest, PullImageRequest,
+    PodSandboxStatusRequest,
+    PullImageRequest,
+    StopContainerRequest,
+    Timestamp,
 };
-use hyprstream_workers::runtime::ContainerMetadata;
 
-use hyprstream_workers::runtime::WorkerClient;
+use hyprstream_rpc_std::worker_client::WorkerClient;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // List Command
@@ -53,7 +66,12 @@ pub async fn handle_worker_list(
                     PodSandboxState::SandboxNotReady => "NotReady",
                 };
                 let id_short = truncate_id(&sb.id, 36);
-                println!("{:<40}{:<16}{}", id_short, state, format_timestamp(sb.created_at.clone()));
+                println!(
+                    "{:<40}{:<16}{}",
+                    id_short,
+                    state,
+                    format_timestamp(sb.created_at.clone())
+                );
             }
         } else if sandboxes_only {
             println!("No sandboxes found.");
@@ -85,12 +103,14 @@ pub async fn handle_worker_list(
                     ContainerState::ContainerUnknown => "Unknown",
                 };
                 let id_short = truncate_id(&c.id, 36);
-                let image = if c.image.image.is_empty() { "-" } else { &c.image.image };
+                let image = if c.image.image.is_empty() {
+                    "-"
+                } else {
+                    &c.image.image
+                };
                 let image_short = truncate_id(image, 30);
                 let sandbox_short = truncate_id(&c.pod_sandbox_id, 12);
-                println!(
-                    "{id_short:<40}{image_short:<32}{state:<16}{sandbox_short}"
-                );
+                println!("{id_short:<40}{image_short:<32}{state:<16}{sandbox_short}");
             }
         }
     }
@@ -125,16 +145,24 @@ pub async fn handle_worker_run(
     };
 
     // Check if image exists locally, pull if not
-    if client.image().status(&ImageStatusRequest {
-        image: image_spec.clone(),
-        verbose: false,
-    }).await.is_err() {
-        println!("Pulling image {image}...");
-        client.image().pull(&PullImageRequest {
+    if client
+        .image()
+        .status(&ImageStatusRequest {
             image: image_spec.clone(),
-            auth: Default::default(),
-            sandbox_config: PodSandboxConfig::default(),
-        }).await?;
+            verbose: false,
+        })
+        .await
+        .is_err()
+    {
+        println!("Pulling image {image}...");
+        client
+            .image()
+            .pull(&PullImageRequest {
+                image: image_spec.clone(),
+                auth: Default::default(),
+                sandbox_config: PodSandboxConfig::default(),
+            })
+            .await?;
         println!("Image pulled");
     }
 
@@ -172,7 +200,8 @@ pub async fn handle_worker_run(
 
     // 4. Create and start container
     let container_id = client
-        .container().create(&CreateContainerRequest {
+        .container()
+        .create(&CreateContainerRequest {
             pod_sandbox_id: sandbox_id.clone(),
             config: container_config,
             sandbox_config: PodSandboxConfig::default(),
@@ -188,15 +217,15 @@ pub async fn handle_worker_run(
 
         // Wait for container to exit
         loop {
-            let status = client.container().status(&ContainerStatusRequest {
-                container_id: container_id.clone(),
-                verbose: false,
-            }).await?;
+            let status = client
+                .container()
+                .status(&ContainerStatusRequest {
+                    container_id: container_id.clone(),
+                    verbose: false,
+                })
+                .await?;
             if status.status.state == ContainerState::ContainerExited {
-                println!(
-                    "Container exited with code {:?}",
-                    status.status.exit_code
-                );
+                println!("Container exited with code {:?}", status.status.exit_code);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -225,15 +254,23 @@ pub async fn handle_worker_stop(
     info!(id = %id, timeout = %timeout, force = %force, "Stopping");
 
     // Try as container first
-    if client.container().status(&ContainerStatusRequest {
-        container_id: id.to_owned(),
-        verbose: false,
-    }).await.is_ok() {
-        let actual_timeout = if force { 0 } else { timeout };
-        client.container().stop(&StopContainerRequest {
+    if client
+        .container()
+        .status(&ContainerStatusRequest {
             container_id: id.to_owned(),
-            timeout: actual_timeout,
-        }).await?;
+            verbose: false,
+        })
+        .await
+        .is_ok()
+    {
+        let actual_timeout = if force { 0 } else { timeout };
+        client
+            .container()
+            .stop(&StopContainerRequest {
+                container_id: id.to_owned(),
+                timeout: actual_timeout,
+            })
+            .await?;
         println!("{id}");
         return Ok(());
     }
@@ -269,10 +306,15 @@ pub async fn handle_worker_restart(client: &WorkerClient, id: &str, timeout: i64
     handle_worker_stop(client, id, timeout, false).await?;
 
     // For containers, we can restart
-    if client.container().status(&ContainerStatusRequest {
-        container_id: id.to_owned(),
-        verbose: false,
-    }).await.is_ok() {
+    if client
+        .container()
+        .status(&ContainerStatusRequest {
+            container_id: id.to_owned(),
+            verbose: false,
+        })
+        .await
+        .is_ok()
+    {
         client.container().start(id).await?;
     } else {
         // For sandboxes, need to recreate
@@ -288,23 +330,26 @@ pub async fn handle_worker_restart(client: &WorkerClient, id: &str, timeout: i64
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker rm` command
-pub async fn handle_worker_rm(
-    client: &WorkerClient,
-    ids: Vec<String>,
-    force: bool,
-) -> Result<()> {
+pub async fn handle_worker_rm(client: &WorkerClient, ids: Vec<String>, force: bool) -> Result<()> {
     for id in ids {
         // Try as container first
-        if let Ok(status) = client.container().status(&ContainerStatusRequest {
-            container_id: id.clone(),
-            verbose: false,
-        }).await {
+        if let Ok(status) = client
+            .container()
+            .status(&ContainerStatusRequest {
+                container_id: id.clone(),
+                verbose: false,
+            })
+            .await
+        {
             if status.status.state == ContainerState::ContainerRunning {
                 if force {
-                    client.container().stop(&StopContainerRequest {
-                        container_id: id.clone(),
-                        timeout: 0,
-                    }).await?;
+                    client
+                        .container()
+                        .stop(&StopContainerRequest {
+                            container_id: id.clone(),
+                            timeout: 0,
+                        })
+                        .await?;
                 } else {
                     bail!("Container {} is running. Use -f to force.", id);
                 }
@@ -315,10 +360,15 @@ pub async fn handle_worker_rm(
         }
 
         // Try as sandbox
-        if client.sandbox().status(&PodSandboxStatusRequest {
-            pod_sandbox_id: id.clone(),
-            verbose: false,
-        }).await.is_ok() {
+        if client
+            .sandbox()
+            .status(&PodSandboxStatusRequest {
+                pod_sandbox_id: id.clone(),
+                verbose: false,
+            })
+            .await
+            .is_ok()
+        {
             if force {
                 let _ = client.sandbox().stop(&id).await;
             }
@@ -340,14 +390,22 @@ pub async fn handle_worker_rm(
 /// Handle `worker status` command
 pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool) -> Result<()> {
     // Try as container
-    if let Ok(status) = client.container().status(&ContainerStatusRequest {
-        container_id: id.to_owned(),
-        verbose,
-    }).await {
+    if let Ok(status) = client
+        .container()
+        .status(&ContainerStatusRequest {
+            container_id: id.to_owned(),
+            verbose,
+        })
+        .await
+    {
         println!("Type: Container");
         println!("ID: {}", status.status.id);
         println!("State: {:?}", status.status.state);
-        let image_str = if status.status.image.image.is_empty() { "-" } else { &status.status.image.image };
+        let image_str = if status.status.image.image.is_empty() {
+            "-"
+        } else {
+            &status.status.image.image
+        };
         println!("Image: {image_str}");
         println!("Created: {}", format_timestamp(status.status.created_at));
         if status.status.state == ContainerState::ContainerExited {
@@ -361,10 +419,13 @@ pub async fn handle_worker_status(client: &WorkerClient, id: &str, verbose: bool
     }
 
     // Try as sandbox
-    let status = client.sandbox().status(&PodSandboxStatusRequest {
-        pod_sandbox_id: id.to_owned(),
-        verbose,
-    }).await?;
+    let status = client
+        .sandbox()
+        .status(&PodSandboxStatusRequest {
+            pod_sandbox_id: id.to_owned(),
+            verbose,
+        })
+        .await?;
     println!("Type: Sandbox");
     println!("ID: {}", status.status.id);
     println!("State: {:?}", status.status.state);
@@ -396,7 +457,10 @@ pub async fn handle_worker_stats(
 
     if ids.is_empty() {
         // Get all container stats
-        let stats = client.container().list_stats(&ContainerStatsFilter::default()).await?;
+        let stats = client
+            .container()
+            .list_stats(&ContainerStatsFilter::default())
+            .await?;
         for s in stats {
             print_container_stats(&s.attributes.id, &s);
         }
@@ -470,11 +534,14 @@ pub async fn handle_worker_exec(
         bail!("No command specified");
     }
 
-    let result = client.container().exec(&ExecSyncRequest {
-        container_id: container_id.to_owned(),
-        cmd: command,
-        timeout,
-    }).await?;
+    let result = client
+        .container()
+        .exec(&ExecSyncRequest {
+            container_id: container_id.to_owned(),
+            cmd: command,
+            timeout,
+        })
+        .await?;
 
     // Print stdout
     if !result.stdout.is_empty() {
@@ -507,19 +574,23 @@ pub async fn handle_worker_terminal(
     container_id: &str,
     detach_keys: &str,
 ) -> Result<()> {
+    use hyprstream_rpc::streaming::StreamPayload;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::signal;
-    use hyprstream_rpc::streaming::StreamPayload;
 
     info!(container_id = %container_id, "Attaching to container terminal");
 
     // Attach RPC — DH keypair, SUB socket, and HMAC verification all managed internally.
-    use hyprstream_workers::generated::worker_client::ContainerRpc;
-    let mut stream_handle = ContainerRpc::attach(&client.container(), &crate::services::worker::AttachRequest {
-        container_id: container_id.to_owned(),
-        fds: vec![],
-    }).await?;
+    use hyprstream_rpc_std::worker_client::ContainerRpc;
+    let mut stream_handle = ContainerRpc::attach(
+        &client.container(),
+        &hyprstream_rpc_std::worker_client::AttachRequest {
+            container_id: container_id.to_owned(),
+            fds: vec![],
+        },
+    )
+    .await?;
 
     println!(
         "Attached to container {}\n\
@@ -602,8 +673,8 @@ pub async fn handle_worker_terminal(
                 }
             }
         });
-        cancel_recv.cancel();  // notify server promptly on all exit paths
-        // _guard drops here, storing false into running
+        cancel_recv.cancel(); // notify server promptly on all exit paths
+                              // _guard drops here, storing false into running
     });
 
     // Read stdin (stdin streaming via StreamBuilder would be implemented here)
@@ -628,7 +699,7 @@ pub async fn handle_worker_terminal(
         }
     }
 
-    cancel.cancel();              // fires token → wakes poll_next → returns None → loop exits
+    cancel.cancel(); // fires token → wakes poll_next → returns None → loop exits
     running.store(false, Ordering::SeqCst);
     let _ = recv_handle.join();
 
@@ -652,14 +723,18 @@ fn parse_detach_keys(keys: &str) -> u8 {
     }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Image Commands
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle `worker images list` command
 pub async fn handle_images_list(client: &WorkerClient, _verbose: bool) -> Result<()> {
-    let images = client.image().list(&ImageFilter { image: ImageSpec::default() }).await?;
+    let images = client
+        .image()
+        .list(&ImageFilter {
+            image: ImageSpec::default(),
+        })
+        .await?;
 
     println!(
         "{:<48}{:<16}{:<16}{:<12}",
@@ -693,7 +768,7 @@ pub async fn handle_images_pull(
     };
 
     let auth = match (username, password) {
-        (Some(u), Some(p)) => crate::services::worker::AuthConfig {
+        (Some(u), Some(p)) => hyprstream_rpc_std::worker_client::AuthConfig {
             username: u,
             password: p,
             auth: String::new(),
@@ -704,11 +779,14 @@ pub async fn handle_images_pull(
         _ => Default::default(),
     };
 
-    let id = client.image().pull(&PullImageRequest {
-        image: image_spec,
-        auth,
-        sandbox_config: PodSandboxConfig::default(),
-    }).await?;
+    let id = client
+        .image()
+        .pull(&PullImageRequest {
+            image: image_spec,
+            auth,
+            sandbox_config: PodSandboxConfig::default(),
+        })
+        .await?;
     println!("Pulled {} ({})", image, truncate_id(&id, 12));
 
     Ok(())

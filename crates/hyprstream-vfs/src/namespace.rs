@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 
-use hyprstream_rpc::Subject;
 use crate::mac_pep::NamespaceAction;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::mac_pep::NamespacePep;
 use crate::mount::{DirEntry, Mount, MountError, Stat, OWRITE};
+use hyprstream_rpc::Subject;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -154,7 +154,12 @@ impl Namespace {
     /// Fail-closed when armed: any unresolvable clearance/label or failed
     /// `can_access` yields [`NamespaceError::Denied`].
     #[cfg(not(target_arch = "wasm32"))]
-    fn enforce(&self, subject: &Subject, path: &str, action: NamespaceAction) -> Result<(), NamespaceError> {
+    async fn enforce(
+        &self,
+        subject: &Subject,
+        path: &str,
+        action: NamespaceAction,
+    ) -> Result<(), NamespaceError> {
         let Some(pep) = &self.pep else {
             return Ok(());
         };
@@ -163,11 +168,11 @@ impl Namespace {
         // performs prefix matching against genesis/bind-label carriers; the
         // namespace supplies only the path, never a caller-authored label.
         let normalized = normalize_path(path);
-        pep.authorize(subject, &normalized, action)
+        pep.authorize(subject, &normalized, action).await
     }
 
     #[cfg(target_arch = "wasm32")]
-    const fn enforce(
+    async fn enforce(
         &self,
         _subject: &Subject,
         _path: &str,
@@ -189,13 +194,14 @@ impl Namespace {
     }
 
     /// Subject-mediated `mount` — the runtime path under an armed PEP (#1272).
-    pub fn mount_as(
+    pub async fn mount_as(
         &mut self,
         prefix: &str,
         target: MountTarget,
         subject: &Subject,
     ) -> Result<(), NamespaceError> {
-        self.enforce(subject, prefix, NamespaceAction::Mount)?;
+        self.enforce(subject, prefix, NamespaceAction::Mount)
+            .await?;
         self.bind_mount_inner(prefix, target, BindFlag::Replace)
     }
 
@@ -210,7 +216,12 @@ impl Namespace {
     ///
     /// Like [`Self::mount`], this is the **construction** path (no subject):
     /// when a PEP is armed it denies — use [`Self::bind_mount_as`].
-    pub fn bind_mount(&mut self, prefix: &str, target: MountTarget, flag: BindFlag) -> Result<(), NamespaceError> {
+    pub fn bind_mount(
+        &mut self,
+        prefix: &str,
+        target: MountTarget,
+        flag: BindFlag,
+    ) -> Result<(), NamespaceError> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(pep) = &self.pep {
             // An armed namespace cannot mutate without a proven subject — the
@@ -224,40 +235,58 @@ impl Namespace {
     }
 
     /// Subject-mediated `bind_mount` — the runtime path under an armed PEP.
-    pub fn bind_mount_as(
+    pub async fn bind_mount_as(
         &mut self,
         prefix: &str,
         target: MountTarget,
         flag: BindFlag,
         subject: &Subject,
     ) -> Result<(), NamespaceError> {
-        self.enforce(subject, prefix, NamespaceAction::BindMount)?;
+        self.enforce(subject, prefix, NamespaceAction::BindMount)
+            .await?;
         self.bind_mount_inner(prefix, target, flag)
     }
 
     // Core bind logic shared by the construction and mediated paths. Assumes
     // the caller has already passed any armed PEP (or is the construction path
     // on an un-armed namespace).
-    fn bind_mount_inner(&mut self, prefix: &str, target: MountTarget, flag: BindFlag) -> Result<(), NamespaceError> {
+    fn bind_mount_inner(
+        &mut self,
+        prefix: &str,
+        target: MountTarget,
+        flag: BindFlag,
+    ) -> Result<(), NamespaceError> {
         let prefix = normalize_prefix(prefix);
 
         match flag {
             BindFlag::Replace => {
                 self.mounts.retain(|m| m.prefix != prefix);
-                self.mounts.push(MountEntry { prefix, targets: vec![target], upper: None });
+                self.mounts.push(MountEntry {
+                    prefix,
+                    targets: vec![target],
+                    upper: None,
+                });
             }
             BindFlag::Before => {
                 if let Some(entry) = self.mounts.iter_mut().find(|m| m.prefix == prefix) {
                     entry.targets.insert(0, target);
                 } else {
-                    self.mounts.push(MountEntry { prefix, targets: vec![target], upper: None });
+                    self.mounts.push(MountEntry {
+                        prefix,
+                        targets: vec![target],
+                        upper: None,
+                    });
                 }
             }
             BindFlag::After => {
                 if let Some(entry) = self.mounts.iter_mut().find(|m| m.prefix == prefix) {
                     entry.targets.push(target);
                 } else {
-                    self.mounts.push(MountEntry { prefix, targets: vec![target], upper: None });
+                    self.mounts.push(MountEntry {
+                        prefix,
+                        targets: vec![target],
+                        upper: None,
+                    });
                 }
             }
             BindFlag::Upper => {
@@ -280,7 +309,8 @@ impl Namespace {
             }
         }
         // Sort by prefix length descending for longest-prefix match.
-        self.mounts.sort_by_key(|b| std::cmp::Reverse(b.prefix.len()));
+        self.mounts
+            .sort_by_key(|b| std::cmp::Reverse(b.prefix.len()));
         Ok(())
     }
 
@@ -300,8 +330,13 @@ impl Namespace {
     }
 
     /// Subject-mediated `unmount` — the runtime path under an armed PEP.
-    pub fn unmount_as(&mut self, prefix: &str, subject: &Subject) -> Result<(), NamespaceError> {
-        self.enforce(subject, prefix, NamespaceAction::Unmount)?;
+    pub async fn unmount_as(
+        &mut self,
+        prefix: &str,
+        subject: &Subject,
+    ) -> Result<(), NamespaceError> {
+        self.enforce(subject, prefix, NamespaceAction::Unmount)
+            .await?;
         let prefix = normalize_prefix(prefix);
         self.mounts.retain(|m| m.prefix != prefix);
         Ok(())
@@ -317,11 +352,15 @@ impl Namespace {
         Namespace {
             #[cfg(not(target_arch = "wasm32"))]
             pep: self.pep.clone(),
-            mounts: self.mounts.iter().map(|m| MountEntry {
-                prefix: m.prefix.clone(),
-                targets: m.targets.iter().map(Arc::clone).collect(),
-                upper: m.upper.as_ref().map(Arc::clone),
-            }).collect(),
+            mounts: self
+                .mounts
+                .iter()
+                .map(|m| MountEntry {
+                    prefix: m.prefix.clone(),
+                    targets: m.targets.iter().map(Arc::clone).collect(),
+                    upper: m.upper.as_ref().map(Arc::clone),
+                })
+                .collect(),
         }
     }
 
@@ -353,7 +392,7 @@ impl Namespace {
     /// Loops reads until an empty Vec is returned, up to 16MB cap.
     /// With union mounts, tries each target in bind order until one succeeds.
     pub async fn cat(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Read)?;
+        self.enforce(caller, path, NamespaceAction::Read).await?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
@@ -370,20 +409,30 @@ impl Namespace {
                         Ok(chunk) if chunk.is_empty() => break,
                         Ok(chunk) => {
                             data.extend_from_slice(&chunk);
-                            if data.len() >= MAX_READ_SIZE { break; }
+                            if data.len() >= MAX_READ_SIZE {
+                                break;
+                            }
                         }
-                        Err(e) => { mount.clunk(fid, caller).await; return Err(e); }
+                        Err(e) => {
+                            mount.clunk(fid, caller).await;
+                            return Err(e);
+                        }
                     }
                 }
                 mount.clunk(fid, caller).await;
                 Ok(data)
-            }.await;
+            }
+            .await;
             match result {
                 Ok(data) => return Ok(data),
-                Err(e) => { last_err = Some(e); }
+                Err(e) => {
+                    last_err = Some(e);
+                }
             }
         }
-        Err(NamespaceError::Mount(last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned()))))
+        Err(NamespaceError::Mount(
+            last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned())),
+        ))
     }
 
     /// Read a single block from a file (for streams). Walk + open + read(once) + clunk.
@@ -391,7 +440,7 @@ impl Namespace {
     /// Unlike `cat()` which loops to EOF, this returns after one read call.
     /// For streams, this returns the next available block. Empty bytes = EOF.
     pub async fn read_one(&self, path: &str, caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Read)?;
+        self.enforce(caller, path, NamespaceAction::Read).await?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
@@ -405,13 +454,18 @@ impl Namespace {
                 let chunk = mount.read(&fid, 0, 64 * 1024, caller).await;
                 mount.clunk(fid, caller).await;
                 chunk
-            }.await;
+            }
+            .await;
             match result {
                 Ok(data) => return Ok(data),
-                Err(e) => { last_err = Some(e); }
+                Err(e) => {
+                    last_err = Some(e);
+                }
             }
         }
-        Err(NamespaceError::Mount(last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned()))))
+        Err(NamespaceError::Mount(
+            last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned())),
+        ))
     }
 
     /// Write data to a file. Walk + open(write) + write + clunk.
@@ -430,8 +484,13 @@ impl Namespace {
     /// This is the overlayfs copy-up primitive lifted into the namespace: a
     /// write to a path that resolves through the union dirty-over-committed
     /// tree lands in the upper layer, leaving the committed floor untouched.
-    pub async fn echo(&self, path: &str, data: &[u8], caller: &Subject) -> Result<(), NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Write)?;
+    pub async fn echo(
+        &self,
+        path: &str,
+        data: &[u8],
+        caller: &Subject,
+    ) -> Result<(), NamespaceError> {
+        self.enforce(caller, path, NamespaceAction::Write).await?;
         let (entry, remainder) = self.resolve_entry(path)?;
         let targets = &entry.targets[..];
         let components: Vec<&str> = split_path(&remainder);
@@ -448,7 +507,8 @@ impl Namespace {
                 mount.write(&fid, 0, data, caller).await?;
                 mount.clunk(fid, caller).await;
                 Ok(())
-            }.await;
+            }
+            .await;
             match result {
                 Ok(()) => return Ok(()),
                 Err(MountError::NotSupported(_)) => {
@@ -457,18 +517,25 @@ impl Namespace {
                     // to the next target.
                     last_err = Some(MountError::NotSupported(path.to_owned()));
                 }
-                Err(e) => { last_err = Some(e); }
+                Err(e) => {
+                    last_err = Some(e);
+                }
             }
         }
 
         // Pass 2: copy-up. If no writable target held the file, check whether a
         // lower layer has it; if so, stage it into the designated (or first
         // writable) upper target before writing the new data.
-        if let Some(copied) = self.copy_up(targets, entry.upper.as_ref(), &components, data, caller).await? {
+        if let Some(copied) = self
+            .copy_up(targets, entry.upper.as_ref(), &components, data, caller)
+            .await?
+        {
             return Ok(copied);
         }
 
-        Err(NamespaceError::Mount(last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned()))))
+        Err(NamespaceError::Mount(
+            last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned())),
+        ))
     }
 
     /// Create a file or directory at `path` in the first writable target.
@@ -487,7 +554,7 @@ impl Namespace {
         perm: u32,
         caller: &Subject,
     ) -> Result<Stat, NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Create)?;
+        self.enforce(caller, path, NamespaceAction::Create).await?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         if components.is_empty() {
@@ -507,19 +574,26 @@ impl Namespace {
                     mount.clunk(dir_fid, caller).await;
                     return Err(e);
                 }
-                let stat = mount.create(&mut dir_fid, name, perm, OWRITE, caller).await?;
+                let stat = mount
+                    .create(&mut dir_fid, name, perm, OWRITE, caller)
+                    .await?;
                 mount.clunk(dir_fid, caller).await;
                 Ok(stat)
-            }.await;
+            }
+            .await;
             match result {
                 Ok(stat) => return Ok(stat),
                 Err(MountError::NotSupported(_)) => {
                     last_err = Some(MountError::NotSupported(path.to_owned()));
                 }
-                Err(e) => { last_err = Some(e); }
+                Err(e) => {
+                    last_err = Some(e);
+                }
             }
         }
-        Err(NamespaceError::Mount(last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned()))))
+        Err(NamespaceError::Mount(
+            last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned())),
+        ))
     }
 
     /// Copy-up: if `components` exists in a read-only lower layer but not in
@@ -578,20 +652,28 @@ impl Namespace {
                         Ok(chunk) if chunk.is_empty() => break,
                         Ok(chunk) => {
                             data.extend_from_slice(&chunk);
-                            if data.len() >= MAX_READ_SIZE { break; }
+                            if data.len() >= MAX_READ_SIZE {
+                                break;
+                            }
                         }
-                        Err(e) => { mount.clunk(fid, caller).await; return Err(e); }
+                        Err(e) => {
+                            mount.clunk(fid, caller).await;
+                            return Err(e);
+                        }
                     }
                 }
                 mount.clunk(fid, caller).await;
                 Ok(data)
-            }.await;
+            }
+            .await;
             if let Ok(data) = result {
                 lower_bytes = Some(data);
                 break;
             }
         }
-        let Some(_lower) = lower_bytes else { return Ok(None); };
+        let Some(_lower) = lower_bytes else {
+            return Ok(None);
+        };
 
         // Stage into the upper target. We only reach copy-up when the direct
         // open(OWRITE) pass failed on every target, so the upper target must
@@ -661,8 +743,13 @@ impl Namespace {
     /// the same fid so the response buffer is available after the write.
     /// Loops reads until an empty Vec is returned, up to 16MB cap.
     /// With union mounts, tries each target in bind order until one succeeds.
-    pub async fn ctl(&self, path: &str, data: &[u8], caller: &Subject) -> Result<Vec<u8>, NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Write)?;
+    pub async fn ctl(
+        &self,
+        path: &str,
+        data: &[u8],
+        caller: &Subject,
+    ) -> Result<Vec<u8>, NamespaceError> {
+        self.enforce(caller, path, NamespaceAction::Write).await?;
         let (targets, remainder) = self.resolve(path)?;
         let components: Vec<&str> = split_path(&remainder);
         let mut last_err = None;
@@ -683,20 +770,30 @@ impl Namespace {
                         Ok(chunk) if chunk.is_empty() => break,
                         Ok(chunk) => {
                             resp.extend_from_slice(&chunk);
-                            if resp.len() >= MAX_READ_SIZE { break; }
+                            if resp.len() >= MAX_READ_SIZE {
+                                break;
+                            }
                         }
-                        Err(e) => { mount.clunk(fid, caller).await; return Err(e); }
+                        Err(e) => {
+                            mount.clunk(fid, caller).await;
+                            return Err(e);
+                        }
                     }
                 }
                 mount.clunk(fid, caller).await;
                 Ok(resp)
-            }.await;
+            }
+            .await;
             match result {
                 Ok(resp) => return Ok(resp),
-                Err(e) => { last_err = Some(e); }
+                Err(e) => {
+                    last_err = Some(e);
+                }
             }
         }
-        Err(NamespaceError::Mount(last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned()))))
+        Err(NamespaceError::Mount(
+            last_err.unwrap_or_else(|| MountError::NotFound(path.to_owned())),
+        ))
     }
 
     /// List directory entries. Walk + open(read) + readdir + clunk.
@@ -704,7 +801,7 @@ impl Namespace {
     /// With union mounts, merges readdir results from all targets at the prefix,
     /// deduplicating by name (first occurrence wins, preserving bind order).
     pub async fn ls(&self, path: &str, caller: &Subject) -> Result<Vec<DirEntry>, NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::Read)?;
+        self.enforce(caller, path, NamespaceAction::Read).await?;
         // Special case: ls "/" shows all mount prefixes as directories.
         if path == "/" || path.is_empty() {
             return Ok(self.root_dir_entries());
@@ -786,14 +883,53 @@ impl Namespace {
     ///
     /// `path` is normalised (`.`/`..` resolved, leading `/` enforced) before the
     /// longest-prefix match, identical to the convenience helpers.
-    pub fn resolve_targets(
+    ///
+    /// Async because an armed PEP revalidates credential-bearing cached
+    /// subject authority against the canonical revocation authority on every
+    /// call. The sync FUSE/vhost-user plane cannot await and uses
+    /// [`Self::resolve_targets_dormant`] instead.
+    pub async fn resolve_targets(
         &self,
         path: &str,
         caller: &Subject,
     ) -> Result<(Vec<MountTarget>, Vec<String>), NamespaceError> {
-        self.enforce(caller, path, NamespaceAction::ResolveHandle)?;
+        self.enforce(caller, path, NamespaceAction::ResolveHandle)
+            .await?;
+        self.route_targets(path)
+    }
+
+    /// Sync routing entry point for planes that serve only dormant (PEP-less)
+    /// namespaces from sync callbacks — the FUSE/vhost-user-fs session loop
+    /// (`hyprstream-vfs-server` over fuse-backend-rs) has no async frame per
+    /// operation, and the authorization revalidation requires an authority
+    /// RPC. An ARMED namespace therefore fails closed on every route through
+    /// this entry point: a plane that cannot revalidate cached authority
+    /// serves nothing rather than serving stale authority.
+    pub fn resolve_targets_dormant(
+        &self,
+        path: &str,
+        caller: &Subject,
+    ) -> Result<(Vec<MountTarget>, Vec<String>), NamespaceError> {
+        if self.pep_armed() {
+            return Err(NamespaceError::Denied(
+                NamespaceAction::ResolveHandle,
+                format!(
+                    "'{}': sync plane cannot revalidate subject authority",
+                    caller.name().unwrap_or("<anonymous>")
+                ),
+            ));
+        }
+        self.route_targets(path)
+    }
+
+    /// Longest-prefix routing shared by the enforcing and dormant entry
+    /// points.
+    fn route_targets(&self, path: &str) -> Result<(Vec<MountTarget>, Vec<String>), NamespaceError> {
         let (targets, remainder) = self.resolve(path)?;
-        let components = split_path(&remainder).into_iter().map(str::to_owned).collect();
+        let components = split_path(&remainder)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         Ok((targets.to_vec(), components))
     }
 
@@ -838,7 +974,8 @@ impl Namespace {
     ///
     /// Returns targets in bind order (Before targets first, After targets last).
     fn resolve(&self, path: &str) -> Result<(&[MountTarget], String), NamespaceError> {
-        self.resolve_entry(path).map(|(entry, remainder)| (&entry.targets[..], remainder))
+        self.resolve_entry(path)
+            .map(|(entry, remainder)| (&entry.targets[..], remainder))
     }
 
     /// Resolve a path to its owning `MountEntry` (which carries the designated
@@ -869,7 +1006,9 @@ impl Namespace {
         let mut entries = Vec::new();
         for m in &self.mounts {
             // Extract the first path component after '/'.
-            let first = m.prefix.trim_start_matches('/')
+            let first = m
+                .prefix
+                .trim_start_matches('/')
                 .split('/')
                 .next()
                 .unwrap_or("");
@@ -887,7 +1026,9 @@ impl Namespace {
 }
 
 impl Default for Namespace {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -895,19 +1036,33 @@ impl Default for Namespace {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn normalize_prefix(prefix: &str) -> String {
-    let p = if prefix.starts_with('/') { prefix.to_owned() } else { format!("/{prefix}") };
+    let p = if prefix.starts_with('/') {
+        prefix.to_owned()
+    } else {
+        format!("/{prefix}")
+    };
     // Remove trailing slash.
-    if p.len() > 1 && p.ends_with('/') { p[..p.len() - 1].to_owned() } else { p }
+    if p.len() > 1 && p.ends_with('/') {
+        p[..p.len() - 1].to_owned()
+    } else {
+        p
+    }
 }
 
 /// Normalize a path: ensure leading `/`, resolve `.` and `..` components, remove trailing `/`.
 fn normalize_path(path: &str) -> String {
-    let path = if path.starts_with('/') { path.to_owned() } else { format!("/{path}") };
+    let path = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
     let mut parts: Vec<&str> = Vec::new();
     for seg in path.split('/') {
         match seg {
             "" | "." => {}
-            ".." => { parts.pop(); }
+            ".." => {
+                parts.pop();
+            }
             s => parts.push(s),
         }
     }
@@ -932,7 +1087,7 @@ fn split_path(path: &str) -> Vec<&str> {
 #[allow(clippy::unwrap_used, clippy::disallowed_types)]
 mod tests {
     use super::*;
-    use crate::mount::{Fid, Stat, MountError};
+    use crate::mount::{Fid, MountError, Stat};
     use async_trait::async_trait;
     use std::collections::HashMap;
 
@@ -944,7 +1099,10 @@ mod tests {
     impl MemMount {
         fn new(files: Vec<(&str, &[u8])>) -> Self {
             Self {
-                files: files.into_iter().map(|(k, v)| (k.to_owned(), v.to_vec())).collect(),
+                files: files
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_vec()))
+                    .collect(),
             }
         }
     }
@@ -958,17 +1116,35 @@ mod tests {
     impl Mount for MemMount {
         async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             let path = components.join("/");
-            Ok(Fid::new(MemFid { path, is_open: false }))
+            Ok(Fid::new(MemFid {
+                path,
+                is_open: false,
+            }))
         }
 
-        async fn open(&self, fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> {
-            let inner = fid.downcast_mut::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        async fn open(
+            &self,
+            fid: &mut Fid,
+            _mode: u8,
+            _caller: &Subject,
+        ) -> Result<(), MountError> {
+            let inner = fid
+                .downcast_mut::<MemFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             inner.is_open = true;
             Ok(())
         }
 
-        async fn read(&self, fid: &Fid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        async fn read(
+            &self,
+            fid: &Fid,
+            offset: u64,
+            _count: u32,
+            _caller: &Subject,
+        ) -> Result<Vec<u8>, MountError> {
+            let inner = fid
+                .downcast_ref::<MemFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             match self.files.get(&inner.path) {
                 Some(data) => {
                     let start = offset as usize;
@@ -982,18 +1158,35 @@ mod tests {
             }
         }
 
-        async fn write(&self, _fid: &Fid, _offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
+        async fn write(
+            &self,
+            _fid: &Fid,
+            _offset: u64,
+            data: &[u8],
+            _caller: &Subject,
+        ) -> Result<u32, MountError> {
             Ok(data.len() as u32)
         }
 
         async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
-            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            let prefix = if inner.path.is_empty() { String::new() } else { format!("{}/", inner.path) };
+            let inner = fid
+                .downcast_ref::<MemFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let prefix = if inner.path.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", inner.path)
+            };
             let mut entries = Vec::new();
             for key in self.files.keys() {
                 if let Some(rest) = key.strip_prefix(&prefix) {
                     if !rest.contains('/') {
-                        entries.push(DirEntry { name: rest.to_owned(), is_dir: false, size: 0, stat: None });
+                        entries.push(DirEntry {
+                            name: rest.to_owned(),
+                            is_dir: false,
+                            size: 0,
+                            stat: None,
+                        });
                     }
                 }
             }
@@ -1001,14 +1194,18 @@ mod tests {
         }
 
         async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-            let inner = fid.downcast_ref::<MemFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<MemFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
         }
 
         async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
     }
 
-    fn test_subject() -> Subject { Subject::new("test") }
+    fn test_subject() -> Subject {
+        Subject::new("test")
+    }
 
     #[tokio::test]
     async fn mount_and_cat() {
@@ -1016,16 +1213,22 @@ mod tests {
         let mount: MountTarget = Arc::new(MemMount::new(vec![("temperature", b"0.7\n")]));
         ns.mount("/config", mount).unwrap();
 
-        let data = ns.cat("/config/temperature", &test_subject()).await.unwrap();
+        let data = ns
+            .cat("/config/temperature", &test_subject())
+            .await
+            .unwrap();
         assert_eq!(data, b"0.7\n");
     }
 
     #[tokio::test]
     async fn mount_and_ls_root() {
         let mut ns = Namespace::new();
-        ns.mount("/srv/model", Arc::new(MemMount::new(vec![])) as MountTarget).unwrap();
-        ns.mount("/srv/mcp", Arc::new(MemMount::new(vec![])) as MountTarget).unwrap();
-        ns.mount("/config", Arc::new(MemMount::new(vec![])) as MountTarget).unwrap();
+        ns.mount("/srv/model", Arc::new(MemMount::new(vec![])) as MountTarget)
+            .unwrap();
+        ns.mount("/srv/mcp", Arc::new(MemMount::new(vec![])) as MountTarget)
+            .unwrap();
+        ns.mount("/config", Arc::new(MemMount::new(vec![])) as MountTarget)
+            .unwrap();
 
         let entries = ns.ls("/", &test_subject()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -1055,8 +1258,16 @@ mod tests {
     #[tokio::test]
     async fn fork_and_unmount() {
         let mut ns = Namespace::new();
-        ns.mount("/srv/model", Arc::new(MemMount::new(vec![("status", b"loaded")])) as MountTarget).unwrap();
-        ns.mount("/srv/worker", Arc::new(MemMount::new(vec![])) as MountTarget).unwrap();
+        ns.mount(
+            "/srv/model",
+            Arc::new(MemMount::new(vec![("status", b"loaded")])) as MountTarget,
+        )
+        .unwrap();
+        ns.mount(
+            "/srv/worker",
+            Arc::new(MemMount::new(vec![])) as MountTarget,
+        )
+        .unwrap();
 
         let mut child = ns.fork();
         let _ = child.unmount("/srv/worker");
@@ -1065,7 +1276,10 @@ mod tests {
         assert_eq!(child.mount_prefixes().len(), 1);
         assert_eq!(child.mount_prefixes()[0], "/srv/model");
 
-        let data = child.cat("/srv/model/status", &test_subject()).await.unwrap();
+        let data = child
+            .cat("/srv/model/status", &test_subject())
+            .await
+            .unwrap();
         assert_eq!(data, b"loaded");
     }
 
@@ -1080,17 +1294,26 @@ mod tests {
         ns.mount("/stream", stream).unwrap();
 
         // Deep rootfs path resolves through "/".
-        assert_eq!(ns.cat("/etc/hostname", &test_subject()).await.unwrap(), b"host\n");
+        assert_eq!(
+            ns.cat("/etc/hostname", &test_subject()).await.unwrap(),
+            b"host\n"
+        );
         // A longer prefix still wins over the root catch-all.
-        assert_eq!(ns.cat("/stream/job/data", &test_subject()).await.unwrap(), b"chunk");
+        assert_eq!(
+            ns.cat("/stream/job/data", &test_subject()).await.unwrap(),
+            b"chunk"
+        );
         // The rootfs itself is reachable at "/".
-        assert!(ns.resolve_targets("/", &test_subject()).is_ok());
+        assert!(ns.resolve_targets("/", &test_subject()).await.is_ok());
     }
 
     #[tokio::test]
     async fn not_found() {
         let ns = Namespace::new();
-        assert!(matches!(ns.cat("/nonexistent/file", &test_subject()).await, Err(NamespaceError::Mount(MountError::NotFound(_)))));
+        assert!(matches!(
+            ns.cat("/nonexistent/file", &test_subject()).await,
+            Err(NamespaceError::Mount(MountError::NotFound(_)))
+        ));
     }
 
     #[tokio::test]
@@ -1099,7 +1322,10 @@ mod tests {
         let mount: MountTarget = Arc::new(MemMount::new(vec![("ctl", b"")]));
         ns.mount("/cmd", mount).unwrap();
 
-        assert!(ns.echo("/cmd/ctl", b"load qwen3:main", &test_subject()).await.is_ok());
+        assert!(ns
+            .echo("/cmd/ctl", b"load qwen3:main", &test_subject())
+            .await
+            .is_ok());
     }
 
     // ── New tests ──────────────────────────────────────────────────────────
@@ -1111,30 +1337,71 @@ mod tests {
         let big_data = vec![0x42u8; 100 * 1024]; // 100 KB
         let mut ns = Namespace::new();
 
-        struct ChunkedMount { data: Vec<u8> }
-        struct ChunkedFid { _offset_limit: bool }
+        struct ChunkedMount {
+            data: Vec<u8>,
+        }
+        struct ChunkedFid {
+            _offset_limit: bool,
+        }
 
         #[async_trait]
         impl Mount for ChunkedMount {
             async fn walk(&self, _c: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
-                Ok(Fid::new(ChunkedFid { _offset_limit: false }))
+                Ok(Fid::new(ChunkedFid {
+                    _offset_limit: false,
+                }))
             }
-            async fn open(&self, _fid: &mut Fid, _mode: u8, _caller: &Subject) -> Result<(), MountError> { Ok(()) }
-            async fn read(&self, _fid: &Fid, offset: u64, count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
+            async fn open(
+                &self,
+                _fid: &mut Fid,
+                _mode: u8,
+                _caller: &Subject,
+            ) -> Result<(), MountError> {
+                Ok(())
+            }
+            async fn read(
+                &self,
+                _fid: &Fid,
+                offset: u64,
+                count: u32,
+                _caller: &Subject,
+            ) -> Result<Vec<u8>, MountError> {
                 let start = offset as usize;
-                if start >= self.data.len() { return Ok(vec![]); }
+                if start >= self.data.len() {
+                    return Ok(vec![]);
+                }
                 let end = std::cmp::min(start + count as usize, self.data.len());
                 Ok(self.data[start..end].to_vec())
             }
-            async fn write(&self, _fid: &Fid, _o: u64, d: &[u8], _c: &Subject) -> Result<u32, MountError> { Ok(d.len() as u32) }
-            async fn readdir(&self, _fid: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> { Ok(vec![]) }
-            async fn stat(&self, _fid: &Fid, _c: &Subject) -> Result<crate::mount::Stat, MountError> {
+            async fn write(
+                &self,
+                _fid: &Fid,
+                _o: u64,
+                d: &[u8],
+                _c: &Subject,
+            ) -> Result<u32, MountError> {
+                Ok(d.len() as u32)
+            }
+            async fn readdir(&self, _fid: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> {
+                Ok(vec![])
+            }
+            async fn stat(
+                &self,
+                _fid: &Fid,
+                _c: &Subject,
+            ) -> Result<crate::mount::Stat, MountError> {
                 Ok(crate::mount::Stat::unknown_qid(0, 0, String::new(), 0))
             }
             async fn clunk(&self, _fid: Fid, _c: &Subject) {}
         }
 
-        ns.mount("/big", Arc::new(ChunkedMount { data: big_data.clone() }) as MountTarget).unwrap();
+        ns.mount(
+            "/big",
+            Arc::new(ChunkedMount {
+                data: big_data.clone(),
+            }) as MountTarget,
+        )
+        .unwrap();
         let result = ns.cat("/big/file", &test_subject()).await.unwrap();
         assert_eq!(result.len(), 100 * 1024);
         assert_eq!(result, big_data);
@@ -1143,7 +1410,7 @@ mod tests {
     /// OTRUNC mode pass-through.
     #[test]
     fn otrunc_mode_passthrough() {
-        use crate::mount::{OWRITE, OTRUNC};
+        use crate::mount::{OTRUNC, OWRITE};
         // Verify the constants combine correctly.
         let mode = OWRITE | OTRUNC;
         assert_eq!(mode & 0x03, OWRITE);
@@ -1164,10 +1431,17 @@ mod tests {
     #[tokio::test]
     async fn resolve_with_dotdot_path() {
         let mut ns = Namespace::new();
-        ns.mount("/srv/model", Arc::new(MemMount::new(vec![("status", b"ok")])) as MountTarget).unwrap();
+        ns.mount(
+            "/srv/model",
+            Arc::new(MemMount::new(vec![("status", b"ok")])) as MountTarget,
+        )
+        .unwrap();
 
         // /config/../srv/model/status should normalize to /srv/model/status
-        let data = ns.cat("/config/../srv/model/status", &test_subject()).await.unwrap();
+        let data = ns
+            .cat("/config/../srv/model/status", &test_subject())
+            .await
+            .unwrap();
         assert_eq!(data, b"ok");
     }
 
@@ -1316,9 +1590,12 @@ mod tests {
     #[tokio::test]
     async fn ls_intermediate_multiple_children() {
         let mut ns = Namespace::new();
-        ns.mount("/a/b", Arc::new(MemMount::new(vec![("x", b"")]))).unwrap();
-        ns.mount("/a/c", Arc::new(MemMount::new(vec![("y", b"")]))).unwrap();
-        ns.mount("/a/d/e", Arc::new(MemMount::new(vec![("z", b"")]))).unwrap();
+        ns.mount("/a/b", Arc::new(MemMount::new(vec![("x", b"")])))
+            .unwrap();
+        ns.mount("/a/c", Arc::new(MemMount::new(vec![("y", b"")])))
+            .unwrap();
+        ns.mount("/a/d/e", Arc::new(MemMount::new(vec![("z", b"")])))
+            .unwrap();
 
         let entries = ns.ls("/a", &test_subject()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -1343,11 +1620,18 @@ mod tests {
 
     impl ReadOnlyMemMount {
         fn new(files: Vec<(&str, &[u8])>) -> Self {
-            Self { files: files.into_iter().map(|(k, v)| (k.to_owned(), v.to_vec())).collect() }
+            Self {
+                files: files
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_vec()))
+                    .collect(),
+            }
         }
     }
 
-    struct RoFid { path: String }
+    struct RoFid {
+        path: String,
+    }
 
     #[async_trait]
     impl Mount for ReadOnlyMemMount {
@@ -1360,25 +1644,49 @@ mod tests {
             if base_mode == OWRITE {
                 return Err(MountError::PermissionDenied("read-only floor".into()));
             }
-            let _ = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let _ = fid
+                .downcast_ref::<RoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(())
         }
-        async fn read(&self, fid: &Fid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-            let inner = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        async fn read(
+            &self,
+            fid: &Fid,
+            offset: u64,
+            _count: u32,
+            _caller: &Subject,
+        ) -> Result<Vec<u8>, MountError> {
+            let inner = fid
+                .downcast_ref::<RoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             match self.files.get(&inner.path) {
                 Some(data) => {
                     let start = offset as usize;
-                    if start >= data.len() { Ok(vec![]) } else { Ok(data[start..].to_vec()) }
+                    if start >= data.len() {
+                        Ok(vec![])
+                    } else {
+                        Ok(data[start..].to_vec())
+                    }
                 }
                 None => Err(MountError::NotFound(inner.path.clone())),
             }
         }
-        async fn write(&self, _fid: &Fid, _o: u64, _d: &[u8], _c: &Subject) -> Result<u32, MountError> {
+        async fn write(
+            &self,
+            _fid: &Fid,
+            _o: u64,
+            _d: &[u8],
+            _c: &Subject,
+        ) -> Result<u32, MountError> {
             Err(MountError::PermissionDenied("read-only floor".into()))
         }
-        async fn readdir(&self, _fid: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> { Ok(vec![]) }
+        async fn readdir(&self, _fid: &Fid, _c: &Subject) -> Result<Vec<DirEntry>, MountError> {
+            Ok(vec![])
+        }
         async fn stat(&self, fid: &Fid, _c: &Subject) -> Result<Stat, MountError> {
-            let inner = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<RoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
         }
         async fn clunk(&self, _fid: Fid, _c: &Subject) {}
@@ -1394,7 +1702,9 @@ mod tests {
 
     impl WritableMemMount {
         fn empty() -> Self {
-            Self { files: std::sync::Mutex::new(HashMap::new()) }
+            Self {
+                files: std::sync::Mutex::new(HashMap::new()),
+            }
         }
 
         fn snapshot(&self) -> HashMap<String, Vec<u8>> {
@@ -1412,11 +1722,17 @@ mod tests {
     impl Mount for WritableMemMount {
         async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
             let path = components.join("/");
-            Ok(Fid::new(WritableFid { path, is_open: false, mode: 0 }))
+            Ok(Fid::new(WritableFid {
+                path,
+                is_open: false,
+                mode: 0,
+            }))
         }
 
         async fn open(&self, fid: &mut Fid, mode: u8, _caller: &Subject) -> Result<(), MountError> {
-            let inner = fid.downcast_mut::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_mut::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let base_mode = mode & 0x03;
             // The root directory (empty path) always exists and is readable.
             if inner.path.is_empty() {
@@ -1435,20 +1751,40 @@ mod tests {
             Ok(())
         }
 
-        async fn read(&self, fid: &Fid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-            let inner = fid.downcast_ref::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        async fn read(
+            &self,
+            fid: &Fid,
+            offset: u64,
+            _count: u32,
+            _caller: &Subject,
+        ) -> Result<Vec<u8>, MountError> {
+            let inner = fid
+                .downcast_ref::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let files = self.files.lock().unwrap();
             match files.get(&inner.path) {
                 Some(data) => {
                     let start = offset as usize;
-                    if start >= data.len() { Ok(vec![]) } else { Ok(data[start..].to_vec()) }
+                    if start >= data.len() {
+                        Ok(vec![])
+                    } else {
+                        Ok(data[start..].to_vec())
+                    }
                 }
                 None => Err(MountError::NotFound(inner.path.clone())),
             }
         }
 
-        async fn write(&self, fid: &Fid, offset: u64, data: &[u8], _caller: &Subject) -> Result<u32, MountError> {
-            let inner = fid.downcast_ref::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        async fn write(
+            &self,
+            fid: &Fid,
+            offset: u64,
+            data: &[u8],
+            _caller: &Subject,
+        ) -> Result<u32, MountError> {
+            let inner = fid
+                .downcast_ref::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let mut files = self.files.lock().unwrap();
             let entry = files.entry(inner.path.clone()).or_default();
             let start = offset as usize;
@@ -1464,14 +1800,25 @@ mod tests {
         }
 
         async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
-            let inner = fid.downcast_ref::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            let prefix = if inner.path.is_empty() { String::new() } else { format!("{}/", inner.path) };
+            let inner = fid
+                .downcast_ref::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let prefix = if inner.path.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", inner.path)
+            };
             let files = self.files.lock().unwrap();
             let mut entries = Vec::new();
             for key in files.keys() {
                 if let Some(rest) = key.strip_prefix(&prefix) {
                     if !rest.contains('/') {
-                        entries.push(DirEntry { name: rest.to_owned(), is_dir: false, size: 0, stat: None });
+                        entries.push(DirEntry {
+                            name: rest.to_owned(),
+                            is_dir: false,
+                            size: 0,
+                            stat: None,
+                        });
                     }
                 }
             }
@@ -1479,7 +1826,9 @@ mod tests {
         }
 
         async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-            let inner = fid.downcast_ref::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
         }
 
@@ -1494,10 +1843,19 @@ mod tests {
             mode: u8,
             _caller: &Subject,
         ) -> Result<Stat, MountError> {
-            let inner = fid.downcast_mut::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            let child_path = if inner.path.is_empty() { name.to_owned() } else { format!("{}/{}", inner.path, name) };
+            let inner = fid
+                .downcast_mut::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let child_path = if inner.path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{}/{}", inner.path, name)
+            };
             // Create empty file.
-            self.files.lock().unwrap().insert(child_path.clone(), Vec::new());
+            self.files
+                .lock()
+                .unwrap()
+                .insert(child_path.clone(), Vec::new());
             // Re-point the fid at the new file, opened.
             inner.path = child_path;
             inner.is_open = true;
@@ -1537,7 +1895,8 @@ mod tests {
         // Bind the floor first (lower), upper after — readdir merges, writes go
         // to the first writable target that accepts them.
         ns.bind_mount("/union", floor, BindFlag::Replace).unwrap();
-        ns.bind_mount("/union", Arc::clone(&upper) as MountTarget, BindFlag::After).unwrap();
+        ns.bind_mount("/union", Arc::clone(&upper) as MountTarget, BindFlag::After)
+            .unwrap();
 
         let caller = test_subject();
 
@@ -1548,7 +1907,9 @@ mod tests {
         // Pass 1 (direct OWRITE): floor rejects (read-only), upper rejects
         // (file doesn't exist yet). Pass 2 (copy-up): reads floor bytes, creates
         // + writes into upper. Result: the upper holds the new content.
-        ns.echo("/union/config", b"new-bytes", &caller).await.unwrap();
+        ns.echo("/union/config", b"new-bytes", &caller)
+            .await
+            .unwrap();
 
         let upper_files = upper.snapshot();
         assert!(upper_files.contains_key("config"));
@@ -1564,7 +1925,8 @@ mod tests {
         let upper = Arc::new(WritableMemMount::empty());
 
         ns.bind_mount("/u", floor, BindFlag::Replace).unwrap();
-        ns.bind_mount("/u", Arc::clone(&upper) as MountTarget, BindFlag::After).unwrap();
+        ns.bind_mount("/u", Arc::clone(&upper) as MountTarget, BindFlag::After)
+            .unwrap();
 
         let caller = test_subject();
         ns.echo("/u/data", b"mutated", &caller).await.unwrap();
@@ -1610,7 +1972,10 @@ mod tests {
 
     impl SubjectGatedMount {
         fn new(allow: &str) -> Self {
-            Self { allow: allow.to_owned(), files: std::sync::Mutex::new(HashMap::new()) }
+            Self {
+                allow: allow.to_owned(),
+                files: std::sync::Mutex::new(HashMap::new()),
+            }
         }
         fn snapshot(&self) -> HashMap<String, Vec<u8>> {
             self.files.lock().unwrap().clone()
@@ -1627,10 +1992,16 @@ mod tests {
     #[async_trait]
     impl Mount for SubjectGatedMount {
         async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
-            Ok(Fid::new(WritableFid { path: components.join("/"), is_open: false, mode: 0 }))
+            Ok(Fid::new(WritableFid {
+                path: components.join("/"),
+                is_open: false,
+                mode: 0,
+            }))
         }
         async fn open(&self, fid: &mut Fid, mode: u8, caller: &Subject) -> Result<(), MountError> {
-            let inner = fid.downcast_mut::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_mut::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             if inner.path.is_empty() {
                 inner.is_open = true;
                 inner.mode = mode;
@@ -1648,19 +2019,39 @@ mod tests {
             inner.mode = mode;
             Ok(())
         }
-        async fn read(&self, fid: &Fid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-            let inner = fid.downcast_ref::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        async fn read(
+            &self,
+            fid: &Fid,
+            offset: u64,
+            _count: u32,
+            _caller: &Subject,
+        ) -> Result<Vec<u8>, MountError> {
+            let inner = fid
+                .downcast_ref::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             match self.files.lock().unwrap().get(&inner.path) {
                 Some(data) => {
                     let start = offset as usize;
-                    if start >= data.len() { Ok(vec![]) } else { Ok(data[start..].to_vec()) }
+                    if start >= data.len() {
+                        Ok(vec![])
+                    } else {
+                        Ok(data[start..].to_vec())
+                    }
                 }
                 None => Err(MountError::NotFound(inner.path.clone())),
             }
         }
-        async fn write(&self, fid: &Fid, offset: u64, data: &[u8], caller: &Subject) -> Result<u32, MountError> {
+        async fn write(
+            &self,
+            fid: &Fid,
+            offset: u64,
+            data: &[u8],
+            caller: &Subject,
+        ) -> Result<u32, MountError> {
             self.check(caller)?;
-            let inner = fid.downcast_ref::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             let mut files = self.files.lock().unwrap();
             let entry = files.entry(inner.path.clone()).or_default();
             let start = offset as usize;
@@ -1671,16 +2062,37 @@ mod tests {
             entry[start..end].copy_from_slice(data);
             Ok(data.len() as u32)
         }
-        async fn readdir(&self, _fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> { Ok(vec![]) }
+        async fn readdir(
+            &self,
+            _fid: &Fid,
+            _caller: &Subject,
+        ) -> Result<Vec<DirEntry>, MountError> {
+            Ok(vec![])
+        }
         async fn stat(&self, fid: &Fid, _caller: &Subject) -> Result<Stat, MountError> {
-            let inner = fid.downcast_ref::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
         }
         async fn clunk(&self, _fid: Fid, _caller: &Subject) {}
-        async fn create(&self, fid: &mut Fid, name: &str, _perm: u32, mode: u8, caller: &Subject) -> Result<Stat, MountError> {
+        async fn create(
+            &self,
+            fid: &mut Fid,
+            name: &str,
+            _perm: u32,
+            mode: u8,
+            caller: &Subject,
+        ) -> Result<Stat, MountError> {
             self.check(caller)?;
-            let inner = fid.downcast_mut::<WritableFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            let child = if inner.path.is_empty() { name.to_owned() } else { format!("{}/{}", inner.path, name) };
+            let inner = fid
+                .downcast_mut::<WritableFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let child = if inner.path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{}/{}", inner.path, name)
+            };
             self.files.lock().unwrap().insert(child.clone(), Vec::new());
             inner.path = child;
             inner.is_open = true;
@@ -1698,52 +2110,92 @@ mod tests {
 
     impl ReadOnlyReaddirMount {
         fn new(files: Vec<(&str, &[u8])>) -> Self {
-            Self { files: files.into_iter().map(|(k, v)| (k.to_owned(), v.to_vec())).collect() }
+            Self {
+                files: files
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_vec()))
+                    .collect(),
+            }
         }
     }
 
     #[async_trait]
     impl Mount for ReadOnlyReaddirMount {
         async fn walk(&self, components: &[&str], _caller: &Subject) -> Result<Fid, MountError> {
-            Ok(Fid::new(RoFid { path: components.join("/") }))
+            Ok(Fid::new(RoFid {
+                path: components.join("/"),
+            }))
         }
         async fn open(&self, fid: &mut Fid, mode: u8, _caller: &Subject) -> Result<(), MountError> {
             if mode & 0x03 == OWRITE {
                 return Err(MountError::PermissionDenied("read-only".into()));
             }
-            let _ = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let _ = fid
+                .downcast_ref::<RoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(())
         }
-        async fn read(&self, fid: &Fid, offset: u64, _count: u32, _caller: &Subject) -> Result<Vec<u8>, MountError> {
-            let inner = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+        async fn read(
+            &self,
+            fid: &Fid,
+            offset: u64,
+            _count: u32,
+            _caller: &Subject,
+        ) -> Result<Vec<u8>, MountError> {
+            let inner = fid
+                .downcast_ref::<RoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             match self.files.get(&inner.path) {
                 Some(data) => {
                     let start = offset as usize;
-                    if start >= data.len() { Ok(vec![]) } else { Ok(data[start..].to_vec()) }
+                    if start >= data.len() {
+                        Ok(vec![])
+                    } else {
+                        Ok(data[start..].to_vec())
+                    }
                 }
                 // The root dir (empty path) has no bytes but is a valid open target.
                 None if inner.path.is_empty() => Ok(vec![]),
                 None => Err(MountError::NotFound(inner.path.clone())),
             }
         }
-        async fn write(&self, _fid: &Fid, _o: u64, _d: &[u8], _c: &Subject) -> Result<u32, MountError> {
+        async fn write(
+            &self,
+            _fid: &Fid,
+            _o: u64,
+            _d: &[u8],
+            _c: &Subject,
+        ) -> Result<u32, MountError> {
             Err(MountError::PermissionDenied("read-only".into()))
         }
         async fn readdir(&self, fid: &Fid, _caller: &Subject) -> Result<Vec<DirEntry>, MountError> {
-            let inner = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
-            let prefix = if inner.path.is_empty() { String::new() } else { format!("{}/", inner.path) };
+            let inner = fid
+                .downcast_ref::<RoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let prefix = if inner.path.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", inner.path)
+            };
             let mut entries = Vec::new();
             for key in self.files.keys() {
                 if let Some(rest) = key.strip_prefix(&prefix) {
                     if !rest.contains('/') {
-                        entries.push(DirEntry { name: rest.to_owned(), is_dir: false, size: 0, stat: None });
+                        entries.push(DirEntry {
+                            name: rest.to_owned(),
+                            is_dir: false,
+                            size: 0,
+                            stat: None,
+                        });
                     }
                 }
             }
             Ok(entries)
         }
         async fn stat(&self, fid: &Fid, _c: &Subject) -> Result<Stat, MountError> {
-            let inner = fid.downcast_ref::<RoFid>().ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
+            let inner = fid
+                .downcast_ref::<RoFid>()
+                .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
             Ok(Stat::unknown_qid(0, 0, inner.path.clone(), 0))
         }
         async fn clunk(&self, _fid: Fid, _c: &Subject) {}
@@ -1762,17 +2214,24 @@ mod tests {
         let chosen = Arc::new(WritableMemMount::empty());
 
         ns.bind_mount("/m", floor, BindFlag::Replace).unwrap();
-        ns.bind_mount("/m", Arc::clone(&first) as MountTarget, BindFlag::After).unwrap();
-        ns.bind_mount("/m", Arc::clone(&chosen) as MountTarget, BindFlag::Upper).unwrap();
+        ns.bind_mount("/m", Arc::clone(&first) as MountTarget, BindFlag::After)
+            .unwrap();
+        ns.bind_mount("/m", Arc::clone(&chosen) as MountTarget, BindFlag::Upper)
+            .unwrap();
 
         assert!(ns.has_designated_upper("/m"));
 
         let caller = test_subject();
-        ns.echo("/m/weights", b"tenant-edit", &caller).await.unwrap();
+        ns.echo("/m/weights", b"tenant-edit", &caller)
+            .await
+            .unwrap();
 
         // The copied-up file landed in the designated upper only.
         assert_eq!(chosen.snapshot().get("weights").unwrap(), b"tenant-edit");
-        assert!(!first.snapshot().contains_key("weights"), "first writable must NOT receive the copy-up");
+        assert!(
+            !first.snapshot().contains_key("weights"),
+            "first writable must NOT receive the copy-up"
+        );
     }
 
     /// A write to a path already present in the upper goes straight to the
@@ -1785,10 +2244,15 @@ mod tests {
         // Seed the upper with the file already present (same length as the new
         // write so the test mount's non-truncating write leaves no stale tail —
         // the point here is Pass-1 direct write, not truncation semantics).
-        upper.files.lock().unwrap().insert("f".to_owned(), b"upperorig".to_vec());
+        upper
+            .files
+            .lock()
+            .unwrap()
+            .insert("f".to_owned(), b"upperorig".to_vec());
 
         ns.bind_mount("/x", floor, BindFlag::Replace).unwrap();
-        ns.bind_mount("/x", Arc::clone(&upper) as MountTarget, BindFlag::Upper).unwrap();
+        ns.bind_mount("/x", Arc::clone(&upper) as MountTarget, BindFlag::Upper)
+            .unwrap();
 
         let caller = test_subject();
         ns.echo("/x/f", b"upper-new", &caller).await.unwrap();
@@ -1805,7 +2269,8 @@ mod tests {
         let upper = Arc::new(WritableMemMount::empty());
 
         ns.bind_mount("/n", floor, BindFlag::Replace).unwrap();
-        ns.bind_mount("/n", Arc::clone(&upper) as MountTarget, BindFlag::Upper).unwrap();
+        ns.bind_mount("/n", Arc::clone(&upper) as MountTarget, BindFlag::Upper)
+            .unwrap();
 
         let caller = test_subject();
         // Pass 1 direct write fails (not present); no lower source either, so the
@@ -1822,18 +2287,23 @@ mod tests {
     async fn readdir_after_copy_up_shows_file_once() {
         let mut ns = Namespace::new();
         // Floor exposes `shared` via readdir; also readable so copy-up can source it.
-        let floor: MountTarget = Arc::new(ReadOnlyReaddirMount::new(vec![("shared", b"floor-bytes")]));
+        let floor: MountTarget =
+            Arc::new(ReadOnlyReaddirMount::new(vec![("shared", b"floor-bytes")]));
         let upper = Arc::new(WritableMemMount::empty());
 
         ns.bind_mount("/r", floor, BindFlag::Replace).unwrap();
-        ns.bind_mount("/r", Arc::clone(&upper) as MountTarget, BindFlag::Upper).unwrap();
+        ns.bind_mount("/r", Arc::clone(&upper) as MountTarget, BindFlag::Upper)
+            .unwrap();
 
         let caller = test_subject();
         ns.echo("/r/shared", b"edited", &caller).await.unwrap();
 
         let entries = ns.ls("/r", &caller).await.unwrap();
         let shared_count = entries.iter().filter(|e| e.name == "shared").count();
-        assert_eq!(shared_count, 1, "copied-up file must appear once, not once per layer");
+        assert_eq!(
+            shared_count, 1,
+            "copied-up file must appear once, not once per layer"
+        );
     }
 
     /// Copy-up threads the caller through create+write, so a denied subject on
@@ -1847,7 +2317,8 @@ mod tests {
         let upper = Arc::new(SubjectGatedMount::new("alice"));
 
         ns.bind_mount("/g", floor, BindFlag::Replace).unwrap();
-        ns.bind_mount("/g", Arc::clone(&upper) as MountTarget, BindFlag::Upper).unwrap();
+        ns.bind_mount("/g", Arc::clone(&upper) as MountTarget, BindFlag::Upper)
+            .unwrap();
 
         // "mallory" is not permitted on the upper.
         let mallory = Subject::new("mallory");
@@ -1856,7 +2327,10 @@ mod tests {
             NamespaceError::Mount(MountError::PermissionDenied(_)) => {}
             other => panic!("expected PermissionDenied (fail closed), got {other:?}"),
         }
-        assert!(upper.snapshot().is_empty(), "denied copy-up must not write the upper");
+        assert!(
+            upper.snapshot().is_empty(),
+            "denied copy-up must not write the upper"
+        );
 
         // The permitted subject succeeds — confirms the deny was about the
         // subject, not a broken path.
@@ -1879,12 +2353,12 @@ mod tests {
     #[tokio::test]
     async fn copy_up_through_root_catch_all() {
         let mut ns = Namespace::new();
-        let image: MountTarget =
-            Arc::new(ReadOnlyMemMount::new(vec![("hostname", b"worker\n")]));
+        let image: MountTarget = Arc::new(ReadOnlyMemMount::new(vec![("hostname", b"worker\n")]));
         let upper = Arc::new(WritableMemMount::empty());
 
         ns.bind_mount("/", image, BindFlag::Replace).unwrap();
-        ns.bind_mount("/", Arc::clone(&upper) as MountTarget, BindFlag::Upper).unwrap();
+        ns.bind_mount("/", Arc::clone(&upper) as MountTarget, BindFlag::Upper)
+            .unwrap();
         assert!(ns.has_designated_upper("/"));
 
         let caller = test_subject();
@@ -1930,8 +2404,9 @@ mod tests {
         name: &'static str,
         ctx: SecurityContext,
     }
+    #[async_trait::async_trait]
     impl SubjectContextResolver for OneSubject {
-        fn resolve(&self, s: &Subject) -> Option<SecurityContext> {
+        async fn resolve(&self, s: &Subject) -> Option<SecurityContext> {
             (s.name() == Some(self.name)).then(|| self.ctx.clone())
         }
     }
@@ -1939,7 +2414,7 @@ mod tests {
     /// Labels `/public/**` Public and everything else `None` (deny).
     struct PublicOnlyResolver;
     impl RpcObjectLabelResolver for PublicOnlyResolver {
-        fn resolve(&self, service_domain: &str, _method: Option<u16>) -> Option<SecurityLabel> {
+        fn resolve(&self, service_domain: &str, _method: Option<&[u16]>) -> Option<SecurityLabel> {
             service_domain
                 .strip_prefix("/public")
                 .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
@@ -1987,8 +2462,11 @@ mod tests {
     #[tokio::test]
     async fn un_unarmed_namespace_is_unenforced() {
         let mut ns = Namespace::new();
-        ns.mount("/public", Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget)
-            .unwrap();
+        ns.mount(
+            "/public",
+            Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget,
+        )
+        .unwrap();
         assert!(!ns.pep_armed());
         assert_eq!(
             ns.cat("/public/f", &Subject::new("anyone")).await.unwrap(),
@@ -2001,19 +2479,28 @@ mod tests {
     #[tokio::test]
     async fn armed_deny_all_pep_denies_reads() {
         let mut ns = Namespace::new();
-        ns.mount("/public", Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget)
-            .unwrap();
+        ns.mount(
+            "/public",
+            Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget,
+        )
+        .unwrap();
         ns.set_pep(deny_all_pep());
         assert!(ns.pep_armed());
-        let err = ns.cat("/public/f", &Subject::new("anyone")).await.unwrap_err();
-        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Read, _)));
+        let err = ns
+            .cat("/public/f", &Subject::new("anyone"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NamespaceError::Denied(NamespaceAction::Read, _)
+        ));
     }
 
     /// A caller cannot bypass an armed PEP by extracting the raw mount target.
     /// The capability boundary must deny before returning a handle when the
     /// caller has no verified clearance.
-    #[test]
-    fn resolve_targets_denies_without_clearance() {
+    #[tokio::test]
+    async fn resolve_targets_denies_without_clearance() {
         let mut ns = Namespace::new();
         ns.mount(
             "/public",
@@ -2023,11 +2510,9 @@ mod tests {
         ns.set_pep(deny_all_pep());
 
         assert!(matches!(
-            ns.resolve_targets("/public/f", &Subject::new("unverified")),
-            Err(NamespaceError::Denied(
-                NamespaceAction::ResolveHandle,
-                _
-            ))
+            ns.resolve_targets("/public/f", &Subject::new("unverified"))
+                .await,
+            Err(NamespaceError::Denied(NamespaceAction::ResolveHandle, _))
         ));
     }
 
@@ -2036,10 +2521,16 @@ mod tests {
     #[tokio::test]
     async fn armed_pep_permits_cleared_read_denies_uncleared() {
         let mut ns = Namespace::new();
-        ns.mount("/public", Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget)
-            .unwrap();
+        ns.mount(
+            "/public",
+            Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget,
+        )
+        .unwrap();
         let pep = Arc::new(NamespacePep::new(
-            Arc::new(OneSubject { name: "alice", ctx: sec_ctx(Level::Public) }),
+            Arc::new(OneSubject {
+                name: "alice",
+                ctx: sec_ctx(Level::Public),
+            }),
             Arc::new(PublicOnlyResolver),
             Arc::new(ReadFloorDecider),
         ));
@@ -2051,8 +2542,14 @@ mod tests {
             b"data"
         );
         // mallory is unenrolled ⇒ clearance unprovable ⇒ deny.
-        let err = ns.cat("/public/f", &Subject::new("mallory")).await.unwrap_err();
-        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Read, _)));
+        let err = ns
+            .cat("/public/f", &Subject::new("mallory"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NamespaceError::Denied(NamespaceAction::Read, _)
+        ));
     }
 
     /// Write-class ops deny under the read-floor decider (write-direction
@@ -2060,17 +2557,29 @@ mod tests {
     #[tokio::test]
     async fn armed_pep_denies_writes_under_read_floor_decider() {
         let mut ns = Namespace::new();
-        ns.mount("/public", Arc::new(MemMount::new(vec![("ctl", b"")])) as MountTarget)
-            .unwrap();
+        ns.mount(
+            "/public",
+            Arc::new(MemMount::new(vec![("ctl", b"")])) as MountTarget,
+        )
+        .unwrap();
         let pep = Arc::new(NamespacePep::new(
-            Arc::new(OneSubject { name: "alice", ctx: sec_ctx(Level::Secret) }),
+            Arc::new(OneSubject {
+                name: "alice",
+                ctx: sec_ctx(Level::Secret),
+            }),
             Arc::new(PublicOnlyResolver),
             Arc::new(ReadFloorDecider),
         ));
         ns.set_pep(pep);
 
-        let err = ns.echo("/public/ctl", b"x", &Subject::new("alice")).await.unwrap_err();
-        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Write, _)));
+        let err = ns
+            .echo("/public/ctl", b"x", &Subject::new("alice"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NamespaceError::Denied(NamespaceAction::Write, _)
+        ));
     }
 
     /// An unlabeled object (no carrier resolves it) denies even for a cleared
@@ -2079,17 +2588,29 @@ mod tests {
     async fn armed_pep_denies_unlabeled_object() {
         let mut ns = Namespace::new();
         // /secret has no label carrier ⇒ PublicOnlyResolver returns None.
-        ns.mount("/secret", Arc::new(MemMount::new(vec![("f", b"x")])) as MountTarget)
-            .unwrap();
+        ns.mount(
+            "/secret",
+            Arc::new(MemMount::new(vec![("f", b"x")])) as MountTarget,
+        )
+        .unwrap();
         let pep = Arc::new(NamespacePep::new(
-            Arc::new(OneSubject { name: "alice", ctx: sec_ctx(Level::Secret) }),
+            Arc::new(OneSubject {
+                name: "alice",
+                ctx: sec_ctx(Level::Secret),
+            }),
             Arc::new(PublicOnlyResolver),
             Arc::new(ReadFloorDecider),
         ));
         ns.set_pep(pep);
 
-        let err = ns.cat("/secret/f", &Subject::new("alice")).await.unwrap_err();
-        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Read, _)));
+        let err = ns
+            .cat("/secret/f", &Subject::new("alice"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NamespaceError::Denied(NamespaceAction::Read, _)
+        ));
     }
 
     /// Subject-less mount/unmount deny once the PEP is armed; the `_as`
@@ -2104,16 +2625,30 @@ mod tests {
         let err = ns
             .mount("/x", Arc::new(MemMount::new(vec![])) as MountTarget)
             .unwrap_err();
-        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::BindMount, _)));
+        assert!(matches!(
+            err,
+            NamespaceError::Denied(NamespaceAction::BindMount, _)
+        ));
 
         let err = ns.unmount("/x").unwrap_err();
-        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Unmount, _)));
+        assert!(matches!(
+            err,
+            NamespaceError::Denied(NamespaceAction::Unmount, _)
+        ));
 
         // The mediated `_as` path consults the PEP (deny-all ⇒ denied).
         let err = ns
-            .mount_as("/x", Arc::new(MemMount::new(vec![])) as MountTarget, &Subject::new("a"))
+            .mount_as(
+                "/x",
+                Arc::new(MemMount::new(vec![])) as MountTarget,
+                &Subject::new("a"),
+            )
+            .await
             .unwrap_err();
-        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Mount, _)));
+        assert!(matches!(
+            err,
+            NamespaceError::Denied(NamespaceAction::Mount, _)
+        ));
     }
 
     /// `fork` inherits the armed PEP — a sandboxed child cannot escape the
@@ -2121,13 +2656,22 @@ mod tests {
     #[tokio::test]
     async fn fork_inherits_pep() {
         let mut ns = Namespace::new();
-        ns.mount("/public", Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget)
-            .unwrap();
+        ns.mount(
+            "/public",
+            Arc::new(MemMount::new(vec![("f", b"data")])) as MountTarget,
+        )
+        .unwrap();
         ns.set_pep(deny_all_pep());
 
         let child = ns.fork();
         assert!(child.pep_armed());
-        let err = child.cat("/public/f", &Subject::new("anyone")).await.unwrap_err();
-        assert!(matches!(err, NamespaceError::Denied(NamespaceAction::Read, _)));
+        let err = child
+            .cat("/public/f", &Subject::new("anyone"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NamespaceError::Denied(NamespaceAction::Read, _)
+        ));
     }
 }

@@ -67,7 +67,6 @@ impl Default for WorkerConfig {
     }
 }
 
-
 /// Hypervisor type for VM management
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -249,8 +248,8 @@ impl Default for WorkflowConfig {
         Self {
             logs_dir: PathBuf::from("/var/lib/hyprstream/workflows/logs"),
             max_concurrent_runs: 10,
-            job_timeout_secs: 3600,  // 1 hour
-            step_timeout_secs: 600,  // 10 minutes
+            job_timeout_secs: 3600, // 1 hour
+            step_timeout_secs: 600, // 10 minutes
             auto_discover: true,
             // Default-off: the workflow engine is opt-in (#989). The factory
             // bails unless an operator explicitly sets `enabled = true`.
@@ -262,7 +261,8 @@ impl Default for WorkflowConfig {
 /// Configuration for the worker event bus.
 ///
 /// The worker publishes lifecycle events over the moq-lite streaming plane
-/// (#167) via `crate::events::EventPublisher`; there is no ZMQ socket to tune.
+/// (#167) via `hyprstream_rpc::events::EventPublisher`; there is no ZMQ socket
+/// to tune.
 /// The former ZMQ high-water-mark knobs (`publisher_hwm`/`subscriber_hwm`) were
 /// removed with the ZMQ stack (#138/#167) — moq back-pressure/QoS is governed by
 /// `hyprstream_rpc::moq_stream` `StreamOpt`, not per-socket HWMs here.
@@ -340,7 +340,10 @@ mod tests {
 
         // Test serialization roundtrip
         let yaml = serde_yaml::to_string(&config)?;
-        assert!(yaml.contains("cloud-hypervisor"), "YAML should contain kebab-case hypervisor");
+        assert!(
+            yaml.contains("cloud-hypervisor"),
+            "YAML should contain kebab-case hypervisor"
+        );
         let parsed: PoolConfig = serde_yaml::from_str(&yaml)?;
         assert_eq!(parsed.hypervisor, HypervisorType::CloudHypervisor);
 
@@ -354,7 +357,10 @@ mod tests {
 
     #[test]
     fn test_hypervisor_type_display() {
-        assert_eq!(HypervisorType::CloudHypervisor.to_string(), "cloud-hypervisor");
+        assert_eq!(
+            HypervisorType::CloudHypervisor.to_string(),
+            "cloud-hypervisor"
+        );
         #[cfg(feature = "dragonball")]
         assert_eq!(HypervisorType::Dragonball.to_string(), "dragonball");
     }

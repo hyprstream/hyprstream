@@ -287,7 +287,7 @@ impl ValkeyUserStore {
 impl super::user_store::private::Sealed for ValkeyUserStore {}
 
 #[async_trait]
-#[cfg(any(not(feature = "credential-pds"), test))]
+#[cfg(any(not(feature = "encrypted-account-admission"), test))]
 impl UserStore for ValkeyUserStore {
     async fn get_profile(&self, username: &str) -> Result<Option<UserProfile>> {
         self.get_profile_raw(username).await

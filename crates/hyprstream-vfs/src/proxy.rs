@@ -44,10 +44,9 @@ pub fn spawn_vfs_proxy(
             // the JoinError is caught here instead of unwinding the proxy loop.
             let handle = tokio::spawn(async move {
                 let result = match req.op {
-                    VfsOp::Cat { ref path } => ns
-                        .cat(path, &subject)
-                        .await
-                        .map_err(|e| e.to_string()),
+                    VfsOp::Cat { ref path } => {
+                        ns.cat(path, &subject).await.map_err(|e| e.to_string())
+                    }
                     VfsOp::Ls { ref path } => ns
                         .ls(path, &subject)
                         .await
@@ -71,10 +70,9 @@ pub fn spawn_vfs_proxy(
                         .await
                         .map(|_| Vec::new())
                         .map_err(|e| e.to_string()),
-                    VfsOp::Ctl { ref path, ref cmd } => ns
-                        .ctl(path, cmd, &subject)
-                        .await
-                        .map_err(|e| e.to_string()),
+                    VfsOp::Ctl { ref path, ref cmd } => {
+                        ns.ctl(path, cmd, &subject).await.map_err(|e| e.to_string())
+                    }
                     VfsOp::MountPrefixes => {
                         let prefixes = ns.mount_prefixes();
                         Ok(prefixes.join("\n").into_bytes())

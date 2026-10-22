@@ -32,6 +32,24 @@ print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["package"]["version"]
 PY
 })"
 
+# The npm manifest's license must be the crate's own, not a value copied in by
+# hand — a hand-copied value silently goes stale when the crate's declared
+# license changes (as happened: this script once hardcoded MIT after the
+# crate's Cargo.toml had already moved to Apache-2.0). Derive it here, fail
+# closed if the crate declares none.
+crate_license="$({
+  python3 - "$CRATE_DIR/Cargo.toml" <<'PY'
+import pathlib
+import sys
+import tomllib
+print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["package"].get("license", ""))
+PY
+})"
+if [[ -z "$crate_license" ]]; then
+  echo "crate manifest declares no license; refusing to package with an unverified license" >&2
+  exit 1
+fi
+
 case "$CHANNEL" in
   production)
     expected_ref="refs/tags/${RELEASE_TAG_PREFIX}-v${crate_version}"
@@ -86,16 +104,16 @@ wasm-pack build \
 
 # wasm-pack derives its name from the Rust package. Validate that generated
 # identity before rewriting it to the explicitly authorized public npm scope.
-node - "$PKG_DIR/package.json" "$package_version" "$WASM_PACK_PACKAGE_NAME" "$PACKAGE_NAME" "$REGISTRY" <<'NODE'
+node - "$PKG_DIR/package.json" "$package_version" "$WASM_PACK_PACKAGE_NAME" "$PACKAGE_NAME" "$REGISTRY" "$crate_license" <<'NODE'
 const fs = require('node:fs');
-const [manifestPath, version, wasmPackName, packageName, registry] = process.argv.slice(2);
+const [manifestPath, version, wasmPackName, packageName, registry, crateLicense] = process.argv.slice(2);
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 if (manifest.name !== wasmPackName) {
   throw new Error(`wasm-pack package name ${manifest.name} != ${wasmPackName}`);
 }
 manifest.name = packageName;
 manifest.version = version;
-manifest.license = 'MIT';
+manifest.license = crateLicense;
 manifest.repository = {
   type: 'git',
   url: 'git+https://github.com/hyprstream/hyprstream.git',

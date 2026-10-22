@@ -94,6 +94,7 @@ use anyhow::{anyhow, Result};
 
 // ===== Section 3 & 4: router + device-pool (CPU, always run) ===================
 
+use hyprstream_core::runtime::device_pool::{DevicePool, LayerDeviceMap};
 /// Capacity-weighted HRW placement for a cell (#322).
 ///
 /// These types are plain data structures (no tensors, no GPU), so the cell
@@ -102,7 +103,6 @@ use hyprstream_core::services::router::{
     CellRouter, ExcludeReason, InferenceServerInfo, PlacementPolicy, SessionAffinity,
     DEFAULT_LEASE_DURATION,
 };
-use hyprstream_core::runtime::device_pool::{DevicePool, LayerDeviceMap};
 use hyprstream_rpc::transport::TransportConfig;
 
 /// Same helper the router's own unit tests use: a node with a byte-pattern
@@ -182,7 +182,10 @@ fn e6_router_same_session_id_is_sticky_across_calls() -> Result<()> {
     let again = router
         .place("sess-A", &set, now)
         .ok_or_else(|| anyhow!("sess-A placement after sess-B"))?;
-    assert_eq!(again.replica_id, first_node, "sess-A unchanged after sess-B");
+    assert_eq!(
+        again.replica_id, first_node,
+        "sess-A unchanged after sess-B"
+    );
     Ok(())
 }
 
@@ -268,7 +271,11 @@ fn e6_router_placement_is_process_independent() -> Result<()> {
         .iter()
         .map(|n| {
             (
-                independent_score("probe", n.replica_id.as_bytes(), n.gpu_memory_free.saturating_add(1)),
+                independent_score(
+                    "probe",
+                    n.replica_id.as_bytes(),
+                    n.gpu_memory_free.saturating_add(1),
+                ),
                 n.replica_id,
             )
         })
@@ -361,7 +368,10 @@ fn e6_router_dial_fail_and_stall_reassign_to_a_different_node() -> Result<()> {
     let after_stall = router2
         .place("sess-B", &set, now)
         .ok_or_else(|| anyhow!("sess-B re-placement after stall"))?;
-    assert_ne!(after_stall.replica_id, owner2.replica_id, "stalled node is skipped");
+    assert_ne!(
+        after_stall.replica_id, owner2.replica_id,
+        "stalled node is skipped"
+    );
 
     // And clearing the stall re-enables the node.
     router2.clear_node(owner2.replica_id);
@@ -413,8 +423,7 @@ fn e6_router_spread_policy_picks_least_loaded() -> Result<()> {
         .place("sess-A", &set, now)
         .ok_or_else(|| anyhow!("sess-A placement under Spread"))?;
     assert_eq!(
-        p.replica_id,
-        set[1].replica_id,
+        p.replica_id, set[1].replica_id,
         "Spread must pick the fewest-active-sessions node"
     );
     Ok(())
@@ -522,7 +531,10 @@ fn e6_layer_device_map_even_split_is_contiguous_and_prefix_heavy() -> Result<()>
     );
 
     // The boundary sits exactly at the device change, not before/after.
-    assert!(!map.is_boundary(tch::Device::Cpu, 0), "no boundary before layer 0");
+    assert!(
+        !map.is_boundary(tch::Device::Cpu, 0),
+        "no boundary before layer 0"
+    );
     assert!(
         map.is_boundary(tch::Device::Cpu, 3),
         "boundary at the Cpu->Cuda(0) change at layer 3"
@@ -577,7 +589,10 @@ fn e6_layer_device_map_single_is_zero_copy() -> Result<()> {
         assert_eq!(map.device_for(g), tch::Device::Cpu);
     }
     for g in 1..8 {
-        assert!(!map.is_boundary(tch::Device::Cpu, g), "no boundary within a stage");
+        assert!(
+            !map.is_boundary(tch::Device::Cpu, g),
+            "no boundary within a stage"
+        );
     }
     Ok(())
 }
@@ -766,7 +781,7 @@ async fn e6_gpu_load_and_stream_tokens() {
 
     // Streaming generation: collect chunks until the stream ends, then read the
     // final stats. This is the exact path a Moq token subscriber consumes.
-    let request = hyprstream_core::runtime::GenerationRequest {
+    let request = hyprstream_rpc_std::inference_client::GenerationRequest {
         prompt: "The capital of France is".to_owned(),
         max_tokens: Some(16),
         temperature: Some(0.0), // greedy — deterministic, fast, stable
@@ -895,11 +910,7 @@ fn e6_report_gpu_and_model_prerequisites() {
     // to stderr. It always passes; its job is to make `cargo test` output tell
     // a reviewer exactly what a full GPU run would need on this host.
     let cuda = tch::Cuda::is_available();
-    let n_devices = if cuda {
-        tch::Cuda::device_count()
-    } else {
-        0
-    };
+    let n_devices = if cuda { tch::Cuda::device_count() } else { 0 };
     let model = e2e_model_dir();
     eprintln!(
         "[e2e_inference] prerequisites: cuda_available={cuda}, cuda_devices={n_devices}, \

@@ -21,7 +21,7 @@ pub fn draw(frame: &mut Frame, app: &CastPlayerApp) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // title bar
         Constraint::Length(3), // tab bar
-        Constraint::Min(8),   // playback area
+        Constraint::Min(8),    // playback area
         Constraint::Length(1), // progress bar
         Constraint::Length(1), // help line
     ])

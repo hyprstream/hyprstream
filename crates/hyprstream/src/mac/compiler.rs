@@ -478,7 +478,10 @@ mod tests {
             cap("mac://other/x", "model/read"),
         ]);
         let policy = compile(&u, &l, &p);
-        assert!(allow_set(&policy).is_empty(), "unmapped grants emit no rules");
+        assert!(
+            allow_set(&policy).is_empty(),
+            "unmapped grants emit no rules"
+        );
         assert_eq!(check_no_escalation(&u, &policy, &p), Ok(()));
     }
 
@@ -549,7 +552,11 @@ mod tests {
 
         let p = permissions();
         let l = lattice(3);
-        let policy = compile(&ucan_with(vec![cap("mac://model/qwen", "model/read")]), &l, &p);
+        let policy = compile(
+            &ucan_with(vec![cap("mac://model/qwen", "model/read")]),
+            &l,
+            &p,
+        );
         assert!(
             policy.matrix.sorted_rules().1.is_empty(),
             "the compiler must not produce an escalate band"
@@ -795,7 +802,11 @@ mod tests {
             }
             s
         };
-        assert_eq!(allow_set(&policy), self_fold, "a self-check would pass this");
+        assert_eq!(
+            allow_set(&policy),
+            self_fold,
+            "a self-check would pass this"
+        );
 
         // The authority-anchored check catches it.
         match check_no_escalation(&u, &policy, &wide) {

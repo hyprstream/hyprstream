@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::cli::gpu_detect;
 

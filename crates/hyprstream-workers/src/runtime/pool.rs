@@ -15,8 +15,10 @@ use crate::error::{Result, WorkerError};
 
 use super::admission::{self, AdmissionTracker};
 use super::backend::SandboxBackend;
-use super::client::{KeyValue, LinuxContainerResources};
-use super::{PodSandbox, PodSandboxConfig, PodSandboxState};
+use super::PodSandbox;
+use hyprstream_rpc_std::worker_client::{
+    KeyValue, LinuxContainerResources, PodSandboxConfig, PodSandboxState,
+};
 use hyprstream_vfs::Subject;
 
 /// Sandbox pool for warm sandbox management
@@ -162,7 +164,11 @@ impl SandboxPool {
     /// `PoolConfig::admission`'s queue settings; see [`WorkerError::QueueFull`]
     /// / [`WorkerError::QueueTimeout`] / [`WorkerError::AdmissionDenied`] for
     /// the distinct failure modes.
-    pub async fn acquire(self: &Arc<Self>, subject: &Subject, config: &PodSandboxConfig) -> Result<String> {
+    pub async fn acquire(
+        self: &Arc<Self>,
+        subject: &Subject,
+        config: &PodSandboxConfig,
+    ) -> Result<String> {
         let demand = admission::derive_demand(config);
         let group_selector = admission::derive_group_selector(config);
         let reservation = self
@@ -226,7 +232,9 @@ impl SandboxPool {
             // Reconfiguring metadata/labels/annotations above must not
             // silently leave a mismatched resource envelope in place.
             let requested = config.linux.resources.clone();
-            if requested != LinuxContainerResources::default() && requested != sandbox.applied_resources {
+            if requested != LinuxContainerResources::default()
+                && requested != sandbox.applied_resources
+            {
                 tracing::debug!(
                     sandbox_id = %sandbox.id,
                     "warm sandbox resource mismatch on reuse — resizing (#519)"
@@ -670,7 +678,7 @@ mod tests {
 mod admission_tests {
     use super::*;
     use crate::runtime::backend::SandboxHandle;
-    use crate::runtime::client::KeyValue;
+    use hyprstream_rpc_std::worker_client::KeyValue;
     use parking_lot::Mutex as StdMutex;
     use std::any::Any;
     use std::collections::HashMap as StdHashMap;
@@ -788,15 +796,24 @@ mod admission_tests {
                     timeout_secs: 0,
                 });
             }
-            self.applied.lock().insert(sandbox.id.clone(), resources.clone());
+            self.applied
+                .lock()
+                .insert(sandbox.id.clone(), resources.clone());
             Ok(())
         }
     }
 
-    fn make_pool_with(max_sandboxes: usize, warm_pool_size: usize) -> (Arc<SandboxPool>, Arc<FakeBackend>) {
+    fn make_pool_with(
+        max_sandboxes: usize,
+        warm_pool_size: usize,
+    ) -> (Arc<SandboxPool>, Arc<FakeBackend>) {
         let fake = Arc::new(FakeBackend::default());
         let backend: Arc<dyn SandboxBackend> = fake.clone();
-        let config = PoolConfig { max_sandboxes, warm_pool_size, ..Default::default() };
+        let config = PoolConfig {
+            max_sandboxes,
+            warm_pool_size,
+            ..Default::default()
+        };
         (Arc::new(SandboxPool::new(config, backend)), fake)
     }
 
@@ -807,7 +824,12 @@ mod admission_tests {
     ) -> (Arc<SandboxPool>, Arc<FakeBackend>) {
         let fake = Arc::new(FakeBackend::default());
         let backend: Arc<dyn SandboxBackend> = fake.clone();
-        let config = PoolConfig { max_sandboxes, warm_pool_size, admission, ..Default::default() };
+        let config = PoolConfig {
+            max_sandboxes,
+            warm_pool_size,
+            admission,
+            ..Default::default()
+        };
         (Arc::new(SandboxPool::new(config, backend)), fake)
     }
 
@@ -819,7 +841,10 @@ mod admission_tests {
         let subject = Subject::new("alice");
         let sandbox_config = PodSandboxConfig::default();
 
-        let id = pool.acquire(&subject, &sandbox_config).await.expect("solo acquire must succeed");
+        let id = pool
+            .acquire(&subject, &sandbox_config)
+            .await
+            .expect("solo acquire must succeed");
         assert!(pool.get(&id).await.is_some());
         assert_eq!(pool.stats().await.active_count, 1);
 
@@ -830,12 +855,18 @@ mod admission_tests {
 
     #[tokio::test]
     async fn solo_capacity_exhausted_without_queue_room_rejects_clearly() {
-        let cfg = crate::runtime::AdmissionConfig { queue_capacity: 0, ..Default::default() };
+        let cfg = crate::runtime::AdmissionConfig {
+            queue_capacity: 0,
+            ..Default::default()
+        };
         let (pool, _fake) = make_pool_with_admission(1, 0, cfg);
         let subject = Subject::new("alice");
         let sandbox_config = PodSandboxConfig::default();
 
-        let _id = pool.acquire(&subject, &sandbox_config).await.expect("first acquire admits");
+        let _id = pool
+            .acquire(&subject, &sandbox_config)
+            .await
+            .expect("first acquire admits");
         let err = pool.acquire(&subject, &sandbox_config).await.unwrap_err();
         assert!(matches!(err, WorkerError::QueueFull { .. }), "got: {err:?}");
     }
@@ -846,8 +877,14 @@ mod admission_tests {
     async fn anonymous_caller_rejected_fail_closed() {
         let (pool, _fake) = make_pool_with(5, 0);
         let sandbox_config = PodSandboxConfig::default();
-        let err = pool.acquire(&Subject::anonymous(), &sandbox_config).await.unwrap_err();
-        assert!(matches!(err, WorkerError::Unauthorized { .. }), "got: {err:?}");
+        let err = pool
+            .acquire(&Subject::anonymous(), &sandbox_config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkerError::Unauthorized { .. }),
+            "got: {err:?}"
+        );
         // Must not have consumed any capacity.
         assert_eq!(pool.stats().await.active_count, 0);
     }
@@ -856,34 +893,50 @@ mod admission_tests {
 
     #[tokio::test]
     async fn per_subject_quota_rejects_over_quota_caller() {
-        let cfg = crate::runtime::AdmissionConfig { max_per_subject: Some(1), ..Default::default() };
+        let cfg = crate::runtime::AdmissionConfig {
+            max_per_subject: Some(1),
+            ..Default::default()
+        };
         let (pool, _fake) = make_pool_with_admission(10, 0, cfg);
         let alice = Subject::new("alice");
         let sandbox_config = PodSandboxConfig::default();
 
-        let _id = pool.acquire(&alice, &sandbox_config).await.expect("first request admitted");
+        let _id = pool
+            .acquire(&alice, &sandbox_config)
+            .await
+            .expect("first request admitted");
         let err = pool.acquire(&alice, &sandbox_config).await.unwrap_err();
-        assert!(matches!(err, WorkerError::AdmissionDenied { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, WorkerError::AdmissionDenied { .. }),
+            "got: {err:?}"
+        );
     }
 
     // ── GPU-aware placement (fit over the #628 scheduling substrate) ─────
 
     #[tokio::test]
     async fn gpu_request_placed_only_when_capacity_declared() {
-        let cfg = crate::runtime::AdmissionConfig { gpu_total: 0, ..Default::default() };
+        let cfg = crate::runtime::AdmissionConfig {
+            gpu_total: 0,
+            ..Default::default()
+        };
         let (pool, _fake) = make_pool_with_admission(10, 0, cfg);
         let subject = Subject::new("alice");
         let mut sandbox_config = PodSandboxConfig::default();
-        sandbox_config
-            .annotations
-            .push(KeyValue { key: crate::runtime::ANN_GPU_REQUEST.to_owned(), value: "1".to_owned() });
+        sandbox_config.annotations.push(KeyValue {
+            key: crate::runtime::ANN_GPU_REQUEST.to_owned(),
+            value: "1".to_owned(),
+        });
 
         // No GPU capacity declared → fail-closed reject, never a silent
         // CPU-only placement. F1: this is *infeasible* (exceeds the node total),
         // so it must reject immediately rather than queue out the timeout.
         let start = std::time::Instant::now();
         let err = pool.acquire(&subject, &sandbox_config).await.unwrap_err();
-        assert!(matches!(err, WorkerError::AdmissionInfeasible { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, WorkerError::AdmissionInfeasible { .. }),
+            "got: {err:?}"
+        );
         assert!(
             start.elapsed() < std::time::Duration::from_secs(1),
             "infeasible GPU request must reject immediately, not wait the queue timeout"
@@ -892,15 +945,22 @@ mod admission_tests {
 
     #[tokio::test]
     async fn gpu_request_placed_when_capacity_available() {
-        let cfg = crate::runtime::AdmissionConfig { gpu_total: 1, ..Default::default() };
+        let cfg = crate::runtime::AdmissionConfig {
+            gpu_total: 1,
+            ..Default::default()
+        };
         let (pool, _fake) = make_pool_with_admission(10, 0, cfg);
         let subject = Subject::new("alice");
         let mut sandbox_config = PodSandboxConfig::default();
-        sandbox_config
-            .annotations
-            .push(KeyValue { key: crate::runtime::ANN_GPU_REQUEST.to_owned(), value: "1".to_owned() });
+        sandbox_config.annotations.push(KeyValue {
+            key: crate::runtime::ANN_GPU_REQUEST.to_owned(),
+            value: "1".to_owned(),
+        });
 
-        let id = pool.acquire(&subject, &sandbox_config).await.expect("gpu request should be admitted");
+        let id = pool
+            .acquire(&subject, &sandbox_config)
+            .await
+            .expect("gpu request should be admitted");
         assert!(pool.get(&id).await.is_some());
     }
 
@@ -918,7 +978,10 @@ mod admission_tests {
         sandbox_config.linux.resources.cpu_quota = 50_000; // 500m
         sandbox_config.linux.resources.memory_limit_in_bytes = 512 * 1024 * 1024;
 
-        let id = pool.acquire(&subject, &sandbox_config).await.expect("fits within declared capacity");
+        let id = pool
+            .acquire(&subject, &sandbox_config)
+            .await
+            .expect("fits within declared capacity");
         assert!(pool.get(&id).await.is_some());
     }
 
@@ -938,7 +1001,10 @@ mod admission_tests {
         // ever satisfy it), so it rejects immediately rather than queueing —
         // still never a silent placement.
         let err = pool.acquire(&subject, &sandbox_config).await.unwrap_err();
-        assert!(matches!(err, WorkerError::AdmissionInfeasible { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, WorkerError::AdmissionInfeasible { .. }),
+            "got: {err:?}"
+        );
     }
 
     // ── #519 regression: warm-sandbox reuse must resize, never silently
@@ -960,10 +1026,15 @@ mod admission_tests {
         // (all-zero resources) — this request asks for something different,
         // so acquire() must detect the mismatch and resize it rather than
         // silently handing out the warm sandbox's original (wrong) size.
-        let id = pool.acquire(&subject, &sandbox_config).await.expect("warm reuse should succeed");
+        let id = pool
+            .acquire(&subject, &sandbox_config)
+            .await
+            .expect("warm reuse should succeed");
 
         let applied = fake.applied.lock();
-        let recorded = applied.get(&id).expect("update_resources must have been called for this sandbox");
+        let recorded = applied
+            .get(&id)
+            .expect("update_resources must have been called for this sandbox");
         assert_eq!(recorded.memory_limit_in_bytes, 256 * 1024 * 1024);
         assert_eq!(recorded.cpu_quota, 75_000);
     }
@@ -978,7 +1049,10 @@ mod admission_tests {
         let mut sandbox_config = PodSandboxConfig::default();
         sandbox_config.linux.resources.memory_limit_in_bytes = 128 * 1024 * 1024;
 
-        let id = pool.acquire(&subject, &sandbox_config).await.expect("cold create should succeed");
+        let id = pool
+            .acquire(&subject, &sandbox_config)
+            .await
+            .expect("cold create should succeed");
         assert!(fake.applied.lock().get(&id).is_none());
     }
 
@@ -1012,7 +1086,10 @@ mod admission_tests {
                 Err(e) => {
                     failed += 1;
                     assert!(
-                        matches!(e, WorkerError::QueueFull { .. } | WorkerError::QueueTimeout { .. }),
+                        matches!(
+                            e,
+                            WorkerError::QueueFull { .. } | WorkerError::QueueTimeout { .. }
+                        ),
                         "unexpected error: {e:?}"
                     );
                 }
@@ -1020,7 +1097,11 @@ mod admission_tests {
         }
 
         assert_eq!(ok, capacity, "exactly `capacity` requests must be admitted");
-        assert_eq!(failed, n - capacity, "the rest must queue-then-timeout or reject, never silently succeed");
+        assert_eq!(
+            failed,
+            n - capacity,
+            "the rest must queue-then-timeout or reject, never silently succeed"
+        );
         // The backend itself must never have seen more concurrently-started
         // sandboxes than the declared capacity — the actual TOCTOU check.
         assert!(
@@ -1033,12 +1114,18 @@ mod admission_tests {
 
     #[tokio::test]
     async fn queued_request_is_admitted_once_capacity_frees() {
-        let cfg = crate::runtime::AdmissionConfig { queue_timeout_secs: 5, ..Default::default() };
+        let cfg = crate::runtime::AdmissionConfig {
+            queue_timeout_secs: 5,
+            ..Default::default()
+        };
         let (pool, _fake) = make_pool_with_admission(1, 0, cfg);
         let subject = Subject::new("alice");
         let sandbox_config = PodSandboxConfig::default();
 
-        let first = pool.acquire(&subject, &sandbox_config).await.expect("first request admitted");
+        let first = pool
+            .acquire(&subject, &sandbox_config)
+            .await
+            .expect("first request admitted");
 
         let pool2 = pool.clone();
         let waiter = tokio::spawn(async move {
@@ -1055,7 +1142,10 @@ mod admission_tests {
             .await
             .expect("queued waiter should be woken well within 2s")
             .expect("task must not panic");
-        assert!(result.is_ok(), "queued request should be admitted once capacity frees: {result:?}");
+        assert!(
+            result.is_ok(),
+            "queued request should be admitted once capacity frees: {result:?}"
+        );
     }
 
     // ── F2: resize failure must not orphan the popped warm sandbox ─────────
@@ -1064,7 +1154,10 @@ mod admission_tests {
     async fn resize_failure_destroys_warm_sandbox_and_rolls_back_reservation() {
         // queue_capacity 0 so any leaked reservation shows up as an immediate
         // QueueFull on the follow-up acquire.
-        let cfg = crate::runtime::AdmissionConfig { queue_capacity: 0, ..Default::default() };
+        let cfg = crate::runtime::AdmissionConfig {
+            queue_capacity: 0,
+            ..Default::default()
+        };
         let (pool, fake) = make_pool_with_admission(1, 1, cfg);
         pool.initialize().await.expect("prewarm one sandbox");
         assert_eq!(pool.stats().await.warm_count, 1);
@@ -1078,7 +1171,10 @@ mod admission_tests {
         sandbox_config.linux.resources.memory_limit_in_bytes = 256 * 1024 * 1024;
 
         let err = pool.acquire(&subject, &sandbox_config).await.unwrap_err();
-        assert!(matches!(err, WorkerError::SandboxTimeout { .. }), "resize error propagates: {err:?}");
+        assert!(
+            matches!(err, WorkerError::SandboxTimeout { .. }),
+            "resize error propagates: {err:?}"
+        );
         // The popped warm sandbox must be destroyed, not orphaned.
         assert!(
             !fake.destroyed.lock().is_empty(),
@@ -1108,19 +1204,29 @@ mod admission_tests {
 
         fake.fail_reset.store(true, Ordering::SeqCst);
         let err = pool.release(&id).await.unwrap_err();
-        assert!(matches!(err, WorkerError::SandboxTimeout { .. }), "reset error propagates: {err:?}");
+        assert!(
+            matches!(err, WorkerError::SandboxTimeout { .. }),
+            "reset error propagates: {err:?}"
+        );
         assert!(
             fake.was_destroyed(&id),
             "sandbox must be destroyed after reset failure to avoid an orphan"
         );
-        assert_eq!(pool.stats().await.active_count, 0, "release removed active sandbox");
+        assert_eq!(
+            pool.stats().await.active_count,
+            0,
+            "release removed active sandbox"
+        );
     }
 
     // ── F5: stop failure on release must not orphan / over-commit ──────────
 
     #[tokio::test]
     async fn stop_failure_on_release_destroys_sandbox_and_still_frees_reservation() {
-        let cfg = crate::runtime::AdmissionConfig { queue_capacity: 0, ..Default::default() };
+        let cfg = crate::runtime::AdmissionConfig {
+            queue_capacity: 0,
+            ..Default::default()
+        };
         let (pool, fake) = make_pool_with_admission(1, 0, cfg);
         let subject = Subject::new("alice");
         let id = pool
@@ -1130,7 +1236,10 @@ mod admission_tests {
 
         fake.fail_stop.store(true, Ordering::SeqCst);
         let err = pool.release(&id).await.unwrap_err();
-        assert!(matches!(err, WorkerError::SandboxTimeout { .. }), "stop error propagates: {err:?}");
+        assert!(
+            matches!(err, WorkerError::SandboxTimeout { .. }),
+            "stop error propagates: {err:?}"
+        );
         // Orphan avoided: a destroy was attempted after the stop failure.
         assert!(
             fake.was_destroyed(&id),

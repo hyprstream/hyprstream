@@ -163,10 +163,16 @@ impl VfsFileSystem {
 
     /// Route a path to its mount targets (bind order) + mount-relative
     /// components. Maps a namespace miss to `ENOENT`.
+    ///
+    /// The FUSE/vhost-user session loop is sync (fuse-backend-rs `Filesystem`
+    /// callbacks) and has no async frame per operation, so it cannot run the
+    /// revocation revalidation an armed PEP requires. This plane therefore
+    /// serves only dormant (PEP-less) namespaces; [`Namespace::resolve_targets_dormant`]
+    /// fails closed if an armed namespace is ever wired here.
     fn route(&self, components: &[String]) -> io::Result<(Vec<MountTarget>, Vec<String>)> {
         let path = Self::abs_path(components);
         self.ns
-            .resolve_targets(&path, &self.subject)
+            .resolve_targets_dormant(&path, &self.subject)
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))
     }
 
@@ -265,10 +271,7 @@ impl VfsFileSystem {
     /// Resolve the writable [`FsMount`] for a path, or `EROFS` if no target at
     /// the path is a full filesystem. Returns the mount plus mount-relative
     /// components. (Mutations don't union: the first FsMount target wins.)
-    fn route_writable(
-        &self,
-        components: &[String],
-    ) -> io::Result<(MountTarget, Vec<String>)> {
+    fn route_writable(&self, components: &[String]) -> io::Result<(MountTarget, Vec<String>)> {
         let (targets, comps) = self.route(components)?;
         for mount in targets {
             if mount.as_fsmount().is_some() {
@@ -277,7 +280,6 @@ impl VfsFileSystem {
         }
         Err(erofs())
     }
-
 }
 
 impl FileSystem for VfsFileSystem {
@@ -315,7 +317,14 @@ impl FileSystem for VfsFileSystem {
     ) -> io::Result<(libc::stat64, Duration)> {
         let data = self.inode_data(inode)?;
         if inode == ROOT_INODE {
-            let st = hyprstream_vfs::Stat { qtype: 0x80, version: 0, path: 0, size: 0, name: String::new(), mtime: 0 };
+            let st = hyprstream_vfs::Stat {
+                qtype: 0x80,
+                version: 0,
+                path: 0,
+                size: 0,
+                name: String::new(),
+                mtime: 0,
+            };
             return Ok((Self::fill_attr(inode, &st, Kind::Dir), TTL));
         }
         let (st, is_dir) = self.stat_path(&data.components)?;
@@ -382,8 +391,10 @@ impl FileSystem for VfsFileSystem {
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
 
         // `.`/`..` first, then entries, honouring the offset cursor.
-        let mut all: Vec<(String, bool, u64)> =
-            vec![(".".to_owned(), true, inode), ("..".to_owned(), true, ROOT_INODE)];
+        let mut all: Vec<(String, bool, u64)> = vec![
+            (".".to_owned(), true, inode),
+            ("..".to_owned(), true, ROOT_INODE),
+        ];
         for e in entries {
             // Intern child inodes so a subsequent lookup is stable.
             let mut comps = data.components.clone();
@@ -554,7 +565,10 @@ impl FileSystem for VfsFileSystem {
             FsMount::create(fs, &comp_refs, mode, &self.subject)
                 .await
                 .map_err(|e| io_err(&e))?;
-            let mut fid = mount.walk(&comp_refs, &self.subject).await.map_err(|e| io_err(&e))?;
+            let mut fid = mount
+                .walk(&comp_refs, &self.subject)
+                .await
+                .map_err(|e| io_err(&e))?;
             mount
                 .open(&mut fid, OWRITE, &self.subject)
                 .await
@@ -676,12 +690,20 @@ impl FileSystem for VfsFileSystem {
     ) -> io::Result<(libc::stat64, Duration)> {
         let data = self.inode_data(inode)?;
         let set = SetAttr {
-            mode: valid.contains(SetattrValid::MODE).then_some(attr.st_mode & 0o7777),
+            mode: valid
+                .contains(SetattrValid::MODE)
+                .then_some(attr.st_mode & 0o7777),
             uid: valid.contains(SetattrValid::UID).then_some(attr.st_uid),
             gid: valid.contains(SetattrValid::GID).then_some(attr.st_gid),
-            size: valid.contains(SetattrValid::SIZE).then_some(attr.st_size as u64),
-            atime: valid.contains(SetattrValid::ATIME).then_some(attr.st_atime as u64),
-            mtime: valid.contains(SetattrValid::MTIME).then_some(attr.st_mtime as u64),
+            size: valid
+                .contains(SetattrValid::SIZE)
+                .then_some(attr.st_size as u64),
+            atime: valid
+                .contains(SetattrValid::ATIME)
+                .then_some(attr.st_atime as u64),
+            mtime: valid
+                .contains(SetattrValid::MTIME)
+                .then_some(attr.st_mtime as u64),
         };
         let (mount, comps) = self.route_writable(&data.components)?;
         let comp_refs: Vec<&str> = comps.iter().map(String::as_str).collect();
@@ -786,7 +808,12 @@ impl FileSystem for VfsFileSystem {
         Err(io::Error::from_raw_os_error(libc::ENODATA))
     }
 
-    fn listxattr(&self, _ctx: &Context, _inode: Self::Inode, _size: u32) -> io::Result<ListxattrReply> {
+    fn listxattr(
+        &self,
+        _ctx: &Context,
+        _inode: Self::Inode,
+        _size: u32,
+    ) -> io::Result<ListxattrReply> {
         Ok(ListxattrReply::Names(Vec::new()))
     }
 }

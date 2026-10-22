@@ -16,26 +16,28 @@
 //! hyprstream           (application: factory functions, CLI)
 //! ```
 
-pub mod service;
 pub mod notify;
+pub mod service;
 
 // Top-level re-exports for convenience
 pub use service::spawner::{
-    DualSpawnable, ProcessBackend, ProcessConfig, ProcessKind,
-    ProcessSpawner, ServiceKind, ServiceMode, ServiceSpawner,
-    Spawnable, SpawnedProcess, SpawnedService, SpawnerBackend, StandaloneBackend,
-    SystemdBackend, InprocManager, UnifiedServiceConfig,
+    DualSpawnable, InprocManager, ProcessBackend, ProcessConfig, ProcessKind, ProcessReadiness,
+    ProcessSpawner, ServiceKind, ServiceMode, ServiceSpawner, Spawnable, SpawnedProcess,
+    SpawnedService, SpawnerBackend, StandaloneBackend, SystemdBackend, UnifiedServiceConfig,
 };
 
 pub use service::factory::{
     deployment_data_dir, get_factory, list_factories, NativeAnnouncementPublisher,
-    NativeAnnouncementRequest, NativeServiceAnnouncement, QuicSharedConfig, ServiceContext,
-    ServiceFactory, ServiceFactoryFn,
+    NativeAnnouncementReach, NativeAnnouncementRequest, NativeServiceAnnouncement,
+    QuicSharedConfig, ServiceContext, ServiceFactory, ServiceFactoryFn,
 };
 
-pub use service::trust_store::{TrustStore, Attestation, global_trust_store};
+pub use service::trust_store::{global_trust_store, Attestation, TrustStore};
 
-pub use service::manager::{detect as detect_service_manager, detect_with_mode as detect_service_manager_with_mode, ServiceManager, ServiceTarget, StandaloneManager};
+pub use service::manager::{
+    detect as detect_service_manager, detect_with_mode as detect_service_manager_with_mode,
+    ServiceManager, ServiceTarget, StandaloneManager,
+};
 
 #[cfg(feature = "systemd")]
 pub use service::manager::{SystemdManager, SystemdSystemManager};
@@ -43,6 +45,8 @@ pub use service::manager::{SystemdManager, SystemdSystemManager};
 #[cfg(feature = "systemd")]
 pub use service::manager::systemd::encrypt_credentials_if_available;
 
-pub use service::metadata::{MethodMeta, ParamMeta, SchemaMetadataFn, ScopedSchemaMetadataFn, ScopedClientTreeNode};
+pub use service::metadata::{
+    MethodMeta, ParamMeta, SchemaMetadataFn, ScopedClientTreeNode, ScopedSchemaMetadataFn,
+};
 
-pub use service::ordering::startup_stages;
+pub use service::ordering::{startup_stages, startup_stages_for_profile};

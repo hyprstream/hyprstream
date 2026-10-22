@@ -35,10 +35,12 @@ fn pathrs_to_fs_error(e: pathrs::error::Error) -> FsError {
     let msg = e.to_string();
     if msg.contains("SafetyViolation") || msg.contains("safety violation") {
         FsError::PathEscape(msg)
-    } else if msg.contains("ENOENT") || msg.contains("No such file") || msg.contains("subpath failed") {
-        FsError::NotFound(msg)
-    } else if msg.contains("EACCES") || msg.contains("EPERM") || msg.contains("Permission denied")
+    } else if msg.contains("ENOENT")
+        || msg.contains("No such file")
+        || msg.contains("subpath failed")
     {
+        FsError::NotFound(msg)
+    } else if msg.contains("EACCES") || msg.contains("EPERM") || msg.contains("Permission denied") {
         FsError::PermissionDenied(msg)
     } else if msg.contains("EEXIST") || msg.contains("File exists") {
         FsError::AlreadyExists(msg)
@@ -62,7 +64,11 @@ impl ContainedFs for PathrsRoot {
             real.strip_prefix(&self.root_path)
                 .map(|p| {
                     let s = p.to_string_lossy().to_string();
-                    if s.is_empty() { ".".to_owned() } else { s }
+                    if s.is_empty() {
+                        ".".to_owned()
+                    } else {
+                        s
+                    }
                 })
                 .unwrap_or_else(|_| path.to_owned())
         };
@@ -193,31 +199,25 @@ impl ContainedFs for PathrsRoot {
             .reopen(OpenFlags::O_PATH | OpenFlags::O_CLOEXEC)
             .map_err(pathrs_to_fs_error)?;
         let src_fd = src_file.as_raw_fd();
-        let src_path =
-            fs::read_link(format!("/proc/self/fd/{}", src_fd)).map_err(FsError::Io)?;
+        let src_path = fs::read_link(format!("/proc/self/fd/{}", src_fd)).map_err(FsError::Io)?;
 
         // Resolve dst parent within root, then construct full dst path
         let dst_validated = validate_relative_path(dst)?;
-        let dst_parent = dst_validated.parent().map(|p| p.to_string_lossy().to_string());
+        let dst_parent = dst_validated
+            .parent()
+            .map(|p| p.to_string_lossy().to_string());
 
         let dst_full = if let Some(parent_str) = dst_parent {
             if !parent_str.is_empty() {
                 // Resolve parent directory within root
-                let parent_handle = self
-                    .root
-                    .resolve(&parent_str)
-                    .map_err(pathrs_to_fs_error)?;
+                let parent_handle = self.root.resolve(&parent_str).map_err(pathrs_to_fs_error)?;
                 let parent_file: File = parent_handle
                     .reopen(OpenFlags::O_PATH | OpenFlags::O_CLOEXEC)
                     .map_err(pathrs_to_fs_error)?;
                 let parent_fd = parent_file.as_raw_fd();
-                let parent_path = fs::read_link(format!("/proc/self/fd/{}", parent_fd))
-                    .map_err(FsError::Io)?;
-                parent_path.join(
-                    dst_validated
-                        .file_name()
-                        .unwrap_or_default(),
-                )
+                let parent_path =
+                    fs::read_link(format!("/proc/self/fd/{}", parent_fd)).map_err(FsError::Io)?;
+                parent_path.join(dst_validated.file_name().unwrap_or_default())
             } else {
                 self.root_path.join(&dst_validated)
             }

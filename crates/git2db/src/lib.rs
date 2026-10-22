@@ -20,6 +20,8 @@ pub mod branch;
 pub mod clone_builder;
 pub mod manager;
 pub mod merge;
+pub mod pinned_disk;
+pub mod pinned_tree;
 pub mod references;
 pub mod registration_builder;
 pub mod registry;
@@ -48,9 +50,9 @@ pub mod xet {
     //!
     //! Provides high-level XET storage operations for model files and large data.
 
+    pub use crate::xet_filter::{clear_last_error, initialize, is_initialized, last_error};
     pub use git_xet_filter::config::XetConfig;
     pub use git_xet_filter::storage::{StorageBackend, XetStorage};
-    pub use crate::xet_filter::{initialize, is_initialized, last_error, clear_last_error};
 }
 
 // LFS pointer support with XET backend
@@ -82,7 +84,9 @@ pub use config::XetConfig;
 pub use branch::{Branch, BranchKind, BranchManager};
 pub use clone_builder::CloneBuilder;
 pub use manager::GitManager;
-pub use merge::{Candidate, CandidateComposer, ConflictEntry, ConflictReport, ConflictSide, MergeTreesResult};
+pub use merge::{
+    Candidate, CandidateComposer, ConflictEntry, ConflictReport, ConflictSide, MergeTreesResult,
+};
 pub use references::{GitRef, IntoGitRef};
 pub use registration_builder::RegistrationBuilder;
 pub use registry::{Git2DB, RemoteConfig, RepoId, TrackedRepository};
@@ -91,7 +95,6 @@ pub use repository_handle::{RepositoryHandle, RepositoryStatus};
 pub use stage::{StageManager, StagedFile};
 pub use transaction::{IsolationMode, TransactionHandle};
 pub use transport::TransportFactory;
-
 
 // Storage driver exports
 pub use storage::{Driver, DriverRegistry, StorageDriver};

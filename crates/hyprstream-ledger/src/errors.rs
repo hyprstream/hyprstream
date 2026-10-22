@@ -113,4 +113,70 @@ pub enum LedgerError {
     /// without mutating state, and is retryable.
     #[error("internal ledger error: {0}")]
     Internal(String),
+
+    /// Another process already holds the single-writer lease for this cell.
+    ///
+    /// A durable backend admits **exactly one** writer per cell for the whole
+    /// instance lifetime (the premise [`crate::engine`] is written against).
+    /// A second instance is rejected at construction rather than allowed to
+    /// stage from its own mirror.
+    #[error("writer lease for this cell is held by another instance (epoch {epoch})")]
+    WriterLeaseHeld {
+        /// The epoch of the lease currently recorded in the database.
+        epoch: u64,
+    },
+
+    /// This instance's writer lease was taken over by another instance.
+    ///
+    /// The fencing epoch recorded in the database no longer matches the epoch
+    /// this instance acquired, so its mirror may be arbitrarily stale. The op
+    /// is refused and the instance poisons itself — it never writes again.
+    #[error("writer lease lost: acquired epoch {expected}, database now at {found}")]
+    WriterLeaseLost {
+        /// The epoch this instance acquired at startup.
+        expected: u64,
+        /// The epoch currently recorded in the database.
+        found: u64,
+    },
+
+    /// The in-memory mirror did not describe the state that produced the
+    /// committed head, so the staged deltas cannot be persisted.
+    ///
+    /// Absolute account counters are only meaningful relative to the state
+    /// they were computed from. Committing deltas staged against a stale
+    /// mirror is exactly the lost-update bug, so the commit is refused inside
+    /// the ordering boundary instead.
+    #[error("mirror stale: staged against seq {mirror_seq}, database head is seq {db_seq}")]
+    MirrorStale {
+        /// The head sequence the mirror staged against.
+        mirror_seq: u64,
+        /// The head sequence actually found in the database.
+        db_seq: u64,
+    },
+
+    /// The backend refused the op because a prior integrity failure poisoned
+    /// this instance. Fail-closed and terminal: the process must restart (and
+    /// rebuild from the journal) to write again.
+    #[error("ledger instance poisoned, refusing all writes: {0}")]
+    Poisoned(String),
+
+    /// A persisted row could not be decoded under the strict representation.
+    ///
+    /// 128-bit ids and amounts are exactly 16 bytes; anything else is a
+    /// legacy or corrupt row. Decoding fails closed rather than truncating or
+    /// substituting zero, which would silently alias distinct ids.
+    #[error("corrupt persisted row: {0}")]
+    CorruptRow(String),
+
+    /// The database schema version is not one this build can serve.
+    #[error("incompatible ledger schema: {0}")]
+    SchemaIncompatible(String),
+
+    /// An issuance was attempted without a valid authorization.
+    ///
+    /// Minting is the only supply-growing operation (INV-1), so it is gated on
+    /// a verified, transfer-bound capability rather than on the caller merely
+    /// holding a backend. See [`crate::mint`].
+    #[error("issuance not authorized: {0}")]
+    MintNotAuthorized(String),
 }

@@ -8,7 +8,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use hyprstream_rpc::auth::JtiBlocklist as _;
 use hyprstream_util::InsertIfAbsentNoEvictResult;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,15 +53,9 @@ impl AuthenticatedUser {
     /// including for services.
     pub fn authorization_domain(&self) -> Result<String, &'static str> {
         if let Some(tenant) = self.verified_tenant.as_deref() {
-            let valid_component = !tenant.is_empty()
-                && tenant.len() <= 253
-                && tenant != "."
-                && tenant != ".."
-                && tenant != "*"
-                && tenant.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
-                });
-            if !valid_component {
+            // The canonical tenant-component rule (crate::auth); every
+            // tenant-carrying plane enforces the same syntax.
+            if !crate::auth::valid_tenant_component(tenant) {
                 return Err("invalid verified tenant");
             }
             return Ok(tenant.to_owned());
@@ -495,6 +488,22 @@ fn local_issuer_matches(claims: &jwt::Claims, expected: &str) -> bool {
     claims.iss == expected
 }
 
+/// W1.3: the Federate TUI class is never an HTTP resource credential. Its
+/// only surface is the tui RPC service (and Policy's delegated read-only
+/// check); over HTTP it would otherwise act as a generic bearer credential
+/// for its DID (HTTP sender binding covers cnf.jkt, while this class
+/// carries cnf.jwk). Classify by marker set OR the deployment's class pin,
+/// so the all-stripped shape denies too.
+fn reject_federate_tui_http(
+    claims: &jwt::Claims,
+    local_issuers: &[&str],
+) -> Result<(), &'static str> {
+    if claims.is_federate_tui_class(local_issuers) {
+        return Err("federate TUI credentials are not HTTP resource credentials");
+    }
+    Ok(())
+}
+
 pub(crate) async fn verify_resource_token_claims(
     state: &ResourceAuthState,
     token: &str,
@@ -569,12 +578,60 @@ pub(crate) async fn verify_resource_token_claims(
         }
     };
 
-    // JTI revocation check (RFC 7009) — shared blocklist with the OAuth
-    // revocation endpoint.
+    // W1.3: the Federate TUI class is never an HTTP resource credential.
+    reject_federate_tui_http(&claims, local_issuers)?;
+
+    // Credential revocation check (RFC 7009) — fail-closed on store absence.
+    // The credential profile makes `jti` REQUIRED on locally issued tokens:
+    // a local token without one is rejected outright (revocation could never
+    // observe it). Federated tokens keep the revocation check only.
+    let token_is_local = hyprstream_rpc::auth::is_local_iss(&claims.iss, local_issuers);
+    if token_is_local && claims.jti.is_none() {
+        return Err("local credential missing required jti");
+    }
     if let Some(ref jti) = claims.jti {
-        if state.jti_blocklist.is_revoked(jti) {
-            return Err("revoked token");
+        let cred_id = hyprstream_rpc::auth::CredentialId::jwt(&claims.iss, jti);
+        match hyprstream_rpc::auth::global_credential_revocation_store() {
+            Some(store) => {
+                if store.is_revoked(&cred_id).await {
+                    return Err("revoked token");
+                }
+            }
+            None => return Err("revocation store unavailable"),
         }
+    }
+
+    // Session check (v16 §3.3): a local token carrying a session ID is
+    // rejected when the session is revoked, expired, unknown, or cannot be
+    // checked.
+    if token_is_local {
+        let session_key = match claims.session_key() {
+            Ok(key) => key,
+            Err(_) => return Err("malformed session claims"),
+        };
+        if let Some(session_key) = session_key {
+            match hyprstream_rpc::auth::global_session_registry() {
+                Some(registry) => {
+                    if registry.is_revoked(&session_key).await {
+                        return Err("session revoked");
+                    }
+                }
+                None => return Err("session registry unavailable"),
+            }
+        }
+    }
+
+    // RFC 9068 §2.2.1 (v16 credential profile): every token admitted on this
+    // resource-server path is an `at+jwt` (the verifier positively rejects any
+    // other `typ` before decoding — see the resource verifier's
+    // `is_rfc9068_access_token_type` gate), so it MUST carry a non-empty
+    // `client_id`. This covers local AND trusted federated at+jwt.
+    if claims
+        .client_id
+        .as_deref()
+        .is_none_or(|c| c.trim().is_empty())
+    {
+        return Err("at+jwt credential missing required client_id");
     }
 
     // Federation is trusted for identity, never for choosing a local
@@ -1283,6 +1340,31 @@ mod rotation_aware_tests {
     }
 
     #[test]
+    fn federate_tui_credentials_are_never_http_resource_credentials() {
+        // Marker path: any TUI marker classifies, no reservation needed.
+        let mut claims = jwt::Claims::new("did:plc:abc".into(), 1, 2);
+        claims.iss = "https://cell.test".into();
+        let issuers = ["https://cell.test"];
+        assert!(reject_federate_tui_http(&claims, &issuers).is_ok());
+        claims.hs_tui_profile = Some("federate-tui-v1".into());
+        assert!(reject_federate_tui_http(&claims, &issuers).is_err());
+        // Pin path: the deployment reservation classifies by (local iss,
+        // configured client id) with every marker stripped. Install-once is
+        // idempotent for the same value (another test may have installed it).
+        if hyprstream_rpc::auth::federate_tui_class_client().is_none() {
+            hyprstream_rpc::auth::install_federate_tui_class_client(Some("hyprstream-tui-staging"))
+                .expect("install class reservation");
+        }
+        let mut pinned = jwt::Claims::new("did:plc:abc".into(), 1, 2);
+        pinned.iss = "https://cell.test".into();
+        pinned.client_id = Some("hyprstream-tui-staging".into());
+        assert!(reject_federate_tui_http(&pinned, &issuers).is_err());
+        // A different local client id stays a generic HTTP credential.
+        pinned.client_id = Some("ordinary-local-client".into());
+        assert!(reject_federate_tui_http(&pinned, &issuers).is_ok());
+    }
+
+    #[test]
     fn ordinary_eddsa_verifier_accepts_exact_rfc9068_type_forms() {
         let ca = new_key();
         let rotation = new_key();
@@ -1405,11 +1487,14 @@ mod rotation_aware_tests {
         assert_eq!(err, "JWT validation failed");
     }
 
-    #[test]
-    fn revoked_jti_still_rejected() {
-        // A rotation-signed token decodes cleanly, but the shared jti-blocklist
-        // check `verify_token_claims` performs after decode still rejects it.
-        use hyprstream_rpc::auth::{InMemoryJtiBlocklist, JtiBlocklist as _};
+    #[tokio::test]
+    async fn revoked_jti_still_rejected() {
+        // A rotation-signed token decodes cleanly, but the global
+        // credential-revocation store check still rejects it.
+        use hyprstream_rpc::auth::{
+            global_credential_revocation_store, set_global_credential_revocation_store,
+            CredentialId, InMemoryCredentialRevocationStore,
+        };
 
         let ca = new_key();
         let rotation = new_key();
@@ -1427,10 +1512,24 @@ mod rotation_aware_tests {
         .unwrap();
         assert_eq!(claims.jti.as_deref(), Some("jti-777"));
 
-        let blocklist = InMemoryJtiBlocklist::new();
-        blocklist.revoke("jti-777".to_owned(), now() + 3600);
+        // Ensure the global store is set.
+        if global_credential_revocation_store().is_none() {
+            let _ = set_global_credential_revocation_store(std::sync::Arc::new(
+                InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let store = global_credential_revocation_store().unwrap();
+        let issuer = claims.iss.as_str();
+        store
+            .revoke_credential(CredentialId::jwt(issuer, "jti-777"), now() + 3600)
+            .await
+            .unwrap();
         // This mirrors the exact post-decode check in `verify_token_claims`.
-        assert!(blocklist.is_revoked(claims.jti.as_deref().unwrap()));
+        assert!(
+            store
+                .is_revoked(&CredentialId::jwt(issuer, claims.jti.as_deref().unwrap()))
+                .await
+        );
     }
 
     #[test]
@@ -1843,9 +1942,12 @@ mod composite_aware_tests {
         .is_err());
     }
 
-    #[test]
-    fn composite_jti_remains_subject_to_revocation() {
-        use hyprstream_rpc::auth::{InMemoryJtiBlocklist, JtiBlocklist as _};
+    #[tokio::test]
+    async fn composite_jti_remains_subject_to_revocation() {
+        use hyprstream_rpc::auth::{
+            global_credential_revocation_store, set_global_credential_revocation_store,
+            CredentialId, InMemoryCredentialRevocationStore,
+        };
 
         let ca = new_ed_key();
         let (pq, pq_vk) = new_ml_dsa();
@@ -1872,9 +1974,18 @@ mod composite_aware_tests {
         )
         .unwrap();
         let jti = verified.jti.as_deref().unwrap();
-        let blocklist = InMemoryJtiBlocklist::new();
-        blocklist.revoke(jti.to_owned(), verified.exp);
-        assert!(blocklist.is_revoked(jti));
+        let issuer = verified.iss.as_str();
+        if global_credential_revocation_store().is_none() {
+            let _ = set_global_credential_revocation_store(std::sync::Arc::new(
+                InMemoryCredentialRevocationStore::new(),
+            ));
+        }
+        let store = global_credential_revocation_store().unwrap();
+        store
+            .revoke_credential(CredentialId::jwt(issuer, jti), verified.exp)
+            .await
+            .unwrap();
+        assert!(store.is_revoked(&CredentialId::jwt(issuer, jti)).await);
     }
 
     #[test]

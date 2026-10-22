@@ -32,10 +32,10 @@ pub mod renewal;
 pub mod tls;
 pub mod zone;
 
-pub use config::AccountZoneConfig;
+pub use config::{AccountHttpConfig, AccountZoneConfig};
 pub use dns::{DnsError, DnsProvider, UnconfiguredDnsProvider};
-pub use renewal::{CertHealth, CertHealthMonitor, CertRenewer, AlarmThresholds};
-pub use tls::{CertHandle, IssuedCert, IssuanceError, NullWildcardCertIssuer, WildcardCertIssuer};
+pub use renewal::{AlarmThresholds, CertHealth, CertHealthMonitor, CertRenewer};
+pub use tls::{CertHandle, IssuanceError, IssuedCert, NullWildcardCertIssuer, WildcardCertIssuer};
 pub use zone::{AccountZone, AccountZoneError};
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -98,15 +98,10 @@ mod tests {
     async fn publish_records_fails_loudly_on_unconfigured() {
         let z = AccountZone::new("acct.example.com").unwrap();
         let dns = UnconfiguredDnsProvider::new();
-        let err = publish_wildcard_records(
-            &z,
-            &dns,
-            Some("203.0.113.10".parse().unwrap()),
-            None,
-            300,
-        )
-        .await
-        .unwrap_err();
+        let err =
+            publish_wildcard_records(&z, &dns, Some("203.0.113.10".parse().unwrap()), None, 300)
+                .await
+                .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("wildcard A"), "{msg}");
     }

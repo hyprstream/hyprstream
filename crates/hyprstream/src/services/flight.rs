@@ -45,13 +45,13 @@ pub const SERVICE_NAME: &str = "flight";
 /// Flight's gRPC authentication and tenant-policy adapter.
 pub struct TenantFlightAuthorizer {
     auth: crate::server::state::ResourceAuthState,
-    policy_client: crate::services::PolicyClient,
+    policy_client: hyprstream_rpc_std::policy_client::PolicyClient,
 }
 
 impl TenantFlightAuthorizer {
     pub fn new(
         auth: crate::server::state::ResourceAuthState,
-        policy_client: crate::services::PolicyClient,
+        policy_client: hyprstream_rpc_std::policy_client::PolicyClient,
     ) -> Self {
         Self {
             auth,
@@ -87,12 +87,9 @@ impl hyprstream_flight::FlightAuthorizer for TenantFlightAuthorizer {
             ));
         }
         let atproto_issuer =
-            crate::services::oauth::state::canonical_issuer_origin(
-                &self.auth.oauth_issuer_url,
-            )
-            .unwrap_or_else(|| self.auth.oauth_issuer_url.clone());
-        let local_issuers =
-            [self.auth.oauth_issuer_url.as_str(), atproto_issuer.as_str()];
+            crate::services::oauth::state::canonical_issuer_origin(&self.auth.oauth_issuer_url)
+                .unwrap_or_else(|| self.auth.oauth_issuer_url.clone());
+        let local_issuers = [self.auth.oauth_issuer_url.as_str(), atproto_issuer.as_str()];
         let subject = claims.subject(&local_issuers);
         subject.validate().map_err(|_| {
             hyprstream_flight::FlightAuthError::Unauthenticated(
@@ -100,11 +97,14 @@ impl hyprstream_flight::FlightAuthorizer for TenantFlightAuthorizer {
             )
         })?;
         let identity = crate::server::middleware::AuthenticatedUser {
-            user: subject.name().ok_or_else(|| {
-                hyprstream_flight::FlightAuthError::Unauthenticated(
-                    "Invalid access-token subject".to_owned(),
-                )
-            })?.to_owned(),
+            user: subject
+                .name()
+                .ok_or_else(|| {
+                    hyprstream_flight::FlightAuthError::Unauthenticated(
+                        "Invalid access-token subject".to_owned(),
+                    )
+                })?
+                .to_owned(),
             verified_tenant: claims.tenant,
             token: Some(token.to_owned()),
             exp: Some(claims.exp),
@@ -114,9 +114,8 @@ impl hyprstream_flight::FlightAuthorizer for TenantFlightAuthorizer {
                 "Verified hosted-account tenant binding required".to_owned(),
             )
         })?;
-        let upstream_subject =
-            hyprstream_rpc::envelope::Subject::new(identity.user.clone());
-        let request = crate::services::generated::policy_client::PolicyCheck {
+        let upstream_subject = hyprstream_rpc::envelope::Subject::new(identity.user.clone());
+        let request = hyprstream_rpc_std::policy_client::PolicyCheck {
             subject: identity.user,
             domain,
             resource: resource.to_owned(),

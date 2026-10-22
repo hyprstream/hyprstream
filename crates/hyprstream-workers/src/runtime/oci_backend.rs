@@ -55,10 +55,10 @@ use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
 use super::backend::{SandboxBackend, SandboxHandle};
-use super::client::{LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
 #[cfg(feature = "oci-image")]
 use crate::image::RafsStore;
+use hyprstream_rpc_std::worker_client::{LinuxContainerResources, PodSandboxConfig};
 
 /// Sub-directory of the per-sandbox runtime dir where the tenant VFS is
 /// FUSE-mounted for Model B (#715) POSIX-rooting. Mirrors nspawn's `VFS_ROOT_DIR`.
@@ -394,10 +394,16 @@ impl OciBackend {
         // CRI identity as labels (so `podman ps --filter label=…` can find pods).
         args.push(format!("--label=io.hyprstream.sandbox-id={}", sandbox.id));
         if !config.metadata.name.is_empty() {
-            args.push(format!("--label=io.hyprstream.pod-name={}", config.metadata.name));
+            args.push(format!(
+                "--label=io.hyprstream.pod-name={}",
+                config.metadata.name
+            ));
         }
         if !config.metadata.namespace.is_empty() {
-            args.push(format!("--label=io.hyprstream.namespace={}", config.metadata.namespace));
+            args.push(format!(
+                "--label=io.hyprstream.namespace={}",
+                config.metadata.namespace
+            ));
         }
         if !config.metadata.uid.is_empty() {
             args.push(format!("--label=io.hyprstream.uid={}", config.metadata.uid));
@@ -646,8 +652,9 @@ impl SandboxBackend for OciBackend {
             };
 
         #[cfg(feature = "oci-image")]
-        let vfs_root_mountpoint: Option<PathBuf> =
-            vfs_root_mount.as_ref().map(|m| m.mountpoint().to_path_buf());
+        let vfs_root_mountpoint: Option<PathBuf> = vfs_root_mount
+            .as_ref()
+            .map(|m| m.mountpoint().to_path_buf());
         #[cfg(not(feature = "oci-image"))]
         let vfs_root_mountpoint: Option<PathBuf> = None;
 
@@ -781,9 +788,7 @@ impl SandboxBackend for OciBackend {
         timeout_secs: u64,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         if command.is_empty() {
-            return Err(WorkerError::ExecFailed(
-                "exec_sync: empty command".into(),
-            ));
+            return Err(WorkerError::ExecFailed("exec_sync: empty command".into()));
         }
         let container_name = Self::container_name(&sandbox.id);
 
@@ -878,8 +883,8 @@ inventory::submit! {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::client::{KeyValue, PodSandboxConfig};
     use super::*;
+    use hyprstream_rpc_std::worker_client::{KeyValue, PodSandboxConfig};
     use std::path::PathBuf;
 
     fn new_pod(id: &str, cfg: &PodSandboxConfig) -> PodSandbox {
@@ -928,10 +933,7 @@ mod tests {
 
     #[test]
     fn mount_spec_normalization() {
-        assert_eq!(
-            normalize_mount_spec("/h:/c"),
-            Some("/h:/c".to_owned())
-        );
+        assert_eq!(normalize_mount_spec("/h:/c"), Some("/h:/c".to_owned()));
         assert_eq!(
             normalize_mount_spec("/h:/c:ro"),
             Some("/h:/c:ro".to_owned())
@@ -983,14 +985,8 @@ mod tests {
         ann.insert("hyprstream.io/env.FOO".into(), "bar".into());
         ann.insert("hyprstream.io/mount.data".into(), "/host:/data:ro".into());
 
-        let args = backend.build_run_args(
-            &pod,
-            "hyprstream-sb-1",
-            "alpine:latest",
-            &cfg,
-            &ann,
-            None,
-        );
+        let args =
+            backend.build_run_args(&pod, "hyprstream-sb-1", "alpine:latest", &cfg, &ann, None);
 
         // Identity threaded.
         assert!(args.contains(&"--name=hyprstream-sb-1".to_owned()));
@@ -1029,19 +1025,27 @@ mod tests {
             "hyprstream.io/env.HYPRSTREAM_9P_SOCK".into(),
             "/run/hyprstream/9p.sock".into(),
         );
-        ann.insert("hyprstream.io/command".into(), "/usr/local/bin/wanix-guest".into());
+        ann.insert(
+            "hyprstream.io/command".into(),
+            "/usr/local/bin/wanix-guest".into(),
+        );
 
-        let args = backend.build_run_args(&pod, "hyprstream-sb-9p", "alpine:latest", &cfg, &ann, None);
+        let args =
+            backend.build_run_args(&pod, "hyprstream-sb-9p", "alpine:latest", &cfg, &ann, None);
 
         // Injected socket bind + env are threaded.
-        assert!(args
-            .contains(&"--volume=/run/hs/sb-9p/9p.sock:/run/hyprstream/9p.sock:rw".to_owned()));
+        assert!(
+            args.contains(&"--volume=/run/hs/sb-9p/9p.sock:/run/hyprstream/9p.sock:rw".to_owned())
+        );
         assert!(args.contains(&"--env=HYPRSTREAM_9P_SOCK=/run/hyprstream/9p.sock".to_owned()));
 
         // The command is the LAST arg, appearing AFTER the image.
         assert_eq!(args.last().unwrap(), "/usr/local/bin/wanix-guest");
         let img_idx = args.iter().position(|a| a == "alpine:latest").unwrap();
-        let cmd_idx = args.iter().position(|a| a == "/usr/local/bin/wanix-guest").unwrap();
+        let cmd_idx = args
+            .iter()
+            .position(|a| a == "/usr/local/bin/wanix-guest")
+            .unwrap();
         assert!(cmd_idx > img_idx, "command must come after the image");
     }
 
@@ -1087,7 +1091,11 @@ mod tests {
         );
 
         assert!(
-            args.contains(&format!("--volume={}:{}", mount.display(), VFS_ROOT_CTR_PATH)),
+            args.contains(&format!(
+                "--volume={}:{}",
+                mount.display(),
+                VFS_ROOT_CTR_PATH
+            )),
             "tenant VFS must be bind-mounted at {VFS_ROOT_CTR_PATH}; got: {args:?}"
         );
     }

@@ -24,12 +24,12 @@
 //! ```
 
 use proc_macro::TokenStream;
-use quote::{quote, format_ident};
-use syn::{parse_macro_input, DeriveInput, Data, Fields, Attribute, Meta, Expr, ExprPath};
+use quote::{format_ident, quote};
+use syn::{parse_macro_input, Attribute, Data, DeriveInput, Expr, ExprPath, Fields, Meta};
 
-mod schema;
 mod codegen;
 mod resolve;
+mod schema;
 mod util;
 
 /// Derive macro for serializing Rust types to Cap'n Proto.
@@ -70,8 +70,10 @@ pub fn derive_to_capnp(input: TokenStream) -> TokenStream {
         None => {
             return syn::Error::new_spanned(
                 &input,
-                "ToCapnp requires #[capnp(path::to::schema)] attribute"
-            ).to_compile_error().into();
+                "ToCapnp requires #[capnp(path::to::schema)] attribute",
+            )
+            .to_compile_error()
+            .into();
         }
     };
 
@@ -80,47 +82,57 @@ pub fn derive_to_capnp(input: TokenStream) -> TokenStream {
         Data::Struct(data) => {
             match &data.fields {
                 Fields::Named(fields) => {
-                    fields.named.iter().filter_map(|f| {
-                        let field_name = f.ident.as_ref()?;
+                    fields
+                        .named
+                        .iter()
+                        .filter_map(|f| {
+                            let field_name = f.ident.as_ref()?;
 
-                        // Check for enum_type (must come before skip check)
-                        if let Some(capnp_enum_path) = get_enum_type(&f.attrs) {
+                            // Check for enum_type (must come before skip check)
+                            if let Some(capnp_enum_path) = get_enum_type(&f.attrs) {
+                                let capnp_name = get_rename(&f.attrs)
+                                    .unwrap_or_else(|| to_accessor_name(&field_name.to_string()));
+                                let setter = format_ident!("set_{}", capnp_name);
+                                let ty = &f.ty;
+                                return Some(generate_enum_setter(
+                                    field_name,
+                                    &setter,
+                                    ty,
+                                    &capnp_enum_path,
+                                ));
+                            }
+
+                            // Check for skip
+                            if has_skip_attr(&f.attrs) {
+                                return None;
+                            }
+
+                            // Check for rename, otherwise use field name as-is
                             let capnp_name = get_rename(&f.attrs)
                                 .unwrap_or_else(|| to_accessor_name(&field_name.to_string()));
+
                             let setter = format_ident!("set_{}", capnp_name);
                             let ty = &f.ty;
-                            return Some(generate_enum_setter(field_name, &setter, ty, &capnp_enum_path));
-                        }
 
-                        // Check for skip
-                        if has_skip_attr(&f.attrs) {
-                            return None;
-                        }
-
-                        // Check for rename, otherwise use field name as-is
-                        let capnp_name = get_rename(&f.attrs)
-                            .unwrap_or_else(|| to_accessor_name(&field_name.to_string()));
-
-                        let setter = format_ident!("set_{}", capnp_name);
-                        let ty = &f.ty;
-
-                        // Generate setter based on type
-                        Some(generate_setter(field_name, &setter, ty))
-                    }).collect::<Vec<_>>()
+                            // Generate setter based on type
+                            Some(generate_setter(field_name, &setter, ty))
+                        })
+                        .collect::<Vec<_>>()
                 }
                 _ => {
                     return syn::Error::new_spanned(
                         &input,
-                        "ToCapnp only supports structs with named fields"
-                    ).to_compile_error().into();
+                        "ToCapnp only supports structs with named fields",
+                    )
+                    .to_compile_error()
+                    .into();
                 }
             }
         }
         _ => {
-            return syn::Error::new_spanned(
-                &input,
-                "ToCapnp only supports structs"
-            ).to_compile_error().into();
+            return syn::Error::new_spanned(&input, "ToCapnp only supports structs")
+                .to_compile_error()
+                .into();
         }
     };
 
@@ -177,8 +189,10 @@ pub fn derive_from_capnp(input: TokenStream) -> TokenStream {
         None => {
             return syn::Error::new_spanned(
                 &input,
-                "FromCapnp requires #[capnp(path::to::schema)] attribute"
-            ).to_compile_error().into();
+                "FromCapnp requires #[capnp(path::to::schema)] attribute",
+            )
+            .to_compile_error()
+            .into();
         }
     };
 
@@ -187,49 +201,54 @@ pub fn derive_from_capnp(input: TokenStream) -> TokenStream {
         Data::Struct(data) => {
             match &data.fields {
                 Fields::Named(fields) => {
-                    fields.named.iter().filter_map(|f| {
-                        let field_name = f.ident.as_ref()?;
+                    fields
+                        .named
+                        .iter()
+                        .filter_map(|f| {
+                            let field_name = f.ident.as_ref()?;
 
-                        // Check for enum_type (must come before skip check)
-                        if let Some(_capnp_enum_path) = get_enum_type(&f.attrs) {
+                            // Check for enum_type (must come before skip check)
+                            if let Some(_capnp_enum_path) = get_enum_type(&f.attrs) {
+                                let capnp_name = get_rename(&f.attrs)
+                                    .unwrap_or_else(|| to_accessor_name(&field_name.to_string()));
+                                let getter = format_ident!("get_{}", capnp_name);
+                                return Some(generate_enum_getter(field_name, &getter));
+                            }
+
+                            // Check for skip - use Default
+                            if has_skip_attr(&f.attrs) {
+                                return Some(quote! {
+                                    #field_name: Default::default(),
+                                });
+                            }
+
+                            // Check for rename, otherwise use field name as-is
                             let capnp_name = get_rename(&f.attrs)
                                 .unwrap_or_else(|| to_accessor_name(&field_name.to_string()));
+
                             let getter = format_ident!("get_{}", capnp_name);
-                            return Some(generate_enum_getter(field_name, &getter));
-                        }
+                            let ty = &f.ty;
+                            let is_optional = has_optional_attr(&f.attrs) || is_option_type(ty);
 
-                        // Check for skip - use Default
-                        if has_skip_attr(&f.attrs) {
-                            return Some(quote! {
-                                #field_name: Default::default(),
-                            });
-                        }
-
-                        // Check for rename, otherwise use field name as-is
-                        let capnp_name = get_rename(&f.attrs)
-                            .unwrap_or_else(|| to_accessor_name(&field_name.to_string()));
-
-                        let getter = format_ident!("get_{}", capnp_name);
-                        let ty = &f.ty;
-                        let is_optional = has_optional_attr(&f.attrs) || is_option_type(ty);
-
-                        // Generate getter based on type
-                        Some(generate_getter(field_name, &getter, ty, is_optional))
-                    }).collect::<Vec<_>>()
+                            // Generate getter based on type
+                            Some(generate_getter(field_name, &getter, ty, is_optional))
+                        })
+                        .collect::<Vec<_>>()
                 }
                 _ => {
                     return syn::Error::new_spanned(
                         &input,
-                        "FromCapnp only supports structs with named fields"
-                    ).to_compile_error().into();
+                        "FromCapnp only supports structs with named fields",
+                    )
+                    .to_compile_error()
+                    .into();
                 }
             }
         }
         _ => {
-            return syn::Error::new_spanned(
-                &input,
-                "FromCapnp only supports structs"
-            ).to_compile_error().into();
+            return syn::Error::new_spanned(&input, "FromCapnp only supports structs")
+                .to_compile_error()
+                .into();
         }
     };
 
@@ -303,7 +322,11 @@ fn get_rename(attrs: &[Attribute]) -> Option<String> {
                 if let Ok(Expr::Assign(assign)) = syn::parse2::<Expr>(list.tokens.clone()) {
                     if let Expr::Path(path) = &*assign.left {
                         if path.path.is_ident("rename") {
-                            if let Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = &*assign.right {
+                            if let Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(s),
+                                ..
+                            }) = &*assign.right
+                            {
                                 return Some(s.value());
                             }
                         }
@@ -327,7 +350,11 @@ fn get_enum_type(attrs: &[Attribute]) -> Option<syn::Path> {
                 if let Ok(Expr::Assign(assign)) = syn::parse2::<Expr>(list.tokens.clone()) {
                     if let Expr::Path(path) = &*assign.left {
                         if path.path.is_ident("enum_type") {
-                            if let Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = &*assign.right {
+                            if let Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(s),
+                                ..
+                            }) = &*assign.right
+                            {
                                 if let Ok(p) = syn::parse_str::<syn::Path>(&s.value()) {
                                     return Some(p);
                                 }
@@ -423,7 +450,9 @@ fn is_vec_u8_type(ty: &syn::Type) -> bool {
         if let Some(segment) = type_path.path.segments.last() {
             if segment.ident == "Vec" {
                 if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if let Some(syn::GenericArgument::Type(syn::Type::Path(inner_path))) = args.args.first() {
+                    if let Some(syn::GenericArgument::Type(syn::Type::Path(inner_path))) =
+                        args.args.first()
+                    {
                         if let Some(inner_seg) = inner_path.path.segments.last() {
                             return inner_seg.ident == "u8";
                         }
@@ -458,8 +487,19 @@ fn is_known_primitive(ty: &syn::Type) -> bool {
             let name = segment.ident.to_string();
             return matches!(
                 name.as_str(),
-                "String" | "bool" | "u8" | "u16" | "u32" | "u64"
-                    | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" | "PathBuf"
+                "String"
+                    | "bool"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "f32"
+                    | "f64"
+                    | "PathBuf"
             );
         }
     }
@@ -650,10 +690,7 @@ fn generate_enum_setter(
 ///
 /// Reads the capnp enum and converts to the Rust enum via `Into`.
 /// Falls back to `Default::default()` if the enum value is not recognized.
-fn generate_enum_getter(
-    field_name: &syn::Ident,
-    getter: &syn::Ident,
-) -> proc_macro2::TokenStream {
+fn generate_enum_getter(field_name: &syn::Ident, getter: &syn::Ident) -> proc_macro2::TokenStream {
     quote! {
         #field_name: reader.#getter().ok().map(Into::into).unwrap_or_default(),
     }
@@ -954,7 +991,12 @@ impl syn::parse::Parse for AuthorizeArgs {
                     let lit: syn::LitStr = input.parse()?;
                     identifier_field = Some(lit.value());
                 }
-                other => return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}"))),
+                other => {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        format!("unknown attribute: {other}"),
+                    ))
+                }
             }
 
             if input.peek(syn::Token![,]) {
@@ -964,8 +1006,10 @@ impl syn::parse::Parse for AuthorizeArgs {
 
         Ok(AuthorizeArgs {
             action: action.ok_or_else(|| syn::Error::new(input.span(), "missing 'action'"))?,
-            resource: resource.ok_or_else(|| syn::Error::new(input.span(), "missing 'resource'"))?,
-            identifier_field: identifier_field.ok_or_else(|| syn::Error::new(input.span(), "missing 'identifier_field'"))?,
+            resource: resource
+                .ok_or_else(|| syn::Error::new(input.span(), "missing 'resource'"))?,
+            identifier_field: identifier_field
+                .ok_or_else(|| syn::Error::new(input.span(), "missing 'identifier_field'"))?,
         })
     }
 }
@@ -1028,22 +1072,25 @@ pub fn register_scopes(_attr: TokenStream, item: TokenStream) -> TokenStream {
     //
     // Native-only (#1305): inventory's linker-section registration doesn't
     // resolve on wasm32, so each submit is gated off there.
-    let registrations: Vec<_> = scopes.iter().map(|(action, resource)| {
-        let example = format!("{action}:{resource}:*");
-        let description = format!("{action} on {resource}");
+    let registrations: Vec<_> = scopes
+        .iter()
+        .map(|(action, resource)| {
+            let example = format!("{action}:{resource}:*");
+            let description = format!("{action} on {resource}");
 
-        quote! {
-            #[cfg(not(target_arch = "wasm32"))]
-            inventory::submit! {
-                hyprstream_rpc::auth::ScopeDefinition::new(
-                    #action,
-                    #resource,
-                    #example,
-                    #description
-                )
+            quote! {
+                #[cfg(not(target_arch = "wasm32"))]
+                inventory::submit! {
+                    hyprstream_rpc::auth::ScopeDefinition::new(
+                        #action,
+                        #resource,
+                        #example,
+                        #description
+                    )
+                }
             }
-        }
-    }).collect();
+        })
+        .collect();
 
     // Output original impl + registrations
     let expanded = quote! {
@@ -1211,16 +1258,27 @@ impl syn::parse::Parse for ServiceFactoryArgs {
                 "depends_on" => {
                     let content;
                     syn::bracketed!(content in input);
-                    let deps = content.parse_terminated(|input: syn::parse::ParseStream<'_>| input.parse::<syn::LitStr>(), syn::Token![,])?;
+                    let deps = content.parse_terminated(
+                        |input: syn::parse::ParseStream<'_>| input.parse::<syn::LitStr>(),
+                        syn::Token![,],
+                    )?;
                     depends_on = deps.into_iter().collect();
                 }
                 other => {
-                    return Err(syn::Error::new(ident.span(), format!("unknown attribute: {other}")));
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        format!("unknown attribute: {other}"),
+                    ));
                 }
             }
         }
 
-        Ok(ServiceFactoryArgs { name, schema, metadata, depends_on })
+        Ok(ServiceFactoryArgs {
+            name,
+            schema,
+            metadata,
+            depends_on,
+        })
     }
 }
 
@@ -1272,11 +1330,18 @@ impl syn::parse::Parse for RpcServiceArgs {
             } else if ident == "scope_handlers" {
                 scope_handlers = true;
             } else {
-                return Err(syn::Error::new(ident.span(), format!("unknown option: {ident}")));
+                return Err(syn::Error::new(
+                    ident.span(),
+                    format!("unknown option: {ident}"),
+                ));
             }
         }
 
-        Ok(RpcServiceArgs { name, types_crate, scope_handlers })
+        Ok(RpcServiceArgs {
+            name,
+            types_crate,
+            scope_handlers,
+        })
     }
 }
 
@@ -1297,7 +1362,9 @@ pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
         Err(e) => {
             return syn::Error::new(
                 service_name.span(),
-                format!("CGR parse failed for '{name}': {e}. Ensure build.rs compiles this schema."),
+                format!(
+                    "CGR parse failed for '{name}': {e}. Ensure build.rs compiles this schema."
+                ),
             )
             .to_compile_error()
             .into()
@@ -1307,11 +1374,67 @@ pub fn generate_rpc_service(input: TokenStream) -> TokenStream {
     codegen::generate_service(&name, &parsed, types_crate, args.scope_handlers).into()
 }
 
+/// Proc macro that generates only the server implementation surface for a
+/// schema whose contracts live in another crate.
+///
+/// The contract crate must export `{name}_client` and `{name}_capnp` modules
+/// (as `hyprstream-rpc-std` does).  The expansion imports those types privately
+/// and emits handler traits, dispatch, request decoding, schema metadata, and
+/// the VFS projection.  It does **not** emit a second client, response enum, or
+/// data-struct implementation, which keeps AGPL service crates from becoming
+/// the distribution home for public clients.
+///
+/// # Usage
+///
+/// ```ignore
+/// pub mod worker_server {
+///     hyprstream_rpc_derive::generate_rpc_server!(
+///         "worker",
+///         types_crate = hyprstream_rpc_std,
+///         scope_handlers,
+///     );
+/// }
+/// ```
+#[proc_macro]
+pub fn generate_rpc_server(input: TokenStream) -> TokenStream {
+    let args: RpcServiceArgs = match syn::parse(input) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let service_name = &args.name;
+    let name = service_name.value();
+    let types_crate = match args.types_crate.as_ref() {
+        Some(path) => path,
+        None => {
+            return syn::Error::new_spanned(
+                service_name,
+                "generate_rpc_server! requires types_crate = <contract_crate>",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    let parsed = match schema::parse_from_cgr(&name) {
+        Ok(p) => p,
+        Err(e) => {
+            return syn::Error::new(
+                service_name.span(),
+                format!("CGR parse failed for '{name}': {e}. Ensure the contract crate exports its CGR via build.rs."),
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    codegen::generate_server(&name, &parsed, types_crate, args.scope_handlers).into()
+}
+
 /// Generate client-only code from a Cap'n Proto service schema.
 ///
-/// Like `generate_rpc_service!` but emits only data structs, response enums,
-/// and metadata — no server handler traits, no ZMQ deps, no async runtime.
-/// Compiles to all targets including wasm32.
+/// Like `generate_rpc_service!` but emits only the portable data, client,
+/// client-trait, JSON-dispatch, and metadata surface — no server handlers or
+/// service implementation code. Compiles to all targets including wasm32.
 ///
 /// # Usage
 ///
@@ -1335,7 +1458,9 @@ pub fn generate_rpc_client(input: TokenStream) -> TokenStream {
         Err(e) => {
             return syn::Error::new(
                 service_name.span(),
-                format!("CGR parse failed for '{name}': {e}. Ensure build.rs compiles this schema."),
+                format!(
+                    "CGR parse failed for '{name}': {e}. Ensure build.rs compiles this schema."
+                ),
             )
             .to_compile_error()
             .into()

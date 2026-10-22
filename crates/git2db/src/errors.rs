@@ -308,7 +308,6 @@ impl Git2DBError {
             _ => false,
         }
     }
-
 }
 
 impl From<git2::Error> for Git2DBError {
@@ -684,5 +683,4 @@ mod tests {
             );
         }
     }
-
 }

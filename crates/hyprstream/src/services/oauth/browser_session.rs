@@ -211,6 +211,8 @@ fn session_error(status: StatusCode, error: &str, description: &str) -> Response
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use p256::ecdsa::signature::Signer as _;
@@ -240,17 +242,25 @@ mod tests {
         }
     }
 
-    struct RejectFederatedResolver;
+    struct CountingFederatedResolver {
+        calls: AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl hyprstream_pds_service::federation_intake::FederatedDidDocumentResolver
-        for RejectFederatedResolver
+        for CountingFederatedResolver
     {
-        async fn resolve_federated_document(
-            &self,
-            _did: &str,
-        ) -> anyhow::Result<serde_json::Value> {
-            anyhow::bail!("federation intake is outside the browser-session fixture")
+        async fn resolve_federated_document(&self, did: &str) -> anyhow::Result<serde_json::Value> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({
+                "id": did,
+                "alsoKnownAs": ["at://foreign.example"],
+                "service": [{
+                    "id": format!("{did}#atproto_pds"),
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "https://foreign.example",
+                }],
+            }))
         }
     }
 
@@ -288,10 +298,11 @@ mod tests {
         cors: crate::config::CorsConfig,
         did: &'static str,
         atproto_key: p256::ecdsa::SigningKey,
+        federated_resolver: Arc<CountingFederatedResolver>,
         _storage: tempfile::TempDir,
     }
 
-    fn fixture(local: bool) -> SessionFixture {
+    async fn fixture(local: bool) -> SessionFixture {
         let storage = tempfile::TempDir::new().unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
         let remote_key = ed25519_dalek::SigningKey::from_bytes(&[0x72; 32]).verifying_key();
@@ -307,6 +318,7 @@ mod tests {
         };
         let mut oauth = crate::config::OAuthConfig::default();
         oauth.external_url = Some(ISSUER.to_owned());
+        oauth.identity_registration_did_web_origins = vec!["https://foreign.example".to_owned()];
         let cors = crate::config::CorsConfig {
             enabled: false,
             ..oauth.cors.clone()
@@ -379,14 +391,20 @@ mod tests {
             ..Default::default()
         };
         let quic = crate::config::QuicConfig {
+            event_publishers: Default::default(),
+            stream_publishers: Default::default(),
             enabled: true,
             bind_addr: "127.0.0.1:4433".to_owned(),
             server_name: "pds.example.test".to_owned(),
             cert_path: cert_path.to_string_lossy().into_owned(),
             key_path: key_path.to_string_lossy().into_owned(),
             iroh: false,
+            native_network_profile: crate::config::NativeNetworkProfile::Compatibility,
             relay: String::new(),
         };
+        let federated_resolver = Arc::new(CountingFederatedResolver {
+            calls: AtomicUsize::new(0),
+        });
         let registration_api =
             super::super::identity_registration::compose_identity_registration_api(
                 &oauth,
@@ -394,15 +412,24 @@ mod tests {
                 &quic,
                 signing_key.clone(),
                 storage.path().join("pds"),
-                Arc::new(RejectFederatedResolver),
+                federated_resolver.clone(),
                 Arc::new(RejectIdentityResolver),
             )
             .unwrap();
 
+        if let Some(store) = hosted_store.as_ref() {
+            store
+                .refresh_hosted_did_index(&hyprstream_rpc::Subject::new(
+                    hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                ))
+                .await
+                .unwrap();
+        }
+
         let mut state = OAuthState::new(
             &oauth,
-            crate::services::PolicyClient::new(make_client()),
-            crate::services::DiscoveryClient::new(make_client()),
+            hyprstream_rpc_std::policy_client::PolicyClient::new(make_client()),
+            hyprstream_rpc_std::discovery_client::DiscoveryClient::new(make_client()),
             signing_key.verifying_key().to_bytes(),
         )
         .with_atproto_did_resolver(Arc::new(FixtureDidResolver {
@@ -418,6 +445,7 @@ mod tests {
             cors,
             did,
             atproto_key,
+            federated_resolver,
             _storage: storage,
         }
     }
@@ -535,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_atproto_exchange_cookie_whoami_and_register_end_to_end() {
-        let fixture = fixture(true);
+        let fixture = fixture(true).await;
         let exchange = exchange_request(&fixture, "local-service", "local-dpop").await;
         assert_eq!(exchange.status(), StatusCode::OK);
         let session_cookie = cookie(&exchange);
@@ -578,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn federated_exchange_whoami_has_no_local_authority() {
-        let fixture = fixture(false);
+        let fixture = fixture(false).await;
         let exchange = exchange_request(&fixture, "foreign-service", "foreign-dpop").await;
         assert_eq!(exchange.status(), StatusCode::OK);
         let session_cookie = cookie(&exchange);
@@ -601,8 +629,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn intake_requires_local_exchange_authority_before_resolver_io() {
+        let fixture = fixture(false).await;
+        let exchange =
+            exchange_request(&fixture, "foreign-intake-service", "foreign-intake-dpop").await;
+        assert_eq!(exchange.status(), StatusCode::OK);
+        let session_cookie = cookie(&exchange);
+
+        let response = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors)
+            .oneshot(
+                axum::http::Request::post("/api/identity/intake")
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"did":"did:web:foreign.example"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body(response).await["error"], "local_authority_required");
+        assert_eq!(fixture.federated_resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn local_exchange_authorizes_intake_and_logout_revokes_captured_cookie() {
+        let fixture = fixture(true).await;
+        let exchange =
+            exchange_request(&fixture, "local-intake-service", "local-intake-dpop").await;
+        assert_eq!(exchange.status(), StatusCode::OK);
+        let session_cookie = cookie(&exchange);
+        let app = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors);
+
+        let intake = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/identity/intake")
+                    .header(header::COOKIE, &session_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"did":"did:web:foreign.example"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(intake.status(), StatusCode::OK);
+        assert_eq!(fixture.federated_resolver.calls.load(Ordering::SeqCst), 1);
+
+        let logout = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/oauth/logout")
+                    .header(header::COOKIE, &session_cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        assert!(logout.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+
+        let whoami = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(WHOAMI_PATH)
+                    .header(header::COOKIE, &session_cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(whoami.status(), StatusCode::OK);
+        assert_eq!(body(whoami).await["kind"], "unauthenticated");
+
+        let replayed_intake = app
+            .oneshot(
+                axum::http::Request::post("/api/identity/intake")
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"did":"did:web:foreign.example"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed_intake.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(fixture.federated_resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn unauthenticated_whoami_is_public_floor() {
-        let fixture = fixture(false);
+        let fixture = fixture(false).await;
         let generic_id = fixture
             .state
             .sessions
@@ -638,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_requires_dpop_and_consumes_service_assertion_once() {
-        let fixture = fixture(false);
+        let fixture = fixture(false).await;
         let app = super::super::create_app(Arc::clone(&fixture.state), &fixture.cors);
         let missing_dpop = app
             .clone()

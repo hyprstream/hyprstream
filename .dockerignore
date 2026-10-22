@@ -63,3 +63,10 @@ node_modules/
 
 # Config directories
 config/
+
+# The final runtime executes this probe; keep all other CI files excluded.
+!.github/
+.github/*
+!.github/scripts/
+.github/scripts/*
+!.github/scripts/check-runtime-pinned-model.sh

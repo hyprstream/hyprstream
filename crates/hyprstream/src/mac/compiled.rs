@@ -643,10 +643,12 @@ mod tests {
     /// and denies (`None`) an unenrolled one.
     #[test]
     fn enrolled_did_resolves_unenrolled_denies() {
-        let enrollment =
-            BTreeMap::from([("did:key:zAlice".to_owned(), label(Level::Secret))]);
+        let enrollment = BTreeMap::from([("did:key:zAlice".to_owned(), label(Level::Secret))]);
         let p = policy(1).with_enrollment(enrollment);
-        assert_eq!(p.clearance_for("did:key:zAlice"), Some(label(Level::Secret)));
+        assert_eq!(
+            p.clearance_for("did:key:zAlice"),
+            Some(label(Level::Secret))
+        );
         assert!(
             p.clearance_for("did:key:zMallory").is_none(),
             "an unenrolled DID must deny, not fall back to a default clearance"
@@ -675,7 +677,10 @@ mod tests {
             .load(&signed)
             .unwrap();
         assert_eq!(loaded.enrollment, enrollment);
-        assert_eq!(loaded.clearance_for("did:key:zBob"), Some(label(Level::Confidential)));
+        assert_eq!(
+            loaded.clearance_for("did:key:zBob"),
+            Some(label(Level::Confidential))
+        );
     }
 
     /// The enrollment table is covered content: tampering with it (without re-signing)
@@ -685,9 +690,9 @@ mod tests {
     #[test]
     fn tampered_enrollment_fails_signature_verification() {
         let key = [13u8; 32];
-        let enrollment =
-            BTreeMap::from([("did:key:zAlice".to_owned(), label(Level::Internal))]);
-        let signed = sign_policy(&policy(4).with_enrollment(enrollment), &StubSigner { key }).unwrap();
+        let enrollment = BTreeMap::from([("did:key:zAlice".to_owned(), label(Level::Internal))]);
+        let signed =
+            sign_policy(&policy(4).with_enrollment(enrollment), &StubSigner { key }).unwrap();
 
         // Tamper: decode, widen Alice's clearance, re-encode — but keep the OLD signature.
         let mut canonical: CanonicalPolicy = serde_json::from_slice(&signed.policy_bytes).unwrap();

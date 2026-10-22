@@ -45,8 +45,8 @@ pub mod gittorrent_storage;
 #[cfg(feature = "xet-storage")]
 use tokio::sync::OnceCell;
 
-use std::sync::Arc;
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 /// Callback invoked on each smudge (download) operation during checkout.
 ///

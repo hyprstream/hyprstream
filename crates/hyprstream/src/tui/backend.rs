@@ -160,10 +160,12 @@ pub fn ingest_structured(pane: &mut TuiPane, data: &[u8]) -> io::Result<()> {
         if cell.x < area.width && cell.y < area.height {
             let target = &mut buf.buffer[(cell.x, cell.y)];
             target.set_symbol(&cell.symbol);
-            target.set_style(ratatui::style::Style::new()
-                .fg(cell.fg)
-                .bg(cell.bg)
-                .add_modifier(cell.modifiers));
+            target.set_style(
+                ratatui::style::Style::new()
+                    .fg(cell.fg)
+                    .bg(cell.bg)
+                    .add_modifier(cell.modifiers),
+            );
             buf.mark_dirty(cell.y);
         }
     }

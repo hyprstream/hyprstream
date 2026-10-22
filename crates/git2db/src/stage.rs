@@ -175,9 +175,9 @@ impl<'a> StageManager<'a> {
             })?;
 
             // Get HEAD commit
-            let head = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
-            })?;
+            let head = repo
+                .head()
+                .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?;
 
             let head_commit = head.peel_to_commit().map_err(|e| {
                 Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {e}"))
@@ -210,18 +210,16 @@ impl<'a> StageManager<'a> {
                 Git2DBError::repository(&repo_path, format!("Failed to open repository: {e}"))
             })?;
 
-            let head = repo.head().map_err(|e| {
-                Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}"))
-            })?;
+            let head = repo
+                .head()
+                .map_err(|e| Git2DBError::reference("HEAD", format!("Failed to get HEAD: {e}")))?;
 
             let head_commit = head.peel_to_commit().map_err(|e| {
                 Git2DBError::reference("HEAD", format!("Failed to get HEAD commit: {e}"))
             })?;
 
             repo.reset(head_commit.as_object(), git2::ResetType::Mixed, None)
-                .map_err(|e| {
-                    Git2DBError::internal(format!("Failed to reset staging area: {e}"))
-                })?;
+                .map_err(|e| Git2DBError::internal(format!("Failed to reset staging area: {e}")))?;
 
             Ok(())
         })
@@ -286,11 +284,4 @@ impl<'a> StageManager<'a> {
     pub async fn is_empty(&self) -> Git2DBResult<bool> {
         Ok(self.staged_files().await?.is_empty())
     }
-}
-
-#[cfg(test)]
-mod tests {
-    
-
-    // Tests will be added for staging operations
 }

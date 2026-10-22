@@ -17,7 +17,7 @@ use ed25519_dalek::SigningKey;
 use std::io::Write;
 use tracing::info;
 
-use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayMode, SendInputRequest};
+use hyprstream_rpc_std::tui_client::{ConnectRequest, DisplayMode, SendInputRequest, TuiClient};
 
 /// Create a TuiClient for RPC calls.
 ///
@@ -26,7 +26,8 @@ use crate::services::generated::tui_client::{TuiClient, ConnectRequest, DisplayM
 pub fn create_tui_client(signing_key: &SigningKey) -> Result<TuiClient> {
     let sk = signing_key.clone();
 
-    TuiClient::from_resolver(sk, None).context("Failed to create TuiClient")
+    TuiClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, sk, None)
+        .context("Failed to create TuiClient")
 }
 
 /// Attach to an existing TUI session.
@@ -42,10 +43,20 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
     let (cols, rows) = terminal_size();
 
     // Connect to session via generated TuiClient
-    let result = client.connect(&ConnectRequest { session_id: sid, display_mode: DisplayMode::Ansi, cols, rows }).await
+    let result = client
+        .connect(&ConnectRequest {
+            session_id: sid,
+            display_mode: DisplayMode::Ansi,
+            cols,
+            rows,
+        })
+        .await
         .context("Failed to connect to TUI session. Is the TUI service running?")?;
 
-    println!("Connected to session {} (viewer {})", result.session_id, result.viewer_id);
+    println!(
+        "Connected to session {} (viewer {})",
+        result.session_id, result.viewer_id
+    );
 
     // FD-indexed streams: [0]=stdin (input relay), [1]=stdout (frames)
     let stdout_stream = result.streams.get(1);
@@ -61,7 +72,12 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
 
     // Print window list
     for win in &result.windows {
-        println!("  Window {}: {} ({} panes)", win.id, win.name, win.panes.len());
+        println!(
+            "  Window {}: {} ({} panes)",
+            win.id,
+            win.name,
+            win.panes.len()
+        );
     }
 
     // Subscribe to frame stream and enter raw mode
@@ -83,7 +99,7 @@ pub async fn handle_tui_attach(signing_key: &SigningKey, session_id: Option<u32>
 /// Subscribes to the viewer's moq broadcast via a UDS socket, verifying each
 /// frame's Blake3 HMAC chain before rendering ANSI data to the terminal.
 async fn run_attach_loop(
-    stream_info: &crate::services::generated::tui_client::StreamInfo,
+    stream_info: &hyprstream_rpc_std::tui_client::StreamInfo,
     client: &TuiClient,
     viewer_id: u32,
 ) -> Result<()> {
@@ -96,7 +112,9 @@ async fn run_attach_loop(
         "TUI service did not return a moq broadcast path — server may be in ZMQ-only mode"
     );
 
-    let mac_key: [u8; 32] = stream_info.mac_key.as_slice()
+    let mac_key: [u8; 32] = stream_info
+        .mac_key
+        .as_slice()
         .try_into()
         .context("mac_key must be 32 bytes")?;
     let topic = stream_info.topic.clone();
@@ -124,12 +142,22 @@ async fn run_attach_loop(
     // `mac_key`+`topic` out of band), so the transport enc_key is never exercised
     // here — derive a stable one from mac_key purely to satisfy the consumer API.
     let enc_key = *hyprstream_rpc::crypto::StreamKeys::new(topic.clone(), mac_key).enc_key;
-    let mut handle = MoqStreamHandle::networked(reach, &qos, broadcast_path, mac_key, enc_key, topic);
+    let mut handle = MoqStreamHandle::networked_with_server_identity(
+        reach,
+        &qos,
+        broadcast_path,
+        mac_key,
+        enc_key,
+        topic,
+        stream_info.moql_server_identity.clone(),
+    );
     let recv_handle = tokio::spawn(async move {
         loop {
             match handle.recv_next().await {
                 Ok(Some(StreamPayload::Data(data))) => {
-                    if tx.send(data).await.is_err() { return; }
+                    if tx.send(data).await.is_err() {
+                        return;
+                    }
                 }
                 Ok(Some(StreamPayload::Complete(_))) | Ok(None) => return,
                 Ok(Some(StreamPayload::Error(msg))) => {
@@ -137,7 +165,10 @@ async fn run_attach_loop(
                     return;
                 }
                 Ok(Some(_)) => continue,
-                Err(e) => { tracing::warn!("moq frame recv: {e}"); return; }
+                Err(e) => {
+                    tracing::warn!("moq frame recv: {e}");
+                    return;
+                }
             }
         }
     });
@@ -208,14 +239,19 @@ pub async fn handle_tui_new(signing_key: &SigningKey) -> Result<()> {
     info!("Creating new TUI session");
 
     let client = create_tui_client(signing_key)?;
-    let window_info = client.create_window().await
+    let window_info = client
+        .create_window()
+        .await
         .context("Failed to create window. Is the TUI service running?")?;
 
     println!("Created window {}:", window_info.id);
     println!("  Name: {}", window_info.name);
     println!("  Active pane: {}", window_info.active_pane_id);
     for pane in &window_info.panes {
-        println!("  Pane {}: {}x{} \"{}\"", pane.id, pane.cols, pane.rows, pane.title);
+        println!(
+            "  Pane {}: {}x{} \"{}\"",
+            pane.id, pane.cols, pane.rows, pane.title
+        );
     }
 
     Ok(())
@@ -227,7 +263,9 @@ pub async fn handle_tui_list(signing_key: &SigningKey) -> Result<()> {
 
     let client = create_tui_client(signing_key)?;
 
-    let window_list = client.list_windows(0).await
+    let window_list = client
+        .list_windows(0)
+        .await
         .context("Failed to list windows. Is the TUI service running?")?;
 
     if window_list.windows.is_empty() {
@@ -363,7 +401,12 @@ pub async fn handle_tui_play(
     let (cols, rows) = terminal_size();
 
     let result = client
-        .connect(&ConnectRequest { session_id, display_mode: DisplayMode::Capnp, cols, rows })
+        .connect(&ConnectRequest {
+            session_id,
+            display_mode: DisplayMode::Capnp,
+            cols,
+            rows,
+        })
         .await
         .context("Failed to connect to TUI session. Is the TUI service running?")?;
 
@@ -393,19 +436,28 @@ pub async fn handle_tui_play(
     let process = crate::tui::process::spawn_app_process(app, config);
 
     // Signal playback started via empty sendInput
-    let _ = client.send_input(&SendInputRequest {
-        viewer_id: result.viewer_id,
-        data: vec![],
-    }).await;
+    let _ = client
+        .send_input(&SendInputRequest {
+            viewer_id: result.viewer_id,
+            data: vec![],
+        })
+        .await;
 
     // The process lives in this CLI process. Forward its output to the TUI
     // service via sendInput RPC, and subscribe to streams[0] (stdin) for
     // relayed viewer input (keypresses from browser/tui-attach viewers).
     let stdin_stream = result.streams.first();
     forward_process_output(
-        process, &client, signing_key, result.viewer_id, active_pane_id,
-        pane_cols, pane_rows, stdin_stream,
-    ).await?;
+        process,
+        &client,
+        signing_key,
+        result.viewer_id,
+        active_pane_id,
+        pane_cols,
+        pane_rows,
+        stdin_stream,
+    )
+    .await?;
 
     println!("Playback complete.");
     Ok(())
@@ -429,7 +481,7 @@ pub async fn forward_process_output(
     _pane_id: u32,
     initial_cols: u16,
     initial_rows: u16,
-    stdin_stream: Option<&crate::services::generated::tui_client::StreamInfo>,
+    stdin_stream: Option<&hyprstream_rpc_std::tui_client::StreamInfo>,
 ) -> Result<()> {
     use crate::tui::process::ProcessInput;
 
@@ -448,7 +500,11 @@ pub async fn forward_process_output(
     // Enter raw mode and read stdin if we're on a real terminal.
     // When stdin is not a tty (piped/headless), skip input handling.
     let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
-    let orig_termios = if is_tty { Some(enter_raw_mode()?) } else { None };
+    let orig_termios = if is_tty {
+        Some(enter_raw_mode()?)
+    } else {
+        None
+    };
 
     // Use a pipe to signal the stdin reader thread to exit.
     // We use a raw std::thread (not spawn_blocking) because tokio's runtime
@@ -474,22 +530,40 @@ pub async fn forward_process_output(
                 loop {
                     // poll stdin and cancel pipe
                     let mut fds = [
-                        libc::pollfd { fd: stdin_fd, events: libc::POLLIN, revents: 0 },
-                        libc::pollfd { fd: read_pipe, events: libc::POLLIN, revents: 0 },
+                        libc::pollfd {
+                            fd: stdin_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: read_pipe,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
                     ];
                     let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-                    if ret <= 0 { break; }
+                    if ret <= 0 {
+                        break;
+                    }
                     // Cancel pipe signaled
-                    if fds[1].revents & libc::POLLIN != 0 { break; }
+                    if fds[1].revents & libc::POLLIN != 0 {
+                        break;
+                    }
                     // Stdin ready
                     if fds[0].revents & libc::POLLIN != 0 {
                         let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr().cast(), buf.len()) };
-                        if n <= 0 { break; }
+                        if n <= 0 {
+                            break;
+                        }
                         let data = buf[..n as usize].to_vec();
-                        if stdin_async_tx.blocking_send(data).is_err() { break; }
+                        if stdin_async_tx.blocking_send(data).is_err() {
+                            break;
+                        }
                     }
                 }
-                unsafe { libc::close(read_pipe); }
+                unsafe {
+                    libc::close(read_pipe);
+                }
             });
         }
 
@@ -532,7 +606,11 @@ pub async fn forward_process_output(
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 match poll_stdin_rpc(&poll_client, poll_viewer_id).await {
                     Ok(data) if !data.is_empty() => {
-                        if stdin_input_tx.send(ProcessInput::Stdin(data)).await.is_err() {
+                        if stdin_input_tx
+                            .send(ProcessInput::Stdin(data))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -548,9 +626,7 @@ pub async fn forward_process_output(
 
     // SIGTERM handler — allows disconnect RPC to fire before the process dies.
     #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    )?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     // Forward output loop (existing sendInput RPC)
     loop {
@@ -568,10 +644,13 @@ pub async fn forward_process_output(
             None => break,
         };
 
-        if let Err(e) = client.send_input(&SendInputRequest {
-            viewer_id,
-            data: data.clone(),
-        }).await {
+        if let Err(e) = client
+            .send_input(&SendInputRequest {
+                viewer_id,
+                data: data.clone(),
+            })
+            .await
+        {
             tracing::debug!("sendInput failed: {}", e);
             break;
         }
@@ -583,17 +662,28 @@ pub async fn forward_process_output(
     let _ = tokio::time::timeout(
         std::time::Duration::from_millis(500),
         client.disconnect(viewer_id),
-    ).await;
+    )
+    .await;
 
     resize_handle.abort();
-    if let Some(h) = stdin_forward { h.abort(); }
-    if let Some(h) = stdin_handle { h.abort(); }
+    if let Some(h) = stdin_forward {
+        h.abort();
+    }
+    if let Some(h) = stdin_handle {
+        h.abort();
+    }
     // Signal stdin reader thread to exit via cancel pipe
     if let Some(fd) = cancel_fd {
-        unsafe { libc::write(fd, b"x".as_ptr().cast(), 1); }
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::write(fd, b"x".as_ptr().cast(), 1);
+        }
+        unsafe {
+            libc::close(fd);
+        }
     }
-    if let Some(ref orig) = orig_termios { restore_terminal(orig); }
+    if let Some(ref orig) = orig_termios {
+        restore_terminal(orig);
+    }
     Ok(())
 }
 

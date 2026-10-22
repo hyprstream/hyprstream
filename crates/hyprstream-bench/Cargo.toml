@@ -1,0 +1,25 @@
+[package]
+name = "hyprstream-bench"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "Verifiable-outcome calibration benchmark (System One P0.6): procedurally generated jev-1 items, adversarial + cyclic-permutation strata, family holdout firewall, frozen item manifest"
+
+# Deliberately dependency-light and permissive-only: this harness is a public
+# release artifact (Apache-2.0; generated items CC-BY-4.0) consumed by the
+# synthesis firewall (P1.3), the baseline gate (P0.5), and the zero-shot
+# transfer gate (P1.4 leg e). It must never depend on an AGPL crate
+# (license-boundary.toml `permissive_roots`).
+[dependencies]
+hyprstream-decision = { version = "0.1", path = "../hyprstream-decision" }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

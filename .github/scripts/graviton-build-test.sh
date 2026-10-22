@@ -9,6 +9,8 @@
 # escaped inline heredoc.
 set -euo pipefail
 
+bash "$(dirname "${BASH_SOURCE[0]}")/verify-libtorch.sh"
+
 # The rust toolchain lives under root's home in the image; the workflow made it
 # a+rwX and created this ci user. CARGO_HOME/RUSTUP_HOME point back at it.
 export PATH="/root/.cargo/bin:/usr/local/bin:${PATH}"
@@ -17,11 +19,44 @@ export RUSTUP_HOME=/root/.rustup
 export SCCACHE_DIR="${PWD}/.sccache"
 mkdir -p "${SCCACHE_DIR}"
 
+# These are standalone workspaces, so Cargo's default target directory is
+# relative to each guest crate.  When the CI workflow supplies a shared target
+# directory, Cargo resolves a relative value from the crate's working
+# directory and an absolute value verbatim.  Keep that resolution in one
+# place so the artifacts we hand to the guest tests are the artifacts the
+# preceding Cargo commands actually produced.
+guest_target_dir() {
+  local crate_dir="$1"
+  if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    if [[ "${CARGO_TARGET_DIR}" = /* ]]; then
+      printf '%s\n' "${CARGO_TARGET_DIR}"
+    else
+      printf '%s/%s\n' "${crate_dir}" "${CARGO_TARGET_DIR}"
+    fi
+  else
+    printf '%s/target\n' "${crate_dir}"
+  fi
+}
+
+require_guest_artifact() {
+  local label="$1"
+  local artifact="$2"
+  if [[ ! -r "${artifact}" || ! -s "${artifact}" ]]; then
+    echo "${label} guest artifact is missing, unreadable, or empty: ${artifact}" >&2
+    return 1
+  fi
+}
+
 # Same-filesystem TMPDIR: the overlay_fsmount tests rename across layers, which
 # fails EXDEV (cross-device link) when temp dirs land on /tmp (tmpfs) while the
 # workspace is on another filesystem. Keep temp on the workspace fs.
 export TMPDIR="${PWD}/.citmp"
 mkdir -p "${TMPDIR}"
+
+# Final sccache stats on ANY exit path (bash runs EXIT traps on SIGTERM as
+# well; only SIGKILL loses them — the per-phase stats in run_phase are the
+# backstop for hard kills).
+trap 'sccache --show-stats || true' EXIT
 
 run_phase() {
   local label="$1"
@@ -36,6 +71,13 @@ run_phase() {
     status=$?
   fi
   local elapsed=$((SECONDS - started))
+  # Cumulative sccache stats after every phase. When a run is slow or gets
+  # killed, these are the only surviving evidence of cache misses / write
+  # errors: the 2026-09-14 140-min timeout (run 34867497318) destroyed the
+  # end-of-script stats that would have explained the run, costing hours of
+  # forensics (resolved only via the re-run's surviving stats — 3,288 misses,
+  # 2,261 write errors).
+  sccache --show-stats || true
   echo "ci-phase name=${label@Q} elapsed_seconds=${elapsed} status=${status}"
   echo "::endgroup::"
   return "${status}"
@@ -47,27 +89,28 @@ run_phase() {
 # browser-facing rpc + vfs + rpc-std package set used by www.
 run_phase "browser WASM check" bash .github/scripts/browser-wasm-check.sh
 
-# Prove the production credential profile is causal: omitting it must fail the
-# build, never silently skip the deployable target.
-run_phase "credential-pds negative build gate" \
-  bash .github/scripts/credential-pds-build-gate.sh
-
 # #1425 r4: the compile-only check above cannot catch a regression in the
 # actual browser-fetch runtime behavior (JS callback, Request/Response, nonce
 # retry, response rejection) — only real execution can. Chromium + a matching
 # chromedriver were installed as root by the workflow before this script
 # dropped to the non-root `ci` user (see rust.yml's `build` job), so
 # browser-wasm-test-ci.sh finds them already on PATH and skips straight to
-# resolving + running crates/hyprstream-rpc/tests/wasm_browser_fetch.rs in a
+# resolving + running the browser-fetch and browser-session proof tests in a
 # real headless Chromium — the same required-merge-gate invariant the fast PR
 # `WASM (browser client)` job checks, but the fast job is explicitly skipped
 # on `merge_group` (rust.yml:167), so this is the only required-gate path that
 # actually launches a browser for the synthetic merge candidate.
 run_phase "browser WASM real execution" bash .github/scripts/browser-wasm-test-ci.sh
 
-# Default features (parity with the former x86 gate); libtorch is the image's
-# aarch64 wheel at /opt/libtorch, so NO download-libtorch feature here.
-run_phase "native release build" cargo build --release
+# TEST LANE FIRST (2026-09-15 merge-queue spike): run everything the test
+# suite consumes before any release/feature lane. nextest and doctests need
+# ONLY the guest .wasm artifacts (verified: no test reads the release
+# binaries — only HYPRSTREAM_PYGUEST_WASM / HYPRSTREAM_FSGUEST_WASM cross
+# this boundary), and test failures were previously discovered after ~50 min
+# of release-lane work they never consumed. Ordering the test lane second
+# surfaces the most common failure class (2026-09-13/14 samples: 2 of 4 red
+# candidates were nextest failures found at 63-68 min) at ~25 min instead.
+# Green-run wall time is unchanged — the same phases run serially either way.
 
 # wasm guest artifacts for the sandbox/mount tests (deny-on-missing-guest guard).
 # cd INTO each guest crate so cargo reads its .cargo/config.toml (the python guest
@@ -76,8 +119,12 @@ run_phase "Python guest WASM build" bash -c \
   'cd crates/hyprstream-workers-python-guest && cargo build --release --target wasm32-unknown-unknown'
 run_phase "Wasmtime guest WASM build" bash -c \
   'cd crates/hyprstream-workers-wasmtime-fsguest && cargo build --release --target wasm32-wasip1'
-export HYPRSTREAM_PYGUEST_WASM="${PWD}/crates/hyprstream-workers-python-guest/target/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm"
-export HYPRSTREAM_FSGUEST_WASM="${PWD}/crates/hyprstream-workers-wasmtime-fsguest/target/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm"
+PYTHON_GUEST_DIR="${PWD}/crates/hyprstream-workers-python-guest"
+FSGUEST_DIR="${PWD}/crates/hyprstream-workers-wasmtime-fsguest"
+export HYPRSTREAM_PYGUEST_WASM="$(guest_target_dir "${PYTHON_GUEST_DIR}")/wasm32-unknown-unknown/release/hyprstream_workers_python_guest.wasm"
+export HYPRSTREAM_FSGUEST_WASM="$(guest_target_dir "${FSGUEST_DIR}")/wasm32-wasip1/release/hyprstream-workers-wasmtime-fsguest.wasm"
+require_guest_artifact "Python" "${HYPRSTREAM_PYGUEST_WASM}"
+require_guest_artifact "Wasmtime" "${HYPRSTREAM_FSGUEST_WASM}"
 
 # nextest ci profile enforces the per-test slow-timeout from .config/nextest.toml;
 # fail-fast (the default) is what the merge gate wants.
@@ -87,6 +134,13 @@ run_phase "nextest" cargo nextest run --cargo-profile ci-test --profile ci
 # acceptance criterion: a measured 318s doctest phase was paying release LTO
 # for almost no runtime win on doc examples. Parity with the nextest profile.
 run_phase "doctests" cargo test --profile ci-test --doc
+
+# RELEASE / FEATURE LANES moved to the parallel build-release job
+# (.github/scripts/graviton-release-lanes.sh) on 2026-09-15: the native
+# release build, pds-postgres lanes, and credential-pds negative gate
+# consume nothing the test suite produces and vice versa (verified: no test
+# reads the release binaries). This job is the test lane — browser
+# conformance, guest WASM artifacts, nextest, doctests.
 
 echo "::group::sccache statistics"
 sccache --show-stats

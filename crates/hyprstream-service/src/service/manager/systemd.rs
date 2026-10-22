@@ -30,17 +30,16 @@ async fn user_systemd_connection() -> Result<Connection> {
 
     // Fallback: well-known socket path that systemd --user maintains.
     let uid = nix::unistd::getuid().as_raw();
-    let rt = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/run/user/{uid}"));
+    let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{uid}"));
     let bus_path = format!("{rt}/bus");
-    zbus_systemd::zbus::ConnectionBuilder::address(
-        format!("unix:path={bus_path}").as_str(),
-    )?
-    .build()
-    .await
-    .with_context(|| format!(
-        "could not connect to user D-Bus (tried $DBUS_SESSION_BUS_ADDRESS and {bus_path})"
-    ))
+    zbus_systemd::zbus::ConnectionBuilder::address(format!("unix:path={bus_path}").as_str())?
+        .build()
+        .await
+        .with_context(|| {
+            format!(
+                "could not connect to user D-Bus (tried $DBUS_SESSION_BUS_ADDRESS and {bus_path})"
+            )
+        })
 }
 
 /// Systemd-based user service manager
@@ -72,7 +71,10 @@ impl SystemdManager {
         let login = LoginProxy::new(&system_connection).await?;
         let uid = nix::unistd::getuid().as_raw();
         if let Err(e) = login.set_user_linger(uid, true, false).await {
-            debug!("Failed to enable user linger (may already be enabled): {}", e);
+            debug!(
+                "Failed to enable user linger (may already be enabled): {}",
+                e
+            );
         } else {
             debug!("User lingering enabled");
         }
@@ -89,10 +91,14 @@ impl SystemdManager {
     /// be tied to an active login session.  Do NOT use for long-lived public
     /// service daemons — the session bus disappears on logout.
     pub async fn new_session() -> Result<Self> {
-        let connection = Connection::session().await
-            .context("could not connect to D-Bus session bus (is $DBUS_SESSION_BUS_ADDRESS set?)")?;
+        let connection = Connection::session().await.context(
+            "could not connect to D-Bus session bus (is $DBUS_SESSION_BUS_ADDRESS set?)",
+        )?;
         let systemd = ManagerProxy::new(&connection).await?;
-        Ok(Self { connection, systemd })
+        Ok(Self {
+            connection,
+            systemd,
+        })
     }
 
     #[allow(dead_code)]
@@ -125,7 +131,10 @@ impl SystemdSystemManager {
     pub async fn new() -> Result<Self> {
         let connection = Connection::system().await?;
         let systemd = ManagerProxy::new(&connection).await?;
-        Ok(Self { connection, systemd })
+        Ok(Self {
+            connection,
+            systemd,
+        })
     }
 
     fn service_unit(service: &str) -> String {
@@ -173,7 +182,10 @@ impl ServiceManager for SystemdSystemManager {
         self.systemd
             .start_unit(Self::service_unit(service), "replace".into())
             .await?;
-        info!("Started system service unit: {}", Self::service_unit(service));
+        info!(
+            "Started system service unit: {}",
+            Self::service_unit(service)
+        );
         Ok(())
     }
 
@@ -181,17 +193,21 @@ impl ServiceManager for SystemdSystemManager {
         self.systemd
             .stop_unit(Self::service_unit(service), "replace".into())
             .await?;
-        info!("Stopped system service unit: {}", Self::service_unit(service));
+        info!(
+            "Stopped system service unit: {}",
+            Self::service_unit(service)
+        );
         Ok(())
     }
 
     async fn is_active(&self, service: &str) -> Result<bool> {
         match self.systemd.get_unit(Self::service_unit(service)).await {
             Ok(unit_path) => {
-                let unit = zbus_systemd::systemd1::UnitProxy::builder(self.systemd.inner().connection())
-                    .path(unit_path)?
-                    .build()
-                    .await?;
+                let unit =
+                    zbus_systemd::systemd1::UnitProxy::builder(self.systemd.inner().connection())
+                        .path(unit_path)?
+                        .build()
+                        .await?;
                 let state = unit.active_state().await?;
                 Ok(state == "active")
             }
@@ -219,9 +235,16 @@ impl ServiceManager for SystemdSystemManager {
             .await
             .context("failed to spawn systemctl enable")?;
         if !status.success() {
-            anyhow::bail!("systemctl enable {} failed (exit {})", Self::service_unit(service), status);
+            anyhow::bail!(
+                "systemctl enable {} failed (exit {})",
+                Self::service_unit(service),
+                status
+            );
         }
-        debug!("Enabled system service unit: {}", Self::service_unit(service));
+        debug!(
+            "Enabled system service unit: {}",
+            Self::service_unit(service)
+        );
         Ok(())
     }
 
@@ -283,10 +306,11 @@ impl ServiceManager for SystemdManager {
         match self.systemd.get_unit(Self::service_unit(service)).await {
             Ok(unit_path) => {
                 // Query the unit's ActiveState property via D-Bus
-                let unit = zbus_systemd::systemd1::UnitProxy::builder(self.systemd.inner().connection())
-                    .path(unit_path)?
-                    .build()
-                    .await?;
+                let unit =
+                    zbus_systemd::systemd1::UnitProxy::builder(self.systemd.inner().connection())
+                        .path(unit_path)?
+                        .build()
+                        .await?;
                 let state = unit.active_state().await?;
                 Ok(state == "active")
             }
@@ -317,7 +341,11 @@ impl ServiceManager for SystemdManager {
             .await
             .context("failed to spawn systemctl --user enable")?;
         if !status.success() {
-            anyhow::bail!("systemctl --user enable {} failed (exit {})", Self::service_unit(service), status);
+            anyhow::bail!(
+                "systemctl --user enable {} failed (exit {})",
+                Self::service_unit(service),
+                status
+            );
         }
         debug!("Enabled service unit: {}", Self::service_unit(service));
         Ok(())
@@ -392,7 +420,7 @@ fn systemd_creds_encrypt(name: &str, plaintext: &[u8], credstore: &std::path::Pa
             "--user",
             &format!("--name={name}"),
             "--with-key=auto",
-            "-",               // read from stdin
+            "-", // read from stdin
             output_path.to_str().unwrap_or("-"),
         ])
         .stdin(std::process::Stdio::piped())
@@ -477,21 +505,30 @@ pub fn encrypt_credentials_if_available(secrets_dir: Option<&std::path::Path>) -
     let credstore = match dirs::config_dir() {
         Some(d) => d.join("credstore.encrypted"),
         None => {
-            tracing::warn!("Could not determine config dir for credstore; skipping credential encryption");
+            tracing::warn!(
+                "Could not determine config dir for credstore; skipping credential encryption"
+            );
             return false;
         }
     };
 
     if let Err(e) = std::fs::create_dir_all(&credstore) {
-        tracing::warn!("Could not create credstore directory '{}': {e}", credstore.display());
+        tracing::warn!(
+            "Could not create credstore directory '{}': {e}",
+            credstore.display()
+        );
         return false;
     }
 
     let mut encrypted_count = 0usize;
 
-    // Encrypt node-level credentials (flat: signing-key, ca-pubkey, bootstrap-pubkeys, rsa-key, TLS)
+    // Encrypt node-level credentials (flat: signing-key, ca-pubkey,
+    // ca-mldsa-pubkey, bootstrap-pubkeys, rsa-key, TLS)
     // Note: signing-key is written as a copy of the CA key so PolicyService can load it
-    for name in units::NODE_CREDENTIAL_NAMES.iter().chain(std::iter::once(&"signing-key")) {
+    for name in units::NODE_CREDENTIAL_NAMES
+        .iter()
+        .chain(std::iter::once(&"signing-key"))
+    {
         let secret_path = dir.join(name);
         if !secret_path.exists() {
             debug!("Skipping node credential '{}' (not yet generated)", name);
@@ -537,9 +574,7 @@ pub fn encrypt_credentials_if_available(secrets_dir: Option<&std::path::Path>) -
                 let prefixed_name = format!("{service_name}-{name}");
                 match systemd_creds_encrypt(&prefixed_name, &plaintext, &credstore) {
                     Ok(()) => encrypted_count += 1,
-                    Err(e) => tracing::warn!(
-                        "Failed to encrypt credential '{prefixed_name}': {e}"
-                    ),
+                    Err(e) => tracing::warn!("Failed to encrypt credential '{prefixed_name}': {e}"),
                 }
             }
         }

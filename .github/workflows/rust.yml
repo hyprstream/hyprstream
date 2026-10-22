@@ -78,6 +78,12 @@ jobs:
       with:
         role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
         aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+        # The merge gate runs 70-140 min; the 3600s default session expired at
+        # ~60 min and every sccache S3 write after that failed (2026-09-14/15:
+        # 2,261 then 813 cache write errors, all in late phases — verified via
+        # the per-phase sccache stats). The role's MaxSessionDuration is now
+        # 14400; request it explicitly so the action does not default to 3600.
+        role-session-duration: 14400
 
     - name: Pull builder image
       run: podman pull "$BUILDER_IMAGE"
@@ -98,44 +104,73 @@ jobs:
           -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            cargo clippy --workspace --all-targets -- -D warnings
+            bash .github/scripts/verify-libtorch.sh
+            # Lint the default-members set: hyprstream-metrics/hyprstream-flight are
+            # excluded from default builds (non-production DuckDB profile; compile
+            # coverage continues in metrics-profile-nightly.yml), so the workspace-wide
+            # lint would pull the whole DuckDB/DataFusion tree into every PR check.
+            cargo clippy --all-targets -- -D warnings
+            # The workspace lint builds default features only, so the
+            # RDS-backed PDS record store (#1257, `pds-postgres`) is cfg-gated
+            # out of it. Lint it explicitly so the module and its tests
+            # always compile in CI. Keep this script apostrophe-free: it is
+            # single-quoted, and an apostrophe would terminate it early.
+            # H2 admission is gated by postgres, distinct from pds-postgres.
+            cargo clippy -p hyprstream --all-targets --features postgres -- -D warnings
+            cargo test -p hyprstream --features postgres --lib h2_admission
+            cargo test -p hyprstream-pds-service --lib h2_current_tenant
+            cargo clippy -p hyprstream --all-targets --features pds-postgres -- -D warnings
+            # Disabled Federate session proof core is behind the application
+            # postgres feature, distinct from pds-postgres. Compile and exercise
+            # it plus the shared source-verifier vectors on this exact PR head.
+            cargo clippy -p hyprstream --all-targets --features postgres -- -D warnings
+            cargo test -p hyprstream --features postgres --lib federate_
             sccache --show-stats
           '
 
   deny:
     name: cargo-deny (bans + licenses)
-    runs-on: ubuntu-latest
+    # The pinned cargo-deny binary and Python runtime are baked into the
+    # immutable ARM builder image. Keep this metadata/static gate on the
+    # native merge-gate runner; do not install tools from the network.
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 20
     steps:
     - uses: actions/checkout@v4
-      # This checkout runs repo-controlled code below (cargo-deny reads deny.toml;
-      # the #1331 matrix gate runs scripts/check_rust_workflow_matrix.py). Do NOT
-      # persist the GITHUB_TOKEN in .git/config — closes the artipacked vector
-      # (zizmor, CodeRabbit), matching the loopback-burndown job.
       with:
         persist-credentials: false
-    - name: Install cargo-deny
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-deny
-    - name: Check bans
-      # ZMQ crates are deny-listed in deny.toml (#138 complete). This gate must
-      # be able to fail — do NOT add `|| true`.
-      # No compilation here (metadata only), arch-independent, no S3 — stays on
-      # the free GitHub-hosted runner.
+    - name: Load builder image pin
+      run: bash .github/scripts/load-builder-image.sh
+    - name: Pull builder image
+      run: podman pull "$BUILDER_IMAGE"
+    - name: Run cargo-deny and static gates in pinned builder
+      # The container has cargo-deny 0.20.2, Python, and the pinned Rust
+      # toolchain. No ad-hoc setup or hosted runner is part of this gate.
       run: |
-        unset RUSTC_WRAPPER
-        cargo deny check bans licenses
-    - name: Static workflow-matrix regression (#1331)
-      # Pure static YAML inspection — no network, no build, no runner. Locks the
-      # Rust workflow to the trigger/job matrix introduced by #1331 (no push-to-
-      # main duplicate run; workflow_dispatch for operator full validation) and
-      # pins the corrected AppImage-trigger comment. Runs on every event this
-      # job sees (PR, merge_group, workflow_dispatch). Must be able to fail — do
-      # NOT add `|| true`.
-      run: |
-        python3 scripts/check_rust_workflow_matrix.py
-        python3 -m unittest discover -s scripts/tests -p 'test_check_license_boundary.py'
-        python3 scripts/check_license_boundary.py
+        podman run --rm \
+          -v "$PWD":/build:Z -w /build \
+          "$BUILDER_IMAGE" \
+          bash -euo pipefail -c '
+            unset RUSTC_WRAPPER
+            cargo deny check bans licenses
+            # workspace-hack drift gate (Wave D): regenerate hakari output and
+            # fail if the committed copy is stale. Deliberately NOT
+            # `cargo hakari verify`: it reports false drift in this workspace
+            # (resolver-v2 build-dep isolation; guppy-rs/guppy#69). The
+            # ungate/gate round trip re-applies scripts/hack_wasm_gate.py
+            # because manage-deps re-emits ungated edges and its lockfile
+            # regeneration cannot parse gated ones.
+            python3 scripts/hack_wasm_gate.py --ungate
+            cargo hakari generate
+            cargo hakari manage-deps --yes
+            python3 scripts/hack_wasm_gate.py
+            git diff --exit-code -- workspace-hack Cargo.toml Cargo.lock crates
+            python3 scripts/check_rust_workflow_matrix.py
+            python3 -m unittest discover -s scripts/tests -p "test_check_license_boundary.py"
+            python3 scripts/check_license_boundary.py
+            python3 scripts/check_build_matrix.py
+            python3 -m unittest discover -s scripts/tests -p "test_check_build_matrix.py"
+          '
 
   loopback-burndown:
     name: Loopback-literal burn-down (#1152 W4)
@@ -183,6 +218,12 @@ jobs:
       with:
         role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
         aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+        # The merge gate runs 70-140 min; the 3600s default session expired at
+        # ~60 min and every sccache S3 write after that failed (2026-09-14/15:
+        # 2,261 then 813 cache write errors, all in late phases — verified via
+        # the per-phase sccache stats). The role's MaxSessionDuration is now
+        # 14400; request it explicitly so the action does not default to 3600.
+        role-session-duration: 14400
 
     - name: Pull builder image
       run: podman pull "$BUILDER_IMAGE"
@@ -209,19 +250,19 @@ jobs:
             sccache --show-stats
           '
 
-    # #1425 r3: actually EXECUTES crates/hyprstream-rpc/tests/wasm_browser_fetch.rs
-    # in a real headless browser, as an isolated named wasm test artifact — not
+    # Actually EXECUTES browser-fetch and browser-session proof tests in a
+    # real headless browser, as isolated named wasm test artifacts — not
     # just a compile check. Deliberately does not use `wasm-pack test`: it
     # unconditionally passes `--tests` to cargo, which additionally compiles
     # every other (native-only) test target in the crate and fails before a
-    # browser is ever launched. browser-wasm-test.sh builds only the named
+    # browser is ever launched. browser-wasm-test.sh builds each named
     # integration test via `cargo test --test <name>` (never `--tests`) and
     # runs it through a wasm-bindgen version-matched wasm-bindgen-test-runner.
     # browser-wasm-test-ci.sh installs a headless-capable Chromium + matching
     # chromedriver from the container's own package repo (arch-correct for
     # this arm64/Graviton runner, unlike Google's x64-only Chrome-for-Testing
     # distribution) before delegating to it.
-    - name: Run browser-fetch conformance test (headless Chromium, rust-builder container)
+    - name: Run browser fetch/session proof tests (headless Chromium, rust-builder container)
       run: |
         podman run --rm \
           -v "$PWD":/build:Z -w /build \
@@ -287,6 +328,12 @@ jobs:
       with:
         role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
         aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+        # The merge gate runs 70-140 min; the 3600s default session expired at
+        # ~60 min and every sccache S3 write after that failed (2026-09-14/15:
+        # 2,261 then 813 cache write errors, all in late phases — verified via
+        # the per-phase sccache stats). The role's MaxSessionDuration is now
+        # 14400; request it explicitly so the action does not default to 3600.
+        role-session-duration: 14400
 
     - name: Pull builder image
       run: podman pull "$BUILDER_IMAGE"
@@ -323,26 +370,21 @@ jobs:
           -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
           -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
           -e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream \
-          -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
+          -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always -e CI=true \
           -e BROWSER_ATTEST_NONCE \
           "$BUILDER_IMAGE" \
           bash -euo pipefail -c '
-            # #1425 r4: install the real headless-browser dependency as root,
-            # before switching to the non-root ci user below — graviton-build-
-            # test.sh runs as ci and cannot apt-get/dnf install. This makes the
-            # required merge-group build path actually launch a browser for the
-            # wasm_browser_fetch conformance test, not just compile-check it.
-            bash /build/.github/scripts/install-chromium.sh
-
-            # cargo-nextest, git-lfs, the wasm targets and clippy are baked into the
-            # builder image (BUILDER_IMAGE, Dockerfile builder-cpu-arm64) — no runtime
-            # installs here. Only set up the NON-ROOT user: several fail-closed tests
-            # assert a write to a read-only dir is rejected, but root bypasses file
-            # permissions, so they pass only as non-root (the old ubuntu-latest gate
-            # ran non-root). Make the toolchain usable by ci and hand it the workspace.
-            useradd -m ci
-            chmod a+rx /root
-            chmod -R a+rwX /root/.cargo /root/.rustup
+            # R4 (#1425): chromium + chromium-driver, the non-root ci user and
+            # the toolchain perms (/root a+rx, /root/.cargo + /root/.rustup
+            # a+rwX) are baked into the builder image (Dockerfile builder-
+            # cpu-arm64) — the former runtime install-chromium / useradd /
+            # chmod dance is gone (it cost every candidate ~150-215 s of apt
+            # install plus an overlay copy-up permission walk). What remains
+            # is per-run only: hand the freshly bind-mounted checkout to ci
+            # (the mount is per-run and cannot be baked), then run the gate
+            # as that non-root user (several fail-closed tests assert a write
+            # to a read-only dir is rejected, which holds only as non-root —
+            # root bypasses file permissions).
             chown -R ci:ci /build
             runuser -u ci -- bash -euo pipefail /build/.github/scripts/graviton-build-test.sh
           '
@@ -357,3 +399,68 @@ jobs:
           echo "browser-wasm conformance phase did not execute in this run (receipt missing or stale)" >&2
           exit 1
         }
+
+  build-release:
+    # MERGE GATE, release/feature-lane half (2026-09-15 split). The native
+    # release build, pds-postgres lanes, and credential-pds negative gate
+    # consume nothing the test suite produces and vice versa (verified: no
+    # test reads the release binaries — only the guest .wasm artifacts cross
+    # the boundary, and the test job builds those). Running them in this
+    # parallel job cuts the merge-gate critical path from the serial sum
+    # (~52 min post metrics-lane removal) to max(test lane ≈ 33 min, this
+    # lane ≈ 22 min of phases + provisioning). Rollout: land non-required,
+    # verify on a few candidates, then add `build-release` to the protection
+    # ruleset's required checks — until then these lanes are advisory on
+    # candidates exactly like `deny`.
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, arm64, graviton, hyprstream-merge-gate]
+    timeout-minutes: 90
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Load builder image pin
+      run: bash .github/scripts/load-builder-image.sh
+
+    - name: Configure AWS credentials (OIDC → sccache S3)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_SCCACHE_ROLE_ARN }}
+        aws-region: ${{ vars.AWS_SCCACHE_REGION }}
+
+    - name: Pull builder image
+      run: podman pull "$BUILDER_IMAGE"
+
+    # Same layer as the test job minus Chromium (no browser phases here) and
+    # minus the conformance nonce. AWS creds forward by name (`-e VAR` with
+    # no value passes the host value) so the in-image sccache reaches the
+    # same-region S3 bucket; the shared EBS cache volume carries Cargo's
+    # target dir; the non-root ci user mirrors the audited build path.
+    - name: Release lanes (in rust-builder container)
+      run: |
+        # Runner boot labels this target subtree container_file_t; leave the
+        # container confined and retain :Z only on the checked-out source.
+        podman run --rm \
+          -v "$PWD":/build:Z -w /build \
+          -v /mnt/hypr-ci-cache:/mnt/hypr-ci-cache \
+          -e RUSTC_WRAPPER=sccache -e SCCACHE_BUCKET -e SCCACHE_REGION \
+          -e SCCACHE_IDLE_TIMEOUT=0 \
+          -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+          -e AWS_REGION -e AWS_DEFAULT_REGION \
+          -e LIBTORCH=/opt/libtorch -e LD_LIBRARY_PATH=/opt/libtorch/lib \
+          -e LIBTORCH_BYPASS_VERSION_CHECK=1 -e OPENSSL_NO_VENDOR=1 \
+          -e CARGO_TARGET_DIR=/mnt/hypr-ci-cache/target/hyprstream \
+          -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always \
+          "$BUILDER_IMAGE" \
+          bash -euo pipefail -c '
+            # R4: the builder image may bake the ci user + toolchain perms
+            # (Dockerfile builder-cpu-arm64); older digests do not. Create
+            # ci only when it is absent so either image works.
+            id -u ci >/dev/null 2>&1 || useradd -m ci
+            chmod a+rx /root
+            chmod -R a+rwX /root/.cargo /root/.rustup
+            chown -R ci:ci /build
+            runuser -u ci -- bash -euo pipefail /build/.github/scripts/graviton-release-lanes.sh
+          '

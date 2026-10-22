@@ -16,7 +16,9 @@ fn main() {
     // Test data: create some float values
     let n = 4096;
     let blocksize = 64;
-    let input: Vec<f32> = (0..n).map(|i| (i as f32 - n as f32 / 2.0) / 100.0).collect();
+    let input: Vec<f32> = (0..n)
+        .map(|i| (i as f32 - n as f32 / 2.0) / 100.0)
+        .collect();
 
     println!("Input data: {} elements", input.len());
     println!("First 10 values: {:?}", &input[..10]);
@@ -30,7 +32,10 @@ fn main() {
             println!("Quantization successful!");
             println!("Quantized data size: {} bytes", quantized.len());
             println!("Number of blocks: {}", state.n_blocks());
-            println!("First 10 absmax values: {:?}", &state.absmax[..10.min(state.absmax.len())]);
+            println!(
+                "First 10 absmax values: {:?}",
+                &state.absmax[..10.min(state.absmax.len())]
+            );
             println!("First 10 quantized values: {:?}", &quantized[..10]);
             println!();
 

@@ -26,7 +26,7 @@
 //! [`Assurance::Unverified`] (the floor) precisely so an un-attested key
 //! dominates nothing above the floor.
 
-use super::label::{Assurance, CompartmentSet, Level, SecurityLabel};
+use super::label::{Assurance, CompartmentSet, CredentialClearance, Level, SecurityLabel};
 use serde::{Deserialize, Serialize};
 
 /// How a principal's key material was verified, used to *derive* (never trust) an
@@ -210,19 +210,22 @@ impl SecurityContext {
 /// Implementing this on `Claims` is a one-liner once the field lands; defining
 /// it now lets S2/S4 compile and test against a stable interface.
 pub trait SubjectContextClaims {
-    /// The authority-asserted clearance carried in the verified claims, if any.
-    /// `None` ⇒ unlabeled subject ⇒ the monitor MUST deny (no default clearance).
-    fn clearance_label(&self) -> Option<SecurityLabel>;
+    /// The authority-asserted clearance carried in the verified claims, if any,
+    /// as its two-axis wire projection (level + compartments only; assurance is
+    /// structurally absent from the credential wire — v16 §11). `None` ⇒
+    /// unlabeled subject ⇒ the monitor MUST deny (no default clearance).
+    fn credential_clearance(&self) -> Option<CredentialClearance>;
 
-    /// Assemble the full subject context, clamping assurance to the verified
-    /// key material. Returns `None` (→ deny) if the subject carries no
-    /// clearance. Default impl composes the two inputs; implementors normally
-    /// only need to provide [`clearance_label`].
+    /// Assemble the full subject context, deriving the assurance axis PURELY
+    /// from the verified key material (never from the wire — the wire cannot
+    /// carry assurance). Returns `None` (→ deny) if the subject carries no
+    /// clearance. Implementors normally only need to provide
+    /// [`credential_clearance`].
     ///
-    /// [`clearance_label`]: SubjectContextClaims::clearance_label
+    /// [`credential_clearance`]: SubjectContextClaims::credential_clearance
     fn security_context(&self, key_material: VerifiedKeyMaterial) -> Option<SecurityContext> {
-        self.clearance_label()
-            .map(|c| SecurityContext::from_clearance(c, key_material))
+        self.credential_clearance()
+            .map(|cc| SecurityContext::new(cc.level, cc.compartments, key_material))
     }
 }
 
@@ -244,8 +247,11 @@ mod tests {
         // delegator: Secret / {0,1} ; actor: Confidential / {1,2}. Both PqHybrid.
         let delegator =
             SecurityContext::new(Level::Secret, comps(&[0, 1]), VerifiedKeyMaterial::PqHybrid);
-        let actor =
-            SecurityContext::new(Level::Confidential, comps(&[1, 2]), VerifiedKeyMaterial::PqHybrid);
+        let actor = SecurityContext::new(
+            Level::Confidential,
+            comps(&[1, 2]),
+            VerifiedKeyMaterial::PqHybrid,
+        );
         let meet = SecurityContext::delegated_meet(&delegator, &actor);
 
         assert_eq!(meet.level(), Level::Confidential, "min level");
@@ -266,7 +272,11 @@ mod tests {
         let actor = SecurityContext::new(Level::Secret, comps(&[]), VerifiedKeyMaterial::Classical);
         let meet = SecurityContext::delegated_meet(&delegator, &actor);
 
-        assert_eq!(meet.assurance(), Assurance::Classical, "assurance is the actor's (signer)");
+        assert_eq!(
+            meet.assurance(),
+            Assurance::Classical,
+            "assurance is the actor's (signer)"
+        );
         let pqhybrid_object = SecurityLabel::new(Level::Secret, Assurance::PqHybrid, comps(&[]));
         assert!(
             !meet.can_access(&pqhybrid_object),
@@ -277,8 +287,14 @@ mod tests {
     #[test]
     fn delegated_fails_closed_if_either_principal_unresolved() {
         let ctx = SecurityContext::new(Level::Secret, comps(&[0]), VerifiedKeyMaterial::PqHybrid);
-        assert!(SecurityContext::delegated(None, Some(&ctx)).is_none(), "missing delegator ⇒ deny");
-        assert!(SecurityContext::delegated(Some(&ctx), None).is_none(), "missing actor ⇒ deny");
+        assert!(
+            SecurityContext::delegated(None, Some(&ctx)).is_none(),
+            "missing delegator ⇒ deny"
+        );
+        assert!(
+            SecurityContext::delegated(Some(&ctx), None).is_none(),
+            "missing actor ⇒ deny"
+        );
         assert!(SecurityContext::delegated(None, None).is_none());
         assert!(SecurityContext::delegated(Some(&ctx), Some(&ctx)).is_some());
     }
@@ -318,7 +334,8 @@ mod tests {
     #[test]
     fn from_clearance_does_not_raise_assurance() {
         // policy assigned Classical, key is PqHybrid → stays Classical (no raise).
-        let claimed = SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
+        let claimed =
+            SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
         let ctx = SecurityContext::from_clearance(claimed, VerifiedKeyMaterial::PqHybrid);
         assert_eq!(ctx.assurance(), Assurance::Classical);
     }
@@ -326,13 +343,14 @@ mod tests {
     #[test]
     fn classical_context_cannot_dominate_pqc_object() {
         let ctx = SecurityContext::new(Level::Secret, comps(&[0]), VerifiedKeyMaterial::Classical);
-        let pqc_object = SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY);
+        let pqc_object =
+            SecurityLabel::new(Level::Public, Assurance::PqHybrid, CompartmentSet::EMPTY);
         assert!(!ctx.can_access(&pqc_object));
     }
 
-    struct FakeClaims(Option<SecurityLabel>);
+    struct FakeClaims(Option<CredentialClearance>);
     impl SubjectContextClaims for FakeClaims {
-        fn clearance_label(&self) -> Option<SecurityLabel> {
+        fn credential_clearance(&self) -> Option<CredentialClearance> {
             self.0
         }
     }
@@ -345,17 +363,25 @@ mod tests {
             .is_none());
     }
 
+    /// The wire clearance carries only level + compartments; the assurance axis
+    /// is derived PURELY from the verified key material. The same wire
+    /// clearance therefore yields `Classical` under a classical key and
+    /// `PqHybrid` under a hybrid key — no synthetic assurance rides the wire.
     #[test]
-    fn labeled_subject_assembles_context_with_clamped_assurance() {
-        let claims = FakeClaims(Some(SecurityLabel::new(
-            Level::Confidential,
-            Assurance::PqHybrid,
-            comps(&[0]),
-        )));
-        let ctx = claims
+    fn assurance_is_derived_from_key_material_not_the_wire() {
+        let clearance = CredentialClearance {
+            level: Level::Confidential,
+            compartments: comps(&[0]),
+        };
+        let classical = FakeClaims(Some(clearance))
             .security_context(VerifiedKeyMaterial::Classical)
             .unwrap();
-        assert_eq!(ctx.level(), Level::Confidential);
-        assert_eq!(ctx.assurance(), Assurance::Classical); // clamped to verified key
+        assert_eq!(classical.level(), Level::Confidential);
+        assert_eq!(classical.assurance(), Assurance::Classical);
+
+        let hybrid = FakeClaims(Some(clearance))
+            .security_context(VerifiedKeyMaterial::PqHybrid)
+            .unwrap();
+        assert_eq!(hybrid.assurance(), Assurance::PqHybrid);
     }
 }

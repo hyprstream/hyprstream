@@ -8,7 +8,9 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use std::{
     collections::BTreeSet,
-    io::Write as _,
+    fs::File,
+    io::{Seek as _, SeekFrom, Write as _},
+    os::fd::{AsRawFd as _, FromRawFd as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -51,19 +53,55 @@ impl AgeRecipients {
     }
 }
 
-/// A validated, non-empty set of deployment `age` identity files.
+/// Where an `age` identity comes from: an on-disk file, or in-memory bytes
+/// staged into an anonymous memfd for the `age` child so the inherited-FD
+/// credential interface (`mint-registry-jwt --identity-fd`) never writes
+/// plaintext identity material to a filesystem path.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AgeIdentities(Vec<PathBuf>);
+pub(crate) enum AgeIdentitySource {
+    Path(PathBuf),
+    InMemory(Zeroizing<Vec<u8>>),
+}
+
+/// A validated, non-empty set of deployment `age` identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AgeIdentities(Vec<AgeIdentitySource>);
 
 impl AgeIdentities {
     pub(crate) fn new(identities: Vec<PathBuf>) -> Result<Self> {
+        Self::from_sources(
+            identities
+                .into_iter()
+                .map(AgeIdentitySource::Path)
+                .collect(),
+        )
+    }
+
+    /// In-memory identities read from inherited file descriptors. The bytes
+    /// are handed to the `age` child through an anonymous memfd, never a
+    /// filesystem path.
+    pub(crate) fn new_in_memory(identities: Vec<Zeroizing<Vec<u8>>>) -> Result<Self> {
+        Self::from_sources(
+            identities
+                .into_iter()
+                .map(AgeIdentitySource::InMemory)
+                .collect(),
+        )
+    }
+
+    pub(crate) fn from_sources(identities: Vec<AgeIdentitySource>) -> Result<Self> {
         ensure!(!identities.is_empty(), "no age identities supplied");
         for identity in &identities {
-            ensure!(
-                identity.is_file(),
-                "age identity file does not exist: {}",
-                identity.display()
-            );
+            match identity {
+                AgeIdentitySource::Path(path) => ensure!(
+                    path.is_file(),
+                    "age identity file does not exist: {}",
+                    path.display()
+                ),
+                AgeIdentitySource::InMemory(bytes) => {
+                    ensure!(!bytes.is_empty(), "in-memory age identity is empty");
+                }
+            }
         }
         Ok(Self(identities))
     }
@@ -76,7 +114,7 @@ impl AgeIdentities {
         max_plaintext_bytes: usize,
     ) -> Result<Zeroizing<Vec<u8>>> {
         ensure!(!ciphertext.is_empty(), "age ciphertext is empty");
-        let mut command = self.decrypt_command();
+        let (mut command, _guards) = self.decrypt_command()?;
         command.arg("-");
         let output = run_with_stdin(command, ciphertext, "decryption")?;
         checked_plaintext(output, max_plaintext_bytes)
@@ -93,7 +131,7 @@ impl AgeIdentities {
             "age ciphertext file does not exist: {}",
             path.display()
         );
-        let mut command = self.decrypt_command();
+        let (mut command, _guards) = self.decrypt_command()?;
         command.stdin(Stdio::inherit()).arg(path);
         let output = command.output().context("launch age decryption")?;
         checked_plaintext(
@@ -105,13 +143,47 @@ impl AgeIdentities {
         )
     }
 
-    fn decrypt_command(&self) -> Command {
+    /// Build the `age --decrypt` command. Returned `File` guards keep the
+    /// memfd descriptors backing in-memory identities alive (and inheritable
+    /// by the child) until the command has been awaited.
+    fn decrypt_command(&self) -> Result<(Command, Vec<File>)> {
         let mut command = age_command(true);
+        let mut guards = Vec::new();
         for identity in &self.0 {
-            command.arg("--identity").arg(identity);
+            command.arg("--identity");
+            match identity {
+                AgeIdentitySource::Path(path) => {
+                    command.arg(path);
+                }
+                AgeIdentitySource::InMemory(bytes) => {
+                    let memfd = memfd_identity(bytes)?;
+                    command.arg(format!("/proc/self/fd/{}", memfd.as_raw_fd()));
+                    guards.push(memfd);
+                }
+            }
         }
-        command
+        Ok((command, guards))
     }
+}
+
+/// Stage identity bytes in an anonymous memfd the `age` child inherits.
+///
+/// The memfd is created without `MFD_CLOEXEC` so the child spawned by
+/// [`Command`] inherits it; `Command` only closes descriptors flagged
+/// close-on-exec. The caller keeps the returned `File` alive until the child
+/// has exited.
+fn memfd_identity(bytes: &[u8]) -> Result<File> {
+    let name = c"hyprstream-age-identity";
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("create memfd for age identity");
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(bytes)
+        .context("write age identity to memfd")?;
+    file.seek(SeekFrom::Start(0))
+        .context("rewind age identity memfd")?;
+    Ok(file)
 }
 
 fn age_command(decrypt: bool) -> Command {
@@ -191,5 +263,15 @@ mod tests {
     fn identity_validation_is_fail_closed() {
         assert!(AgeIdentities::new(Vec::new()).is_err());
         assert!(AgeIdentities::new(vec![PathBuf::from("/definitely/not/an/identity")]).is_err());
+    }
+
+    #[test]
+    fn in_memory_identity_validation_is_fail_closed() {
+        assert!(AgeIdentities::new_in_memory(Vec::new()).is_err());
+        assert!(AgeIdentities::new_in_memory(vec![Zeroizing::new(Vec::new())]).is_err());
+        assert!(AgeIdentities::new_in_memory(vec![Zeroizing::new(
+            b"AGE-SECRET-KEY-1TEST".to_vec()
+        )])
+        .is_ok());
     }
 }

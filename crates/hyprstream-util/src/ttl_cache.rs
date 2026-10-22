@@ -95,6 +95,39 @@ struct Inner<K, V> {
 
 /// Generic per-entry-TTL cache with lazy version-tagged eviction and a
 /// capacity bound. See the module docs for the design.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use hyprstream_util::{InsertIfAbsentNoEvictResult, TtlCache};
+///
+/// let cache: TtlCache<String, u32> = TtlCache::new(16, 8);
+/// cache.insert("session-1".to_owned(), 42, Duration::from_secs(60));
+/// assert_eq!(cache.get("session-1"), Some(42));
+///
+/// // `insert_if_absent_no_evict` is the replay-barrier primitive: while the
+/// // entry is live, re-inserting the same key is reported as a duplicate, and
+/// // a full barrier reports exhaustion instead of evicting live replay state
+/// // (unlike `insert_if_absent`, which may evict to admit the new key).
+/// assert_eq!(
+///     cache.insert_if_absent_no_evict("session-1".to_owned(), 7, Duration::from_secs(60)),
+///     InsertIfAbsentNoEvictResult::Duplicate,
+/// );
+///
+/// // At capacity, a new key is refused rather than displacing a live entry.
+/// let barrier: TtlCache<String, u32> = TtlCache::new(1, 8);
+/// assert_eq!(
+///     barrier.insert_if_absent_no_evict("jti-a".to_owned(), 1, Duration::from_secs(60)),
+///     InsertIfAbsentNoEvictResult::Inserted,
+/// );
+/// assert_eq!(
+///     barrier.insert_if_absent_no_evict("jti-b".to_owned(), 2, Duration::from_secs(60)),
+///     InsertIfAbsentNoEvictResult::Full,
+/// );
+/// assert_eq!(barrier.get("jti-a"), Some(1), "live replay state preserved");
+/// ```
 pub struct TtlCache<K, V> {
     inner: Mutex<Inner<K, V>>,
     /// Maximum number of live entries. When full, an insert of a new key

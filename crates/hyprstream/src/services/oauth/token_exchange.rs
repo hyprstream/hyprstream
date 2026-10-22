@@ -21,8 +21,8 @@ use subtle::ConstantTimeEq as _;
 
 use super::state::{DpopJtiAdmission, OAuthState};
 use crate::mac::exchange::{GrantDecision, GrantError, GrantRequest, GrantedAccess};
-use crate::services::generated::policy_client::IssueToken;
 use hyprstream_pds::repo_authority::is_path_form_did_web;
+use hyprstream_rpc_std::policy_client::{IssueToken, IssueTokenProfile};
 // #1425: the browser RFC 8693 sender-bound contract. The public client_id is
 // the single source of truth shared with the WASM client (`hyprstream-rpc`),
 // so the wire contract cannot drift between client and server.
@@ -67,6 +67,7 @@ pub async fn exchange_token_exchange(
     output_dpop_jkt: Option<String>,
     requested_token_type: Option<&str>,
     tenant: Option<&str>,
+    client_id: &str,
 ) -> Response {
     // Actor token (delegation) is deferred — RFC 8693 §4.
     if actor_token.is_some() {
@@ -158,16 +159,17 @@ pub async fn exchange_token_exchange(
 
     // Service assertions carry the exact key which verified their signature.
     let user_pub_key = verified.cnf_key_bytes.map(|b| URL_SAFE_NO_PAD.encode(b));
-    let output_issuer =
-        state.issuer_for_scopes(requested_scopes.as_deref().unwrap_or_default());
+    let output_issuer = state.issuer_for_scopes(requested_scopes.as_deref().unwrap_or_default());
 
     let result = state
         .policy_client
         .issue_token(&IssueToken {
             requested_scopes,
-            ttl: Some(state.token_ttl.min(
-                verified.ttl_ceiling.unwrap_or(state.token_ttl),
-            )),
+            ttl: Some(
+                state
+                    .token_ttl
+                    .min(verified.ttl_ceiling.unwrap_or(state.token_ttl)),
+            ),
             audience: audience.map(str::to_owned),
             subject: Some(verified.sub.clone()),
             user_pub_key,
@@ -177,6 +179,15 @@ pub async fn exchange_token_exchange(
             issuer: Some(output_issuer),
             tenant,
             require_clearance: verified.require_clearance,
+            session_id: None,
+            issuance_profile: if verified.sub.starts_with("service:") {
+                IssueTokenProfile::Service
+            } else {
+                IssueTokenProfile::Rfc8693
+            },
+            // RFC 9068 §2.2.1: the exchanging OAuth client on the user
+            // `at+jwt`; the service (`wit+jwt`) form carries none.
+            client_id: (!verified.sub.starts_with("service:")).then(|| client_id.to_owned()),
         })
         .await;
 
@@ -420,16 +431,12 @@ pub(super) async fn exchange_browser_token_exchange(
     let verified = match subject_token_type {
         TOKEN_TYPE_ACCESS_TOKEN => verify_access_token(state, subject_token).await,
         TOKEN_TYPE_JWT => verify_jwt(state, subject_token).await,
-        TOKEN_TYPE_ID_TOKEN => Err(
-            "id_token is not supported for browser token-exchange \
+        TOKEN_TYPE_ID_TOKEN => Err("id_token is not supported for browser token-exchange \
              (no audience/client binding)"
-                .to_owned(),
-        ),
-        _ => Err(
-            "unsupported subject_token_type for browser exchange; \
+            .to_owned()),
+        _ => Err("unsupported subject_token_type for browser exchange; \
              supported: access_token, jwt"
-                .to_owned(),
-        ),
+            .to_owned()),
     };
     let verified = match verified {
         Ok(v) => v,
@@ -443,7 +450,9 @@ pub(super) async fn exchange_browser_token_exchange(
     };
     let tenant = match exchange_tenant(&verified, None) {
         Ok(t) => t,
-        Err(description) => return tx_error(StatusCode::BAD_REQUEST, "invalid_target", description),
+        Err(description) => {
+            return tx_error(StatusCode::BAD_REQUEST, "invalid_target", description)
+        }
     };
     // ── Subject-token sender-constraint preservation (#1425 P1) ──────────────
     // A DPoP-bound subject access token (cnf.jkt present) MUST be exchanged
@@ -519,7 +528,11 @@ pub(super) async fn exchange_browser_token_exchange(
         .policy_client
         .issue_token(&IssueToken {
             requested_scopes,
-            ttl: Some(state.token_ttl.min(verified.ttl_ceiling.unwrap_or(state.token_ttl))),
+            ttl: Some(
+                state
+                    .token_ttl
+                    .min(verified.ttl_ceiling.unwrap_or(state.token_ttl)),
+            ),
             audience: Some(rpc_resource),
             subject: Some(verified.sub.clone()),
             user_pub_key: None,
@@ -529,6 +542,15 @@ pub(super) async fn exchange_browser_token_exchange(
             issuer: Some(output_issuer),
             tenant,
             require_clearance: verified.require_clearance,
+            session_id: None,
+            issuance_profile: if verified.sub.starts_with("service:") {
+                IssueTokenProfile::Service
+            } else {
+                IssueTokenProfile::Rfc8693
+            },
+            // RFC 9068 §2.2.1: the exchanging OAuth client on the user
+            // `at+jwt`; the service (`wit+jwt`) form carries none.
+            client_id: (!verified.sub.starts_with("service:")).then(|| client_id.to_owned()),
         })
         .await;
 
@@ -635,12 +657,35 @@ async fn verify_id_token(state: &Arc<OAuthState>, token: &str) -> Result<Verifie
     })
 }
 
+/// The Federate TUI class is never a generic exchange subject (W1.3): the
+/// generic IssueToken path drops the class markers and the session binding
+/// and substitutes the request's client_id, laundering the class away. Deny
+/// the class by marker set OR the deployment's class pin at the local
+/// issuer.
+fn reject_federate_tui_exchange_subject(
+    claims: &hyprstream_rpc::auth::Claims,
+    local_issuer: &str,
+) -> Result<(), String> {
+    if claims.is_federate_tui_class(&[local_issuer]) {
+        return Err("federate TUI credentials are not exchangeable".to_owned());
+    }
+    Ok(())
+}
+
 /// Verify an existing hyprstream at+jwt through the same algorithm, audience,
 /// issuer, and revocation checks used by protected OAuth routes.
 async fn verify_access_token(state: &OAuthState, token: &str) -> Result<VerifiedSubject, String> {
     let claims = super::auth::validate_oauth_access_token(state, token)
         .await
         .map_err(|e| format!("access_token verification failed: {e}"))?;
+
+    // The Federate TUI class is never a generic exchange subject (W1.3): the
+    // generic IssueToken path drops the class markers and the session
+    // binding and substitutes the request's client_id, which would launder
+    // the credential's class away. Deny the class here — by marker set or
+    // the deployment's class pin — so its only exchange surface remains the
+    // dedicated federate rail.
+    reject_federate_tui_exchange_subject(&claims, &state.issuer_url)?;
 
     let granted_scopes = claims
         .scope
@@ -672,10 +717,16 @@ async fn verify_jwt(state: &Arc<OAuthState>, token: &str) -> Result<VerifiedSubj
         .nth(1)
         .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
         .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())
-        .and_then(|payload| payload.get("iss").and_then(serde_json::Value::as_str).map(str::to_owned));
-    if issuer_hint.as_deref().is_some_and(|issuer| {
-        issuer.starts_with("did:plc:") || issuer.starts_with("did:web:")
-    }) {
+        .and_then(|payload| {
+            payload
+                .get("iss")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    if issuer_hint
+        .as_deref()
+        .is_some_and(|issuer| issuer.starts_with("did:plc:") || issuer.starts_with("did:web:"))
+    {
         return verify_atproto_service_jwt(state, token, ATPROTO_EXCHANGE_NSID).await;
     }
 
@@ -771,15 +822,22 @@ pub(super) async fn verify_atproto_service_jwt(
     if !matches!(header.alg.as_str(), "ES256" | "ES256K") {
         return Err("ATProto service JWT alg must be ES256 or ES256K".to_owned());
     }
-    if header.typ.as_deref().is_some_and(|typ| !typ.eq_ignore_ascii_case("JWT")) {
+    if header
+        .typ
+        .as_deref()
+        .is_some_and(|typ| !typ.eq_ignore_ascii_case("JWT"))
+    {
         return Err("ATProto service JWT typ must be JWT when present".to_owned());
     }
     super::state::subject_did_for(&state.issuer_url, &claims.iss)
         .map_err(|error| format!("invalid ATProto issuer DID: {error}"))?;
-    let expected_audience = state.atproto_service_did()
+    let expected_audience = state
+        .atproto_service_did()
         .ok_or_else(|| "OAuth issuer cannot be represented as a host service DID".to_owned())?;
     if claims.aud != expected_audience {
-        return Err(format!("ATProto service JWT aud must equal host DID {expected_audience}"));
+        return Err(format!(
+            "ATProto service JWT aud must equal host DID {expected_audience}"
+        ));
     }
     if claims.lxm != expected_lxm {
         return Err(format!("ATProto service JWT lxm must equal {expected_lxm}"));
@@ -800,7 +858,10 @@ pub(super) async fn verify_atproto_service_jwt(
         return Err("ATProto service JWT jti must be 1..=256 bytes".to_owned());
     }
 
-    let document = state.atproto_did_resolver.resolve_document(&claims.iss).await
+    let document = state
+        .atproto_did_resolver
+        .resolve_document(&claims.iss)
+        .await
         .map_err(|error| format!("ATProto DID resolution failed: {error}"))?;
     let fragment = header.kid.as_deref().unwrap_or("#atproto");
     let key_id = if fragment.starts_with('#') {
@@ -811,24 +872,26 @@ pub(super) async fn verify_atproto_service_jwt(
     if !key_id.starts_with(&format!("{}#", claims.iss)) {
         return Err("ATProto signing kid must be a fragment of the issuer DID".to_owned());
     }
-    let methods = document.get("verificationMethod")
+    let methods = document
+        .get("verificationMethod")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "ATProto DID document has no verificationMethod array".to_owned())?;
     let mut matches = methods.iter().filter(|method| {
         method.get("id").and_then(serde_json::Value::as_str) == Some(key_id.as_str())
     });
-    let method = matches.next()
+    let method = matches
+        .next()
         .ok_or_else(|| format!("ATProto signing method {key_id} not found"))?;
     if matches.next().is_some() {
         return Err(format!("ATProto signing method {key_id} is ambiguous"));
     }
     if method.get("type").and_then(serde_json::Value::as_str) != Some("Multikey")
-        || method.get("controller").and_then(serde_json::Value::as_str)
-            != Some(claims.iss.as_str())
+        || method.get("controller").and_then(serde_json::Value::as_str) != Some(claims.iss.as_str())
     {
         return Err("ATProto signing method must be a subject-controlled Multikey".to_owned());
     }
-    let multikey = method.get("publicKeyMultibase")
+    let multikey = method
+        .get("publicKeyMultibase")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "ATProto signing method has no publicKeyMultibase".to_owned())?;
     verify_atproto_ecdsa(
@@ -855,11 +918,9 @@ pub(super) async fn verify_atproto_service_jwt(
     })
 }
 
-fn decode_jwt_json<T: serde::de::DeserializeOwned>(
-    segment: &str,
-    name: &str,
-) -> Result<T, String> {
-    let bytes = URL_SAFE_NO_PAD.decode(segment)
+fn decode_jwt_json<T: serde::de::DeserializeOwned>(segment: &str, name: &str) -> Result<T, String> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(segment)
         .map_err(|_| format!("ATProto service JWT {name} is not base64url"))?;
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("ATProto service JWT {name} is invalid: {error}"))
@@ -873,31 +934,38 @@ fn verify_atproto_ecdsa(
 ) -> Result<(), String> {
     use p256::ecdsa::signature::Verifier as _;
 
-    let encoded = multikey.strip_prefix('z')
+    let encoded = multikey
+        .strip_prefix('z')
         .ok_or_else(|| "ATProto Multikey must use base58btc".to_owned())?;
-    let key = bs58::decode(encoded).into_vec()
+    let key = bs58::decode(encoded)
+        .into_vec()
         .map_err(|_| "ATProto Multikey is invalid base58btc".to_owned())?;
-    let signature = URL_SAFE_NO_PAD.decode(signature_segment)
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature_segment)
         .map_err(|_| "ATProto service JWT signature is not base64url".to_owned())?;
     match alg {
         "ES256" => {
-            let raw = key.strip_prefix(&[0x80, 0x24])
+            let raw = key
+                .strip_prefix(&[0x80, 0x24])
                 .ok_or_else(|| "ES256 requires a p256-pub Multikey".to_owned())?;
             let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(raw)
                 .map_err(|_| "invalid P-256 ATProto signing key".to_owned())?;
             let signature = p256::ecdsa::Signature::from_slice(&signature)
                 .map_err(|_| "invalid ES256 service JWT signature encoding".to_owned())?;
-            verifying_key.verify(signing_input, &signature)
+            verifying_key
+                .verify(signing_input, &signature)
                 .map_err(|_| "ATProto service JWT signature verification failed".to_owned())
         }
         "ES256K" => {
-            let raw = key.strip_prefix(&[0xe7, 0x01])
+            let raw = key
+                .strip_prefix(&[0xe7, 0x01])
                 .ok_or_else(|| "ES256K requires a secp256k1-pub Multikey".to_owned())?;
             let verifying_key = k256::ecdsa::VerifyingKey::from_sec1_bytes(raw)
                 .map_err(|_| "invalid secp256k1 ATProto signing key".to_owned())?;
             let signature = k256::ecdsa::Signature::from_slice(&signature)
                 .map_err(|_| "invalid ES256K service JWT signature encoding".to_owned())?;
-            verifying_key.verify(signing_input, &signature)
+            verifying_key
+                .verify(signing_input, &signature)
                 .map_err(|_| "ATProto service JWT signature verification failed".to_owned())
         }
         _ => Err("unsupported ATProto service JWT algorithm".to_owned()),
@@ -910,7 +978,9 @@ fn exchange_tenant(
 ) -> Result<Option<String>, &'static str> {
     let requested = requested.map(str::trim);
     if requested.is_some_and(|tenant| {
-        tenant.is_empty() || tenant == "*" || tenant.len() > 128
+        tenant.is_empty()
+            || tenant == "*"
+            || tenant.len() > 128
             || tenant.chars().any(char::is_control)
     }) {
         return Err("tenant must be a concrete, non-empty domain");
@@ -948,7 +1018,8 @@ pub async fn exchange_atproto_ucan(
     headers: HeaderMap,
     Json(request): Json<AtprotoExchangeRequest>,
 ) -> Response {
-    let Some(assertion) = headers.get(header::AUTHORIZATION)
+    let Some(assertion) = headers
+        .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split_once(' '))
         .filter(|(scheme, token)| {
@@ -992,7 +1063,12 @@ pub async fn exchange_atproto_ucan(
         output_dpop_jkt,
         Some(ISSUED_TOKEN_TYPE),
         Some(&request.tenant),
-    ).await;
+        // The atproto XRPC exchange is a public-client (UCAN-authenticated)
+        // flow; the public client identifier is the RFC 9068 `client_id` for a
+        // user `at+jwt` output (unused for a service `wit+jwt` output).
+        BROWSER_PUBLIC_CLIENT_ID,
+    )
+    .await;
     if response.status().is_success() {
         return response;
     }
@@ -1002,10 +1078,12 @@ pub async fn exchange_atproto_ucan(
         .await
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    let oauth_error = body.as_ref()
+    let oauth_error = body
+        .as_ref()
         .and_then(|value| value.get("error"))
         .and_then(serde_json::Value::as_str);
-    let message = body.as_ref()
+    let message = body
+        .as_ref()
         .and_then(|value| value.get("error_description"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("ATProto credential exchange failed");
@@ -1292,7 +1370,9 @@ fn resolve_grant_subject(
             // reader can re-take the meet off the one verified token. `None` if
             // the actor is unresolved — in which case `ctx` above is already
             // `None` and the grant fails closed before minting.
-            clearance: actor_ctx.map(|c| *c.clearance()),
+            clearance: actor_ctx.map(|c| {
+                hyprstream_rpc::auth::mac::CredentialClearance::from_label(*c.clearance())
+            }),
             act: None,
         }),
     };
@@ -1787,10 +1867,7 @@ async fn mint_grant_token(
 
     // DPoP sender-binding via cnf.jkt (RFC 9449 §6). ZSP: no cnf ⇒ bearer ⇒
     // rejected. We set jkt directly from the verified proof.
-    claims.cnf = Some(hyprstream_rpc::auth::Cnf {
-        jwk: None,
-        jkt: Some(dpop_jkt.to_owned()),
-    });
+    claims = claims.with_cnf_jkt_thumbprint(dpop_jkt.to_owned());
 
     // S8 (#574) + Fu3/#677: sign via the mandatory hybrid composite (EdDSA +
     // ML-DSA-65). If no ML-DSA-65 signing key is provisioned, refuse to mint
@@ -1892,6 +1969,7 @@ async fn issue_grant_refresh_token(
         dpop_jkt: None,
         client_assertion_jkt: None,
         ucan_grant: grant_refresh,
+        session_id: None,
     };
 
     if let Some(db) = &state.token_db {
@@ -1925,9 +2003,7 @@ mod tests {
         let message = b"header.payload";
         let p256_key = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         let mut p256_multikey = vec![0x80, 0x24];
-        p256_multikey.extend_from_slice(
-            p256_key.verifying_key().to_encoded_point(true).as_bytes(),
-        );
+        p256_multikey.extend_from_slice(p256_key.verifying_key().to_encoded_point(true).as_bytes());
         let p256_signature: p256::ecdsa::Signature = p256_key.sign(message);
         verify_atproto_ecdsa(
             "ES256",
@@ -1939,9 +2015,7 @@ mod tests {
 
         let k256_key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         let mut k256_multikey = vec![0xe7, 0x01];
-        k256_multikey.extend_from_slice(
-            k256_key.verifying_key().to_encoded_point(true).as_bytes(),
-        );
+        k256_multikey.extend_from_slice(k256_key.verifying_key().to_encoded_point(true).as_bytes());
         let k256_signature: k256::ecdsa::Signature = k256_key.sign(message);
         verify_atproto_ecdsa(
             "ES256K",
@@ -1950,6 +2024,35 @@ mod tests {
             &URL_SAFE_NO_PAD.encode(k256_signature.to_bytes()),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn federate_tui_class_is_never_a_generic_exchange_subject() {
+        let issuer = "https://cell.test";
+        // Marker path: any TUI marker classifies, regardless of the global
+        // reservation.
+        let mut claims = hyprstream_rpc::auth::Claims::new("did:plc:abc".into(), 1, 2);
+        claims.iss = issuer.into();
+        claims.client_id = Some("anything".into());
+        assert!(reject_federate_tui_exchange_subject(&claims, issuer).is_ok());
+        claims.hs_tui_profile = Some("federate-tui-v1".into());
+        assert!(reject_federate_tui_exchange_subject(&claims, issuer).is_err());
+
+        // Pin path: the deployment reservation classifies by
+        // (local iss, configured client id) even with markers stripped.
+        // The reservation is process-global and install-once; no other test
+        // in this process installs it, and no other test uses this client id.
+        if hyprstream_rpc::auth::federate_tui_class_client().is_none() {
+            hyprstream_rpc::auth::install_federate_tui_class_client(Some("hyprstream-tui-staging"))
+                .expect("install class reservation");
+        }
+        let mut pinned = hyprstream_rpc::auth::Claims::new("did:plc:abc".into(), 1, 2);
+        pinned.iss = issuer.into();
+        pinned.client_id = Some("hyprstream-tui-staging".into());
+        assert!(reject_federate_tui_exchange_subject(&pinned, issuer).is_err());
+        // A foreign issuer with the reserved client id is NOT classified.
+        pinned.iss = "https://other.example".into();
+        assert!(reject_federate_tui_exchange_subject(&pinned, issuer).is_ok());
     }
 
     #[test]
@@ -1997,10 +2100,11 @@ mod tests {
 
     fn mint_test_state() -> Arc<OAuthState> {
         use crate::config::OAuthConfig;
-        use crate::services::{DiscoveryClient, PolicyClient};
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
+        use hyprstream_rpc_std::discovery_client::DiscoveryClient;
+        use hyprstream_rpc_std::policy_client::PolicyClient;
 
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x65; 32]);
         let dummy = std::path::PathBuf::from("/dev/null/path-form-mint-test.sock");
@@ -2343,6 +2447,7 @@ mod tests {
                 requested_scope: Some("read:model:llama".to_owned()),
                 audience: Some("https://api.example".to_owned()),
             }),
+            session_id: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: super::super::state::RefreshTokenEntry = serde_json::from_str(&json).unwrap();

@@ -56,8 +56,8 @@ use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
 use super::backend::{SandboxBackend, SandboxHandle};
-use super::client::{LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
+use hyprstream_rpc_std::worker_client::{LinuxContainerResources, PodSandboxConfig};
 
 /// Annotation key: filesystem path to the guest `.wasm`/`.wat` module.
 const ANN_WASM_PATH: &str = "hyprstream.io/wasm-module";
@@ -316,12 +316,10 @@ impl SandboxBackend for WasmBackend {
         let handle = sandbox
             .backend_handle()
             .and_then(|h| h.as_any().downcast_ref::<WasmHandle>())
-            .ok_or_else(|| {
-                WorkerError::SandboxInvalidState {
-                    sandbox_id: sandbox.id.clone(),
-                    state: "non-wasm sandbox handle".into(),
-                    expected: "wasm handle".into(),
-                }
+            .ok_or_else(|| WorkerError::SandboxInvalidState {
+                sandbox_id: sandbox.id.clone(),
+                state: "non-wasm sandbox handle".into(),
+                expected: "wasm handle".into(),
             })?;
 
         // Reinstantiate from the same module bytes is not possible (we don't keep
@@ -453,7 +451,9 @@ impl SandboxBackend for WasmBackend {
         // (wall-clock). Those are fixed per `WasmConfig` at start; re-tuning them
         // per running sandbox would require swapping the handle's fuel/epoch, which
         // P2 does not plumb. No-op with a note.
-        debug!("wasm backend: update_resources is a no-op (DoS bounds are fuel/epoch, set at start)");
+        debug!(
+            "wasm backend: update_resources is a no-op (DoS bounds are fuel/epoch, set at start)"
+        );
         Ok(())
     }
 }
@@ -498,8 +498,8 @@ inventory::submit! {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::super::client::KeyValue;
     use super::*;
+    use hyprstream_rpc_std::worker_client::KeyValue;
     use std::path::PathBuf;
 
     /// A tiny hand-written guest matching the substrate's pyguest export
@@ -592,7 +592,11 @@ mod tests {
             .expect("exec_sync");
         assert_eq!(code, 7, "exec_sync should return the guest export's status");
         assert!(stdout.is_empty());
-        assert!(stderr.is_empty(), "no trap expected: {:?}", String::from_utf8_lossy(&stderr));
+        assert!(
+            stderr.is_empty(),
+            "no trap expected: {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
     }
 
     #[tokio::test]
@@ -721,7 +725,9 @@ mod tests {
 
         match result {
             Err(WorkerError::Unsupported(_)) => {}
-            other => panic!("expected Unsupported error (no linker wiring yet, #612), got: {other:?}"),
+            other => {
+                panic!("expected Unsupported error (no linker wiring yet, #612), got: {other:?}")
+            }
         }
     }
 

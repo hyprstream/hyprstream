@@ -12,18 +12,17 @@
 //! 4. `flush` — Write automerge state back to disk (atomic, checks file_hash)
 //! 5. `editClose` — Close this client's session (decrements client_count)
 
-use automerge::AutoCommit;
 use automerge::transaction::Transactable;
+use automerge::AutoCommit;
 use dashmap::DashMap;
-use sha2::{Sha256, Digest};
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Document format for parsing/serialization.
 ///
-/// Re-exports the generated Cap'n Proto enum — canonical OCI-aligned type.
-pub use crate::services::generated::registry_client::DocFormat;
+use hyprstream_rpc_std::registry_client::DocFormat;
 
 /// Shared CRDT document for a file, accessed by multiple clients.
 ///
@@ -81,9 +80,7 @@ impl EditingTable {
     ) -> Result<Arc<Mutex<SharedDoc>>, String> {
         let session_key = (client_id.to_owned(), fid);
         if self.sessions.contains_key(&session_key) {
-            return Err(format!(
-                "fid {} already has an active editing session", fid
-            ));
+            return Err(format!("fid {} already has an active editing session", fid));
         }
 
         let doc_key: DocKey = (
@@ -119,11 +116,7 @@ impl EditingTable {
     }
 
     /// Get the shared doc for a client's active session.
-    pub fn get_session(
-        &self,
-        client_id: &str,
-        fid: u32,
-    ) -> Option<Arc<Mutex<SharedDoc>>> {
+    pub fn get_session(&self, client_id: &str, fid: u32) -> Option<Arc<Mutex<SharedDoc>>> {
         let session_key = (client_id.to_owned(), fid);
         let doc_key = self.sessions.get(&session_key)?;
         let shared = self.docs.get(&*doc_key)?;
@@ -131,12 +124,7 @@ impl EditingTable {
     }
 
     /// Check if a file has an active editing session (by any client).
-    pub fn has_active_session(
-        &self,
-        repo_id: &str,
-        worktree: &str,
-        rel_path: &str,
-    ) -> bool {
+    pub fn has_active_session(&self, repo_id: &str, worktree: &str, rel_path: &str) -> bool {
         let doc_key: DocKey = (
             repo_id.to_owned(),
             worktree.to_owned(),
@@ -214,12 +202,7 @@ impl EditingTable {
 
     /// Check if a file at the given path has any active editing session.
     /// Used by handle_write to guard against direct writes to CRDT-edited files.
-    pub fn file_has_session(
-        &self,
-        repo_id: &str,
-        worktree: &str,
-        rel_path: &str,
-    ) -> bool {
+    pub fn file_has_session(&self, repo_id: &str, worktree: &str, rel_path: &str) -> bool {
         self.has_active_session(repo_id, worktree, rel_path)
     }
 }
@@ -231,7 +214,11 @@ pub fn normalize_path(path: &str) -> String {
         .trim_start_matches("./")
         .trim_end_matches('/')
         .to_owned();
-    if p.is_empty() { ".".to_owned() } else { p }
+    if p.is_empty() {
+        ".".to_owned()
+    } else {
+        p
+    }
 }
 
 /// SHA-256 hash of bytes.

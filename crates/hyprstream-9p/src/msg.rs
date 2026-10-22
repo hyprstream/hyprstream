@@ -219,16 +219,50 @@ pub fn treaddir(tag: u16, fid: u32, offset: u64, count: u32) -> Vec<u8> {
 /// it through each arm.
 #[derive(Debug)]
 pub enum Request {
-    Version { msize: u32, version: String },
-    Attach { fid: u32, afid: u32, uname: String, aname: String },
-    Flush { oldtag: u16 },
-    Walk { fid: u32, newfid: u32, wnames: Vec<String> },
-    Lopen { fid: u32, flags: u32 },
-    Read { fid: u32, offset: u64, count: u32 },
-    Write { fid: u32, offset: u64, data: Vec<u8> },
-    Clunk { fid: u32 },
-    Getattr { fid: u32, request_mask: u64 },
-    Readdir { fid: u32, offset: u64, count: u32 },
+    Version {
+        msize: u32,
+        version: String,
+    },
+    Attach {
+        fid: u32,
+        afid: u32,
+        uname: String,
+        aname: String,
+    },
+    Flush {
+        oldtag: u16,
+    },
+    Walk {
+        fid: u32,
+        newfid: u32,
+        wnames: Vec<String>,
+    },
+    Lopen {
+        fid: u32,
+        flags: u32,
+    },
+    Read {
+        fid: u32,
+        offset: u64,
+        count: u32,
+    },
+    Write {
+        fid: u32,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    Clunk {
+        fid: u32,
+    },
+    Getattr {
+        fid: u32,
+        request_mask: u64,
+    },
+    Readdir {
+        fid: u32,
+        offset: u64,
+        count: u32,
+    },
 }
 
 /// Parse a T-message from wire bytes (including length prefix).
@@ -258,7 +292,12 @@ pub fn parse_request(buf: &[u8]) -> anyhow::Result<(u16, Request)> {
             let aname = read_string(&mut r)?;
             // 9P2000.L: n_uname (ignored)
             let _n_uname = read_u32(&mut r)?;
-            Request::Attach { fid, afid, uname, aname }
+            Request::Attach {
+                fid,
+                afid,
+                uname,
+                aname,
+            }
         }
         TFLUSH => {
             let oldtag = read_u16(&mut r)?;
@@ -272,7 +311,11 @@ pub fn parse_request(buf: &[u8]) -> anyhow::Result<(u16, Request)> {
             for _ in 0..nwname {
                 wnames.push(read_string(&mut r)?);
             }
-            Request::Walk { fid, newfid, wnames }
+            Request::Walk {
+                fid,
+                newfid,
+                wnames,
+            }
         }
         TLOPEN => {
             let fid = read_u32(&mut r)?;
@@ -335,9 +378,12 @@ pub fn encode_response(tag: u16, response: &Response) -> Vec<u8> {
         Response::Read { data } => rread(tag, data),
         Response::Write { count } => rwrite(tag, *count),
         Response::Clunk => rclunk(tag),
-        Response::Getattr { qid, mode, size, mtime_sec } => {
-            rgetattr(tag, qid, *mode, *size, *mtime_sec)
-        }
+        Response::Getattr {
+            qid,
+            mode,
+            size,
+            mtime_sec,
+        } => rgetattr(tag, qid, *mode, *size, *mtime_sec),
         // Rreaddir shares Rread's `count[4] · data[count]` body shape but MUST
         // carry the RREADDIR (41) message type — a standard 9P2000.L client
         // (e.g. Wanix `p9kit.ClientFS` over `progrium/p9`) rejects an Rread (117)
@@ -453,16 +499,39 @@ pub fn rgetattr(tag: u16, qid: &Qid, mode: u32, size: u64, mtime_sec: u64) -> Ve
 /// Parsed R-message from server.
 #[derive(Debug)]
 pub enum Response {
-    Version { msize: u32, version: String },
-    Attach { qid: Qid },
-    Walk { qids: Vec<Qid> },
-    Lopen { qid: Qid, iounit: u32 },
-    Read { data: Vec<u8> },
-    Write { count: u32 },
+    Version {
+        msize: u32,
+        version: String,
+    },
+    Attach {
+        qid: Qid,
+    },
+    Walk {
+        qids: Vec<Qid>,
+    },
+    Lopen {
+        qid: Qid,
+        iounit: u32,
+    },
+    Read {
+        data: Vec<u8>,
+    },
+    Write {
+        count: u32,
+    },
     Clunk,
-    Getattr { qid: Qid, mode: u32, size: u64, mtime_sec: u64 },
-    Readdir { data: Vec<u8> },
-    Error { ecode: u32 },
+    Getattr {
+        qid: Qid,
+        mode: u32,
+        size: u64,
+        mtime_sec: u64,
+    },
+    Readdir {
+        data: Vec<u8>,
+    },
+    Error {
+        ecode: u32,
+    },
 }
 
 /// Parse an R-message from wire bytes (including length prefix).
@@ -533,7 +602,12 @@ pub fn parse_response(buf: &[u8]) -> anyhow::Result<(u16, Response)> {
             let _btime_nsec = read_u64(&mut r)?;
             let _gen = read_u64(&mut r)?;
             let _data_version = read_u64(&mut r)?;
-            Response::Getattr { qid, mode, size, mtime_sec }
+            Response::Getattr {
+                qid,
+                mode,
+                size,
+                mtime_sec,
+            }
         }
         RREADDIR => {
             let data = read_data(&mut r)?;
@@ -619,7 +693,12 @@ pub fn parse_readdir_entries(data: &[u8]) -> anyhow::Result<Vec<DirEntryP9>> {
         let offset = read_u64(&mut r)?;
         let dtype = read_u8(&mut r)?;
         let name = read_string(&mut r)?;
-        entries.push(DirEntryP9 { qid, offset, dtype, name });
+        entries.push(DirEntryP9 {
+            qid,
+            offset,
+            dtype,
+            name,
+        });
     }
 
     Ok(entries)

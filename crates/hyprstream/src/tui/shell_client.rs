@@ -3,9 +3,7 @@
 //! Thin wrappers around generated `TuiClient` typed methods for ergonomic
 //! call-site usage: spawnShell, pollStdin, focusWindow, spawnChatApp, closeWindow.
 
-use crate::services::generated::tui_client::{
-    SpawnShellRequest, SpawnChatAppRequest, TuiClient,
-};
+use hyprstream_rpc_std::tui_client::{SpawnChatAppRequest, SpawnShellRequest, TuiClient};
 
 /// Send a spawnShell RPC to TuiService.
 pub async fn spawn_shell_rpc(
@@ -14,11 +12,13 @@ pub async fn spawn_shell_rpc(
     pane_id: u32,
     cwd: &str,
 ) -> anyhow::Result<()> {
-    let _ = client.spawn_shell(&SpawnShellRequest {
-        session_id,
-        pane_id,
-        cwd: cwd.to_owned(),
-    }).await?;
+    let _ = client
+        .spawn_shell(&SpawnShellRequest {
+            session_id,
+            pane_id,
+            cwd: cwd.to_owned(),
+        })
+        .await?;
     Ok(())
 }
 
@@ -41,13 +41,15 @@ pub async fn spawn_chat_app_rpc(
     rows: u16,
     pane_id: u32,
 ) -> anyhow::Result<()> {
-    let _ = client.spawn_chat_app(&SpawnChatAppRequest {
-        session_id,
-        model_ref: model_ref.to_owned(),
-        cols,
-        rows,
-        pane_id,
-    }).await?;
+    let _ = client
+        .spawn_chat_app(&SpawnChatAppRequest {
+            session_id,
+            model_ref: model_ref.to_owned(),
+            cols,
+            rows,
+            pane_id,
+        })
+        .await?;
     Ok(())
 }
 

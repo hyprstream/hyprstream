@@ -6,11 +6,11 @@
 
 pub mod blobs;
 pub mod crypto;
+pub mod daemon;
 pub mod error;
 pub mod git;
-pub mod types;
 pub mod service;
-pub mod daemon;
+pub mod types;
 
 /// at9p mainline (BEP5) locator — see #889 / epic #880 Track C.
 pub mod locator;
@@ -20,7 +20,9 @@ pub use error::{Error, Result};
 pub use types::*;
 
 // Re-export transport functionality for consuming applications
-pub use git::transport::{GittorrentTransportFactory, TransportFactory, register_gittorrent_transport};
+pub use git::transport::{
+    register_gittorrent_transport, GittorrentTransportFactory, TransportFactory,
+};
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -22,10 +22,10 @@ use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 
 use super::backend::{SandboxBackend, SandboxHandle};
-use super::client::{LinuxContainerResources, PodSandboxConfig};
 use super::sandbox::PodSandbox;
 #[cfg(feature = "oci-image")]
 use crate::image::RafsStore;
+use hyprstream_rpc_std::worker_client::{LinuxContainerResources, PodSandboxConfig};
 
 /// Sub-directory of the per-sandbox runtime dir where the tenant VFS is
 /// FUSE-mounted for Model B (#715) POSIX-rooting.
@@ -61,8 +61,7 @@ impl Default for NspawnConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/usr/lib/libtorch"));
 
-        let ld_library_path =
-            std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        let ld_library_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
 
         Self {
             libtorch_path,
@@ -201,10 +200,7 @@ impl NspawnBackend {
 
         // Bind-mount libtorch read-only
         if self.config.libtorch_path.exists() {
-            args.push(format!(
-                "--bind-ro={}",
-                self.config.libtorch_path.display()
-            ));
+            args.push(format!("--bind-ro={}", self.config.libtorch_path.display()));
         }
 
         // Network isolation
@@ -223,10 +219,7 @@ impl NspawnBackend {
         }
 
         // Environment variables
-        args.push(format!(
-            "--setenv=HYPRSTREAM_INSTANCE={}",
-            sandbox.id
-        ));
+        args.push(format!("--setenv=HYPRSTREAM_INSTANCE={}", sandbox.id));
         if !self.config.ld_library_path.is_empty() {
             args.push(format!(
                 "--setenv=LD_LIBRARY_PATH={}",
@@ -241,10 +234,7 @@ impl NspawnBackend {
         // Resource limits → systemd property flags
         if let Some(res) = resources {
             if res.cpu_quota > 0 {
-                args.push(format!(
-                    "--property=CPUQuota={}%",
-                    res.cpu_quota
-                ));
+                args.push(format!("--property=CPUQuota={}%", res.cpu_quota));
             }
             if res.memory_limit_in_bytes > 0 {
                 args.push(format!(
@@ -373,8 +363,7 @@ impl NspawnBackend {
             .join(sandbox_id)
             .join("discovery.sock");
 
-        let deadline =
-            tokio::time::Instant::now() + self.config.ready_timeout;
+        let deadline = tokio::time::Instant::now() + self.config.ready_timeout;
 
         while tokio::time::Instant::now() < deadline {
             if discovery_sock.exists() {
@@ -410,8 +399,7 @@ impl SandboxBackend for NspawnBackend {
     }
 
     fn is_available(&self) -> bool {
-        which::which("systemd-nspawn").is_ok()
-            && which::which("machinectl").is_ok()
+        which::which("systemd-nspawn").is_ok() && which::which("machinectl").is_ok()
     }
 
     async fn initialize(&self, _config: &PoolConfig) -> Result<()> {
@@ -471,8 +459,9 @@ impl SandboxBackend for NspawnBackend {
             };
 
         #[cfg(feature = "oci-image")]
-        let vfs_root_mountpoint: Option<PathBuf> =
-            vfs_root_mount.as_ref().map(|m| m.mountpoint().to_path_buf());
+        let vfs_root_mountpoint: Option<PathBuf> = vfs_root_mount
+            .as_ref()
+            .map(|m| m.mountpoint().to_path_buf());
         #[cfg(not(feature = "oci-image"))]
         let vfs_root_mountpoint: Option<PathBuf> = None;
 
@@ -499,17 +488,14 @@ impl SandboxBackend for NspawnBackend {
             .stderr(std::process::Stdio::null());
 
         let _child = cmd.spawn().map_err(|e| {
-            WorkerError::VmStartFailed(format!(
-                "failed to spawn systemd-nspawn: {e}"
-            ))
+            WorkerError::VmStartFailed(format!("failed to spawn systemd-nspawn: {e}"))
         })?;
 
         // Wait for the inner hyprstream to become ready
         self.wait_for_ready(&sandbox.id).await?;
 
         // Discover leader PID
-        let leader_pid =
-            Self::discover_leader_pid(&machine_name).await;
+        let leader_pid = Self::discover_leader_pid(&machine_name).await;
 
         let handle = Arc::new(NspawnHandle {
             sandbox_id: sandbox.id.clone(),
@@ -539,9 +525,7 @@ impl SandboxBackend for NspawnBackend {
             .status()
             .await
             .map_err(|e| {
-                WorkerError::VmStopFailed(format!(
-                    "failed to run machinectl stop: {e}"
-                ))
+                WorkerError::VmStopFailed(format!("failed to run machinectl stop: {e}"))
             })?;
 
         if !status.success() {
@@ -668,11 +652,7 @@ impl SandboxBackend for NspawnBackend {
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let machine_name = format!("hyprstream-{}", sandbox.id);
 
-        let mut args = vec![
-            "shell".to_owned(),
-            machine_name,
-            "--".to_owned(),
-        ];
+        let mut args = vec!["shell".to_owned(), machine_name, "--".to_owned()];
         args.extend_from_slice(command);
 
         let output = tokio::time::timeout(
@@ -686,11 +666,7 @@ impl SandboxBackend for NspawnBackend {
             operation: format!("exec_sync in {}", sandbox.id),
             timeout_secs,
         })?
-        .map_err(|e| {
-            WorkerError::ExecFailed(format!(
-                "machinectl shell failed: {e}"
-            ))
-        })?;
+        .map_err(|e| WorkerError::ExecFailed(format!("machinectl shell failed: {e}")))?;
 
         let exit_code = output.status.code().unwrap_or(-1);
         Ok((exit_code, output.stdout, output.stderr))
@@ -807,8 +783,7 @@ mod tests {
         let devices = detect_gpu_devices();
         for d in &devices {
             assert!(
-                d.to_string_lossy().contains("card")
-                    || d.to_string_lossy().contains("renderD")
+                d.to_string_lossy().contains("card") || d.to_string_lossy().contains("renderD")
             );
         }
     }

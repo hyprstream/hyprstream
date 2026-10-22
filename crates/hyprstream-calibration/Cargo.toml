@@ -1,0 +1,27 @@
+[package]
+name = "hyprstream-calibration"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "Calibration metrics library for the System One program (P0.2): ECE/Brier/reliability curves, selective accuracy, APS/RAPS and ordinal (RPS-based / min-CPS) conformal nonconformity, the pinned gate measurement protocol, and pre-committed disclosure language"
+
+# Deliberately dependency-light: pure functions over probability vectors, no
+# Arrow, no metrics-engine deps, no model code. Consumed by the eval harness
+# (P0.4), the gate runs (P0.5/P1.4/P2.3), and the post-hoc calibration layer
+# (P2.2), so this crate must stay a permissive-only leaf
+# (.github/license-boundary.toml). MAPIE has no ordinal-aware conformal support
+# (S6b2), so the ordinal contiguous-interval nonconformity lives here.
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

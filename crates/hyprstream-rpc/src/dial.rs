@@ -162,13 +162,60 @@ pub fn dial_with_crypto_stores<S>(
 where
     S: Signer + 'static,
 {
+    let token_provider = token.map(|token| {
+        Arc::new(move || Some(token.clone())) as Arc<dyn Fn() -> Option<String> + Send + Sync>
+    });
+    dial_with_crypto_stores_and_token_provider(
+        target,
+        signer,
+        server_verifying_key,
+        token_provider,
+        request_kem_store,
+        response_pq_store,
+    )
+}
+
+/// Dial with a JWT provider evaluated for each request, so long-lived clients
+/// observe credential renewal without rebuilding their transport.
+pub fn dial_with_token_provider<S>(
+    target: &TransportConfig,
+    signer: S,
+    server_verifying_key: Option<VerifyingKey>,
+    token_provider: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+) -> Result<Arc<dyn RpcClient>>
+where
+    S: Signer + 'static,
+{
+    dial_with_crypto_stores_and_token_provider(
+        target,
+        signer,
+        server_verifying_key,
+        token_provider,
+        None,
+        None,
+    )
+}
+
+/// The provider form of the crypto-bound dial. A missing JWT remains missing;
+/// this API does not manufacture clearance from the caller's signing key.
+pub fn dial_with_crypto_stores_and_token_provider<S>(
+    target: &TransportConfig,
+    signer: S,
+    server_verifying_key: Option<VerifyingKey>,
+    token_provider: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    request_kem_store: Option<Arc<dyn KemTrustStore>>,
+    response_pq_store: Option<Arc<dyn crate::envelope::PqTrustStore>>,
+) -> Result<Arc<dyn RpcClient>>
+where
+    S: Signer + 'static,
+{
     /// Wrap a built transport as an `RpcClient`, applying the optional default
     /// JWT (CA-signed trust cert included in request envelopes) if present.
     fn build_client<S2, T2>(
         signer: S2,
         transport: T2,
         vk: Option<VerifyingKey>,
-        token: Option<String>,
+        token_provider: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
         request_kem_store: Option<Arc<dyn KemTrustStore>>,
         response_pq_store: Option<Arc<dyn crate::envelope::PqTrustStore>>,
     ) -> Arc<dyn RpcClient>
@@ -185,8 +232,8 @@ where
             Some(store) => rpc.with_response_pq_store(store),
             None => rpc,
         };
-        let rpc = match token {
-            Some(t) => rpc.with_default_jwt(t),
+        let rpc = match token_provider {
+            Some(provider) => rpc.with_token_provider(move || provider()),
             None => rpc,
         };
         Arc::new(rpc) as Arc<dyn RpcClient>
@@ -205,7 +252,7 @@ where
                 signer,
                 transport,
                 server_verifying_key,
-                token,
+                token_provider,
                 request_kem_store,
                 response_pq_store,
             ))
@@ -237,29 +284,19 @@ where
                 signer,
                 transport,
                 server_verifying_key,
-                token,
+                token_provider,
                 request_kem_store,
                 response_pq_store,
             ))
-        }
-        EndpointType::Iroh {
-            direct_addrs,
-            relay_url,
-            ..
-        } if direct_addrs.is_empty() && relay_url.is_none() => {
-            // Fail fast rather than hand iroh an EndpointId with no reachability,
-            // which would fall through to discovery and time out (~10-30s). The
-            // resolver is expected to supply at least one direct addr or a relay.
-            bail!(
-                "dial(): iroh endpoint has neither direct addrs nor a relay URL — \
-                 not dialable; the resolver must supply reachability"
-            )
         }
         EndpointType::Iroh {
             node_id,
             direct_addrs,
             relay_url,
         } => {
+            // Discovery may publish only the NodeId. LazyIrohTransport gives its
+            // N0-enabled endpoint that empty-hints address under a bounded connect
+            // timeout; NodeId never replaces the independent authority below.
             let response_key = server_verifying_key.ok_or_else(|| {
                 anyhow!(
                     "dial(): iroh reach has no independently resolved application response key; \
@@ -275,7 +312,7 @@ where
                 signer,
                 transport,
                 Some(response_key),
-                token,
+                token_provider,
                 request_kem_store,
                 response_pq_store,
             ))
@@ -293,7 +330,7 @@ where
                 signer,
                 transport,
                 server_verifying_key,
-                token,
+                token_provider,
                 request_kem_store,
                 response_pq_store,
             ))
@@ -304,7 +341,7 @@ where
                 signer,
                 transport,
                 server_verifying_key,
-                token,
+                token_provider,
                 request_kem_store,
                 response_pq_store,
             ))
@@ -446,20 +483,22 @@ async fn dial_iroh_moq(
         )
     })?;
 
-    dial_iroh_moq_from_endpoint(endpoint, node_id, direct_addrs, relay_url).await
+    let conn = dial_iroh_moq_from_endpoint(endpoint, node_id, direct_addrs, relay_url).await?;
+    Ok(web_transport_iroh::Session::raw(conn))
 }
 
-/// Dial from an explicitly owned endpoint.
+/// Dial from an explicitly owned endpoint, returning the raw `moql` connection.
 ///
 /// Tests use this primitive so a runtime-bound endpoint never leaks into the
 /// process-global production slot. The caller owns the endpoint for the full
-/// connection lifecycle.
+/// connection lifecycle. The raw connection lets the #1027 admission exchange
+/// consume the first bi stream before the session is wrapped.
 async fn dial_iroh_moq_from_endpoint(
     endpoint: iroh::Endpoint,
     node_id: &[u8; 32],
     direct_addrs: &[std::net::SocketAddr],
     relay_url: &Option<String>,
-) -> Result<web_transport_iroh::Session> {
+) -> Result<iroh::endpoint::Connection> {
     use crate::transport::iroh_substrate::ALPN_MOQ_LITE;
     use iroh::{EndpointAddr, EndpointId, TransportAddr};
 
@@ -481,7 +520,65 @@ async fn dial_iroh_moq_from_endpoint(
         .connect(addr, ALPN_MOQ_LITE)
         .await
         .map_err(|e| anyhow!("iroh moql connect: {e}"))?;
-    Ok(web_transport_iroh::Session::raw(conn))
+    Ok(conn)
+}
+
+/// #1027: dial the moq streaming plane over iroh `moql` and run the
+/// inside-carrier admission challenge/response
+/// ([`crate::transport::moql_admission`]) BEFORE returning the session. The
+/// returned session is admitted: the server has verified the proof against its
+/// current accepted Ed25519 + ML-DSA-65 state and scoped the session to the
+/// resolved tenant.
+///
+/// Admission is the iroh-carrier path only; the quinn `/moq` plane
+/// authenticates at CONNECT time ([`crate::transport::moq_connect_auth`]).
+/// Same-host endpoints are rejected exactly as in [`dial_stream`].
+pub async fn dial_stream_authenticated(
+    target: &TransportConfig,
+    proof: &crate::transport::moql_admission::MoqlAdmissionProof,
+) -> Result<MoqStreamSession> {
+    match &target.endpoint {
+        EndpointType::Iroh {
+            node_id,
+            direct_addrs,
+            relay_url,
+        } => {
+            let endpoint =
+                crate::transport::lazy_iroh::iroh_client_endpoint().ok_or_else(|| {
+                    anyhow!(
+                        "dial_stream_authenticated(): no iroh client endpoint installed — call \
+                     install_iroh_client_endpoint() at startup before dialing iroh streams"
+                    )
+                })?;
+            let client_carrier_node_id = *endpoint.id().as_bytes();
+            let conn =
+                dial_iroh_moq_from_endpoint(endpoint, node_id, direct_addrs, relay_url).await?;
+            crate::transport::moql_admission::prove_moql_admission(
+                &conn,
+                proof,
+                client_carrier_node_id,
+                crate::transport::moql_admission::DEFAULT_ADMISSION_TIMEOUT,
+            )
+            .await
+            .map_err(|e| anyhow!("moql admission proof failed: {e}"))?;
+            Ok(MoqStreamSession::Iroh(web_transport_iroh::Session::raw(
+                conn,
+            )))
+        }
+        EndpointType::Quic { .. } => {
+            bail!(
+                "dial_stream_authenticated(): #1027 admission is the iroh `moql` path; \
+                 the quinn `/moq` plane authenticates at CONNECT time (#1153)"
+            )
+        }
+        EndpointType::Ipc { .. } | EndpointType::SystemdFd { .. } | EndpointType::Inproc { .. } => {
+            bail!(
+                "dial_stream_authenticated(): same-host endpoint ({:?}) is resolved from local \
+                 config, not dialed from the wire — use the UDS fast path",
+                target.endpoint
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -651,6 +748,27 @@ mod tests {
     }
 
     #[test]
+    fn rpc_iroh_node_id_alone_builds_lazy_transport_but_never_uses_node_as_authority() {
+        let response_signer = SigningKey::generate(&mut OsRng);
+        let cfg = TransportConfig::iroh([0x19; 32], Vec::new(), None);
+
+        assert!(
+            dial(
+                &cfg,
+                test_signer(),
+                Some(response_signer.verifying_key()),
+                None
+            )
+            .is_ok(),
+            "an empty-hints NodeId must reach LazyIrohTransport for bounded N0 discovery"
+        );
+        assert!(
+            dial(&cfg, test_signer(), None, None).is_err(),
+            "NodeId must not be repurposed as an application response key"
+        );
+    }
+
+    #[test]
     fn iroh_node_equality_never_selects_or_changes_application_response_key() {
         let response_signer = SigningKey::generate(&mut OsRng);
         let response_key = response_signer.verifying_key();
@@ -712,20 +830,25 @@ mod tests {
         // Exercise the same carrier dial primitive from the isolated endpoint.
         let cfg = TransportConfig::iroh(server_id, direct, None);
         let session = match &cfg.endpoint {
-            EndpointType::Iroh { node_id, direct_addrs, relay_url } => {
-                MoqStreamSession::Iroh(
-                    dial_iroh_moq_from_endpoint(
-                        client.endpoint().clone(),
-                        node_id,
-                        direct_addrs,
-                        relay_url,
-                    )
-                    .await?,
+            EndpointType::Iroh {
+                node_id,
+                direct_addrs,
+                relay_url,
+            } => MoqStreamSession::Iroh(web_transport_iroh::Session::raw(
+                dial_iroh_moq_from_endpoint(
+                    client.endpoint().clone(),
+                    node_id,
+                    direct_addrs,
+                    relay_url,
                 )
-            }
+                .await?,
+            )),
             other => panic!("expected iroh endpoint, got {other:?}"),
         };
-        assert!(matches!(session, MoqStreamSession::Iroh(_)), "must be an iroh session");
+        assert!(
+            matches!(session, MoqStreamSession::Iroh(_)),
+            "must be an iroh session"
+        );
 
         let moq_client = Client::new();
         let handshake = session.connect_moq(&moq_client).await;

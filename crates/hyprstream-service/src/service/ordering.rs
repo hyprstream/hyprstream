@@ -23,6 +23,15 @@ use crate::service::factory::list_factories;
 /// Panics if the dependency graph contains a cycle (should not happen
 /// with a well-formed `depends_on` declaration).
 pub fn startup_stages(requested: &[impl AsRef<str>]) -> Vec<Vec<String>> {
+    startup_stages_for_profile(requested, false)
+}
+
+/// Required native Discovery publishes through its owned state before Policy
+/// starts. Policy clients resolve signed bootstrap reach lazily until then.
+pub fn startup_stages_for_profile(
+    requested: &[impl AsRef<str>],
+    iroh_required: bool,
+) -> Vec<Vec<String>> {
     let requested_set: HashSet<&str> = requested.iter().map(AsRef::as_ref).collect();
 
     // Build adjacency: service -> [dependencies that are also in requested]
@@ -43,6 +52,16 @@ pub fn startup_stages(requested: &[impl AsRef<str>]) -> Vec<Vec<String>> {
     // Services in requested but not in any factory (shouldn't happen, but be safe)
     for &name in &requested_set {
         deps.entry(name).or_default();
+    }
+    if iroh_required {
+        if let Some(discovery) = deps.get_mut("discovery") {
+            discovery.retain(|dependency| *dependency != "policy");
+        }
+        if requested_set.contains("discovery") {
+            if let Some(policy) = deps.get_mut("policy") {
+                policy.push("discovery");
+            }
+        }
     }
 
     // Kahn's algorithm for topological sort by depth
@@ -121,7 +140,10 @@ mod tests {
         // verify it doesn't panic.
         let stages = startup_stages(&["policy", "registry", "model"]);
         // All requested services should appear exactly once across all stages.
-        let all: Vec<&str> = stages.iter().flat_map(|s| s.iter().map(String::as_str)).collect();
+        let all: Vec<&str> = stages
+            .iter()
+            .flat_map(|s| s.iter().map(String::as_str))
+            .collect();
         // Services not in the inventory will still appear (with no deps).
         assert!(all.len() <= 3);
     }

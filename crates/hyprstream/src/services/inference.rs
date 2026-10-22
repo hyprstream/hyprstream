@@ -33,28 +33,29 @@
 //! Uses `InferenceHandler::authorize()` via generated dispatch for policy-backed
 //! authorization on all requests. The handler delegates to PolicyClient.
 
-use crate::services::PolicyClient;
 use crate::config::TrainingMode;
-use crate::runtime::GenerationRequest;
-use crate::runtime::ModelInfo;
 use crate::runtime::kv_cache::CacheOwner;
 use crate::runtime::model_config::ModelConfig;
-use crate::runtime::{RuntimeConfig, RuntimeEngine, TorchEngine};
+use crate::runtime::{create_engine, RuntimeConfig, RuntimeEngine, TorchEngine};
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
+use hyprstream_rpc_std::policy_client::PolicyClient;
 
 use crate::services::EnvelopeContext;
-use crate::services::WorktreeClient;
-use crate::training::{DeltaPool, TenantDeltaConfig, TTTConfig, TestTimeTrainer};
-use hyprstream_rpc::Subject;
+use crate::services::WorktreeClientExt;
 use crate::training::serialize_state_dict_to_bytes;
+use crate::training::{DeltaPool, TTTConfig, TenantDeltaConfig, TestTimeTrainer};
 use anyhow::{anyhow, Result};
 use hyprstream_rpc::prelude::*;
 use hyprstream_rpc::StreamChannel;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use hyprstream_rpc::Subject;
+use hyprstream_rpc_std::registry_client::WorktreeClient;
 use parking_lot::Mutex;
-use tokio::runtime::Handle;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokenizers::Tokenizer;
+use tokio::runtime::Handle;
 use tracing::{debug, error, info, trace, warn};
 
 // #1264/#1265: completion-time ledger spend (behind the `ledger` feature,
@@ -63,7 +64,6 @@ use tracing::{debug, error, info, trace, warn};
 use crate::services::ledger::{
     observe_spend_result, InferenceSpendEmitter, SpendInput, SpendResult,
 };
-
 
 /// Pending work to be executed after REP response is sent.
 ///
@@ -108,7 +108,6 @@ enum PendingWork {
     },
 }
 
-
 /// Default endpoint for the inference service
 pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 
@@ -141,9 +140,12 @@ pub const INFERENCE_ENDPOINT: &str = "inproc://hyprstream/inference";
 /// Streaming continuations clone the `Arc` to own the state across await points.
 pub struct InferenceServiceInner {
     engine: parking_lot::RwLock<TorchEngine>,
-    /// Model path for checkpoint management
-    #[allow(dead_code)] // Future: checkpoint management
+    /// Immutable base inputs, including reads deferred until after startup.
     model_path: PathBuf,
+    /// Writable adaptation state is never placed in the sealed base tree.
+    state_path: PathBuf,
+    /// Retains verified read-only descriptors and their paths through lazy reads.
+    _pinned_artifact: Option<Arc<crate::storage::pinned_model::PinnedModelArtifact>>,
     /// Current session ID for events
     session_id: parking_lot::RwLock<Option<String>>,
     /// Runtime handle for async operations (reused instead of creating new runtimes)
@@ -212,13 +214,17 @@ pub struct InferenceService {
 
 impl Clone for InferenceService {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 
 impl std::ops::Deref for InferenceService {
     type Target = InferenceServiceInner;
-    fn deref(&self) -> &Self::Target { &self.inner }
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 // SAFETY: InferenceServiceInner contains tch-rs types (raw pointers) behind
@@ -302,13 +308,19 @@ enum GenLoopOutcome {
 /// accounting paths without a live engine.
 trait GenSink {
     /// Forward one generated chunk; an `Err` is a terminal publish-failure.
-    fn publish_chunk(&mut self, data: &str, rate: f32)
-        -> impl std::future::Future<Output = Result<()>>;
+    fn publish_chunk(
+        &mut self,
+        data: &str,
+        rate: f32,
+    ) -> impl std::future::Future<Output = Result<()>>;
 }
 
 impl GenSink for hyprstream_rpc::moq_stream::AnyStreamPublisher {
-    fn publish_chunk(&mut self, data: &str, rate: f32)
-        -> impl std::future::Future<Output = Result<()>> {
+    fn publish_chunk(
+        &mut self,
+        data: &str,
+        rate: f32,
+    ) -> impl std::future::Future<Output = Result<()>> {
         self.publish_data_with_rate(data.as_bytes(), rate)
     }
 }
@@ -365,7 +377,7 @@ async fn drive_generation_loop<S: GenOutput>(
 /// The content-free error frame emitted when a generation is denied because the
 /// caller has no self-certifying billing identity while a spend emitter is
 /// attached (#1265). Carries no subject DID and no prompt material.
-#[cfg_attr(not(feature = "ledger"), allow(dead_code))]  // only read on the ledger gate path
+#[cfg_attr(not(feature = "ledger"), allow(dead_code))] // only read on the ledger gate path
 const LEDGER_DENY_NO_IDENTITY: &str =
     "generation denied: no verified billing identity for token-spend accounting";
 
@@ -378,7 +390,7 @@ const LEDGER_DENY_NO_IDENTITY: &str =
 /// With no emitter attached the subsystem is inert — anonymous callers are
 /// unaffected. An explicit fail-open / debt policy for anonymous callers is a
 /// separate decision and is intentionally NOT implemented here.
-#[cfg_attr(not(feature = "ledger"), allow(dead_code))]  // only read on the ledger gate path
+#[cfg_attr(not(feature = "ledger"), allow(dead_code))] // only read on the ledger gate path
 fn ledger_requires_identity(emitter_attached: bool, owner_did: Option<&str>) -> bool {
     emitter_attached && owner_did.is_none()
 }
@@ -468,13 +480,17 @@ impl InferenceService {
         crate::training::GuardStatus {
             expired,
             at_capacity,
-            lora_generation: self.lora_generation.load(std::sync::atomic::Ordering::Acquire),
+            lora_generation: self
+                .lora_generation
+                .load(std::sync::atomic::Ordering::Acquire),
         }
     }
 
     /// Initialize the service
     async fn initialize(
         model_path: PathBuf,
+        state_path: PathBuf,
+        pinned_artifact: Option<Arc<crate::storage::pinned_model::PinnedModelArtifact>>,
         config: RuntimeConfig,
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
@@ -492,8 +508,19 @@ impl InferenceService {
         // Capture runtime handle for reuse in handlers
         let runtime_handle = Handle::current();
 
-        let mut engine = TorchEngine::new(config.clone())?;
+        #[cfg(test)]
+        crate::services::restart_diag::phase("engine.create.enter");
+        let mut engine = create_engine(&config)?;
+        #[cfg(test)]
+        crate::services::restart_diag::phase("engine.create.done");
+        #[cfg(test)]
+        crate::services::restart_diag::phase("engine.load_model.enter");
+        if let Some(ref artifact) = pinned_artifact {
+            artifact.ensure_current_process()?;
+        }
         RuntimeEngine::load_model(&mut engine, &model_path).await?;
+        #[cfg(test)]
+        crate::services::restart_diag::phase("engine.load_model.done");
 
         // Initialize KV cache registry
         let model_info = RuntimeEngine::model_info(&engine);
@@ -567,14 +594,19 @@ impl InferenceService {
             };
 
             // Try to load TTN layer profile for non-uniform rank allocation
-            let model_config_result = crate::runtime::model_config::ModelConfig::load(&model_path, &std::collections::HashMap::new());
+            let model_config_result = crate::runtime::model_config::ModelConfig::load(
+                &model_path,
+                &std::collections::HashMap::new(),
+            );
             let delta_config = if let Ok(ref mc) = model_config_result {
                 match crate::runtime::ttn_profile::get_layer_profile(&model_path, mc, None) {
                     Ok(profile) => {
                         let cfg = TenantDeltaConfig::from_profile(&base_delta_config, &profile);
                         info!(
                             "Delta pool: using TTN profile ({} layer overrides)",
-                            cfg.layer_overrides.as_ref().map_or(0, std::collections::HashMap::len)
+                            cfg.layer_overrides
+                                .as_ref()
+                                .map_or(0, std::collections::HashMap::len)
                         );
                         cfg
                     }
@@ -588,14 +620,25 @@ impl InferenceService {
             };
 
             let kv_reg = engine.kv_registry();
-            let snapshots_dir = model_path.join("adapters").join(".snapshots");
+            let snapshots_dir = state_path.join("adapters").join(".snapshots");
             let num_layers = engine.get_num_layers().unwrap_or(32);
 
             info!(
                 "Delta pool initialized: rank={}, alpha={:.1}, modules={:?}, lr={:.1e}",
-                delta_config.rank, delta_config.alpha, delta_config.target_modules, delta_config.learning_rate
+                delta_config.rank,
+                delta_config.alpha,
+                delta_config.target_modules,
+                delta_config.learning_rate
             );
-            let mut pool = DeltaPool::new(delta_config, module_dims, device, kv_reg, snapshots_dir, fs.clone(), num_layers);
+            let mut pool = DeltaPool::new(
+                delta_config,
+                module_dims,
+                device,
+                kv_reg,
+                snapshots_dir,
+                fs.clone(),
+                num_layers,
+            );
             if let Some(pld) = per_layer_dims {
                 pool = pool.with_per_layer_dims(pld);
             }
@@ -603,7 +646,10 @@ impl InferenceService {
             if let Some(ref tc) = training_config {
                 if let Some(ref oracle_config) = tc.ttt.rank_oracle {
                     pool = pool.with_rank_oracle(oracle_config.clone());
-                    info!("Rank oracle enabled: interval={}, auto_adapt={}", oracle_config.adaptation_interval, oracle_config.auto_adapt);
+                    info!(
+                        "Rank oracle enabled: interval={}, auto_adapt={}",
+                        oracle_config.adaptation_interval, oracle_config.auto_adapt
+                    );
                 }
             }
 
@@ -622,6 +668,8 @@ impl InferenceService {
             inner: Arc::new(InferenceServiceInner {
                 engine: parking_lot::RwLock::new(engine),
                 model_path,
+                state_path,
+                _pinned_artifact: pinned_artifact,
                 session_id: parking_lot::RwLock::new(None),
                 runtime_handle,
                 stream_channel: Some(stream_channel),
@@ -727,20 +775,21 @@ impl InferenceService {
 
         let ttt_trainer = match self.ttt_trainer.as_ref() {
             Some(t) => t,
-            None => return Ok(None),  // TTT not configured
+            None => return Ok(None), // TTT not configured
         };
 
         let pool = match self.delta_pool.as_ref() {
             Some(p) => p,
-            None => return Ok(None),  // No delta pool
+            None => return Ok(None), // No delta pool
         };
 
         let tokenizer = match self.tokenizer.as_ref() {
             Some(t) => t,
-            None => return Ok(None),  // No tokenizer available
+            None => return Ok(None), // No tokenizer available
         };
 
-        let encoding = tokenizer.encode(prompt, false)
+        let encoding = tokenizer
+            .encode(prompt, false)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
         let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
@@ -793,7 +842,9 @@ impl InferenceService {
                 let guard = crate::training::GuardStatus {
                     expired: delta.adaptation_state.is_expired(),
                     at_capacity: delta.is_at_capacity(),
-                    lora_generation: self.lora_generation.load(std::sync::atomic::Ordering::Acquire),
+                    lora_generation: self
+                        .lora_generation
+                        .load(std::sync::atomic::Ordering::Acquire),
                 };
 
                 let outcome = delta.adaptation_state.resolve(
@@ -815,7 +866,11 @@ impl InferenceService {
                         result.pending = false;
                         debug!("TTT: auto-committed adaptation for subject {}", subject);
                     }
-                    crate::training::ResolveOutcome::Evicted { snapshot, muon, eff_ranks } => {
+                    crate::training::ResolveOutcome::Evicted {
+                        snapshot,
+                        muon,
+                        eff_ranks,
+                    } => {
                         // resolve() transitioned state to Idle and returned the baseline
                         // snapshot (which may be the promoted old-pending baseline in the
                         // stacked case, or the new adaptation's pre-state otherwise).
@@ -886,11 +941,14 @@ impl InferenceService {
         // is sent) to avoid blocking the ZMQ REQ/REP handler with GPU-intensive work.
 
         // DH key derivation is required - no legacy fallback
-        let client_pub_bytes = client_ephemeral_pubkey
-            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let client_pub_bytes = client_ephemeral_pubkey.ok_or_else(|| {
+            anyhow!("Streaming requires client ephemeral pubkey for E2E authentication")
+        })?;
 
         // Use StreamChannel for DH key exchange and pre-authorization
-        let stream_channel = self.stream_channel.as_ref()
+        let stream_channel = self
+            .stream_channel
+            .as_ref()
             .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
 
         let stream_ctx = stream_channel
@@ -942,7 +1000,7 @@ impl InferenceService {
     /// tokio::sync::RwLock allows concurrent readers, but write-lock requests (createLora) will
     /// block until all active streams complete. GPU-intensive TTT is deferred to this continuation
     /// to avoid blocking the ZMQ REQ/REP handler.
-    #[allow(clippy::await_holding_lock)]  // engine read-lock must be held while stream borrows it
+    #[allow(clippy::await_holding_lock)] // engine read-lock must be held while stream borrows it
     async fn execute_stream(&self, pending: PendingWork) {
         // SAFETY: parking_lot::Mutex is safe here because InferenceService runs on
         // current_thread runtime — no task migration, no .await while lock held.
@@ -963,7 +1021,8 @@ impl InferenceService {
             subject,
             ttt_overrides,
             owner_did,
-        } = pending else {
+        } = pending
+        else {
             error!("execute_stream called with non-Generation PendingWork");
             return;
         };
@@ -1020,9 +1079,10 @@ impl InferenceService {
         // TTT runs HERE (in continuation, after REP sent — ZMQ loop unblocked).
         // If the user explicitly enabled TTT (ttt_enabled=true), failures are stream errors.
         // If TTT is only from server config, failures are non-fatal (warn + continue).
-        let ttt_result = match self.apply_ttt_adaptation_with_overrides(
-            request.prompt.as_str(), &subject, &ttt_overrides
-        ).await {
+        let ttt_result = match self
+            .apply_ttt_adaptation_with_overrides(request.prompt.as_str(), &subject, &ttt_overrides)
+            .await
+        {
             Ok(Some(result)) => Some(result),
             Ok(None) => {
                 // TTT not available on this server (no trainer/pool/tokenizer configured)
@@ -1030,31 +1090,48 @@ impl InferenceService {
                     // User explicitly requested TTT — this is an error
                     error!(stream_id = %stream_ctx.stream_id(), subject = %subject, "TTT explicitly enabled but not available on server");
                     let sc = stream_channel;
-                    if let Err(send_err) = sc.run_stream(stream_ctx, |publisher| async move {
-                        (publisher, Err::<(), _>(anyhow::anyhow!("TTT explicitly enabled but not configured on this server")))
-                    }).await {
+                    if let Err(send_err) = sc
+                        .run_stream(stream_ctx, |publisher| async move {
+                            (
+                                publisher,
+                                Err::<(), _>(anyhow::anyhow!(
+                                    "TTT explicitly enabled but not configured on this server"
+                                )),
+                            )
+                        })
+                        .await
+                    {
                         error!(stream_id = %stream_ctx.stream_id(), error = %send_err,
                             "Failed to publish TTT error to stream");
                     }
                     return;
                 }
-                None  // TTT not requested or not configured — proceed without
+                None // TTT not requested or not configured — proceed without
             }
             Err(e) => {
                 if ttt_overrides.enabled == Some(true) {
                     // User explicitly requested TTT — adaptation failure is a stream error
                     error!(stream_id = %stream_ctx.stream_id(), subject = %subject, error = %e, "TTT adaptation failed");
                     let sc = stream_channel;
-                    if let Err(send_err) = sc.run_stream(stream_ctx, |publisher| async move {
-                        (publisher, Err::<(), _>(anyhow::anyhow!("TTT adaptation failed: {}", e)))
-                    }).await {
+                    if let Err(send_err) = sc
+                        .run_stream(stream_ctx, |publisher| async move {
+                            (
+                                publisher,
+                                Err::<(), _>(anyhow::anyhow!("TTT adaptation failed: {}", e)),
+                            )
+                        })
+                        .await
+                    {
                         error!(stream_id = %stream_ctx.stream_id(), error = %send_err,
                             "Failed to publish TTT error to stream");
                     }
                     return;
                 }
                 // TTT running from server config only — warn and continue
-                warn!("TTT adaptation failed (server-config), continuing without: {}", e);
+                warn!(
+                    "TTT adaptation failed (server-config), continuing without: {}",
+                    e
+                );
                 None
             }
         };
@@ -1079,9 +1156,17 @@ impl InferenceService {
                 lora_gen_before, lora_gen_now
             );
             let sc = stream_channel;
-            if let Err(e) = sc.run_stream(stream_ctx, |publisher| async move {
-                (publisher, Err::<(), _>(anyhow::anyhow!("LoRA adapter was reconfigured during adaptation — retry request")))
-            }).await {
+            if let Err(e) = sc
+                .run_stream(stream_ctx, |publisher| async move {
+                    (
+                        publisher,
+                        Err::<(), _>(anyhow::anyhow!(
+                            "LoRA adapter was reconfigured during adaptation — retry request"
+                        )),
+                    )
+                })
+                .await
+            {
                 error!(stream_id = %stream_ctx.stream_id(), error = %e, "Failed to publish LoRA error");
             }
             return;
@@ -1090,65 +1175,72 @@ impl InferenceService {
         // Run the stream with StreamChannel's async publisher callback.
         // Engine read-lock held across await: generate_with_delta returns a stream borrowing engine.
         let engine = self.engine.read();
-        let stream_result = engine.generate_with_delta(request, delta, tenant_id, weight_epoch);
+        // Pass the live LoRA generation so the KV-compat expected identity reflects
+        // the effective adapter actually applied (#1277): a re-adapted model is
+        // detected as incompatible and its stale KV is rejected at the cache boundary.
+        let stream_result =
+            engine.generate_with_delta(request, delta, tenant_id, weight_epoch, lora_gen_now);
 
         // #1264/#1265: capture the completion stats out of the stream closure so
         // the token-spend can be posted after the client-visible completion frame
         // — on EVERY terminal path (normal end, cancel, stream error, publish
         // failure), not only normal exhaustion.
         #[cfg(feature = "ledger")]
-        let completion_stats: Arc<parking_lot::Mutex<Option<crate::runtime::GenerationStats>>> =
-            Arc::new(parking_lot::Mutex::new(None));
+        let completion_stats: Arc<
+            parking_lot::Mutex<Option<crate::runtime::GenerationStats>>,
+        > = Arc::new(parking_lot::Mutex::new(None));
 
-        let result = stream_channel.run_stream(stream_ctx, |mut publisher| {
-            #[cfg(feature = "ledger")]
-            let completion_stats = completion_stats.clone();
-            async move {
-                let result = match stream_result {
-                    Ok(mut stream) => {
-                        let cancel = stream_ctx.cancel_token();
-                        // Drive the generation loop to a terminal outcome. The
-                        // loop publishes each chunk; cancel / stream-error /
-                        // publish-failure are all terminal. Completion stats are
-                        // captured on the SINGLE common exit below, so no
-                        // terminal path can skip accounting for the work actually
-                        // done (#1265).
-                        let outcome =
-                            drive_generation_loop(&mut stream, cancel, &mut publisher).await;
+        let result = stream_channel
+            .run_stream(stream_ctx, |mut publisher| {
+                #[cfg(feature = "ledger")]
+                let completion_stats = completion_stats.clone();
+                async move {
+                    let result = match stream_result {
+                        Ok(mut stream) => {
+                            let cancel = stream_ctx.cancel_token();
+                            // Drive the generation loop to a terminal outcome. The
+                            // loop publishes each chunk; cancel / stream-error /
+                            // publish-failure are all terminal. Completion stats are
+                            // captured on the SINGLE common exit below, so no
+                            // terminal path can skip accounting for the work actually
+                            // done (#1265).
+                            let outcome =
+                                drive_generation_loop(&mut stream, cancel, &mut publisher).await;
 
-                        // Common exit: ALWAYS snapshot the stats once generation
-                        // has begun, regardless of how it ended — so a cancelled,
-                        // errored, or publish-failed generation still accounts.
-                        let stats = stream.completion_stats();
-                        #[cfg(feature = "ledger")]
-                        {
-                            *completion_stats.lock() = Some(stats.clone());
+                            // Common exit: ALWAYS snapshot the stats once generation
+                            // has begun, regardless of how it ended — so a cancelled,
+                            // errored, or publish-failed generation still accounts.
+                            let stats = stream.completion_stats();
+                            #[cfg(feature = "ledger")]
+                            {
+                                *completion_stats.lock() = Some(stats.clone());
+                            }
+
+                            match outcome {
+                                GenLoopOutcome::Exhausted => {
+                                    let mut complete =
+                                        crate::services::rpc_types::InferenceComplete::from(&stats);
+                                    // Attach TTT metrics to completion (deferred TTT).
+                                    complete.ttt_metrics = ttt_result.map(std::convert::Into::into);
+                                    publisher.complete_ref(&complete.to_bytes()).await
+                                }
+                                GenLoopOutcome::Cancelled => {
+                                    let _ = publisher.publish_error("cancelled").await;
+                                    Ok(())
+                                }
+                                GenLoopOutcome::StreamError(e) => {
+                                    let _ = publisher.publish_error(&e.to_string()).await;
+                                    Ok(())
+                                }
+                                GenLoopOutcome::PublishFailed(e) => Err(e),
+                            }
                         }
-
-                        match outcome {
-                            GenLoopOutcome::Exhausted => {
-                                let mut complete =
-                                    crate::services::rpc_types::InferenceComplete::from(&stats);
-                                // Attach TTT metrics to completion (deferred TTT).
-                                complete.ttt_metrics = ttt_result.map(std::convert::Into::into);
-                                publisher.complete_ref(&complete.to_bytes()).await
-                            }
-                            GenLoopOutcome::Cancelled => {
-                                let _ = publisher.publish_error("cancelled").await;
-                                Ok(())
-                            }
-                            GenLoopOutcome::StreamError(e) => {
-                                let _ = publisher.publish_error(&e.to_string()).await;
-                                Ok(())
-                            }
-                            GenLoopOutcome::PublishFailed(e) => Err(e),
-                        }
-                    }
-                    Err(e) => Err(e),  // framework sends Error frame automatically
-                };
-                (publisher, result)
-            }
-        }).await;
+                        Err(e) => Err(e), // framework sends Error frame automatically
+                    };
+                    (publisher, result)
+                }
+            })
+            .await;
 
         if let Err(e) = result {
             error!(
@@ -1197,7 +1289,15 @@ impl InferenceService {
     /// Runs the training step in the background and publishes results via StreamChannel.
     /// This avoids REQ/REP timeout on long-running training (e.g., backward pass compilation).
     async fn execute_training_stream(&self, pending: PendingWork) {
-        let PendingWork::Training { stream_ctx, subject, input, gradient_steps, learning_rate, adaptation_strategy } = pending else {
+        let PendingWork::Training {
+            stream_ctx,
+            subject,
+            input,
+            gradient_steps,
+            learning_rate,
+            adaptation_strategy,
+        } = pending
+        else {
             error!("execute_training_stream called with non-Training PendingWork");
             return;
         };
@@ -1216,22 +1316,34 @@ impl InferenceService {
             "Starting training stream via StreamChannel"
         );
 
-        let result = stream_channel.run_stream(stream_ctx, |mut publisher| async move {
-            if stream_ctx.cancel_token().is_cancelled() {
-                let _ = publisher.publish_error("cancelled").await;
-                return (publisher, Ok(()));
-            }
-            let result = match self.handle_train_step(&subject, &input, gradient_steps, learning_rate, adaptation_strategy).await {
-                Ok(result) => {
-                    // Serialize training result as JSON for the completion payload
-                    let payload = serde_json::to_vec(&result)
-                        .unwrap_or_else(|e| format!("{{\"error\":\"serialize failed: {e}\"}}").into_bytes());
-                    publisher.complete_ref(&payload).await
+        let result = stream_channel
+            .run_stream(stream_ctx, |mut publisher| async move {
+                if stream_ctx.cancel_token().is_cancelled() {
+                    let _ = publisher.publish_error("cancelled").await;
+                    return (publisher, Ok(()));
                 }
-                Err(e) => Err(e),  // framework sends Error frame automatically
-            };
-            (publisher, result)
-        }).await;
+                let result = match self
+                    .handle_train_step(
+                        &subject,
+                        &input,
+                        gradient_steps,
+                        learning_rate,
+                        adaptation_strategy,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        // Serialize training result as JSON for the completion payload
+                        let payload = serde_json::to_vec(&result).unwrap_or_else(|e| {
+                            format!("{{\"error\":\"serialize failed: {e}\"}}").into_bytes()
+                        });
+                        publisher.complete_ref(&payload).await
+                    }
+                    Err(e) => Err(e), // framework sends Error frame automatically
+                };
+                (publisher, result)
+            })
+            .await;
 
         if let Err(e) = result {
             error!(
@@ -1263,9 +1375,13 @@ impl InferenceService {
         enable_thinking: Option<bool>,
         template_vars_json: Option<&str>,
     ) -> Result<String> {
-        self.engine
-            .read()
-            .apply_chat_template_with_vars(&messages, add_generation_prompt, tools, enable_thinking, template_vars_json)
+        self.engine.read().apply_chat_template_with_vars(
+            &messages,
+            add_generation_prompt,
+            tools,
+            enable_thinking,
+            template_vars_json,
+        )
     }
 
     /// Truncate messages to fit within the context budget.
@@ -1295,28 +1411,38 @@ impl InferenceService {
             Err(_) => return Ok(messages), // Can't tokenize — skip truncation
         };
 
-        let msg_costs: Vec<usize> = messages.iter().map(|m| {
-            // Count content tokens
-            let content_tokens = m.content.as_deref()
-                .and_then(|c| tokenizer.encode(c, false).ok())
-                .map(|e| e.get_ids().len())
-                .unwrap_or(0);
+        let msg_costs: Vec<usize> = messages
+            .iter()
+            .map(|m| {
+                // Count content tokens
+                let content_tokens = m
+                    .content
+                    .as_deref()
+                    .and_then(|c| tokenizer.encode(c, false).ok())
+                    .map(|e| e.get_ids().len())
+                    .unwrap_or(0);
 
-            // Count tool_calls tokens (function name + serialized arguments)
-            let tool_call_tokens = m.tool_calls.as_ref().map_or(0, |tcs| {
-                tcs.iter().map(|tc| {
-                    let call_str = format!(
-                        "{}({})", tc.function.name,
-                        serde_json::to_string(&tc.function.arguments).unwrap_or_default()
-                    );
-                    tokenizer.encode(call_str.as_str(), false).ok()
-                        .map(|e| e.get_ids().len())
-                        .unwrap_or(10) // conservative fallback
-                }).sum::<usize>()
-            });
+                // Count tool_calls tokens (function name + serialized arguments)
+                let tool_call_tokens = m.tool_calls.as_ref().map_or(0, |tcs| {
+                    tcs.iter()
+                        .map(|tc| {
+                            let call_str = format!(
+                                "{}({})",
+                                tc.function.name,
+                                serde_json::to_string(&tc.function.arguments).unwrap_or_default()
+                            );
+                            tokenizer
+                                .encode(call_str.as_str(), false)
+                                .ok()
+                                .map(|e| e.get_ids().len())
+                                .unwrap_or(10) // conservative fallback
+                        })
+                        .sum::<usize>()
+                });
 
-            content_tokens + tool_call_tokens + FRAMING_OVERHEAD
-        }).collect();
+                content_tokens + tool_call_tokens + FRAMING_OVERHEAD
+            })
+            .collect();
 
         let total: usize = msg_costs.iter().sum();
         if total <= budget {
@@ -1330,15 +1456,23 @@ impl InferenceService {
         while i < messages.len() {
             let m = &messages[i];
             if m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) {
-                let tool_ids: std::collections::HashSet<&str> = m.tool_calls.as_deref()
+                let tool_ids: std::collections::HashSet<&str> = m
+                    .tool_calls
+                    .as_deref()
                     .unwrap_or_default()
-                    .iter().map(|tc| tc.id.as_str()).collect();
+                    .iter()
+                    .map(|tc| tc.id.as_str())
+                    .collect();
                 let mut indices = vec![i];
                 let mut cost = msg_costs[i];
                 let mut j = i + 1;
-                while j < messages.len() && messages[j].role == "tool"
-                    && messages[j].tool_call_id.as_deref()
-                        .is_some_and(|id| tool_ids.contains(id)) {
+                while j < messages.len()
+                    && messages[j].role == "tool"
+                    && messages[j]
+                        .tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| tool_ids.contains(id))
+                {
                     indices.push(j);
                     cost += msg_costs[j];
                     j += 1;
@@ -1352,7 +1486,10 @@ impl InferenceService {
         }
 
         // Find cutoff: keep system groups + as many recent groups as fit
-        let has_system = messages.first().map(|m| m.role == "system").unwrap_or(false);
+        let has_system = messages
+            .first()
+            .map(|m| m.role == "system")
+            .unwrap_or(false);
         let system_cost = if has_system { groups[0].0 } else { 0 };
         let start = if has_system { 1 } else { 0 };
 
@@ -1399,7 +1536,10 @@ impl InferenceService {
             );
         }
 
-        Ok(kept_indices.into_iter().map(|i| messages[i].clone()).collect())
+        Ok(kept_indices
+            .into_iter()
+            .map(|i| messages[i].clone())
+            .collect())
     }
 
     /// Handle create LoRA
@@ -1431,14 +1571,21 @@ impl InferenceService {
     async fn setup_stream(
         &self,
         ctx: &EnvelopeContext,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::streaming::StreamContext)> {
-        let client_pub_bytes = ctx.ephemeral_pubkey()
-            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+    ) -> Result<(
+        hyprstream_rpc_std::inference_client::StreamInfo,
+        hyprstream_rpc::streaming::StreamContext,
+    )> {
+        let client_pub_bytes = ctx.ephemeral_pubkey().ok_or_else(|| {
+            anyhow!("Streaming requires client ephemeral pubkey for E2E authentication")
+        })?;
         let client_pub_ref: &[u8] = &client_pub_bytes;
-        let stream_channel = self.stream_channel.as_ref()
+        let stream_channel = self
+            .stream_channel
+            .as_ref()
             .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
 
-        let expiry_secs = ctx.claims()
+        let expiry_secs = ctx
+            .claims()
             .map(|c| c.exp - chrono::Utc::now().timestamp())
             .unwrap_or(600)
             .max(600);
@@ -1455,12 +1602,13 @@ impl InferenceService {
             .map(|o| o.broadcast_path(stream_ctx.topic()))
             .unwrap_or_default();
 
-        let stream_info = crate::services::generated::inference_client::StreamInfo {
+        let stream_info = hyprstream_rpc_std::inference_client::StreamInfo {
             stream_id,
             dh_public: server_pubkey,
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
@@ -1478,46 +1626,81 @@ impl InferenceService {
     ) {
         let sc = match &self.stream_channel {
             Some(sc) => sc,
-            None => { error!("StreamChannel not initialized"); return; }
-        };
-        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
-            let result = InferenceService::handle_create_lora(self, config).await;
-            match &result {
-                Ok(()) => { let _ = publisher.complete_ref(b"{}").await; }
-                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            None => {
+                error!("StreamChannel not initialized");
+                return;
             }
-            (publisher, result.map(|_| ()))
-        }).await;
+        };
+        let _ = sc
+            .run_stream(&stream_ctx, |mut publisher| async {
+                let result = InferenceService::handle_create_lora(self, config).await;
+                match &result {
+                    Ok(()) => {
+                        let _ = publisher.complete_ref(b"{}").await;
+                    }
+                    Err(e) => {
+                        let _ = publisher.publish_error(&format!("{:#}", e)).await;
+                    }
+                }
+                (publisher, result.map(|_| ()))
+            })
+            .await;
     }
 
-    async fn execute_load_lora_stream(&self, stream_ctx: hyprstream_rpc::streaming::StreamContext, path: String) {
+    async fn execute_load_lora_stream(
+        &self,
+        stream_ctx: hyprstream_rpc::streaming::StreamContext,
+        path: String,
+    ) {
         let sc = match &self.stream_channel {
             Some(sc) => sc,
-            None => { error!("StreamChannel not initialized"); return; }
-        };
-        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
-            let result = self.load_lora(Path::new(&path)).await;
-            match &result {
-                Ok(()) => { let _ = publisher.complete_ref(b"{}").await; }
-                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            None => {
+                error!("StreamChannel not initialized");
+                return;
             }
-            (publisher, result)
-        }).await;
+        };
+        let _ = sc
+            .run_stream(&stream_ctx, |mut publisher| async {
+                let result = self.load_lora(Path::new(&path)).await;
+                match &result {
+                    Ok(()) => {
+                        let _ = publisher.complete_ref(b"{}").await;
+                    }
+                    Err(e) => {
+                        let _ = publisher.publish_error(&format!("{:#}", e)).await;
+                    }
+                }
+                (publisher, result)
+            })
+            .await;
     }
 
-    async fn execute_save_lora_stream(&self, stream_ctx: hyprstream_rpc::streaming::StreamContext, name: String) {
+    async fn execute_save_lora_stream(
+        &self,
+        stream_ctx: hyprstream_rpc::streaming::StreamContext,
+        name: String,
+    ) {
         let sc = match &self.stream_channel {
             Some(sc) => sc,
-            None => { error!("StreamChannel not initialized"); return; }
-        };
-        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
-            let result = self.save_lora(&name).await;
-            match &result {
-                Ok(()) => { let _ = publisher.complete_ref(b"{}").await; }
-                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            None => {
+                error!("StreamChannel not initialized");
+                return;
             }
-            (publisher, result)
-        }).await;
+        };
+        let _ = sc
+            .run_stream(&stream_ctx, |mut publisher| async {
+                let result = self.save_lora(&name).await;
+                match &result {
+                    Ok(()) => {
+                        let _ = publisher.complete_ref(b"{}").await;
+                    }
+                    Err(e) => {
+                        let _ = publisher.publish_error(&format!("{:#}", e)).await;
+                    }
+                }
+                (publisher, result)
+            })
+            .await;
     }
 
     async fn execute_save_adaptation_stream(
@@ -1530,26 +1713,39 @@ impl InferenceService {
     ) {
         let sc = match &self.stream_channel {
             Some(sc) => sc,
-            None => { error!("StreamChannel not initialized"); return; }
-        };
-        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
-            let result = InferenceService::handle_save_adaptation(
-                self, &subject, &name, &merge_strategy, merge_weight,
-            ).await;
-            match &result {
-                Ok(info) => {
-                    let payload = serde_json::to_vec(&serde_json::json!({
-                        "adapter_name": info.adapter_name,
-                        "adapter_path": info.adapter_path,
-                        "content_hash": info.content_hash,
-                        "merge_strategy": info.merge_strategy,
-                    })).unwrap_or_default();
-                    let _ = publisher.complete_ref(&payload).await;
-                }
-                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            None => {
+                error!("StreamChannel not initialized");
+                return;
             }
-            (publisher, result.map(|_| ()))
-        }).await;
+        };
+        let _ = sc
+            .run_stream(&stream_ctx, |mut publisher| async {
+                let result = InferenceService::handle_save_adaptation(
+                    self,
+                    &subject,
+                    &name,
+                    &merge_strategy,
+                    merge_weight,
+                )
+                .await;
+                match &result {
+                    Ok(info) => {
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "adapter_name": info.adapter_name,
+                            "adapter_path": info.adapter_path,
+                            "content_hash": info.content_hash,
+                            "merge_strategy": info.merge_strategy,
+                        }))
+                        .unwrap_or_default();
+                        let _ = publisher.complete_ref(&payload).await;
+                    }
+                    Err(e) => {
+                        let _ = publisher.publish_error(&format!("{:#}", e)).await;
+                    }
+                }
+                (publisher, result.map(|_| ()))
+            })
+            .await;
     }
 
     async fn execute_snapshot_delta_stream(
@@ -1559,24 +1755,32 @@ impl InferenceService {
     ) {
         let sc = match &self.stream_channel {
             Some(sc) => sc,
-            None => { error!("StreamChannel not initialized"); return; }
-        };
-        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
-            let result = InferenceService::handle_snapshot_delta(self, &subject).await;
-            match &result {
-                Ok(info) => {
-                    let payload = serde_json::to_vec(&serde_json::json!({
-                        "content_hash": info.content_hash,
-                        "size_bytes": info.size_bytes,
-                        "accumulated_steps": info.accumulated_steps,
-                        "request_count": info.request_count,
-                    })).unwrap_or_default();
-                    let _ = publisher.complete_ref(&payload).await;
-                }
-                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            None => {
+                error!("StreamChannel not initialized");
+                return;
             }
-            (publisher, result.map(|_| ()))
-        }).await;
+        };
+        let _ = sc
+            .run_stream(&stream_ctx, |mut publisher| async {
+                let result = InferenceService::handle_snapshot_delta(self, &subject).await;
+                match &result {
+                    Ok(info) => {
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "content_hash": info.content_hash,
+                            "size_bytes": info.size_bytes,
+                            "accumulated_steps": info.accumulated_steps,
+                            "request_count": info.request_count,
+                        }))
+                        .unwrap_or_default();
+                        let _ = publisher.complete_ref(&payload).await;
+                    }
+                    Err(e) => {
+                        let _ = publisher.publish_error(&format!("{:#}", e)).await;
+                    }
+                }
+                (publisher, result.map(|_| ()))
+            })
+            .await;
     }
 
     async fn execute_export_peft_adapter_stream(
@@ -1588,24 +1792,36 @@ impl InferenceService {
     ) {
         let sc = match &self.stream_channel {
             Some(sc) => sc,
-            None => { error!("StreamChannel not initialized"); return; }
-        };
-        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
-            let result = InferenceService::handle_export_peft_adapter(
-                self, &subject, &name, &commit_message,
-            ).await;
-            match &result {
-                Ok(info) => {
-                    let payload = serde_json::to_vec(&serde_json::json!({
-                        "adapter_path": info.adapter_path,
-                        "content_hash": info.content_hash,
-                    })).unwrap_or_default();
-                    let _ = publisher.complete_ref(&payload).await;
-                }
-                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            None => {
+                error!("StreamChannel not initialized");
+                return;
             }
-            (publisher, result.map(|_| ()))
-        }).await;
+        };
+        let _ = sc
+            .run_stream(&stream_ctx, |mut publisher| async {
+                let result = InferenceService::handle_export_peft_adapter(
+                    self,
+                    &subject,
+                    &name,
+                    &commit_message,
+                )
+                .await;
+                match &result {
+                    Ok(info) => {
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "adapter_path": info.adapter_path,
+                            "content_hash": info.content_hash,
+                        }))
+                        .unwrap_or_default();
+                        let _ = publisher.complete_ref(&payload).await;
+                    }
+                    Err(e) => {
+                        let _ = publisher.publish_error(&format!("{:#}", e)).await;
+                    }
+                }
+                (publisher, result.map(|_| ()))
+            })
+            .await;
     }
 
     async fn execute_merge_lora_stream(
@@ -1617,16 +1833,27 @@ impl InferenceService {
     ) {
         let sc = match &self.stream_channel {
             Some(sc) => sc,
-            None => { error!("StreamChannel not initialized"); return; }
-        };
-        let _ = sc.run_stream(&stream_ctx, |mut publisher| async {
-            let result = self.merge_lora(Path::new(&adapter_path), weight, &strategy).await;
-            match &result {
-                Ok(()) => { let _ = publisher.complete_ref(b"{}").await; }
-                Err(e) => { let _ = publisher.publish_error(&format!("{:#}", e)).await; }
+            None => {
+                error!("StreamChannel not initialized");
+                return;
             }
-            (publisher, result)
-        }).await;
+        };
+        let _ = sc
+            .run_stream(&stream_ctx, |mut publisher| async {
+                let result = self
+                    .merge_lora(Path::new(&adapter_path), weight, &strategy)
+                    .await;
+                match &result {
+                    Ok(()) => {
+                        let _ = publisher.complete_ref(b"{}").await;
+                    }
+                    Err(e) => {
+                        let _ = publisher.publish_error(&format!("{:#}", e)).await;
+                    }
+                }
+                (publisher, result)
+            })
+            .await;
     }
 
     // =========================================================================
@@ -1642,10 +1869,12 @@ impl InferenceService {
                 delta.accumulated_steps += info.steps_performed as u64;
                 delta.request_count += 1;
                 let n = delta.request_count as f64;
-                delta.avg_loss_improvement = delta.avg_loss_improvement * ((n - 1.0) / n)
-                    + info.loss_improvement as f64 / n;
-                debug!("Wrote back adaptation for '{}': steps={}, improvement={:.4}",
-                    subject, info.steps_performed, info.loss_improvement);
+                delta.avg_loss_improvement =
+                    delta.avg_loss_improvement * ((n - 1.0) / n) + info.loss_improvement as f64 / n;
+                debug!(
+                    "Wrote back adaptation for '{}': steps={}, improvement={:.4}",
+                    subject, info.steps_performed, info.loss_improvement
+                );
                 Ok(())
             } else {
                 Err(anyhow::anyhow!("No delta found for subject '{}'", subject))
@@ -1662,7 +1891,10 @@ impl InferenceService {
                 let mut delta = delta_arc.lock();
                 let snapshot = delta.adaptation_state.evict()?;
                 let _ = delta.load_state_dict(&snapshot.pre_snapshot);
-                crate::training::muon::restore_muon_states(&mut delta.muon_states, &snapshot.pre_muon);
+                crate::training::muon::restore_muon_states(
+                    &mut delta.muon_states,
+                    &snapshot.pre_muon,
+                );
                 delta.effective_ranks = snapshot.pre_eff_ranks;
                 debug!("Evicted adaptation for subject '{}'", subject);
                 Ok(())
@@ -1683,11 +1915,17 @@ impl InferenceService {
         learning_rate: Option<f32>,
         strategy: crate::training::adaptation_state::AdaptationStrategy,
     ) -> Result<crate::training::ttt::TTTResult> {
-        let ttt_trainer = self.ttt_trainer.as_ref()
+        let ttt_trainer = self
+            .ttt_trainer
+            .as_ref()
             .ok_or_else(|| anyhow!("TTT not configured"))?;
-        let tokenizer = self.tokenizer.as_ref()
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
             .ok_or_else(|| anyhow!("No tokenizer available"))?;
-        let pool = self.delta_pool.as_ref()
+        let pool = self
+            .delta_pool
+            .as_ref()
             .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
 
         // Ensure pool has capacity before creating/accessing delta
@@ -1701,7 +1939,8 @@ impl InferenceService {
         // Always snapshot (even for auto_commit) so auto-rollback can restore state.
         let (input_tokens, pre_snapshot, pre_muon, pre_eff_ranks) = {
             let delta = delta_arc.lock();
-            let encoding = tokenizer.encode(input, false)
+            let encoding = tokenizer
+                .encode(input, false)
                 .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
             let input_tokens: Vec<u32> = encoding.get_ids().to_vec();
             let pre_snapshot = delta.extract_state_dict();
@@ -1710,7 +1949,9 @@ impl InferenceService {
             (input_tokens, pre_snapshot, pre_muon, pre_eff_ranks)
         }; // guard dropped
 
-        let steps = gradient_steps.map(|g| g as usize).unwrap_or(ttt_trainer.config.gradient_steps as usize);
+        let steps = gradient_steps
+            .map(|g| g as usize)
+            .unwrap_or(ttt_trainer.config.gradient_steps as usize);
         let lr = learning_rate.map(|l| l as f64);
 
         // Phase 2: Await engine (no lock held — safe for spawn_local concurrency)
@@ -1718,7 +1959,8 @@ impl InferenceService {
 
         // Phase 3: Reacquire delta lock for train_step
         let mut delta = delta_arc.lock();
-        let mut result = ttt_trainer.train_step(&engine, &mut delta, &input_tokens, steps, lr, None)?;
+        let mut result =
+            ttt_trainer.train_step(&engine, &mut delta, &input_tokens, steps, lr, None)?;
 
         // strategy is passed in directly from the caller
 
@@ -1726,7 +1968,9 @@ impl InferenceService {
         let guard = crate::training::GuardStatus {
             expired: delta.adaptation_state.is_expired(),
             at_capacity: delta.is_at_capacity(),
-            lora_generation: self.lora_generation.load(std::sync::atomic::Ordering::Acquire),
+            lora_generation: self
+                .lora_generation
+                .load(std::sync::atomic::Ordering::Acquire),
         };
 
         let outcome = delta.adaptation_state.resolve(
@@ -1746,9 +1990,16 @@ impl InferenceService {
                 delta.avg_loss_improvement = delta.avg_loss_improvement * ((n - 1.0) / n)
                     + result.loss_improvement as f64 / n;
                 result.pending = false;
-                debug!("TTT: auto-committed train_step adaptation for subject {}", subject);
+                debug!(
+                    "TTT: auto-committed train_step adaptation for subject {}",
+                    subject
+                );
             }
-            crate::training::ResolveOutcome::Evicted { snapshot, muon, eff_ranks } => {
+            crate::training::ResolveOutcome::Evicted {
+                snapshot,
+                muon,
+                eff_ranks,
+            } => {
                 let _ = delta.load_state_dict(&snapshot);
                 crate::training::muon::restore_muon_states(&mut delta.muon_states, &muon);
                 delta.effective_ranks = eff_ranks;
@@ -1757,10 +2008,16 @@ impl InferenceService {
             }
             crate::training::ResolveOutcome::StoredPending => {
                 result.pending = true;
-                debug!("TTT: stored pending train_step adaptation for subject {}", subject);
+                debug!(
+                    "TTT: stored pending train_step adaptation for subject {}",
+                    subject
+                );
             }
             crate::training::ResolveOutcome::Skipped { reason } => {
-                debug!("TTT: train_step skipped for subject {}: {}", subject, reason);
+                debug!(
+                    "TTT: train_step skipped for subject {}: {}",
+                    subject, reason
+                );
             }
         }
 
@@ -1797,10 +2054,13 @@ impl InferenceService {
                     avg_loss_improvement: delta.avg_loss_improvement as f32,
                     memory_bytes: delta.memory_bytes() as u64,
                     last_snapshot_hash: delta.last_snapshot_hash.clone().unwrap_or_default(),
-                    delta_norm_ratios: norm_ratios.into_iter().map(|(name, ratio)| ModuleNormRatio {
-                        module_name: name,
-                        ratio: ratio as f32,
-                    }).collect(),
+                    delta_norm_ratios: norm_ratios
+                        .into_iter()
+                        .map(|(name, ratio)| ModuleNormRatio {
+                            module_name: name,
+                            ratio: ratio as f32,
+                        })
+                        .collect(),
                     has_pending,
                 });
             }
@@ -1830,12 +2090,15 @@ impl InferenceService {
         merge_strategy_name: &str,
         merge_weight: f32,
     ) -> Result<SaveAdaptationResult> {
-        use crate::training::{MergeStrategy, merge_state_dicts};
+        use crate::training::{merge_state_dicts, MergeStrategy};
 
-        let pool = self.delta_pool.as_ref()
+        let pool = self
+            .delta_pool
+            .as_ref()
             .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
 
-        let delta_arc = pool.get(subject)
+        let delta_arc = pool
+            .get(subject)
             .ok_or_else(|| anyhow!("No delta for subject '{}'", subject))?;
         let new_state_dict = {
             let delta = delta_arc.lock();
@@ -1843,12 +2106,20 @@ impl InferenceService {
         };
 
         // Parse merge strategy (default to DO-Merge)
-        let strategy_name = if merge_strategy_name.is_empty() { "do_merge" } else { merge_strategy_name };
-        let weight = if merge_weight <= 0.0 || merge_weight > 1.0 { 0.3 } else { merge_weight as f64 };
+        let strategy_name = if merge_strategy_name.is_empty() {
+            "do_merge"
+        } else {
+            merge_strategy_name
+        };
+        let weight = if merge_weight <= 0.0 || merge_weight > 1.0 {
+            0.3
+        } else {
+            merge_weight as f64
+        };
         let strategy = MergeStrategy::from_name(strategy_name, weight)?;
 
         // Save as adapter file
-        let adapter_mgr = crate::storage::AdapterManager::new(&self.model_path);
+        let adapter_mgr = crate::storage::AdapterManager::new(&self.state_path);
         let adapter_name = if name.is_empty() {
             format!("ttt_{}", subject)
         } else {
@@ -1857,41 +2128,57 @@ impl InferenceService {
 
         // Check for existing adapter to merge with (loads via FsOps)
         let existing_adapters = adapter_mgr.list_adapters().unwrap_or_default();
-        let existing_state = if let Some(existing) = existing_adapters.iter().find(|a| a.name == adapter_name) {
-            let rel_path = format!("adapters/{}", existing.path.file_name()
-                .and_then(|f| f.to_str()).unwrap_or(""));
-            if let Some(ref fs) = self.fs {
-                match fs.read_file_chunked(&rel_path).await {
-                    Ok(bytes) => {
-                        crate::training::load_state_dict_from_bytes(&bytes)
+        let existing_state =
+            if let Some(existing) = existing_adapters.iter().find(|a| a.name == adapter_name) {
+                let rel_path = format!(
+                    "adapters/{}",
+                    existing
+                        .path
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or("")
+                );
+                if let Some(ref fs) = self.fs {
+                    match fs.read_file_chunked(&rel_path).await {
+                        Ok(bytes) => crate::training::load_state_dict_from_bytes(&bytes)
                             .map_err(|e| {
-                                tracing::debug!("Could not load existing adapter '{}': {}", existing.name, e);
+                                tracing::debug!(
+                                    "Could not load existing adapter '{}': {}",
+                                    existing.name,
+                                    e
+                                );
                                 e
                             })
-                            .ok()
+                            .ok(),
+                        Err(e) => {
+                            tracing::debug!(
+                                "Could not read existing adapter '{}': {}",
+                                existing.name,
+                                e
+                            );
+                            None
+                        }
                     }
-                    Err(e) => {
-                        tracing::debug!("Could not read existing adapter '{}': {}", existing.name, e);
-                        None
-                    }
+                } else {
+                    None
                 }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         // Determine adapter filename
-        let adapter_filename = if let Some(existing) = existing_adapters.iter().find(|a| a.name == adapter_name) {
-            existing.path.file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("adapter.safetensors")
-                .to_owned()
-        } else {
-            let next_index = adapter_mgr.get_next_index().unwrap_or(0);
-            format!("{:02}_{}.safetensors", next_index, adapter_name)
-        };
+        let adapter_filename =
+            if let Some(existing) = existing_adapters.iter().find(|a| a.name == adapter_name) {
+                existing
+                    .path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("adapter.safetensors")
+                    .to_owned()
+            } else {
+                let next_index = adapter_mgr.get_next_index().unwrap_or(0);
+                format!("{:02}_{}.safetensors", next_index, adapter_name)
+            };
 
         // Apply merge strategy
         let final_state = if let Some(existing) = existing_state {
@@ -1901,13 +2188,16 @@ impl InferenceService {
         };
 
         // Write adapter file through FsOps (path-contained)
-        let fs = self.fs.as_ref()
-            .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
+        let fs = self.fs.as_ref().ok_or_else(|| {
+            anyhow!("FsOps not available — cannot write without path containment")
+        })?;
         let rel_path = format!("adapters/{}", adapter_filename);
-        fs.mkdir_p("adapters").await
+        fs.mkdir_p("adapters")
+            .await
             .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
         let bytes = serialize_state_dict_to_bytes(&final_state)?;
-        fs.write_file_chunked(&rel_path, &bytes).await
+        fs.write_file_chunked(&rel_path, &bytes)
+            .await
             .map_err(|e| anyhow!("FsOps write_file failed: {}", e))?;
         let result_path = rel_path;
 
@@ -1928,10 +2218,13 @@ impl InferenceService {
 
     /// Snapshot a tenant's delta to a file
     async fn handle_snapshot_delta(&self, subject: &Subject) -> Result<SnapshotDeltaResult> {
-        let pool = self.delta_pool.as_ref()
+        let pool = self
+            .delta_pool
+            .as_ref()
             .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
 
-        let delta_arc = pool.get(subject)
+        let delta_arc = pool
+            .get(subject)
             .ok_or_else(|| anyhow!("No delta for subject '{}'", subject))?;
 
         let filename = subject.to_string();
@@ -1941,14 +2234,17 @@ impl InferenceService {
         };
 
         // Write snapshot through FsOps (path-contained)
-        let fs = self.fs.as_ref()
-            .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
+        let fs = self.fs.as_ref().ok_or_else(|| {
+            anyhow!("FsOps not available — cannot write without path containment")
+        })?;
         let rel_snapshot = format!("adapters/.snapshots/{}.safetensors", filename);
-        fs.mkdir_p("adapters/.snapshots").await
+        fs.mkdir_p("adapters/.snapshots")
+            .await
             .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
         let bytes = serialize_state_dict_to_bytes(&state_dict)?;
         let size_bytes = bytes.len() as u64;
-        fs.write_file_chunked(&rel_snapshot, &bytes).await
+        fs.write_file_chunked(&rel_snapshot, &bytes)
+            .await
             .map_err(|e| anyhow!("FsOps write_file failed: {}", e))?;
         let path_str = rel_snapshot;
 
@@ -1974,10 +2270,13 @@ impl InferenceService {
         name: &str,
         _commit_message: &str,
     ) -> Result<ExportPeftResult> {
-        let pool = self.delta_pool.as_ref()
+        let pool = self
+            .delta_pool
+            .as_ref()
             .ok_or_else(|| anyhow!("Delta pool not initialized"))?;
 
-        let delta_arc = pool.get(subject)
+        let delta_arc = pool
+            .get(subject)
             .ok_or_else(|| anyhow!("No delta for subject '{}'", subject))?;
 
         let adapter_name = if name.is_empty() {
@@ -2019,24 +2318,30 @@ impl InferenceService {
         };
 
         // Write through FsOps (path-contained)
-        let fs = self.fs.as_ref()
-            .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
+        let fs = self.fs.as_ref().ok_or_else(|| {
+            anyhow!("FsOps not available — cannot write without path containment")
+        })?;
 
         let dir_path = format!("adapters/{}", adapter_name);
-        fs.mkdir_p(&dir_path).await
+        fs.mkdir_p(&dir_path)
+            .await
             .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
 
         let safetensors_path = format!("{}/adapter_model.safetensors", dir_path);
-        fs.write_file_chunked(&safetensors_path, &safetensors_bytes).await
+        fs.write_file_chunked(&safetensors_path, &safetensors_bytes)
+            .await
             .map_err(|e| anyhow!("FsOps write adapter_model.safetensors failed: {}", e))?;
 
         let config_path = format!("{}/adapter_config.json", dir_path);
-        fs.write_file_chunked(&config_path, &config_bytes).await
+        fs.write_file_chunked(&config_path, &config_bytes)
+            .await
             .map_err(|e| anyhow!("FsOps write adapter_config.json failed: {}", e))?;
 
         info!(
             "Exported PEFT adapter for subject '{}' as '{}' ({} bytes safetensors)",
-            subject, adapter_name, safetensors_bytes.len()
+            subject,
+            adapter_name,
+            safetensors_bytes.len()
         );
 
         Ok(ExportPeftResult {
@@ -2048,7 +2353,9 @@ impl InferenceService {
     /// Get TTT configuration (for status queries)
     #[allow(dead_code)]
     fn get_ttt_config(&self) -> Option<crate::training::ttt::TTTConfig> {
-        self.ttt_trainer.as_ref().map(|trainer| trainer.config.clone())
+        self.ttt_trainer
+            .as_ref()
+            .map(|trainer| trainer.config.clone())
     }
 
     /// Handle set session
@@ -2082,11 +2389,18 @@ impl InferenceService {
     pub async fn load_lora(&self, path: &Path) -> Result<()> {
         let device = self.engine.read().device();
         // Read via FsOps (path-contained)
-        let fs = self.fs.as_ref()
+        let fs = self
+            .fs
+            .as_ref()
             .ok_or_else(|| anyhow!("FsOps not available — cannot read without path containment"))?;
         let safetensors_path = format!("{}/adapter_model.safetensors", path.to_string_lossy());
-        let bytes = fs.read_file_chunked(&safetensors_path).await
-            .map_err(|e| anyhow!("Failed to read LoRA adapter from {}: {}", safetensors_path, e))?;
+        let bytes = fs.read_file_chunked(&safetensors_path).await.map_err(|e| {
+            anyhow!(
+                "Failed to read LoRA adapter from {}: {}",
+                safetensors_path,
+                e
+            )
+        })?;
         let delta = crate::training::TenantDelta::load_from_safetensors_bytes(&bytes, device)?;
 
         // Warn if the adapter rank differs from the delta pool rank —
@@ -2098,7 +2412,8 @@ impl InferenceService {
                 tracing::warn!(
                     "LoRA adapter rank ({}) differs from delta pool rank ({}). \
                      Composition will use effective-weight decomposition (slower but correct).",
-                    delta.rank, pool_rank
+                    delta.rank,
+                    pool_rank
                 );
             }
         }
@@ -2118,13 +2433,16 @@ impl InferenceService {
                 delta.serialize_to_safetensors_bytes()?
             };
             // Sanitize name and write via FsOps (path-contained)
-            let fs = self.fs.as_ref()
-                .ok_or_else(|| anyhow!("FsOps not available — cannot write without path containment"))?;
+            let fs = self.fs.as_ref().ok_or_else(|| {
+                anyhow!("FsOps not available — cannot write without path containment")
+            })?;
             let safe_name = sanitize_adapter_name(path)?;
             let rel_path = format!("adapters/{}.safetensors", safe_name);
-            fs.mkdir_p("adapters").await
+            fs.mkdir_p("adapters")
+                .await
                 .map_err(|e| anyhow!("FsOps mkdir failed: {}", e))?;
-            fs.write_file_chunked(&rel_path, &bytes).await
+            fs.write_file_chunked(&rel_path, &bytes)
+                .await
                 .map_err(|e| anyhow!("FsOps write_file failed: {}", e))?;
             Ok(())
         } else {
@@ -2159,19 +2477,25 @@ impl InferenceService {
         let device = self.engine.read().device();
 
         // Read the adapter from disk via FsOps
-        let fs = self.fs.as_ref()
+        let fs = self
+            .fs
+            .as_ref()
             .ok_or_else(|| anyhow!("FsOps not available — cannot read without path containment"))?;
         let safetensors_path = format!("{}/adapter_model.safetensors", path.to_string_lossy());
-        let bytes = fs.read_file_chunked(&safetensors_path).await
+        let bytes = fs
+            .read_file_chunked(&safetensors_path)
+            .await
             .map_err(|e| anyhow!("Failed to read adapter for merge: {}", e))?;
         let incoming = crate::training::TenantDelta::load_from_safetensors_bytes(&bytes, device)?;
 
         // Get existing base_delta
-        let base_arc = self.base_delta.lock().clone()
-            .ok_or_else(|| anyhow!("No adapter loaded in base_delta register. Load one first with adapter.load."))?;
+        let base_arc = self.base_delta.lock().clone().ok_or_else(|| {
+            anyhow!("No adapter loaded in base_delta register. Load one first with adapter.load.")
+        })?;
 
         // Parse merge strategy
-        let strategy = crate::training::merge::MergeStrategy::from_name(strategy_name, weight as f64)?;
+        let strategy =
+            crate::training::merge::MergeStrategy::from_name(strategy_name, weight as f64)?;
 
         // Extract state dicts, merge, and update
         let merged_state = {
@@ -2189,7 +2513,9 @@ impl InferenceService {
 
         tracing::info!(
             "Merged adapter from {} into base_delta (strategy={}, weight={})",
-            path.display(), strategy_name, weight
+            path.display(),
+            strategy_name,
+            weight
         );
         Ok(())
     }
@@ -2217,7 +2543,10 @@ fn sanitize_adapter_name(name: &str) -> Result<String> {
         .collect();
 
     if safe.is_empty() {
-        return Err(anyhow!("Adapter name '{}' contains no valid characters", name));
+        return Err(anyhow!(
+            "Adapter name '{}' contains no valid characters",
+            name
+        ));
     }
 
     Ok(safe)
@@ -2228,15 +2557,15 @@ fn sanitize_adapter_name(name: &str) -> Result<String> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 use crate::services::generated::inference_client::{
-    InferenceHandler, dispatch_inference, serialize_response,
-    InferenceResponseVariant, ErrorInfo,
-    HealthStatus, DeltaStatusResult, ModuleNormRatio,
-    SaveAdaptationResult, SnapshotDeltaResult, ExportPeftResult,
-    ChatTemplateRequest, LoraConfig, TrainStepRequest, SaveAdaptationRequest, ExportPeftRequest,
-    MergeLoraRequest, EmbedImagesRequest, EmbedImagesResponse,
-    AdaptationStrategy as AdaptationStrategyEnum,
+    dispatch_inference, serialize_response, InferenceHandler,
 };
-use crate::services::generated::policy_client::PolicyCheck;
+use hyprstream_rpc_std::inference_client::{
+    AdaptationStrategy as AdaptationStrategyEnum, ChatTemplateRequest, DeltaStatusResult,
+    EmbedImagesRequest, EmbedImagesResponse, ErrorInfo, ExportPeftRequest, ExportPeftResult,
+    HealthStatus, InferenceResponseVariant, LoraConfig, MergeLoraRequest, ModuleNormRatio,
+    SaveAdaptationRequest, SaveAdaptationResult, SnapshotDeltaResult, TrainStepRequest,
+};
+use hyprstream_rpc_std::policy_client::PolicyCheck;
 // Conflicting names — use canonical path at usage sites:
 //   inference_client::GenerationResult, inference_client::ModelInfo, inference_client::StreamInfo
 
@@ -2265,7 +2594,38 @@ fn map_adaptation_strategy(
 
 #[async_trait::async_trait(?Send)]
 impl InferenceHandler for InferenceService {
-    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> Result<()> {
+    async fn authorize(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> Result<()> {
+        // Single-service boundary (user-approved D5): controller internal work
+        // was authorized at Model ingress — Model is the authority for this
+        // leg. The worker re-checks the mandatory MAC floor against the
+        // caller-claims snapshot carried in the verified work order and
+        // requires the exact bound operation coordinate, but makes NO Policy
+        // call: it is a subprocessor, not an independent authority domain.
+        if let Some(work) = ctx.internal_work() {
+            anyhow::ensure!(
+                work.resource == resource && work.operation == operation,
+                "internal work order does not authorize {operation} on {resource}"
+            );
+            enforce_inference_mac(ctx, &self.object_label)?;
+            tracing::info!(
+                target: "hyprstream.mac.audit",
+                decision = "allow",
+                subject = %work.subject,
+                resource = %resource,
+                action = %operation,
+                request_id = ctx.request_id,
+                plane = "rpc",
+                via = "model-internal-work",
+                controller = hex::encode(self.controller_pubkey.as_bytes()),
+                "authorization decision"
+            );
+            return Ok(());
+        }
         let subject = ctx.subject();
         let domain = self.authorization_domain(ctx)?;
         enforce_inference_mac(ctx, &self.object_label)?;
@@ -2275,28 +2635,42 @@ impl InferenceHandler for InferenceService {
             resource: resource.to_owned(),
             operation: operation.to_owned(),
         };
-        let allowed = crate::services::policy::check_with_verified_bearer(
+        let allowed = crate::services::policy::check_with_holder_evidence(
             &self.policy_client,
             &request,
             ctx.jwt_token(),
             &ctx.subject(),
+            ctx.original_holder_evidence(),
         )
         .await
         .unwrap_or_else(|e| {
-            warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
+            warn!(
+                "Policy check failed for {} on {}: {} - denying access",
+                subject, resource, e
+            );
             false
         });
         if allowed {
             Ok(())
         } else {
-            anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+            anyhow::bail!(
+                "Unauthorized: {} cannot {} on {}",
+                subject,
+                operation,
+                resource
+            )
         }
     }
 
     async fn handle_generate_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-        data: &crate::services::generated::inference_client::GenerationRequest,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &hyprstream_rpc_std::inference_client::GenerationRequest,
+    ) -> Result<(
+        hyprstream_rpc_std::inference_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
         let subject = ctx.subject();
         let request = data.clone();
 
@@ -2305,12 +2679,16 @@ impl InferenceHandler for InferenceService {
             enabled: if data.ttt_enabled { Some(true) } else { None },
             gradient_steps: data.ttt_gradient_steps,
             learning_rate: data.ttt_learning_rate,
-            adaptation_strategy: map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold),
+            adaptation_strategy: map_adaptation_strategy(
+                data.adaptation_strategy,
+                data.writeback_threshold,
+            ),
             max_adaptation_ms: None,
         };
 
         // Calculate expiry from claims
-        let expiry_secs = ctx.claims()
+        let expiry_secs = ctx
+            .claims()
             .map(|c| c.exp - chrono::Utc::now().timestamp())
             .unwrap_or(600)
             .max(600);
@@ -2322,19 +2700,40 @@ impl InferenceHandler for InferenceService {
         // authorization label (e.g. "alice"), not a DID and never a ledger
         // principal; the self-certifying DID is derived from the same verified
         // envelope (svc.rs / the enforcer's S1 model). Anonymous ⇒ `None`.
+        //
+        // Single-service boundary: on controller internal work the envelope
+        // signer is the PINNED CONTROLLER, so the spend owner comes from the
+        // verified work order's original-caller DID; only direct callers fall
+        // back to their own signer DID.
         #[cfg(feature = "ledger")]
-        let owner_did = ctx.authenticated_pairwise_did().map(|d| d.as_str().to_owned());
+        let owner_did = ctx
+            .internal_work()
+            .and_then(|work| work.owner_did.clone())
+            .or_else(|| {
+                ctx.authenticated_pairwise_did()
+                    .map(|d| d.as_str().to_owned())
+            });
         #[cfg(not(feature = "ledger"))]
         let owner_did: Option<String> = None;
-        let (stream_id, server_pubkey, broadcast_path, reach, pending) =
-            self.prepare_stream(request, client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice), claims, expiry_secs, &subject, ttt_overrides, owner_did).await?;
+        let (stream_id, server_pubkey, broadcast_path, reach, pending) = self
+            .prepare_stream(
+                request,
+                client_ephemeral_pubkey.as_ref().map(<[u8; 32]>::as_slice),
+                claims,
+                expiry_secs,
+                &subject,
+                ttt_overrides,
+                owner_did,
+            )
+            .await?;
 
-        let stream_info = crate::services::generated::inference_client::StreamInfo {
+        let stream_info = hyprstream_rpc_std::inference_client::StreamInfo {
             stream_id,
             dh_public: server_pubkey,
             qos: <hyprstream_rpc::stream_info::Job as hyprstream_rpc::stream_info::StreamOptPreset>::stream_opt(),
             broadcast_path,
             announced_at: reach,
+            moql_server_identity: Default::default(),
             kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
@@ -2349,20 +2748,32 @@ impl InferenceHandler for InferenceService {
         Ok((stream_info, continuation))
     }
 
-    async fn handle_model_info(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_model_info(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         let mut info = InferenceService::handle_model_info(self).await;
         info.lora_loaded = self.base_delta.lock().is_some();
         Ok(InferenceResponseVariant::ModelInfoResult(info))
     }
 
-    async fn handle_is_ready(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_is_ready(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         let ready = InferenceService::handle_is_ready(self).await;
         Ok(InferenceResponseVariant::IsReadyResult(ready))
     }
 
-    async fn handle_get_layer_profile(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_get_layer_profile(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         use crate::runtime::ttn_profile;
-        use crate::services::generated::inference_client::LayerProfileResult;
+        use hyprstream_rpc_std::inference_client::LayerProfileResult;
 
         let model_config = crate::runtime::model_config::ModelConfig::load(
             &self.model_path,
@@ -2371,14 +2782,19 @@ impl InferenceHandler for InferenceService {
         let profile = ttn_profile::get_layer_profile(&self.model_path, &model_config, None)?;
         let json = serde_json::to_string_pretty(&profile)?;
 
-        Ok(InferenceResponseVariant::GetLayerProfileResult(LayerProfileResult { json }))
+        Ok(InferenceResponseVariant::GetLayerProfileResult(
+            LayerProfileResult { json },
+        ))
     }
 
     async fn handle_apply_chat_template(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &ChatTemplateRequest,
     ) -> Result<InferenceResponseVariant> {
-        let chat_messages: Vec<crate::runtime::template_engine::ChatMessage> = data.messages
+        let chat_messages: Vec<crate::runtime::template_engine::ChatMessage> = data
+            .messages
             .iter()
             .map(|m| {
                 let tool_calls = if m.tool_calls.is_empty() {
@@ -2386,20 +2802,33 @@ impl InferenceHandler for InferenceService {
                 } else {
                     // Convert RPC ToolCall (arguments: String) to TemplateToolCall
                     // (arguments: Value) so templates can iterate with |items.
-                    Some(m.tool_calls.iter()
-                        .map(crate::runtime::template_engine::TemplatToolCall::from)
-                        .collect())
+                    Some(
+                        m.tool_calls
+                            .iter()
+                            .map(crate::runtime::template_engine::TemplatToolCall::from)
+                            .collect(),
+                    )
                 };
                 crate::runtime::template_engine::ChatMessage {
                     role: m.role.clone(),
-                    content: if m.content.is_empty() { None } else { Some(m.content.clone()) },
+                    content: if m.content.is_empty() {
+                        None
+                    } else {
+                        Some(m.content.clone())
+                    },
                     tool_calls,
-                    tool_call_id: if m.tool_call_id.is_empty() { None } else { Some(m.tool_call_id.clone()) },
+                    tool_call_id: if m.tool_call_id.is_empty() {
+                        None
+                    } else {
+                        Some(m.tool_call_id.clone())
+                    },
                 }
             })
             .collect();
         // tools_json is passed as a JSON string via the schema; parse it here
-        let tools: Option<serde_json::Value> = data.tools_json.as_deref()
+        let tools: Option<serde_json::Value> = data
+            .tools_json
+            .as_deref()
             .filter(|s| !s.is_empty())
             .and_then(|s| serde_json::from_str(s).ok());
 
@@ -2413,15 +2842,21 @@ impl InferenceHandler for InferenceService {
         };
 
         let result = InferenceService::handle_apply_chat_template(
-            self, chat_messages, data.add_generation_prompt, tools.as_ref(),
+            self,
+            chat_messages,
+            data.add_generation_prompt,
+            tools.as_ref(),
             data.enable_thinking,
             data.template_vars_json.as_deref(),
-        ).await?;
+        )
+        .await?;
         Ok(InferenceResponseVariant::ApplyChatTemplateResult(result))
     }
 
     async fn handle_create_lora(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &LoraConfig,
     ) -> Result<InferenceResponseVariant> {
         let defaults = crate::training::TenantDeltaConfig::default();
@@ -2430,49 +2865,88 @@ impl InferenceHandler for InferenceService {
             alpha: data.alpha.unwrap_or(defaults.alpha),
             dropout: data.dropout.unwrap_or(defaults.dropout),
             target_modules: data.target_modules.clone(),
-            learning_rate: data.learning_rate.map(|v| v as f64).unwrap_or(defaults.learning_rate),
+            learning_rate: data
+                .learning_rate
+                .map(|v| v as f64)
+                .unwrap_or(defaults.learning_rate),
             ..defaults
         };
         InferenceService::handle_create_lora(self, config).await?;
         Ok(InferenceResponseVariant::CreateLoraResult)
     }
 
-    async fn handle_load_lora(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<InferenceResponseVariant> {
+    async fn handle_load_lora(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> Result<InferenceResponseVariant> {
         self.load_lora(Path::new(value)).await?;
         Ok(InferenceResponseVariant::LoadLoraResult)
     }
 
-    async fn handle_save_lora(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<InferenceResponseVariant> {
+    async fn handle_save_lora(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> Result<InferenceResponseVariant> {
         self.save_lora(value).await?;
         Ok(InferenceResponseVariant::SaveLoraResult)
     }
 
-    async fn handle_unload_lora(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_unload_lora(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         self.unload_lora().await?;
         Ok(InferenceResponseVariant::UnloadLoraResult)
     }
 
-    async fn handle_has_lora(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_has_lora(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         let has = self.has_lora().await?;
         Ok(InferenceResponseVariant::HasLoraResult(has))
     }
 
-    async fn handle_set_session(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<InferenceResponseVariant> {
+    async fn handle_set_session(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> Result<InferenceResponseVariant> {
         InferenceService::handle_set_session(self, value.to_owned()).await?;
         Ok(InferenceResponseVariant::SetSessionResult)
     }
 
-    async fn handle_clear_session(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_clear_session(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         InferenceService::handle_clear_session(self).await;
         Ok(InferenceResponseVariant::ClearSessionResult)
     }
 
-    async fn handle_release_session(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> Result<InferenceResponseVariant> {
+    async fn handle_release_session(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> Result<InferenceResponseVariant> {
         InferenceService::handle_release_session(self, value).await?;
         Ok(InferenceResponseVariant::ReleaseSessionResult)
     }
 
-    async fn handle_health_check(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_health_check(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         let model_loaded = self.engine.read().is_loaded();
         let network_ready = self.network_ready.load(Ordering::Acquire);
         let draining = self.draining.load(Ordering::Acquire);
@@ -2494,7 +2968,11 @@ impl InferenceHandler for InferenceService {
         }))
     }
 
-    async fn handle_shutdown(&self, _ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_shutdown(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         info!("Inference service shutdown requested");
         self.draining.store(true, Ordering::Release);
         self.network_ready.store(false, Ordering::Release);
@@ -2506,42 +2984,63 @@ impl InferenceHandler for InferenceService {
         Ok(InferenceResponseVariant::Success)
     }
 
-    async fn handle_ttt_writeback(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_ttt_writeback(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
         InferenceService::handle_writeback(self, &subject)?;
         Ok(InferenceResponseVariant::TttWritebackResult)
     }
 
-    async fn handle_ttt_evict(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_ttt_evict(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
         InferenceService::handle_evict(self, &subject)?;
         Ok(InferenceResponseVariant::TttEvictResult)
     }
 
     async fn handle_train_step(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         _data: &TrainStepRequest,
     ) -> Result<InferenceResponseVariant> {
         // DEPRECATED: trainStep @17 blocks the REQ/REP loop during forward/backward pass.
         // Use trainStepStream instead, which returns StreamInfo immediately and runs
         // the training in a continuation after the REP is sent.
-        Err(anyhow!("trainStep is deprecated — use trainStepStream for non-blocking training"))
+        Err(anyhow!(
+            "trainStep is deprecated — use trainStepStream for non-blocking training"
+        ))
     }
 
     async fn handle_train_step_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &TrainStepRequest,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(
+        hyprstream_rpc_std::inference_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
         let subject = ctx.subject();
 
         // DH key derivation
-        let client_pub_bytes = ctx.ephemeral_pubkey()
-            .ok_or_else(|| anyhow!("Streaming requires client ephemeral pubkey for E2E authentication"))?;
+        let client_pub_bytes = ctx.ephemeral_pubkey().ok_or_else(|| {
+            anyhow!("Streaming requires client ephemeral pubkey for E2E authentication")
+        })?;
         let client_pub_ref: &[u8] = &client_pub_bytes;
-        let stream_channel = self.stream_channel.as_ref()
+        let stream_channel = self
+            .stream_channel
+            .as_ref()
             .ok_or_else(|| anyhow!("StreamChannel not initialized"))?;
 
-        let expiry_secs = ctx.claims()
+        let expiry_secs = ctx
+            .claims()
             .map(|c| c.exp - chrono::Utc::now().timestamp())
             .unwrap_or(600)
             .max(600);
@@ -2558,16 +3057,18 @@ impl InferenceHandler for InferenceService {
             .map(|o| o.broadcast_path(stream_ctx.topic()))
             .unwrap_or_default();
 
-        let stream_info = crate::services::generated::inference_client::StreamInfo {
+        let stream_info = hyprstream_rpc_std::inference_client::StreamInfo {
             stream_id,
             dh_public: server_pubkey,
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             kem_ciphertexts: Vec::new(), // #554: classical stream (dh_public path), no hybrid KEM
         };
 
-        let adaptation_strategy = map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);
+        let adaptation_strategy =
+            map_adaptation_strategy(data.adaptation_strategy, data.writeback_threshold);
         let pending = PendingWork::Training {
             stream_ctx,
             subject,
@@ -2586,49 +3087,85 @@ impl InferenceHandler for InferenceService {
         Ok((stream_info, continuation))
     }
 
-    async fn handle_ttt_zero(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_ttt_zero(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
         InferenceService::handle_reset_delta(self, &subject)?;
         Ok(InferenceResponseVariant::TttZeroResult)
     }
 
-    async fn handle_get_delta_status(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_get_delta_status(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
         let result = InferenceService::handle_get_delta_status(self, &subject)?;
         Ok(InferenceResponseVariant::GetDeltaStatusResult(result))
     }
 
     async fn handle_save_adaptation(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &SaveAdaptationRequest,
     ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        let result = InferenceService::handle_save_adaptation(self, &subject, &data.name, data.merge_strategy.as_deref().unwrap_or(""), data.merge_weight.unwrap_or(0.0)).await?;
+        let result = InferenceService::handle_save_adaptation(
+            self,
+            &subject,
+            &data.name,
+            data.merge_strategy.as_deref().unwrap_or(""),
+            data.merge_weight.unwrap_or(0.0),
+        )
+        .await?;
         Ok(InferenceResponseVariant::SaveAdaptationResult(result))
     }
 
-    async fn handle_snapshot_delta(&self, ctx: &EnvelopeContext, _request_id: u64) -> Result<InferenceResponseVariant> {
+    async fn handle_snapshot_delta(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
         let result = InferenceService::handle_snapshot_delta(self, &subject).await?;
         Ok(InferenceResponseVariant::SnapshotDeltaResult(result))
     }
 
     async fn handle_export_peft_adapter(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &ExportPeftRequest,
     ) -> Result<InferenceResponseVariant> {
         let subject = ctx.subject();
-        let result = InferenceService::handle_export_peft_adapter(self, &subject, &data.name, data.commit_message.as_deref().unwrap_or("")).await?;
+        let result = InferenceService::handle_export_peft_adapter(
+            self,
+            &subject,
+            &data.name,
+            data.commit_message.as_deref().unwrap_or(""),
+        )
+        .await?;
         Ok(InferenceResponseVariant::ExportPeftAdapterResult(result))
     }
 
     async fn handle_merge_lora(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &MergeLoraRequest,
     ) -> Result<InferenceResponseVariant> {
         let weight = data.weight.filter(|&w| w > 0.0).unwrap_or(1.0);
-        let strategy = data.strategy.as_deref().filter(|s| !s.is_empty()).unwrap_or("do_merge");
-        self.merge_lora(Path::new(&data.adapter_path), weight, strategy).await?;
+        let strategy = data
+            .strategy
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("do_merge");
+        self.merge_lora(Path::new(&data.adapter_path), weight, strategy)
+            .await?;
         Ok(InferenceResponseVariant::MergeLoraResult)
     }
 
@@ -2641,9 +3178,14 @@ impl InferenceHandler for InferenceService {
     // =========================================================================
 
     async fn handle_create_lora_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &LoraConfig,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(
+        hyprstream_rpc_std::inference_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let defaults = crate::training::TenantDeltaConfig::default();
@@ -2652,7 +3194,10 @@ impl InferenceHandler for InferenceService {
             alpha: data.alpha.unwrap_or(defaults.alpha),
             dropout: data.dropout.unwrap_or(defaults.dropout),
             target_modules: data.target_modules.clone(),
-            learning_rate: data.learning_rate.map(|v| v as f64).unwrap_or(defaults.learning_rate),
+            learning_rate: data
+                .learning_rate
+                .map(|v| v as f64)
+                .unwrap_or(defaults.learning_rate),
             ..defaults
         };
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
@@ -2662,9 +3207,14 @@ impl InferenceHandler for InferenceService {
     }
 
     async fn handle_load_lora_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         value: &str,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(
+        hyprstream_rpc_std::inference_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let path = value.to_owned();
@@ -2675,9 +3225,14 @@ impl InferenceHandler for InferenceService {
     }
 
     async fn handle_save_lora_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         value: &str,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(
+        hyprstream_rpc_std::inference_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let name = value.to_owned();
@@ -2688,9 +3243,14 @@ impl InferenceHandler for InferenceService {
     }
 
     async fn handle_save_adaptation_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &SaveAdaptationRequest,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(
+        hyprstream_rpc_std::inference_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let subject = ctx.subject();
@@ -2698,55 +3258,96 @@ impl InferenceHandler for InferenceService {
         let merge_strategy = data.merge_strategy.clone();
         let merge_weight = data.merge_weight;
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
-            service.execute_save_adaptation_stream(stream_ctx, subject, name, merge_strategy.unwrap_or_default(), merge_weight.unwrap_or(0.0)).await;
+            service
+                .execute_save_adaptation_stream(
+                    stream_ctx,
+                    subject,
+                    name,
+                    merge_strategy.unwrap_or_default(),
+                    merge_weight.unwrap_or(0.0),
+                )
+                .await;
         });
         Ok((stream_info, continuation))
     }
 
     async fn handle_snapshot_delta_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> Result<(
+        hyprstream_rpc_std::inference_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let subject = ctx.subject();
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
-            service.execute_snapshot_delta_stream(stream_ctx, subject).await;
+            service
+                .execute_snapshot_delta_stream(stream_ctx, subject)
+                .await;
         });
         Ok((stream_info, continuation))
     }
 
     async fn handle_export_peft_adapter_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &ExportPeftRequest,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(
+        hyprstream_rpc_std::inference_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let subject = ctx.subject();
         let name = data.name.clone();
         let commit_message = data.commit_message.clone();
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
-            service.execute_export_peft_adapter_stream(stream_ctx, subject, name, commit_message.unwrap_or_default()).await;
+            service
+                .execute_export_peft_adapter_stream(
+                    stream_ctx,
+                    subject,
+                    name,
+                    commit_message.unwrap_or_default(),
+                )
+                .await;
         });
         Ok((stream_info, continuation))
     }
 
     async fn handle_merge_lora_stream(
-        &self, ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &MergeLoraRequest,
-    ) -> Result<(crate::services::generated::inference_client::StreamInfo, hyprstream_rpc::service::Continuation)> {
+    ) -> Result<(
+        hyprstream_rpc_std::inference_client::StreamInfo,
+        hyprstream_rpc::service::Continuation,
+    )> {
         let (stream_info, stream_ctx) = self.setup_stream(ctx).await?;
         let service = self.clone();
         let adapter_path = data.adapter_path.clone();
         let weight = data.weight.filter(|&w| w > 0.0).unwrap_or(1.0);
-        let strategy = data.strategy.as_deref().filter(|s| !s.is_empty()).unwrap_or("do_merge").to_owned();
+        let strategy = data
+            .strategy
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("do_merge")
+            .to_owned();
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
-            service.execute_merge_lora_stream(stream_ctx, adapter_path, weight, strategy).await;
+            service
+                .execute_merge_lora_stream(stream_ctx, adapter_path, weight, strategy)
+                .await;
         });
         Ok((stream_info, continuation))
     }
 
     async fn handle_embed(
-        &self, _ctx: &EnvelopeContext, _request_id: u64,
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
         data: &EmbedImagesRequest,
     ) -> Result<InferenceResponseVariant> {
         let engine = self.engine.read();
@@ -2777,16 +3378,33 @@ struct InferenceZmqAdapter {
     signing_key: SigningKey,
     expected_audience: Option<String>,
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
+    /// Model reference binding; `None` ⇒ internal work orders are never
+    /// admitted (standalone direct-caller service, fail-closed).
+    instance_model_ref: Option<String>,
+    /// EXACT versioned internal-work audience of THIS worker incarnation
+    /// (`iw1/{service name}/{worker-generated incarnation}`). Work orders
+    /// naming anything else are denied.
+    instance_audience: String,
 }
 
 #[async_trait::async_trait(?Send)]
 impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, and dispatch below all consume.
+        crate::services::generated::inference_client::decode_inference_request_body(signed_body)
+    }
+
     async fn handle_request(
         &self,
         ctx: &EnvelopeContext,
-        payload: &[u8],
+        body: &hyprstream_rpc::service::DecodedRequestBody,
     ) -> anyhow::Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
-        dispatch_inference(&self.service, ctx, payload).await
+        dispatch_inference(&self.service, ctx, body).await
     }
 
     fn name(&self) -> &str {
@@ -2814,6 +3432,53 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
         signer_pubkey == &self.service.controller_pubkey.to_bytes()
     }
 
+    /// Single-service boundary admission (user-approved D5): the pinned
+    /// allocated instance executes only its controller's internal work orders,
+    /// bound to THIS instance/tenant/model and one exact operation.
+    ///
+    /// Fail-closed on: missing instance binding (standalone service), a foreign
+    /// envelope signer, wrong audience/tenant/model, expired/oversized/replayed
+    /// tokens, and missing caller snapshots. Verified against the PINNED
+    /// controller key — never against the CA key source.
+    async fn verify_internal_work_bearer(
+        &self,
+        ctx: &EnvelopeContext,
+        token: &str,
+        _protected: &hyprstream_rpc::auth::ProtectedHeader,
+    ) -> anyhow::Result<hyprstream_rpc::auth::internal_work::InternalWorkClaims> {
+        let instance_model_ref = self.instance_model_ref.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("standalone inference accepts no internal work bearer")
+        })?;
+        anyhow::ensure!(
+            ctx.cnf == self.service.controller_pubkey.to_bytes(),
+            "internal work bearer envelope was not signed by the pinned controller"
+        );
+        let now = chrono::Utc::now().timestamp();
+        let claims = hyprstream_rpc::auth::internal_work::verify_internal_work(
+            token,
+            &self.service.controller_pubkey,
+            &self.instance_audience,
+            now,
+        )?;
+        anyhow::ensure!(
+            claims.tenant == self.service.tenant_domain,
+            "internal work token tenant does not match this instance binding"
+        );
+        anyhow::ensure!(
+            claims.model == *instance_model_ref,
+            "internal work token model does not match this instance binding"
+        );
+        anyhow::ensure!(
+            hyprstream_rpc::auth::internal_work::admit_internal_work_jti_once(
+                &claims.jti,
+                claims.exp,
+                now,
+            ),
+            "internal work token jti was already admitted (replay)"
+        );
+        Ok(claims)
+    }
+
     /// Resolve a verified mesh-peer signer key to its per-host subject (#328).
     ///
     /// Routes through the global trust store, which is populated at startup from
@@ -2822,7 +3487,10 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
     /// peer whose key is enrolled resolves to `service:inference:host-<label>`;
     /// an unenrolled peer resolves to `None` → anonymous (fail-closed,
     /// deny-by-default — never the `"system"` god principal).
-    fn resolve_key_subject(&self, signer_pubkey: &[u8; 32]) -> Option<hyprstream_rpc::envelope::Subject> {
+    fn resolve_key_subject(
+        &self,
+        signer_pubkey: &[u8; 32],
+    ) -> Option<hyprstream_rpc::envelope::Subject> {
         hyprstream_service::global_trust_store().resolve_subject(signer_pubkey)
     }
 
@@ -2839,6 +3507,36 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
     }
 }
 
+/// Private per-attempt readiness handoff from the worker to its owning
+/// ModelService (Sol bounded incarnation plan). The worker generates its own
+/// 256-bit incarnation inside its service thread and reports the exact
+/// versioned audience plus the spawn-attempt identity through this channel —
+/// never via a request, resolver record, or cached deterministic name.
+#[derive(Clone)]
+pub struct IncarnationHandoff {
+    /// The deterministic instance name this worker was spawned for.
+    pub instance_service_name: String,
+    /// The pinned controller (Model) key this worker was configured with.
+    pub controller_pubkey: [u8; 32],
+    /// The spawn-attempt generation the ModelService allocated.
+    pub generation: u64,
+    /// Worker-generated 256-bit incarnation (hex-encoded).
+    pub incarnation: String,
+    /// Exact versioned internal-work audience:
+    /// `iw1/{instance_service_name}/{incarnation}`.
+    pub audience: String,
+}
+
+/// Seconds a ModelService waits for the worker's incarnation handoff after
+/// the spawner reports readiness. Missing readiness fails the load closed.
+pub const INCARNATION_HANDOFF_TIMEOUT_SECS: u64 = 30;
+
+/// The versioned internal-work audience for one worker incarnation.
+/// Exact-comparison string: no fallback to the deterministic name alone.
+pub(crate) fn internal_work_audience(service_name: &str, incarnation: &str) -> String {
+    format!("iw1/{service_name}/{incarnation}")
+}
+
 /// Configuration for spawning an InferenceService.
 ///
 /// This struct holds all parameters needed to initialize an InferenceService.
@@ -2847,6 +3545,8 @@ impl hyprstream_rpc::service::RequestService for InferenceZmqAdapter {
 pub struct InferenceServiceConfig {
     service_name: String,
     model_path: PathBuf,
+    state_path: PathBuf,
+    pinned_artifact: Option<Arc<crate::storage::pinned_model::PinnedModelArtifact>>,
     config: RuntimeConfig,
     server_pubkey: VerifyingKey,
     signing_key: SigningKey,
@@ -2855,6 +3555,7 @@ pub struct InferenceServiceConfig {
     /// created in the caller's runtime will fail with "Tokio context being shutdown" when
     /// used on a different thread's runtime.
     policy_signing_key: SigningKey,
+    policy_transport: hyprstream_rpc::transport::TransportConfig,
     transport: hyprstream_rpc::transport::TransportConfig,
     fs: Option<WorktreeClient>,
     /// Expected audience for JWT validation (resource URL)
@@ -2863,12 +3564,21 @@ pub struct InferenceServiceConfig {
     jwt_key_source: Option<std::sync::Arc<dyn hyprstream_rpc::auth::JwtKeySource>>,
     /// Tenant binding inherited from the authority-verified ModelService call.
     tenant_domain: String,
+    /// Model reference this instance serves, when spawned as a pinned
+    /// Model-subprocessor instance. Present ⇒ the instance accepts controller
+    /// internal work orders (`iw+jwt`); absent (standalone service) ⇒ it never
+    /// accepts them, fail-closed.
+    model_ref: Option<String>,
+    /// Private per-attempt readiness handoff: the worker reports its
+    /// worker-generated incarnation here after its engine is initialized.
+    /// `None` (or a dropped sender) ⇒ the owning load attempt fails closed.
+    incarnation_handoff: Option<tokio::sync::oneshot::Sender<IncarnationHandoff>>,
+    /// Spawn-attempt generation echoed in the handoff for staleness checks.
+    attempt_generation: u64,
     /// ModelService key allowed to bridge local calls into this tenant.
     controller_pubkey: VerifyingKey,
     /// Network reach published after the engine and Iroh endpoint are ready.
-    network_reach: Arc<
-        parking_lot::RwLock<Option<hyprstream_rpc::transport::TransportConfig>>,
-    >,
+    network_reach: Arc<parking_lot::RwLock<Option<hyprstream_rpc::transport::TransportConfig>>>,
     /// Reach and origin shared with the browser-addressable QUIC/MoQ relay.
     producer_reach_config: hyprstream_rpc::moq_stream::ProducerReachConfigHandle,
     moq_origin: hyprstream_rpc::moq_stream::MoqStreamOriginHandle,
@@ -2897,21 +3607,28 @@ impl InferenceServiceConfig {
         server_pubkey: VerifyingKey,
         signing_key: SigningKey,
         transport: hyprstream_rpc::transport::TransportConfig,
+        policy_transport: hyprstream_rpc::transport::TransportConfig,
         fs: Option<WorktreeClient>,
     ) -> Self {
         let policy_signing_key = signing_key.clone();
         Self {
             service_name: "inference".to_owned(),
             model_path: model_path.as_ref().to_path_buf(),
+            state_path: model_path.as_ref().to_path_buf(),
+            pinned_artifact: None,
             config,
             server_pubkey,
             signing_key,
             policy_signing_key,
+            policy_transport,
             transport,
             fs,
             expected_audience: None,
             jwt_key_source: None,
             tenant_domain: "local".to_owned(),
+            model_ref: None,
+            incarnation_handoff: None,
+            attempt_generation: 0,
             controller_pubkey: server_pubkey,
             network_reach: Arc::new(parking_lot::RwLock::new(None)),
             producer_reach_config: Arc::new(parking_lot::RwLock::new(
@@ -2929,6 +3646,18 @@ impl InferenceServiceConfig {
         }
     }
 
+    /// Bind all base-model path reads to the owned exact-tree projection.
+    /// Adapter and training writes continue to use the original checkout.
+    #[must_use]
+    pub fn with_pinned_artifact(
+        mut self,
+        artifact: Arc<crate::storage::pinned_model::PinnedModelArtifact>,
+    ) -> Self {
+        self.model_path = artifact.root().to_path_buf();
+        self.pinned_artifact = Some(artifact);
+        self
+    }
+
     /// Bind this engine to one verified tenant and one controller identity.
     #[must_use]
     pub fn with_instance_identity(
@@ -2940,6 +3669,29 @@ impl InferenceServiceConfig {
         self.service_name = service_name;
         self.tenant_domain = tenant_domain;
         self.controller_pubkey = controller_pubkey;
+        self
+    }
+
+    /// Bind the model reference this pinned instance serves. Present ⇒
+    /// controller internal work orders (`iw+jwt`) are admissible; absent ⇒
+    /// they are never admitted (standalone direct-caller service).
+    #[must_use]
+    pub fn with_model_ref(mut self, model_ref: impl Into<String>) -> Self {
+        self.model_ref = Some(model_ref.into());
+        self
+    }
+
+    /// Attach this spawn attempt's private incarnation handoff. The worker
+    /// sends its worker-generated incarnation + audience + attempt identity
+    /// after its engine is initialized; the owner awaits it after readiness.
+    #[must_use]
+    pub fn with_incarnation_handoff(
+        mut self,
+        sender: tokio::sync::oneshot::Sender<IncarnationHandoff>,
+        attempt_generation: u64,
+    ) -> Self {
+        self.incarnation_handoff = Some(sender);
+        self.attempt_generation = attempt_generation;
         self
     }
 
@@ -3009,9 +3761,7 @@ impl InferenceServiceConfig {
 async fn serve_inference_bridged(
     service_name: &str,
     transport: &hyprstream_rpc::transport::TransportConfig,
-    processor: Arc<
-        dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor,
-    >,
+    processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor>,
     signing_key: SigningKey,
     shutdown: Arc<tokio::sync::Notify>,
     on_ready: Option<tokio::sync::oneshot::Sender<()>>,
@@ -3035,9 +3785,7 @@ async fn serve_inference_bridged(
     };
 
     hyprstream_rpc::transport::install_pq_crypto_provider().map_err(|error| {
-        hyprstream_rpc::error::RpcError::SpawnFailed(format!(
-            "QUIC crypto provider: {error}"
-        ))
+        hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC crypto provider: {error}"))
     })?;
     let chain: Vec<rustls::pki_types::CertificateDer<'static>> = qc
         .cert_chain
@@ -3045,22 +3793,17 @@ async fn serve_inference_bridged(
         .map(|der| rustls::pki_types::CertificateDer::from(der.clone()))
         .collect();
     let key = rustls::pki_types::PrivateKeyDer::try_from((*qc.key_der).clone())
-        .map_err(|e| {
-            hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC key: {e}"))
-        })?;
+        .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC key: {e}")))?;
     let wt_server = web_transport_quinn::ServerBuilder::new()
         .with_addr(qc.bind_addr)
         .with_certificate(chain, key)
-        .map_err(|e| {
-            hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC bind: {e}"))
-        })?;
+        .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC bind: {e}")))?;
     let actual_addr = wt_server.local_addr().map_err(|e| {
         hyprstream_rpc::error::RpcError::SpawnFailed(format!("QUIC local_addr: {e}"))
     })?;
     let advertise_addr = quic_advertise_addr.ok_or_else(|| {
         hyprstream_rpc::error::RpcError::SpawnFailed(
-            "standalone inference requires an explicit routable QUIC advertise address"
-                .to_owned(),
+            "standalone inference requires an explicit routable QUIC advertise address".to_owned(),
         )
     })?;
     if advertise_addr.ip().is_unspecified()
@@ -3073,8 +3816,7 @@ async fn serve_inference_bridged(
             actual_addr.port()
         )));
     }
-    let pin =
-        hyprstream_rpc::transport::quinn_transport::cert_sha256(&qc.cert_chain[0]);
+    let pin = hyprstream_rpc::transport::quinn_transport::cert_sha256(&qc.cert_chain[0]);
     let origin = moq_origin
         .read()
         .clone()
@@ -3085,14 +3827,13 @@ async fn serve_inference_bridged(
             )
         })?;
 
-    let rpc_server =
-        hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::with_capacity(
-            wt_server,
-            Arc::clone(&processor),
-            signing_key.clone(),
-            hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
-        )
-        .with_moq_consumer(origin.consumer().clone());
+    let rpc_server = hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::with_capacity(
+        wt_server,
+        Arc::clone(&processor),
+        signing_key.clone(),
+        hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
+    )
+    .with_moq_consumer(origin.consumer().clone());
 
     if let Some(registry) = hyprstream_rpc::registry::try_global() {
         registry.register(
@@ -3127,8 +3868,53 @@ async fn serve_inference_bridged(
         hyprstream_rpc::moq_stream::serve_origin_to_relay_background(
             origin.producer().clone(),
             relay,
+            qc.moq_admission_proof.clone(),
+            qc.moq_relay_server_identity.take(),
         );
     }
+
+    // Start REP before arming the QUIC drain waiter. The bridged serve helper
+    // acknowledges only after its own shutdown waiter is registered, before
+    // it signals socket readiness, so the owner can safely arm both waiters
+    // before exposing external readiness.
+    let (rep_armed_tx, rep_armed_rx) = tokio::sync::oneshot::channel();
+    let rep_transport = transport.clone();
+    let rep_processor = Arc::clone(&processor);
+    let rep_shutdown = Arc::clone(&shutdown);
+    let rep_task = tokio::spawn(async move {
+        hyprstream_rpc::service::serve::serve_bridged_with_shutdown_armed_silent(
+            &rep_transport,
+            rep_processor,
+            signing_key,
+            rep_shutdown,
+            None,
+            Some(rep_armed_tx),
+        )
+        .await
+    });
+    let rep_owner = RepTaskOwner::new(rep_task);
+    if rep_armed_rx.await.is_err() {
+        network_ready.store(false, Ordering::Release);
+        let rep_error = rep_owner.join().await;
+        processor.close_admission();
+        return Err(match rep_error {
+            Err(error) => hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string()),
+            Ok(()) => {
+                hyprstream_rpc::error::RpcError::SpawnFailed("REP waiter failed to arm".to_owned())
+            }
+        });
+    }
+    let rep_admission = Arc::clone(&processor);
+    let rep = async move {
+        let result = rep_owner.join().await;
+        if result.is_err() {
+            // A bind/setup or serve failure can happen after QUIC/Iroh was
+            // advertised. Close admission before the QUIC drain waits so no
+            // new work can enter while the owner tears down.
+            rep_admission.close_admission();
+        }
+        result
+    };
 
     let drain_limit = rpc_server.stream_limit();
     let drain_capacity = rpc_server.capacity();
@@ -3136,8 +3922,16 @@ async fn serve_inference_bridged(
     let drain_shutdown = Arc::clone(&shutdown);
     let drain_state = Arc::clone(&draining);
     let drain_ready = Arc::clone(&network_ready);
-    tokio::spawn(async move {
-        drain_shutdown.notified().await;
+    let (drain_armed_tx, drain_armed_rx) = tokio::sync::oneshot::channel();
+    let drain_task = tokio::spawn(async move {
+        // Arm before notifying the owner can become possible. `Notify`'s
+        // notify_waiters() does not retain a notification for a waiter that
+        // has not registered yet.
+        let notified = drain_shutdown.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let _ = drain_armed_tx.send(());
+        notified.await;
         drain_state.store(true, Ordering::Release);
         drain_ready.store(false, Ordering::Release);
         hyprstream_rpc::transport::quinn_transport::QuinnRpcServer::shutdown(
@@ -3147,20 +3941,44 @@ async fn serve_inference_bridged(
         )
         .await;
     });
+    let drain_owner = QuinnDrainOwner::new(drain_task);
+    // Do not enter the select until both the REP and QUIC waiters have
+    // registered. This closes the notification-lost race on an immediately
+    // failing peer.
+    let _ = drain_armed_rx.await;
+    // The nested REP helper suppresses its own systemd readiness signal. The
+    // standalone inference owner emits the single outer READY=1 only after
+    // both REP and QUIC shutdown waiters are armed.
+    let _ = hyprstream_rpc::notify::ready();
+    if let Some(on_ready) = on_ready {
+        let _ = on_ready.send(());
+    }
+    let quic = rpc_server.run();
+    run_quinn_lifecycle(rep, quic, shutdown, network_ready, draining, drain_owner).await
+}
 
-    let rep = hyprstream_rpc::service::serve::serve_bridged(
-        transport,
-        Arc::clone(&processor),
-        signing_key,
-        Arc::clone(&shutdown),
-        on_ready,
-    );
-    let mut rep = Box::pin(rep);
-    let mut quic = Box::pin(rpc_server.run());
+async fn run_quinn_lifecycle<Rep, Quic>(
+    rep: Rep,
+    quic: Quic,
+    shutdown: Arc<tokio::sync::Notify>,
+    network_ready: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+    drain_owner: QuinnDrainOwner,
+) -> hyprstream_rpc::error::Result<()>
+where
+    Rep: std::future::Future<Output = anyhow::Result<()>>,
+    Quic: std::future::Future<Output = anyhow::Result<()>>,
+{
+    tokio::pin!(rep);
+    tokio::pin!(quic);
     tokio::select! {
+        // Poll REP first so `serve_bridged` registers its Notify waiter before
+        // the QUIC-first arm can notify it on an unexpected accept-loop exit.
+        biased;
         rep_result = &mut rep => {
             shutdown.notify_waiters();
             let quic_result = quic.await;
+            drain_owner.join().await;
             network_ready.store(false, Ordering::Release);
             if let Err(error) = quic_result {
                 tracing::warn!(%error, "standalone inference QUIC loop ended during drain");
@@ -3172,18 +3990,111 @@ async fn serve_inference_bridged(
         quic_result = &mut quic => {
             network_ready.store(false, Ordering::Release);
             if draining.load(Ordering::Acquire) {
-                return rep.await.map_err(|error| {
+                // The drain waiter and REP shutdown must run together.  The
+                // shutdown notification has already closed admission; polling
+                // both futures here makes the grace interval shared instead
+                // of delaying REP teardown until QUIC drain completes.
+                // Re-notify to cover a REP waiter that was registered after
+                // the first notification but before this branch was polled.
+                shutdown.notify_waiters();
+                let (rep_result, _) = tokio::join!(rep, drain_owner.join());
+                let rep_result = rep_result.map_err(|error| {
                     hyprstream_rpc::error::RpcError::SpawnFailed(error.to_string())
                 });
+                return rep_result;
             }
             shutdown.notify_waiters();
             let detail = match quic_result {
                 Ok(()) => "QUIC server exited unexpectedly".to_owned(),
                 Err(error) => format!("QUIC server failed: {error}"),
             };
+            // Preserve the unexpected QUIC exit as the primary service error;
+            // REP teardown and the QUIC drain share the same grace interval,
+            // so a wedged request cannot hold admission open for a second
+            // full drain period.
+            let (_rep_result, _) = tokio::join!(rep, drain_owner.join());
             Err(hyprstream_rpc::error::RpcError::SpawnFailed(detail))
         }
     }
+}
+
+/// Owns the QUIC drain waiter for the lifetime of the bridged service.
+///
+/// Normal service exits consume and join this handle. If the owning future is
+/// cancelled before one of those exits, abort the child instead of detaching
+/// it into the runtime.
+struct QuinnDrainOwner {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Owns the REP task for the lifetime of the bridged service. Cancellation of
+/// the lifecycle must abort the child instead of detaching it while retaining
+/// the processor and its admission handles.
+struct RepTaskOwner {
+    task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl RepTaskOwner {
+    fn new(task: tokio::task::JoinHandle<anyhow::Result<()>>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    async fn join(mut self) -> anyhow::Result<()> {
+        let Some(task) = self.task.as_mut() else {
+            return Err(anyhow::anyhow!("REP task missing"));
+        };
+        let result = task
+            .await
+            .map_err(|error| anyhow::anyhow!("REP task failed: {error}"))?;
+        self.task.take();
+        result
+    }
+}
+
+impl Drop for RepTaskOwner {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl QuinnDrainOwner {
+    fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    async fn join(mut self) {
+        if let Some(task) = self.task.as_mut() {
+            if let Err(error) = task.await {
+                tracing::warn!(%error, "standalone inference QUIC drain task ended unexpectedly");
+            }
+        }
+        self.task.take();
+    }
+}
+
+impl Drop for QuinnDrainOwner {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+async fn observe_inference_shutdown(
+    shutdown: Arc<tokio::sync::Notify>,
+    network_ready: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+    armed: tokio::sync::oneshot::Sender<()>,
+) {
+    let notified = shutdown.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let _ = armed.send(());
+    notified.await;
+    draining.store(true, Ordering::Release);
+    network_ready.store(false, Ordering::Release);
 }
 
 impl hyprstream_service::Spawnable for InferenceServiceConfig {
@@ -3191,8 +4102,16 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
         &self.service_name
     }
 
-    fn registrations(&self) -> Vec<(hyprstream_rpc::registry::SocketKind, hyprstream_rpc::transport::TransportConfig)> {
-        vec![(hyprstream_rpc::registry::SocketKind::Rep, self.transport.clone())]
+    fn registrations(
+        &self,
+    ) -> Vec<(
+        hyprstream_rpc::registry::SocketKind,
+        hyprstream_rpc::transport::TransportConfig,
+    )> {
+        vec![(
+            hyprstream_rpc::registry::SocketKind::Rep,
+            self.transport.clone(),
+        )]
     }
 
     fn run(
@@ -3221,15 +4140,21 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             let InferenceServiceConfig {
                 service_name,
                 model_path,
+                state_path,
+                pinned_artifact,
                 config,
                 server_pubkey,
                 signing_key: svc_signing_key,
                 policy_signing_key,
+                policy_transport,
                 transport: _transport,
                 fs,
                 expected_audience,
                 jwt_key_source,
                 tenant_domain,
+                model_ref: model_ref_binding,
+                incarnation_handoff,
+                attempt_generation,
                 controller_pubkey,
                 network_reach,
                 producer_reach_config,
@@ -3241,15 +4166,27 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 draining,
             } = *self;
             let adapter_transport = transport.clone();
+            // Instance audience for controller internal work orders (`iw+jwt`).
+            let instance_service_name = service_name.clone();
 
             let lifecycle_ready = Arc::clone(&network_ready);
             let lifecycle_draining = Arc::clone(&draining);
             let lifecycle_shutdown = Arc::clone(&shutdown);
+            let (lifecycle_armed_tx, lifecycle_armed_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
-                lifecycle_shutdown.notified().await;
-                lifecycle_draining.store(true, Ordering::Release);
-                lifecycle_ready.store(false, Ordering::Release);
+                observe_inference_shutdown(
+                    lifecycle_shutdown,
+                    lifecycle_ready,
+                    lifecycle_draining,
+                    lifecycle_armed_tx,
+                )
+                .await;
             });
+            lifecycle_armed_rx.await.map_err(|_| {
+                hyprstream_rpc::error::RpcError::SpawnFailed(
+                    "inference lifecycle shutdown observer exited before arming".to_owned(),
+                )
+            })?;
 
             // Standalone instances use an isolated origin so two CPU replicas
             // in one deployment cannot expose each other's broadcast namespace.
@@ -3267,6 +4204,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             let bridge_shutdown = Arc::clone(&shutdown);
 
             // Build PolicyClient + GPU service + adapter ON the bridge thread.
+            #[cfg(test)]
+            crate::services::restart_diag::phase("bridge.build.enter");
             let (bridge, ready) = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn_with(
                 "inference",
                 move || async move {
@@ -3275,10 +4214,23 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                         .ok_or_else(|| {
                             anyhow::anyhow!("trust store has no policy key — startup must populate it")
                         })?;
-                    let policy_client =
-                        PolicyClient::for_local_bootstrap(policy_signing_key, policy_vk, None)?;
+                    // Required profile resolves through the checkpoint-backed
+                    // discovery resolver; compatibility dials the factory-
+                    // resolved deterministic IPC transport.
+                    let policy_client = if hyprstream_discovery::native_network_required() {
+                        PolicyClient::from_provider(&hyprstream_discovery::ProductionRpcClientProvider, policy_signing_key, None)?
+                    } else {
+                        PolicyClient::for_local_transport_bootstrap(
+                            &policy_transport,
+                            policy_signing_key,
+                            policy_vk,
+                            None,
+                        )?
+                    };
                     let service = InferenceService::initialize(
                         model_path,
+                        state_path,
+                        pinned_artifact,
                         config,
                         server_pubkey,
                         svc_signing_key.clone(),
@@ -3295,12 +4247,56 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("inference init: {e}"))?;
+
+                    // Sol bounded incarnation plan: the WORKER generates its
+                    // own fresh 256-bit incarnation inside this service
+                    // thread, after the engine is initialized and before the
+                    // request adapter exists. The versioned audience is stored
+                    // on the adapter for its entire run and reported to the
+                    // owner through the private per-attempt handoff. Never
+                    // accepted from a request, resolver record, or cached name.
+                    let incarnation_bytes = [
+                        hyprstream_rpc::envelope::generate_nonce(),
+                        hyprstream_rpc::envelope::generate_nonce(),
+                    ]
+                    .concat();
+                    let incarnation = hex::encode(incarnation_bytes);
+                    let instance_audience =
+                        internal_work_audience(&instance_service_name, &incarnation);
+                    match incarnation_handoff {
+                        Some(sender) => sender
+                            .send(IncarnationHandoff {
+                                instance_service_name: instance_service_name.clone(),
+                                controller_pubkey: controller_pubkey.to_bytes(),
+                                generation: attempt_generation,
+                                incarnation,
+                                audience: instance_audience.clone(),
+                            })
+                            .map_err(|_| {
+                                anyhow::anyhow!(
+                                    "incarnation handoff receiver dropped by the owner;                                      refusing to serve internal work from an unbound worker"
+                                )
+                            })?,
+                        // A pinned instance without a handoff receiver has no
+                        // owner awaiting its binding — fail closed.
+                        None if model_ref_binding.is_some() => {
+                            anyhow::bail!(
+                                "pinned instance has no incarnation handoff receiver; refusing to serve"
+                            )
+                        }
+                        None => {}
+                    }
+                    #[cfg(test)]
+                    crate::services::restart_diag::phase("incarnation.sent");
+
                     Ok(InferenceZmqAdapter {
                         service,
                         transport: adapter_transport,
                         signing_key: svc_signing_key,
                         expected_audience,
                         jwt_key_source,
+                        instance_model_ref: model_ref_binding,
+                        instance_audience,
                     })
                 },
                 nonce_cache,
@@ -3309,6 +4305,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
             .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("bridge: {e}")))?;
 
             // Surface GPU-init failure before advertising readiness.
+            #[cfg(test)]
+            crate::services::restart_diag::phase("bridge.ready.await.enter");
             ready
                 .await
                 .map_err(|_| {
@@ -3317,6 +4315,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     )
                 })?
                 .map_err(|e| hyprstream_rpc::error::RpcError::SpawnFailed(format!("init: {e}")))?;
+            #[cfg(test)]
+            crate::services::restart_diag::phase("bridge.ready.await.done");
 
             let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
                 Arc::new(bridge);
@@ -3330,6 +4330,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                     server_signing_key.clone(),
                     hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT,
                 );
+            #[cfg(test)]
+            crate::services::restart_diag::phase("iroh.bind.enter");
             let substrate =
                 hyprstream_rpc::transport::iroh_substrate::IrohSubstrate::new(
                     iroh_key.to_bytes(),
@@ -3344,6 +4346,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                         "inference iroh bind: {e}"
                     ))
                 })?;
+            #[cfg(test)]
+            crate::services::restart_diag::phase("iroh.bind.done");
             let node_id = *substrate.endpoint_id().as_bytes();
             let direct_addrs = substrate.endpoint().bound_sockets().into_iter().collect();
             *network_reach.write() = Some(hyprstream_rpc::transport::TransportConfig::iroh(
@@ -3351,6 +4355,8 @@ impl hyprstream_service::Spawnable for InferenceServiceConfig {
                 direct_addrs,
                 None,
             ));
+            #[cfg(test)]
+            crate::services::restart_diag::phase("inproc.serve.enter");
             let result = serve_inference_bridged(
                 &service_name,
                 &transport,
@@ -3410,19 +4416,19 @@ impl StreamChunkMessage {
         use crate::services::rpc_types::{InferenceStreamPayload, StreamPayloadExt};
 
         match payload.to_inference() {
-            Ok(InferenceStreamPayload::Token(text)) => {
-                StreamChunkMessage::Chunk { text }
-            }
+            Ok(InferenceStreamPayload::Token(text)) => StreamChunkMessage::Chunk { text },
             Ok(InferenceStreamPayload::Error(message)) => {
                 StreamChunkMessage::Error { error: message }
             }
             Ok(InferenceStreamPayload::Complete(stats)) => {
                 let quality_metrics = if stats.perplexity.is_some() || stats.avg_entropy.is_some() {
-                    Some(crate::runtime::generation_metrics::GenerationQualityMetrics {
-                        perplexity: stats.perplexity.unwrap_or(0.0),
-                        avg_entropy: stats.avg_entropy.unwrap_or(0.0),
-                        ..Default::default()
-                    })
+                    Some(
+                        crate::runtime::generation_metrics::GenerationQualityMetrics {
+                            perplexity: stats.perplexity.unwrap_or(0.0),
+                            avg_entropy: stats.avg_entropy.unwrap_or(0.0),
+                            ..Default::default()
+                        },
+                    )
                 } else {
                     None
                 };
@@ -3445,18 +4451,24 @@ impl StreamChunkMessage {
                     inference_time_ms: stats.inference_time_ms,
                     inference_tokens_per_sec: stats.inference_tokens_per_sec,
                     inference_tokens_per_sec_ema: stats.inference_tokens_per_sec_ema,
+                    // The streaming wire protocol has no speculative counters yet.
+                    speculative_accepted: 0,
+                    speculative_rejected: 0,
                 };
                 StreamChunkMessage::Complete { stats: gen_stats }
             }
-            Err(e) => {
-                StreamChunkMessage::Error { error: format!("Failed to parse payload: {e}") }
-            }
+            Err(e) => StreamChunkMessage::Error {
+                error: format!("Failed to parse payload: {e}"),
+            },
         }
     }
 
     /// Returns true if this is the last message (Complete or Error)
     pub fn is_last(&self) -> bool {
-        matches!(self, StreamChunkMessage::Complete { .. } | StreamChunkMessage::Error { .. })
+        matches!(
+            self,
+            StreamChunkMessage::Complete { .. } | StreamChunkMessage::Error { .. }
+        )
     }
 }
 
@@ -3467,13 +4479,54 @@ impl StreamChunkMessage {
 mod tenant_binding_tests {
     use super::*;
     use hyprstream_rpc::auth::mac::{
-        Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel,
-        VerifiedKeyMaterial,
+        Assurance, CompartmentSet, Level, SecurityContext, SecurityLabel, VerifiedKeyMaterial,
     };
     use hyprstream_rpc::envelope::Subject;
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[tokio::test]
+    async fn pinned_config_retains_base_inputs_but_not_writable_state() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo = git2db::Repository::init(dir.path())?;
+        std::fs::write(dir.path().join("config.json"), b"reviewed")?;
+        let mut index = repo.index()?;
+        index.add_path(Path::new("config.json"))?;
+        index.write()?;
+        let tree = repo.find_tree(index.write_tree()?)?;
+        let sig = git2::Signature::now("test", "test@example.invalid")?;
+        let oid = repo.commit(Some("HEAD"), &sig, &sig, "reviewed", &tree, &[])?;
+        drop(tree);
+        drop(repo);
+        let artifact = crate::storage::pinned_model::acquire_pinned_model(dir.path(), oid).await?;
+        let signing_key = key(3);
+        let config = InferenceServiceConfig::new(
+            dir.path(),
+            RuntimeConfig::default(),
+            signing_key.verifying_key(),
+            signing_key,
+            hyprstream_rpc::transport::TransportConfig::inproc("pinned-test"),
+            hyprstream_rpc::transport::TransportConfig::inproc("policy"),
+            None,
+        )
+        .with_pinned_artifact(artifact);
+        std::fs::write(dir.path().join("config.json"), b"replaced")?;
+        assert_eq!(
+            std::fs::read(config.model_path.join("config.json"))?,
+            b"reviewed"
+        );
+        assert_eq!(config.state_path, dir.path());
+        assert_eq!(
+            config
+                .pinned_artifact
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing pin"))?
+                .commit(),
+            oid
+        );
+        Ok(())
     }
 
     #[test]
@@ -3488,9 +4541,8 @@ mod tenant_binding_tests {
             RuntimeConfig::default(),
             signing_key.verifying_key(),
             signing_key.clone(),
-            hyprstream_rpc::transport::TransportConfig::inproc(
-                "inference-stream-plane-test",
-            ),
+            hyprstream_rpc::transport::TransportConfig::inproc("inference-stream-plane-test"),
+            hyprstream_rpc::transport::TransportConfig::inproc("policy"),
             None,
         )
         .with_stream_plane(Arc::clone(&reach), Arc::clone(&origin));
@@ -3509,9 +4561,8 @@ mod tenant_binding_tests {
             RuntimeConfig::default(),
             signing_key.verifying_key(),
             signing_key,
-            hyprstream_rpc::transport::TransportConfig::inproc(
-                "inference-legacy-readiness-test",
-            ),
+            hyprstream_rpc::transport::TransportConfig::inproc("inference-legacy-readiness-test"),
+            hyprstream_rpc::transport::TransportConfig::inproc("policy"),
             None,
         );
 
@@ -3572,8 +4623,11 @@ mod tenant_binding_tests {
 
     #[test]
     fn mac_denies_insufficient_clearance() {
-        let subject =
-            SecurityContext::new(Level::Public, CompartmentSet::EMPTY, VerifiedKeyMaterial::Classical);
+        let subject = SecurityContext::new(
+            Level::Public,
+            CompartmentSet::EMPTY,
+            VerifiedKeyMaterial::Classical,
+        );
         let object =
             SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
         assert!(enforce_inference_security_context(Some(subject), &object).is_err());
@@ -3581,13 +4635,602 @@ mod tenant_binding_tests {
 
     #[test]
     fn mac_allows_dominating_clearance() {
-        let subject =
-            SecurityContext::new(Level::Secret, CompartmentSet::EMPTY, VerifiedKeyMaterial::Classical);
+        let subject = SecurityContext::new(
+            Level::Secret,
+            CompartmentSet::EMPTY,
+            VerifiedKeyMaterial::Classical,
+        );
         let object =
             SecurityLabel::new(Level::Internal, Assurance::Classical, CompartmentSet::EMPTY);
         assert!(enforce_inference_security_context(Some(subject), &object).is_ok());
     }
+}
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod quinn_drain_tests {
+    use super::*;
+    use anyhow::Context as _;
+    use std::future::Future as _;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    struct JoinGuard<T> {
+        task: Option<tokio::task::JoinHandle<T>>,
+    }
+
+    impl<T> JoinGuard<T> {
+        fn new(task: tokio::task::JoinHandle<T>) -> Self {
+            Self { task: Some(task) }
+        }
+
+        fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+            self.task.as_mut().expect("join guard task present")
+        }
+
+        async fn join(mut self) -> std::result::Result<T, tokio::task::JoinError> {
+            let result = self.handle_mut().await;
+            self.task.take();
+            result
+        }
+    }
+
+    impl<T> Drop for JoinGuard<T> {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<tokio::sync::Semaphore>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.add_permits(1);
+        }
+    }
+
+    struct PermitInferenceDispatch;
+
+    impl hyprstream_rpc::auth::mac::MacDispatchPep for PermitInferenceDispatch {
+        fn check(
+            &self,
+            _ctx: &EnvelopeContext,
+            service_domain: &str,
+            _method: Option<&[u16]>,
+        ) -> hyprstream_rpc::auth::mac::MacDecision {
+            if service_domain == "inference" {
+                hyprstream_rpc::auth::mac::MacDecision::Permit
+            } else {
+                hyprstream_rpc::auth::mac::MacDecision::Deny(
+                    hyprstream_rpc::auth::mac::MacDenyReason::UnlabeledObject,
+                )
+            }
+        }
+    }
+
+    struct DrainGateService {
+        transport: hyprstream_rpc::transport::TransportConfig,
+        signing_key: SigningKey,
+        handler_entered: Arc<tokio::sync::Semaphore>,
+        handler_completed: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl hyprstream_rpc::service::RequestService for DrainGateService {
+        async fn handle_request(
+            &self,
+            _ctx: &EnvelopeContext,
+            _body: &hyprstream_rpc::service::DecodedRequestBody,
+        ) -> Result<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+            self.handler_entered.add_permits(1);
+            self.release.acquire().await?.forget();
+            self.handler_completed.add_permits(1);
+            Ok((b"held-response".to_vec(), None))
+        }
+
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> Result<hyprstream_rpc::service::DecodedRequestBody> {
+            crate::services::generated::inference_client::decode_inference_request_body(signed_body)
+        }
+
+        async fn verify_claims(&self, _ctx: &mut EnvelopeContext) -> Result<()> {
+            Ok(())
+        }
+
+        fn build_error_payload(&self, _request_id: u64, _error: &str) -> Vec<u8> {
+            b"error-response".to_vec()
+        }
+
+        fn name(&self) -> &str {
+            "inference"
+        }
+
+        fn transport(&self) -> &hyprstream_rpc::transport::TransportConfig {
+            &self.transport
+        }
+
+        fn signing_key(&self) -> SigningKey {
+            self.signing_key.clone()
+        }
+    }
+
+    fn test_quic_config(
+        port: u16,
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+    ) -> hyprstream_rpc::service::QuicLoopConfig {
+        hyprstream_rpc::service::QuicLoopConfig {
+            announcement_cancellation: tokio_util::sync::CancellationToken::new(),
+            cert_chain: vec![cert_der],
+            key_der: zeroize::Zeroizing::new(key_der),
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            server_name: "localhost".to_owned(),
+            protected_resource_json: None,
+            on_quic_bound: None,
+            iroh_enabled: false,
+            iroh_required: false,
+            on_iroh_bound: None,
+            moq_relay: None,
+            moq_relay_server_identity: None,
+            moq_admission: None,
+            moq_ingress_authorizer: None,
+            moq_admission_proof: None,
+        }
+    }
+
+    fn valid_request_body() -> Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut request = message
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>(
+            );
+            request.set_id(7);
+            request.set_is_ready(());
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    /// Install the process-global verification config in a child test process;
+    /// its OnceLock must not contaminate the rest of the lib test binary.
+    #[test]
+    fn inference_quic_owner_joins_drain_before_returning() -> Result<()> {
+        let executable = std::env::current_exe()?;
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "services::inference::quinn_drain_tests::inference_quic_owner_joins_drain_before_returning_child",
+                "--nocapture",
+            ])
+            .env("HYPRSTREAM_INFERENCE_DRAIN_CHILD", "1")
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill()?;
+                let _ = child.wait();
+                anyhow::bail!("isolated causal child exceeded 30 second watchdog");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        anyhow::ensure!(
+            status.success(),
+            "isolated causal child exited with {status}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inference_quic_owner_joins_drain_before_returning_child() -> Result<()> {
+        if std::env::var_os("HYPRSTREAM_INFERENCE_DRAIN_CHILD").is_none() {
+            return Ok(());
+        }
+        hyprstream_rpc::transport::install_pq_crypto_provider()?;
+        let cert_key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+        let cert_der = cert_key.cert.der().to_vec();
+        let key_der = cert_key.key_pair.serialize_der();
+        let probe = UdpSocket::bind("127.0.0.1:0")?;
+        let port = probe.local_addr()?.port();
+        drop(probe);
+
+        let handler_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let handler_completed = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let _release_cleanup = ReleaseOnDrop(Arc::clone(&release));
+        let service_key = SigningKey::from_bytes(&[0x31; 32]);
+        let client_key = SigningKey::from_bytes(&[0x32; 32]);
+        let mut verify_store = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
+        let client_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&client_key);
+        let client_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&client_pq),
+        )?;
+        verify_store.bind(client_key.verifying_key().to_bytes(), &client_pq_vk);
+        verify_store.bind(
+            service_key.verifying_key().to_bytes(),
+            &hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+                &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(
+                    &hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_key),
+                ),
+            )?,
+        );
+        hyprstream_rpc::envelope::install_verify_config(
+            hyprstream_rpc::envelope::EnvelopeVerifyConfig {
+                policy: hyprstream_rpc::crypto::CryptoPolicy::Hybrid,
+                pq_store: Some(Arc::new(verify_store)),
+            },
+        )?;
+        hyprstream_rpc::auth::mac::install_mac_dispatch_pep(Arc::new(PermitInferenceDispatch));
+        let transport = hyprstream_rpc::transport::TransportConfig::inproc(format!(
+            "inference-drain-test-{port}"
+        ));
+        let bridge = hyprstream_rpc::transport::iroh_rpc::LocalServiceBridge::spawn(
+            DrainGateService {
+                transport: transport.clone(),
+                signing_key: service_key.clone(),
+                handler_entered: Arc::clone(&handler_entered),
+                handler_completed: Arc::clone(&handler_completed),
+                release: Arc::clone(&release),
+            },
+            Arc::new(hyprstream_rpc::envelope::InMemoryNonceCache::new()),
+            0,
+        )?;
+        let processor: Arc<dyn hyprstream_rpc::transport::rpc_session::IrohRequestProcessor> =
+            Arc::new(bridge);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let network_ready = Arc::new(AtomicBool::new(false));
+        let draining = Arc::new(AtomicBool::new(false));
+        let producer_reach_config = Arc::new(parking_lot::RwLock::new(
+            hyprstream_rpc::moq_stream::ProducerReachConfig::default(),
+        ));
+        let moq_origin = Arc::new(parking_lot::RwLock::new(Some(
+            hyprstream_rpc::moq_stream::MoqStreamOrigin::standalone().build(),
+        )));
+        let advertised_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), port);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let owner_transport = transport.clone();
+        let owner_cert_der = cert_der.clone();
+        let owner_shutdown = Arc::clone(&shutdown);
+        let owner_draining = Arc::clone(&draining);
+        let owner_service_key = service_key.clone();
+        let mut owner = JoinGuard::new(tokio::spawn(async move {
+            serve_inference_bridged(
+                "inference",
+                &owner_transport,
+                Arc::clone(&processor),
+                owner_service_key,
+                owner_shutdown,
+                Some(ready_tx),
+                Some(test_quic_config(port, owner_cert_der, key_der)),
+                Some(advertised_addr),
+                Arc::clone(&producer_reach_config),
+                Arc::clone(&moq_origin),
+                Arc::clone(&network_ready),
+                owner_draining,
+            )
+            .await
+        }));
+
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .context("inference owner readiness timeout")??;
+        let session = tokio::time::timeout(
+            Duration::from_secs(5),
+            hyprstream_rpc::transport::quinn_transport::connect_pinned(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                &cert_der,
+            ),
+        )
+        .await
+        .context("QUIC connect timed out")??;
+        let service_vk = service_key.verifying_key();
+        let mut kem_store = hyprstream_rpc::crypto::hybrid_kem::KeyedKemTrustStore::new();
+        kem_store.bind(
+            service_vk.to_bytes(),
+            hyprstream_rpc::node_identity::derive_mesh_kem_recipient(&service_key)?.public(),
+        );
+        let service_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&service_key);
+        let service_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_vk_from_bytes(
+            &hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&service_pq),
+        )?;
+        let mut pq_store = hyprstream_rpc::envelope::KeyedPqTrustStore::new();
+        pq_store.bind(service_vk.to_bytes(), &service_pq_vk);
+        let client = hyprstream_rpc::rpc_client::RpcClientImpl::new(
+            hyprstream_rpc::signer::LocalSigner::new(client_key),
+            hyprstream_rpc::transport::quinn_transport::QuinnTransport::new(session),
+            Some(service_vk),
+        )
+        .with_request_kem_store(Arc::new(kem_store))
+        .with_response_pq_store(Arc::new(pq_store));
+        let response = JoinGuard::new(tokio::spawn(async move {
+            client
+                .call_for_service("inference", valid_request_body()?)
+                .await
+        }));
+        let entered_permit =
+            match tokio::time::timeout(Duration::from_secs(5), handler_entered.acquire()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => {
+                    let response_result =
+                        tokio::time::timeout(Duration::from_secs(5), response.join())
+                            .await
+                            .context("held request task cleanup timed out")?
+                            .context("held request task panicked")?;
+                    anyhow::bail!(
+                        "QUIC request did not enter service; response result: {response_result:?}"
+                    );
+                }
+            };
+        entered_permit.forget();
+
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !draining.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("inference drain did not start")?;
+        let owner_done = tokio::time::timeout(Duration::from_millis(100), owner.handle_mut()).await;
+        assert!(
+            owner_done.is_err(),
+            "inference owner returned before QUIC drain"
+        );
+
+        release.add_permits(1);
+        let response_result = tokio::time::timeout(Duration::from_secs(5), response.join())
+            .await
+            .context("held QUIC response did not complete")??;
+        assert_eq!(response_result?, b"held-response");
+        tokio::time::timeout(Duration::from_secs(5), handler_completed.acquire())
+            .await
+            .context("handler completion marker timed out")??
+            .forget();
+        let owner_result = tokio::time::timeout(Duration::from_secs(5), owner.join())
+            .await
+            .context("inference owner did not join QUIC drain")??;
+        owner_result?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unexpected_quic_exit_notifies_unpolled_rep_and_joins_drain() -> Result<()> {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let drain_shutdown = Arc::clone(&shutdown);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
+        let (drain_release_tx, drain_release_rx) = tokio::sync::oneshot::channel();
+        let drain_finished = Arc::new(AtomicBool::new(false));
+        let drain_finished_task = Arc::clone(&drain_finished);
+        let drain_task = tokio::spawn(async move {
+            let notified = drain_shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let _ = armed_tx.send(());
+            notified.await;
+            let _ = drain_started_tx.send(());
+            let _ = drain_release_rx.await;
+            drain_finished_task.store(true, Ordering::Release);
+        });
+        tokio::time::timeout(Duration::from_secs(1), armed_rx)
+            .await
+            .context("test drain waiter did not arm")??;
+
+        let rep_shutdown_observed = Arc::new(AtomicBool::new(false));
+        let rep_shutdown_observed_task = Arc::clone(&rep_shutdown_observed);
+        let rep_shutdown = Arc::clone(&shutdown);
+        let rep = async move {
+            rep_shutdown.notified().await;
+            rep_shutdown_observed_task.store(true, Ordering::Release);
+            Ok::<(), anyhow::Error>(())
+        };
+        let quic = async { Err::<(), _>(anyhow::anyhow!("accept-loop sentinel")) };
+        let lifecycle = tokio::spawn(run_quinn_lifecycle(
+            rep,
+            quic,
+            shutdown,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            QuinnDrainOwner::new(drain_task),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), drain_started_rx)
+            .await
+            .context("test drain did not start")??;
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while !rep_shutdown_observed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("REP shutdown was not polled while QUIC drain was blocked")?;
+        drain_release_tx
+            .send(())
+            .expect("drain waiter remains live");
+        let result = tokio::time::timeout(Duration::from_secs(1), lifecycle)
+            .await
+            .context("unexpected QUIC lifecycle cleanup timed out")??;
+        let error = result.expect_err("unexpected QUIC exit must remain the primary error");
+        assert!(error.to_string().contains("accept-loop sentinel"));
+        assert!(rep_shutdown_observed.load(Ordering::Acquire));
+        assert!(drain_finished.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_quic_exit_renotifies_rep_before_join() -> Result<()> {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let drain_shutdown = Arc::clone(&shutdown);
+        let (drain_armed_tx, drain_armed_rx) = tokio::sync::oneshot::channel();
+        let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
+        let (drain_release_tx, drain_release_rx) = tokio::sync::oneshot::channel();
+        let drain_task = tokio::spawn(async move {
+            let notified = drain_shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let _ = drain_armed_tx.send(());
+            notified.await;
+            let _ = drain_started_tx.send(());
+            let _ = drain_release_rx.await;
+        });
+
+        let rep_shutdown = Arc::clone(&shutdown);
+        let rep_observed = Arc::new(AtomicBool::new(false));
+        let rep_observed_task = Arc::clone(&rep_observed);
+        let rep = async move {
+            // Register the REP waiter, then let the QUIC branch win. The
+            // lifecycle's re-notify keeps this waiter live through the join.
+            let notified = rep_shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            tokio::task::yield_now().await;
+            notified.await;
+            rep_observed_task.store(true, Ordering::Release);
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(1), drain_armed_rx)
+            .await
+            .context("drain waiter did not arm")??;
+        let quic = async { Err::<(), _>(anyhow::anyhow!("draining accept-loop sentinel")) };
+        let lifecycle = tokio::spawn(run_quinn_lifecycle(
+            rep,
+            quic,
+            Arc::clone(&shutdown),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            QuinnDrainOwner::new(drain_task),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), drain_started_rx)
+            .await
+            .context("drain did not start")??;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !rep_observed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("draining QUIC exit did not re-notify REP")?;
+        drain_release_tx
+            .send(())
+            .expect("drain waiter remains live");
+        let result = tokio::time::timeout(Duration::from_secs(1), lifecycle)
+            .await
+            .context("draining lifecycle cleanup timed out")??;
+        result?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_drain_join_aborts_owned_waiter() -> Result<()> {
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _marker = DropMarker(marker);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let owner = QuinnDrainOwner::new(task);
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .context("drain child did not start")??;
+        let mut join = Box::pin(owner.join());
+        let mut join_polled = false;
+        let join_was_pending = std::future::poll_fn(|cx| {
+            join_polled = true;
+            match join.as_mut().poll(cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(true),
+                std::task::Poll::Ready(()) => std::task::Poll::Ready(false),
+            }
+        })
+        .await;
+        assert!(join_polled, "owner join was not polled");
+        assert!(join_was_pending, "owner join unexpectedly completed");
+        drop(join);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("cancellation did not abort the owned drain waiter")?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_rep_join_aborts_owned_task() -> Result<()> {
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _marker = DropMarker(marker);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok::<(), anyhow::Error>(())
+        });
+        let owner = RepTaskOwner::new(task);
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .context("REP child did not start")??;
+        let mut join = Box::pin(owner.join());
+        let pending = std::future::poll_fn(|cx| match join.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(true),
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(false),
+        })
+        .await;
+        assert!(pending, "REP owner join unexpectedly completed");
+        drop(join);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("cancellation did not abort owned REP task")?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rep_startup_ack_failure_preserves_task_error() -> Result<()> {
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let task =
+            tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("REP bind sentinel")) });
+        let owner = RepTaskOwner::new(task);
+        drop(armed_tx);
+        assert!(armed_rx.await.is_err(), "startup arm channel must close");
+        let error = owner
+            .join()
+            .await
+            .expect_err("REP startup failure must remain visible");
+        assert!(error.to_string().contains("REP bind sentinel"));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3612,6 +5255,58 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
+    #[test]
+    fn standalone_ready_follows_quic_drain_arm() {
+        let source = include_str!("inference.rs");
+        let drain_arm = source
+            .find("let _ = drain_armed_rx.await;")
+            .expect("standalone inference must await the drain arm barrier");
+        let outer = &source[drain_arm..];
+        let ready = outer
+            .find("hyprstream_rpc::notify::ready()")
+            .expect("outer inference must emit systemd readiness");
+        let oneshot = outer
+            .find("if let Some(on_ready) = on_ready")
+            .expect("outer readiness oneshot must remain explicit");
+        assert!(ready < oneshot, "systemd READY must follow drain arming");
+        assert!(
+            source.contains("serve_bridged_with_shutdown_armed_silent"),
+            "nested REP helper must suppress its own readiness"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_shutdown_observer_arms_before_owner_readiness() {
+        let source = include_str!("inference.rs");
+        assert!(
+            source.contains("lifecycle_armed_rx.await"),
+            "inference startup must wait for the lifecycle shutdown observer to arm"
+        );
+
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let network_ready = Arc::new(AtomicBool::new(true));
+        let draining = Arc::new(AtomicBool::new(false));
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let observer = tokio::spawn(observe_inference_shutdown(
+            Arc::clone(&shutdown),
+            Arc::clone(&network_ready),
+            Arc::clone(&draining),
+            armed_tx,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), armed_rx)
+            .await
+            .expect("lifecycle observer did not arm")
+            .expect("lifecycle observer dropped before arming");
+        shutdown.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(5), observer)
+            .await
+            .expect("lifecycle observer did not finish")
+            .expect("lifecycle observer panicked");
+        assert!(draining.load(Ordering::Acquire));
+        assert!(!network_ready.load(Ordering::Acquire));
+    }
+
     /// Build a `GenerationStats` with only the fields the spend reads.
     fn stats(prefill: usize, generated: usize) -> GenerationStats {
         GenerationStats {
@@ -3627,6 +5322,8 @@ mod tests {
             inference_time_ms: 0,
             inference_tokens_per_sec: 0.0,
             inference_tokens_per_sec_ema: 0.0,
+            speculative_accepted: 0,
+            speculative_rejected: 0,
         }
     }
 
@@ -3642,7 +5339,11 @@ mod tests {
 
     impl FakeStream {
         fn new(chunks: Vec<Result<String, String>>, prefill: usize) -> Self {
-            FakeStream { chunks, pos: 0, prefill }
+            FakeStream {
+                chunks,
+                pos: 0,
+                prefill,
+            }
         }
         fn generated(&self) -> usize {
             self.chunks[..self.pos].iter().filter(|c| c.is_ok()).count()
@@ -3695,7 +5396,11 @@ mod tests {
 
     impl CancelAfterSink {
         fn new(cancel: tokio_util::sync::CancellationToken, cancel_after: usize) -> Self {
-            CancelAfterSink { published: vec![], cancel, cancel_after }
+            CancelAfterSink {
+                published: vec![],
+                cancel,
+                cancel_after,
+            }
         }
     }
 
@@ -3717,7 +5422,10 @@ mod tests {
 
     impl FailOnSink {
         fn new(fail_on: usize) -> Self {
-            FailOnSink { published: vec![], fail_on }
+            FailOnSink {
+                published: vec![],
+                fail_on,
+            }
         }
     }
 
@@ -3738,8 +5446,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_after_one_token_captures_partial_stats() {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut stream =
-            FakeStream::new(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())], 5);
+        let mut stream = FakeStream::new(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())], 5);
         let mut sink = CancelAfterSink::new(cancel.clone(), 1);
         let outcome = drive_generation_loop(&mut stream, &cancel, &mut sink).await;
         assert!(matches!(outcome, GenLoopOutcome::Cancelled), "{outcome:?}");
@@ -3754,11 +5461,13 @@ mod tests {
     #[tokio::test]
     async fn publish_failure_after_partial_captures_stats() {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut stream =
-            FakeStream::new(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())], 5);
+        let mut stream = FakeStream::new(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())], 5);
         let mut sink = FailOnSink::new(2);
         let outcome = drive_generation_loop(&mut stream, &cancel, &mut sink).await;
-        assert!(matches!(outcome, GenLoopOutcome::PublishFailed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, GenLoopOutcome::PublishFailed(_)),
+            "{outcome:?}"
+        );
         // "a" published; "b" generated then its publish failed.
         let s = stream.completion_stats();
         assert_eq!(s.prefill_tokens, 5);
@@ -3768,11 +5477,13 @@ mod tests {
     #[tokio::test]
     async fn stream_error_after_partial_captures_stats() {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut stream =
-            FakeStream::new(vec![Ok("a".into()), Err("decode boom".to_owned())], 5);
+        let mut stream = FakeStream::new(vec![Ok("a".into()), Err("decode boom".to_owned())], 5);
         let mut sink = RecordingSink::default();
         let outcome = drive_generation_loop(&mut stream, &cancel, &mut sink).await;
-        assert!(matches!(outcome, GenLoopOutcome::StreamError(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, GenLoopOutcome::StreamError(_)),
+            "{outcome:?}"
+        );
         // Only the one Ok token counts; the error chunk does not.
         let s = stream.completion_stats();
         assert_eq!(s.prefill_tokens, 5);
@@ -3844,7 +5555,8 @@ mod tests {
             let mut stream =
                 FakeStream::new(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())], 5);
             let mut sink = CancelAfterSink::new(cancel.clone(), 1);
-            let res = drive_and_post(&mut stream, &cancel, &mut sink, &emitter, "stream-cancel").await;
+            let res =
+                drive_and_post(&mut stream, &cancel, &mut sink, &emitter, "stream-cancel").await;
             assert!(
                 matches!(res, Some(SpendResult::Posted { amount: 6, .. })),
                 "{res:?}"
@@ -3860,7 +5572,8 @@ mod tests {
             let mut stream =
                 FakeStream::new(vec![Ok("a".into()), Ok("b".into()), Ok("c".into())], 5);
             let mut sink = FailOnSink::new(2);
-            let res = drive_and_post(&mut stream, &cancel, &mut sink, &emitter, "stream-pubfail").await;
+            let res =
+                drive_and_post(&mut stream, &cancel, &mut sink, &emitter, "stream-pubfail").await;
             assert!(
                 matches!(res, Some(SpendResult::Posted { amount: 7, .. })),
                 "{res:?}"
@@ -3913,9 +5626,957 @@ mod tests {
         async fn no_stats_means_nothing_to_account() {
             // Generation never began (engine returned Err) ⇒ no spend attempted.
             let (emitter, handle) = fixture(&[("did:web:alice", 1000)]).await;
-            let res = post_completion_spend(&emitter, None, Some("did:web:alice"), "stream-nostart").await;
+            let res =
+                post_completion_spend(&emitter, None, Some("did:web:alice"), "stream-nostart")
+                    .await;
             assert!(res.is_none(), "{res:?}");
             assert_eq!(available(&handle, "did:web:alice").await, 1000);
+        }
+    }
+}
+
+/// User-approved single-service Model→Inference boundary (D5) — causal tests.
+///
+/// These exercise the REAL changed boundaries without a live engine:
+/// - the adapter's `verify_internal_work_bearer` hook through the REAL generic
+///   `verify_claims` pipeline (typ routing, pinned-controller signature,
+///   instance/tenant/model binding, freshness, replay);
+/// - the REAL `InferenceHandler::authorize` internal-work branch (exact
+///   operation binding, MAC floor on the carried claims, and — via a dead
+///   Policy transport — proof that the worker consults NO Policy on the
+///   internal leg).
+///
+/// The spawned-engine transport leg remains covered only by the GPU-gated
+/// `e2e_inference` suite; that facet is reported as untested in the receipt.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod single_service_boundary_tests {
+    use super::*;
+
+    use crate::runtime::inference_profile::InferenceInstanceId;
+    use hyprstream_rpc::auth::internal_work::{
+        encode_internal_work, InternalWorkClaims, INTERNAL_WORK_ISSUER,
+    };
+    use hyprstream_rpc::envelope::{RequestEnvelope, SignedEnvelope};
+
+    const CONTROLLER_KEY: [u8; 32] = [0xC7; 32];
+    const STRANGER_KEY: [u8; 32] = [0xC9; 32];
+    const TENANT: &str = "tenant-boundary";
+    const MODEL: &str = "boundary-model:main";
+
+    /// A policy transport that fails loudly if dialed. The internal leg must
+    /// never consult Policy — an `Ok` from `authorize` IS the causal proof.
+    struct DeadPolicyRpc;
+
+    #[async_trait::async_trait]
+    impl hyprstream_rpc::RpcClient for DeadPolicyRpc {
+        async fn call(&self, _payload: Vec<u8>) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_for_service_with_method(
+            &self,
+            _service_domain: &str,
+            _method_discriminator: u16,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_with_options(
+            &self,
+            _payload: Vec<u8>,
+            _options: hyprstream_rpc::CallOptions,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_with_options_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+            _options: hyprstream_rpc::CallOptions,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_streaming(
+            &self,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_streaming_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn call_streaming_for_service_with_method(
+            &self,
+            _service_domain: &str,
+            _method_discriminator: u16,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn open_stream(
+            &self,
+            _payload: Vec<u8>,
+        ) -> Result<Box<dyn hyprstream_rpc::stream_consumer::StreamHandle>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        async fn open_stream_from_info(
+            &self,
+            _stream_info: hyprstream_rpc::stream_info::StreamInfo,
+            _client_secret: [u8; 32],
+            _client_pubkey: [u8; 32],
+        ) -> Result<Box<dyn hyprstream_rpc::stream_consumer::StreamHandle>> {
+            anyhow::bail!("policy must not be dialed on the internal work leg")
+        }
+        fn next_id(&self) -> u64 {
+            1
+        }
+    }
+
+    /// Build a real adapter over an unloaded engine (no weights needed: these
+    /// tests never execute generation) with a DEAD policy transport.
+    /// The test incarnation bound into every default fixture adapter.
+    const TEST_INCARNATION: &str = "test-incarnation-0000";
+
+    fn boundary_adapter(
+        controller: &SigningKey,
+        instance_service_name: &str,
+        tenant: &str,
+        model: &str,
+        with_model_binding: bool,
+    ) -> InferenceZmqAdapter {
+        boundary_adapter_with_pool(
+            controller,
+            instance_service_name,
+            tenant,
+            model,
+            with_model_binding,
+            None,
+            TEST_INCARNATION,
+        )
+    }
+
+    fn boundary_adapter_with_pool(
+        controller: &SigningKey,
+        instance_service_name: &str,
+        tenant: &str,
+        model: &str,
+        with_model_binding: bool,
+        delta_pool: Option<Arc<DeltaPool>>,
+        incarnation: &str,
+    ) -> InferenceZmqAdapter {
+        let service = InferenceService {
+            inner: Arc::new(InferenceServiceInner {
+                engine: parking_lot::RwLock::new(
+                    create_engine(&RuntimeConfig::default())
+                        .expect("engine construction (no weights)"),
+                ),
+                model_path: PathBuf::from("/nonexistent"),
+                state_path: PathBuf::from("/nonexistent"),
+                _pinned_artifact: None,
+                session_id: parking_lot::RwLock::new(None),
+                runtime_handle: Handle::current(),
+                stream_channel: None,
+                server_pubkey: controller.verifying_key(),
+                signing_key: controller.clone(),
+                nonce_cache: Arc::new(InMemoryNonceCache::new()),
+                policy_client: PolicyClient::new(Arc::new(DeadPolicyRpc)),
+                ttt_trainer: None,
+                tokenizer: None,
+                delta_pool,
+                base_delta: Mutex::new(None),
+                fs: None,
+                transport: hyprstream_rpc::transport::TransportConfig::inproc("boundary-test"),
+                lora_generation: Arc::new(AtomicU64::new(0)),
+                tenant_domain: tenant.to_owned(),
+                controller_pubkey: controller.verifying_key(),
+                network_ready: Arc::new(AtomicBool::new(true)),
+                draining: Arc::new(AtomicBool::new(false)),
+                shutdown: Arc::new(tokio::sync::Notify::new()),
+                #[cfg(feature = "ledger")]
+                ledger: parking_lot::RwLock::new(None),
+                object_label: inference_object_label(),
+            }),
+        };
+        InferenceZmqAdapter {
+            service,
+            transport: hyprstream_rpc::transport::TransportConfig::inproc("boundary-test"),
+            signing_key: controller.clone(),
+            expected_audience: None,
+            jwt_key_source: None,
+            instance_model_ref: with_model_binding.then(|| model.to_owned()),
+            instance_audience: internal_work_audience(instance_service_name, incarnation),
+        }
+    }
+
+    fn fixture_work_claims(
+        controller: &SigningKey,
+        instance_service_name: &str,
+        now: i64,
+    ) -> InternalWorkClaims {
+        fixture_work_claims_for_subject(controller, instance_service_name, now, "alice")
+    }
+
+    fn fixture_work_claims_for_subject(
+        controller: &SigningKey,
+        instance_service_name: &str,
+        now: i64,
+        subject_string: &str,
+    ) -> InternalWorkClaims {
+        InternalWorkClaims {
+            iss: INTERNAL_WORK_ISSUER.to_owned(),
+            sub: subject_string.to_owned(),
+            aud: internal_work_audience(instance_service_name, TEST_INCARNATION),
+            tenant: TENANT.to_owned(),
+            model: MODEL.to_owned(),
+            resource: "inference:GenerateStream".to_owned(),
+            operation: "infer".to_owned(),
+            iat: now,
+            exp: now + 60,
+            jti: format!(
+                "jti-{}-{}",
+                hex::encode(&controller.verifying_key().as_bytes()[..4]),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ),
+            cnf: InternalWorkClaims::controller_cnf(&controller.verifying_key()),
+            owner_did: Some("did:key:z6Mkboundary".to_owned()),
+            caller: hyprstream_rpc::auth::Claims::new(subject_string.to_owned(), now, now + 3600)
+                .with_tenant(TENANT.to_owned())
+                // The MAC floor the worker enforces on the internal leg — the
+                // same clearance Model's ingress gate required of the caller.
+                .with_clearance(inference_object_label()),
+        }
+    }
+
+    /// Context fixture shaped like the production AnySigner bridge: the
+    /// envelope signer (`cnf`) is the controller, the bearer is the minted
+    /// work order.
+    fn ctx_with_work(token: String, controller: &SigningKey) -> EnvelopeContext {
+        let envelope = SignedEnvelope::new_signed(
+            RequestEnvelope::anonymous(Vec::new()).with_jwt_token(token),
+            controller,
+        );
+        EnvelopeContext::from_verified_as_system(&envelope)
+    }
+
+    #[tokio::test]
+    async fn internal_work_admits_through_real_verify_claims_and_authorize() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_work_claims(&controller, &instance.service_name(), now),
+            &controller,
+        );
+        let mut ctx = ctx_with_work(token, &controller);
+
+        // The REAL generic pipeline routes `iw+jwt` into the adapter hook.
+        adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect("controller work order must pass the real verify_claims routing");
+        let work = ctx.internal_work().expect("work order installed");
+        assert_eq!(work.resource, "inference:GenerateStream");
+        assert_eq!(work.operation, "infer");
+        assert_eq!(ctx.verified_tenant(), Some(TENANT));
+        assert_eq!(ctx.claims().map(|c| c.sub.as_str()), Some("alice"));
+
+        // The REAL per-method PEP accepts the exact bound coordinate with the
+        // policy transport DEAD — causal proof of non-consultation.
+        InferenceHandler::authorize(&adapter.service, &ctx, "inference:GenerateStream", "infer")
+            .await
+            .expect("internal work authorizes exactly its bound operation");
+        // The original caller subject the work order carries (on the
+        // production AnySigner bridge — the only serving plane — ctx.subject()
+        // resolves to exactly this; proven at the svc.rs routing test).
+        assert_eq!(
+            ctx.internal_work().expect("work order").subject.name(),
+            Some("alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_work_rejects_wrong_instance_tenant_model_and_standalone() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let now = chrono::Utc::now().timestamp();
+
+        // Wrong audience (a DIFFERENT allocated instance).
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let mut ctx = ctx_with_work(
+            encode_internal_work(
+                &fixture_work_claims(&controller, "inference-other-instance", now),
+                &controller,
+            ),
+            &controller,
+        );
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a work order for another instance must deny");
+        assert!(err.to_string().contains("audience"), "{err:#}");
+
+        // Wrong tenant binding: the instance is bound to TENANT while the work
+        // order claims a different tenant.
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let mut claims = fixture_work_claims(&controller, &instance.service_name(), now);
+        claims.tenant = "tenant-other".to_owned();
+        let mut ctx = ctx_with_work(encode_internal_work(&claims, &controller), &controller);
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a work order for another tenant must deny");
+        assert!(err.to_string().contains("tenant"), "{err:#}");
+
+        // Wrong model binding: the instance serves MODEL while the work order
+        // claims a different model.
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let mut claims = fixture_work_claims(&controller, &instance.service_name(), now);
+        claims.model = "model-other:main".to_owned();
+        let mut ctx = ctx_with_work(encode_internal_work(&claims, &controller), &controller);
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a work order for another model must deny");
+        assert!(err.to_string().contains("model"), "{err:#}");
+
+        // Standalone instance (no model binding): internal work never admitted.
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, false);
+        let claims = fixture_work_claims(&controller, &instance.service_name(), now);
+        let mut ctx = ctx_with_work(encode_internal_work(&claims, &controller), &controller);
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a standalone instance accepts no internal work");
+        assert!(err.to_string().contains("standalone"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn internal_work_rejects_foreign_controller_expired_and_replayed() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let stranger = SigningKey::from_bytes(&STRANGER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let now = chrono::Utc::now().timestamp();
+
+        // A foreign controller minting for our instance: signature fails
+        // against the PINNED key.
+        let mut ctx = ctx_with_work(
+            encode_internal_work(
+                &fixture_work_claims(&stranger, &instance.service_name(), now),
+                &stranger,
+            ),
+            &stranger,
+        );
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("a foreign controller cannot mint for a pinned instance");
+        assert!(err.to_string().contains("pinned controller"), "{err:#}");
+
+        // Expired work order.
+        let mut expired = fixture_work_claims(&controller, &instance.service_name(), now);
+        expired.exp = now - 1;
+        let mut ctx = ctx_with_work(encode_internal_work(&expired, &controller), &controller);
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("expired work orders deny");
+        assert!(err.to_string().contains("expired"), "{err:#}");
+
+        // Oversized lifetime (forged exp beyond the hard bound).
+        let mut long = fixture_work_claims(&controller, &instance.service_name(), now);
+        long.exp = now + 60 * 60;
+        let mut ctx = ctx_with_work(encode_internal_work(&long, &controller), &controller);
+        let err = adapter
+            .verify_claims(&mut ctx)
+            .await
+            .expect_err("oversized lifetimes deny");
+        assert!(
+            err.to_string().contains("maximum internal lifetime"),
+            "{err:#}"
+        );
+
+        // Replay: the same jti admitted twice.
+        let claims = fixture_work_claims(&controller, &instance.service_name(), now);
+        let token = encode_internal_work(&claims, &controller);
+        let mut first = ctx_with_work(token.clone(), &controller);
+        adapter
+            .verify_claims(&mut first)
+            .await
+            .expect("first admission succeeds");
+        let mut second = ctx_with_work(token, &controller);
+        let err = adapter
+            .verify_claims(&mut second)
+            .await
+            .expect_err("the same work order cannot be admitted twice");
+        assert!(err.to_string().contains("replay"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn internal_work_authorize_denies_unbound_operations() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let now = chrono::Utc::now().timestamp();
+        let token = encode_internal_work(
+            &fixture_work_claims(&controller, &instance.service_name(), now),
+            &controller,
+        );
+        let mut ctx = ctx_with_work(token, &controller);
+        adapter.verify_claims(&mut ctx).await.expect("admitted");
+
+        // A different operation on the same resource is NOT authorized by this
+        // work order — Model authorized exactly one operation.
+        let err =
+            InferenceHandler::authorize(&adapter.service, &ctx, "inference:tttZero", "manage")
+                .await
+                .expect_err("work order does not authorize other operations");
+        assert!(err.to_string().contains("does not authorize"), "{err:#}");
+
+        // The same operation on a different resource is NOT authorized either.
+        let err = InferenceHandler::authorize(&adapter.service, &ctx, "inference:embed", "infer")
+            .await
+            .expect_err("work order does not authorize other resources");
+        assert!(err.to_string().contains("does not authorize"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn direct_caller_path_still_requires_policy_on_dead_transport() {
+        // Control: a NON-internal caller on the same service still goes through
+        // Policy — the dead transport must deny, proving the internal branch
+        // (not a blanket bypass) is what skipped Policy above.
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        // NOT the internal-work path (no internal_work on ctx). A
+        // clearance-bearing fixture reaches the Policy dial.
+        let mut label_claims = hyprstream_rpc::auth::Claims::new(
+            "alice".to_owned(),
+            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp() + 3600,
+        )
+        .with_tenant(TENANT.to_owned());
+        label_claims.clearance = Some(
+            crate::mac::genesis::SitePolicy::conservative()
+                .label_for("/srv/inference")
+                .into(),
+        );
+        let ctx = EnvelopeContext::for_test_authenticated_subject_with_claims(
+            Subject::new("alice"),
+            TENANT,
+            controller.verifying_key(),
+            label_claims,
+        );
+        let err = InferenceHandler::authorize(
+            &adapter.service,
+            &ctx,
+            "inference:generateStream",
+            "infer",
+        )
+        .await
+        .expect_err("direct callers still require the Policy decision");
+        assert!(
+            err.to_string().contains("policy must not be dialed")
+                || err.to_string().contains("Unauthorized")
+                || err.to_string().contains("denying"),
+            "expected the dead-policy denial, got: {err:#}"
+        );
+    }
+
+    // ── REAL generated-dispatch coverage (K3 findings B1/B2) ────────────────
+    //
+    // The earlier boundary tests called `authorize` directly with
+    // hand-written coordinates, so mint and PEP agreed with each other while
+    // both disagreed with the generated dispatch grammar (camelCase mint vs
+    // PascalCase dispatch; Text variants embedding the payload). These tests
+    // close that gap: each mints through the Model grammar helper, admits
+    // through the REAL `verify_claims` + adapter hook, and then drives the
+    // REAL generated `dispatch_inference` over a real capnp request body —
+    // one forwarded operation per dispatch variant class (Void, Text,
+    // struct).
+
+    use crate::services::generated::inference_client::dispatch_inference;
+
+    /// Serialize a real `InferenceRequest` wire body for the given variant.
+    fn encoded_request(
+        build: impl FnOnce(&mut hyprstream_rpc_std::inference_capnp::inference_request::Builder<'_>),
+    ) -> Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut request = message
+                .init_root::<hyprstream_rpc_std::inference_capnp::inference_request::Builder>(
+            );
+            request.set_id(42);
+            build(&mut request);
+        }
+        let mut bytes = Vec::new();
+        capnp::serialize::write_message(&mut bytes, &message)?;
+        Ok(bytes)
+    }
+
+    /// Mint a work order with the PRODUCTION grammar coordinate and admit it
+    /// through the real pipeline, returning the dispatch-ready context.
+    async fn admitted_ctx(
+        adapter: &InferenceZmqAdapter,
+        controller: &SigningKey,
+        instance_service_name: &str,
+        resource: String,
+        operation: &str,
+    ) -> Result<EnvelopeContext> {
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = fixture_work_claims(controller, instance_service_name, now);
+        claims.resource = resource;
+        claims.operation = operation.to_owned();
+        let mut ctx = ctx_with_work(encode_internal_work(&claims, controller), controller);
+        adapter.verify_claims(&mut ctx).await?;
+        Ok(ctx)
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_void_variant_has_lora_succeeds_through_full_chain() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        // The EXACT coordinate the production mint emits (Model grammar
+        // helper), which must equal what generated dispatch enforces.
+        let resource = crate::services::model::ModelService::inference_dispatch_resource("hasLora");
+        assert_eq!(resource, "inference:HasLora");
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            resource,
+            "query",
+        )
+        .await
+        .expect("work order must pass the real verify_claims routing");
+
+        let payload = encoded_request(|request| {
+            request.set_has_lora(());
+        })
+        .expect("encode hasLora");
+        let decoded =
+            crate::services::generated::inference_client::decode_inference_request_body(&payload)
+                .expect("decode hasLora");
+        // The REAL generated dispatch: PEP + handler + serialization.
+        let (response, continuation) =
+            match dispatch_inference(&adapter.service, &ctx, &decoded).await {
+                Ok(pair) => pair,
+                Err(error) => panic!(
+                "real dispatch of a correctly-scoped work order must reach the handler: {error:#}"
+            ),
+            };
+        assert!(continuation.is_none());
+        let parsed =
+            hyprstream_rpc_std::inference_client::InferenceClient::parse_response(&response)
+                .expect("parse hasLora response");
+        match parsed {
+            InferenceResponseVariant::HasLoraResult(has) => {
+                assert!(!has, "unloaded engine reports no adapter");
+            }
+            other => panic!("expected HasLoraResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_text_variant_load_lora_binds_exact_payload_coordinate() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        // K3 finding B2: Text-payload variants dispatch as
+        // `inference:{payload}` — the production mint binds the exact
+        // adapter path, so the payload below must match.
+        let path = "probe/adapters/k3";
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            format!("inference:{path}"),
+            "write",
+        )
+        .await
+        .expect("payload-bound work order must pass the real verify_claims routing");
+
+        let payload = encoded_request(|request| {
+            request.set_load_lora(path);
+        })
+        .expect("encode loadLora");
+        let decoded =
+            crate::services::generated::inference_client::decode_inference_request_body(&payload)
+                .expect("decode loadLora");
+        let (response, _continuation) =
+            match dispatch_inference(&adapter.service, &ctx, &decoded).await {
+                Ok(pair) => pair,
+                Err(error) => panic!(
+                    "real dispatch must pass the PEP for the payload-bound coordinate: {error:#}"
+                ),
+            };
+        // The handler runs and fails on the FIXTURE's missing path containment
+        // (post-PEP), never on authorization.
+        let parsed =
+            hyprstream_rpc_std::inference_client::InferenceClient::parse_response(&response)
+                .expect("parse loadLora response");
+        match parsed {
+            InferenceResponseVariant::Error(info) => {
+                assert!(
+                    !info.message.contains("does not authorize")
+                        && !info.message.contains("UNAUTHORIZED"),
+                    "handler error must be post-PEP, got: {}",
+                    info.message
+                );
+                assert!(
+                    info.message.contains("FsOps not available"),
+                    "expected the fixture's path-containment handler error, got: {}",
+                    info.message
+                );
+            }
+            other => panic!("expected the handler Error variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_struct_variant_generate_stream_reaches_handler_after_pep() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            crate::services::model::ModelService::inference_dispatch_resource("generateStream"),
+            "infer",
+        )
+        .await
+        .expect("work order must pass the real verify_claims routing");
+
+        let payload = encoded_request(|request| {
+            request.reborrow().init_generate_stream();
+        })
+        .expect("encode generateStream");
+        let decoded =
+            crate::services::generated::inference_client::decode_inference_request_body(&payload)
+                .expect("decode generateStream");
+        // Streaming arms propagate handler errors: the PEP must pass and the
+        // handler must fail on the missing caller ephemeral pubkey (this
+        // fixture carries none) — K3's own control observation. The Ok
+        // payload is not Debug, so match instead of expect_err.
+        let error = match dispatch_inference(&adapter.service, &ctx, &decoded).await {
+            Ok(_) => panic!("struct variant must reach the handler after the PEP"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("ephemeral pubkey"),
+            "expected the post-PEP handler error, got: {error:#}"
+        );
+        assert!(
+            !error.to_string().contains("does not authorize"),
+            "the PEP must not deny a correctly-scoped work order"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_denies_when_mint_grammar_and_dispatch_disagree() {
+        // Guard the B1 fix itself: a camelCase coordinate (the old, wrong
+        // grammar) must still deny at the REAL dispatch.
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter(&controller, &instance.service_name(), TENANT, MODEL, true);
+        let ctx = admitted_ctx(
+            &adapter,
+            &controller,
+            &instance.service_name(),
+            "inference:hasLora".to_owned(),
+            "query",
+        )
+        .await
+        .expect("admission is coordinate-agnostic; the PEP compares");
+        let payload = encoded_request(|request| {
+            request.set_has_lora(());
+        })
+        .expect("encode hasLora");
+        let decoded =
+            crate::services::generated::inference_client::decode_inference_request_body(&payload)
+                .expect("decode hasLora");
+        let error = match dispatch_inference(&adapter.service, &ctx, &decoded).await {
+            Ok(_) => panic!("the stale camelCase grammar must keep denying"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("does not authorize"),
+            "expected the exact-match PEP denial, got: {error:#}"
+        );
+    }
+
+    // ── Sol bounded incarnation plan: worker incarnation binding ────────────
+    //
+    // The work-order audience is now `iw1/{instance}/{worker incarnation}`.
+    // These tests prove: a token minted for incarnation A is DENIED at a
+    // worker incarnation B of the SAME deterministic instance/tenant/model;
+    // a token for B is admitted at B; a second submission of the same receipt
+    // is denied through the JTI gate; and standalone instances still deny.
+
+    #[tokio::test]
+    async fn incarnation_a_token_denied_at_worker_incarnation_b() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter_a = boundary_adapter_with_pool(
+            &controller,
+            &instance.service_name(),
+            TENANT,
+            MODEL,
+            true,
+            None,
+            "incarnation-aaaa",
+        );
+        let adapter_b = boundary_adapter_with_pool(
+            &controller,
+            &instance.service_name(),
+            TENANT,
+            MODEL,
+            true,
+            None,
+            "incarnation-bbbb",
+        );
+        let now = chrono::Utc::now().timestamp();
+        let mut claims =
+            fixture_work_claims_for_subject(&controller, &instance.service_name(), now, "alice");
+        // A's token binds EXACTLY A's versioned audience.
+        claims.aud = internal_work_audience(&instance.service_name(), "incarnation-aaaa");
+        let mut ctx = ctx_with_work(encode_internal_work(&claims, &controller), &controller);
+        adapter_a
+            .verify_claims(&mut ctx)
+            .await
+            .expect("A token admits at A");
+        // The same receipt is DENIED at incarnation B — pre-restart receipts
+        // do not survive a worker replacement.
+        let mut ctx_b = ctx_with_work(encode_internal_work(&claims, &controller), &controller);
+        let error = adapter_b
+            .verify_claims(&mut ctx_b)
+            .await
+            .expect_err("A token must fail at worker incarnation B");
+        assert!(error.to_string().contains("audience"), "{error:#}");
+        assert!(ctx_b.internal_work().is_none());
+
+        // B's own receipt admits at B through the same real path.
+        let mut b_claims =
+            fixture_work_claims_for_subject(&controller, &instance.service_name(), now, "alice");
+        b_claims.aud = internal_work_audience(&instance.service_name(), "incarnation-bbbb");
+        b_claims.jti = format!("{}-b", b_claims.jti);
+        let mut ctx_b2 = ctx_with_work(encode_internal_work(&b_claims, &controller), &controller);
+        adapter_b
+            .verify_claims(&mut ctx_b2)
+            .await
+            .expect("B token admits at B");
+    }
+
+    #[tokio::test]
+    async fn duplicate_incarnation_receipt_denies_through_jti_gate() {
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        let adapter = boundary_adapter_with_pool(
+            &controller,
+            &instance.service_name(),
+            TENANT,
+            MODEL,
+            true,
+            None,
+            "incarnation-cccc",
+        );
+        let now = chrono::Utc::now().timestamp();
+        let mut claims =
+            fixture_work_claims_for_subject(&controller, &instance.service_name(), now, "alice");
+        claims.aud = internal_work_audience(&instance.service_name(), "incarnation-cccc");
+        let token = encode_internal_work(&claims, &controller);
+        // Same jti, same aud, same everything: first submission admitted,
+        // second submission denied through the JTI gate INSIDE one incarnation.
+        let mut first = ctx_with_work(token.clone(), &controller);
+        adapter
+            .verify_claims(&mut first)
+            .await
+            .expect("first submission admitted");
+        let mut second = ctx_with_work(token, &controller);
+        let error = adapter
+            .verify_claims(&mut second)
+            .await
+            .expect_err("second submission of one receipt must deny");
+        assert!(error.to_string().contains("replay"), "{error:#}");
+    }
+
+    // ── Sol S1: distinct callers keep subject-keyed TTT state separate ─────
+    //
+    // Admission installs the EXACT resolved subject (proven at the real
+    // verify_claims seam by the svc.rs Sol S1 regressions; the production
+    // LocalServiceBridge serves AnySigner, where ctx.subject() IS the
+    // installed jwt_subject). This test proves the DOWNSTREAM half: the
+    // subject-keyed TTT operations key on those exact typed identities at the
+    // real DeltaPool and real handler code, so `user:alice` and `alice` never
+    // share adaptation state.
+    #[tokio::test]
+    async fn sol_s1_distinct_callers_keep_subject_keyed_ttt_state_separate() {
+        use hyprstream_rpc::envelope::Subject;
+
+        let controller = SigningKey::from_bytes(&CONTROLLER_KEY);
+        let instance = InferenceInstanceId::new(TENANT, MODEL, 0).expect("fixture instance");
+        // Real subject-keyed pool (CPU device reached through the engine trait
+        // without naming the tch type).
+        let device = create_engine(&RuntimeConfig::default())
+            .expect("engine construction (no weights)")
+            .device();
+        let snapshots_dir = std::env::temp_dir().join(format!(
+            "sol-s1-delta-pool-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        // Module dims for the default target modules — blank delta creation
+        // allocates LoRA matrices per (layer, module) against these dims.
+        let module_dims = std::collections::HashMap::from([
+            ("q_proj".to_owned(), (16usize, 16usize)),
+            ("v_proj".to_owned(), (16usize, 16usize)),
+        ]);
+        let pool = Arc::new(DeltaPool::new(
+            crate::training::TenantDeltaConfig::default(),
+            module_dims,
+            device,
+            None,
+            snapshots_dir,
+            None,
+            2,
+        ));
+        let adapter = boundary_adapter_with_pool(
+            &controller,
+            &instance.service_name(),
+            TENANT,
+            MODEL,
+            true,
+            Some(Arc::clone(&pool)),
+            "test-incarnation-0000",
+        );
+
+        let caller_a = "user:alice";
+        let caller_b = "alice";
+
+        // A's TTT state is seeded exactly like adaptation state would be after
+        // A's own training steps: subject-keyed at the real pool.
+        let subject_a = Subject::new(caller_a);
+        let delta_a = pool.get_or_create(&subject_a).expect("seed caller A delta");
+        delta_a.lock().accumulated_steps = 7;
+
+        // Admit BOTH callers' work orders through the real adapter hook, then
+        // check the typed identities the admission installed.
+        async fn admit(
+            adapter: &InferenceZmqAdapter,
+            controller: &SigningKey,
+            instance_service_name: &str,
+            subject_string: &str,
+        ) -> EnvelopeContext {
+            let now = chrono::Utc::now().timestamp();
+            let mut claims = fixture_work_claims_for_subject(
+                controller,
+                instance_service_name,
+                now,
+                subject_string,
+            );
+            claims.resource = "inference:GetDeltaStatus".to_owned();
+            claims.operation = "query".to_owned();
+            let mut ctx = ctx_with_work(encode_internal_work(&claims, controller), controller);
+            adapter
+                .verify_claims(&mut ctx)
+                .await
+                .unwrap_or_else(|error| panic!("{subject_string} must be admitted: {error:#}"));
+            ctx
+        }
+        let ctx_a = admit(&adapter, &controller, &instance.service_name(), caller_a).await;
+        let ctx_b = admit(&adapter, &controller, &instance.service_name(), caller_b).await;
+        assert_eq!(
+            ctx_a.internal_work().expect("A work order").subject,
+            Subject::new(caller_a),
+            "caller A identity must install verbatim"
+        );
+        assert_eq!(
+            ctx_b.internal_work().expect("B work order").subject,
+            Subject::new(caller_b),
+            "caller B identity must install verbatim"
+        );
+
+        // Handler contexts carrying the EXACT typed identities admission just
+        // installed (the svc.rs Sol S1 regressions prove real `verify_claims`
+        // installs these on the AnySigner serving plane, where ctx.subject()
+        // is the installed identity; this fixture's FixedSigner constructor
+        // cannot express that shape, so the identity enters here explicitly
+        // instead of being shadowed by `system`).
+        let handler_ctx = |subject_string: &str| {
+            let now = chrono::Utc::now().timestamp();
+            let caller_claims =
+                hyprstream_rpc::auth::Claims::new(subject_string.to_owned(), now, now + 3600)
+                    .with_tenant(TENANT.to_owned());
+            EnvelopeContext::for_test_authenticated_subject_with_claims(
+                Subject::new(subject_string),
+                TENANT,
+                controller.verifying_key(),
+                caller_claims,
+            )
+        };
+        let handler_ctx_a = handler_ctx(caller_a);
+        let handler_ctx_b = handler_ctx(caller_b);
+
+        // B's REAL generated handler reads ctx.subject() and must NOT observe
+        // A's subject-keyed adaptation state.
+        let status_b =
+            InferenceHandler::handle_get_delta_status(&adapter.service, &handler_ctx_b, 1)
+                .await
+                .unwrap_or_else(|error| panic!("B delta status failed: {error:#}"));
+        match status_b {
+            InferenceResponseVariant::GetDeltaStatusResult(status) => {
+                assert!(
+                    !status.exists,
+                    "caller B must not see caller A's subject-keyed delta"
+                );
+            }
+            other => panic!("expected GetDeltaStatusResult, got {other:?}"),
+        }
+
+        // B's reset operation (real handler) must not touch A's keyed state.
+        InferenceHandler::handle_ttt_zero(&adapter.service, &handler_ctx_b, 2)
+            .await
+            .unwrap_or_else(|error| panic!("B tttZero failed: {error:#}"));
+        let delta_a_after = pool.get(&subject_a).expect("A delta survives B's reset");
+        assert_eq!(
+            delta_a_after.lock().accumulated_steps,
+            7,
+            "A's accumulated TTT steps must be untouched by caller B's operations"
+        );
+
+        // And A's own status view observes exactly A's state.
+        let status_a =
+            InferenceHandler::handle_get_delta_status(&adapter.service, &handler_ctx_a, 3)
+                .await
+                .unwrap_or_else(|error| panic!("A delta status failed: {error:#}"));
+        match status_a {
+            InferenceResponseVariant::GetDeltaStatusResult(status) => {
+                assert!(status.exists, "A observes its own delta");
+                assert_eq!(status.accumulated_steps, 7);
+            }
+            other => panic!("expected GetDeltaStatusResult, got {other:?}"),
         }
     }
 }

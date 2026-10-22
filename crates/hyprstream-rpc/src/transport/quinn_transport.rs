@@ -358,18 +358,29 @@ impl QuinnRpcServer {
     /// through a clone of the relevant handles while [`QuinnRpcServer::run`]
     /// owns `self`. See the `quinn_shutdown_drains_in_flight` test.
     pub async fn shutdown(stream_limit: &Arc<Semaphore>, capacity: u32, token: &CancellationToken) {
+        Self::shutdown_until(
+            stream_limit,
+            capacity,
+            token,
+            tokio::time::Instant::now() + super::rpc_session::DRAIN_TIMEOUT,
+        )
+        .await;
+    }
+
+    /// Drain against the owner's shared deadline, without starting a new grace.
+    pub async fn shutdown_until(
+        stream_limit: &Arc<Semaphore>,
+        capacity: u32,
+        token: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) {
         // Stop accepting new streams (level-triggered).
         token.cancel();
         // Wait for all in-flight streams to release their permits, but bound
         // the wait (#159): a wedged processor/transport must not hang shutdown
         // forever. On timeout we close() and proceed — remaining tasks are torn
         // down when the connection drops.
-        match tokio::time::timeout(
-            super::rpc_session::DRAIN_TIMEOUT,
-            stream_limit.acquire_many(capacity),
-        )
-        .await
-        {
+        match tokio::time::timeout_at(deadline, stream_limit.acquire_many(capacity)).await {
             Ok(Ok(permits)) => {
                 permits.forget();
                 stream_limit.close();
@@ -532,6 +543,7 @@ impl QuinnRpcServer {
                             );
                             if !moq_authz
                                 .authorize_without_track_hook(&moq_peer)
+                                .await
                                 .is_allowed()
                             {
                                 tracing::warn!(
@@ -847,10 +859,7 @@ impl Transport for QuinnTransport {
 /// Build a quinn WebTransport client session against a server with a CA-issued
 /// certificate, validated via the system root store and the DNS `server_name`
 /// (`QuicServerAuth::web_pki`). Dials `https://{server_name}:{port}/`.
-pub async fn connect_webpki(
-    server_name: &str,
-    port: u16,
-) -> Result<web_transport_quinn::Session> {
+pub async fn connect_webpki(server_name: &str, port: u16) -> Result<web_transport_quinn::Session> {
     let client = external_client_builder()?
         .with_system_roots()
         .map_err(|e| anyhow!("quinn client (system roots): {e}"))?;
@@ -1048,8 +1057,7 @@ mod tests {
     /// with a 0xCD marker prefix, client asserts on the response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quinn_rpc_round_trip() -> Result<()> {
-        crate::transport::pq_provider::install_pq_crypto_provider()
-            .expect("install PQ provider");
+        crate::transport::pq_provider::install_pq_crypto_provider().expect("install PQ provider");
 
         let processor = crate::transport::rpc_session::from_fn(|req: Bytes| async move {
             let mut out = Vec::with_capacity(1 + req.len());
@@ -1080,10 +1088,8 @@ mod tests {
     /// wrong => Err, empty set => Err = fail-closed).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn verify_peer_cert_pinned_accepts_right_rejects_wrong() -> Result<()> {
-        crate::transport::pq_provider::install_pq_crypto_provider()
-            .expect("install PQ provider");
-        let processor =
-            crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
+        crate::transport::pq_provider::install_pq_crypto_provider().expect("install PQ provider");
+        let processor = crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
         let (server, addr, cert_der) = build_server()?;
         let rpc_server =
             QuinnRpcServer::new(server, processor, fresh_signing_key()).with_test_trusted_carrier();
@@ -1116,8 +1122,7 @@ mod tests {
     /// rejected while the first is still live. The first keeps working.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quinn_connection_cap_rejects_excess() -> Result<()> {
-        crate::transport::pq_provider::install_pq_crypto_provider()
-            .expect("install PQ provider");
+        crate::transport::pq_provider::install_pq_crypto_provider().expect("install PQ provider");
 
         let processor = crate::transport::rpc_session::from_fn(|req: Bytes| async move { Ok(req) });
 
@@ -1166,8 +1171,7 @@ mod tests {
     /// with "now safe to shut down" — no wall-clock sleep races.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quinn_shutdown_drains_in_flight() -> Result<()> {
-        crate::transport::pq_provider::install_pq_crypto_provider()
-            .expect("install PQ provider");
+        crate::transport::pq_provider::install_pq_crypto_provider().expect("install PQ provider");
 
         let entered = Arc::new(tokio::sync::Notify::new());
         let entered_c = Arc::clone(&entered);

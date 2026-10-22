@@ -307,19 +307,31 @@ mod tests {
     #[test]
     fn test_pattern_matching() {
         // Exact match
-        assert!(pattern_matches("dbus:session:org.test:iface:Method", "dbus:session:org.test:iface:Method"));
+        assert!(pattern_matches(
+            "dbus:session:org.test:iface:Method",
+            "dbus:session:org.test:iface:Method"
+        ));
 
         // Wildcard at end
-        assert!(pattern_matches("dbus:session:org.test:iface:Method", "dbus:session:org.test:*"));
+        assert!(pattern_matches(
+            "dbus:session:org.test:iface:Method",
+            "dbus:session:org.test:*"
+        ));
 
         // Wildcard in middle
-        assert!(pattern_matches("dbus:session:org.test:iface:Method", "dbus:session:*:Method"));
+        assert!(pattern_matches(
+            "dbus:session:org.test:iface:Method",
+            "dbus:session:*:Method"
+        ));
 
         // Full wildcard
         assert!(pattern_matches("dbus:session:org.test:iface:Method", "*"));
 
         // No match
-        assert!(!pattern_matches("dbus:session:org.test:iface:Method", "dbus:system:*"));
+        assert!(!pattern_matches(
+            "dbus:session:org.test:iface:Method",
+            "dbus:system:*"
+        ));
     }
 
     #[test]

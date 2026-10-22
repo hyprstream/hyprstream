@@ -50,8 +50,8 @@ mod set;
 
 // Re-export core capability trait and markers
 pub use core::{
-    is_known_capability, Capability, Context, Infer, LoraSupport, Manage, Multimodal,
-    Quantization, Query, Serve, Train, Write, KNOWN_CAPABILITY_IDS,
+    is_known_capability, Capability, Context, Infer, LoraSupport, Manage, Multimodal, Quantization,
+    Query, Serve, Train, Write, KNOWN_CAPABILITY_IDS,
 };
 
 // Re-export capability set

@@ -151,12 +151,14 @@ impl EndpointRegistry {
         description: Option<&str>,
     ) {
         let mut services = self.services.write();
-        let entry = services.entry(name.to_owned()).or_insert_with(|| ServiceEntry {
-            name: name.to_owned(),
-            endpoints: HashMap::new(),
-            description: description.map(String::from),
-            schema: None,
-        });
+        let entry = services
+            .entry(name.to_owned())
+            .or_insert_with(|| ServiceEntry {
+                name: name.to_owned(),
+                endpoints: HashMap::new(),
+                description: description.map(String::from),
+                schema: None,
+            });
         // Update description if provided
         if let Some(desc) = description {
             entry.description = Some(desc.to_owned());
@@ -206,7 +208,11 @@ impl EndpointRegistry {
     /// Registered endpoints are returned as-is. Missing REP/REQ endpoints keep
     /// the historical local fallback (`inproc` or same-host UDS), while missing
     /// QUIC/network endpoints fail closed instead of synthesizing a placeholder.
-    pub fn try_endpoint(&self, name: &str, socket_kind: SocketKind) -> anyhow::Result<TransportConfig> {
+    pub fn try_endpoint(
+        &self,
+        name: &str,
+        socket_kind: SocketKind,
+    ) -> anyhow::Result<TransportConfig> {
         if let Some(endpoint) = self.registered_endpoint(name, socket_kind) {
             return Ok(endpoint);
         }
@@ -240,7 +246,9 @@ impl EndpointRegistry {
     ) -> anyhow::Result<TransportConfig> {
         match self.mode {
             EndpointMode::Inproc => local_inproc_endpoint(name, socket_kind),
-            EndpointMode::Ipc => same_host_uds_endpoint(name, socket_kind, self.runtime_dir.as_ref()),
+            EndpointMode::Ipc => {
+                same_host_uds_endpoint(name, socket_kind, self.runtime_dir.as_ref())
+            }
         }
     }
 }
@@ -338,12 +346,14 @@ impl EndpointRegistry {
         schema: Option<&'static [u8]>,
     ) {
         let mut services = self.services.write();
-        let entry = services.entry(name.to_owned()).or_insert_with(|| ServiceEntry {
-            name: name.to_owned(),
-            endpoints: HashMap::new(),
-            description: description.map(String::from),
-            schema: None,
-        });
+        let entry = services
+            .entry(name.to_owned())
+            .or_insert_with(|| ServiceEntry {
+                name: name.to_owned(),
+                endpoints: HashMap::new(),
+                description: description.map(String::from),
+                schema: None,
+            });
         if let Some(desc) = description {
             entry.description = Some(desc.to_owned());
         }
@@ -456,11 +466,9 @@ pub fn shutdown() {
 /// Do NOT hold the returned guard across `.await` points.
 /// Clone needed data before awaiting.
 pub fn global() -> impl std::ops::Deref<Target = EndpointRegistry> + 'static {
-    parking_lot::RwLockReadGuard::map(REGISTRY.read(), |r| {
-        match r.as_ref() {
-            Some(registry) => registry,
-            None => panic!("EndpointRegistry not initialized - call init() first"),
-        }
+    parking_lot::RwLockReadGuard::map(REGISTRY.read(), |r| match r.as_ref() {
+        Some(registry) => registry,
+        None => panic!("EndpointRegistry not initialized - call init() first"),
     })
 }
 
@@ -657,11 +665,17 @@ mod tests {
 
         // REP socket (default, no suffix)
         let endpoint = global().endpoint("policy", SocketKind::Rep);
-        assert_eq!(endpoint.endpoint_string(), "ipc:///run/hyprstream/policy.sock");
+        assert_eq!(
+            endpoint.endpoint_string(),
+            "ipc:///run/hyprstream/policy.sock"
+        );
 
         // REQ socket (with suffix)
         let endpoint = global().endpoint("model", SocketKind::Req);
-        assert_eq!(endpoint.endpoint_string(), "ipc:///run/hyprstream/model-req.sock");
+        assert_eq!(
+            endpoint.endpoint_string(),
+            "ipc:///run/hyprstream/model-req.sock"
+        );
     }
 
     #[test]
@@ -676,7 +690,10 @@ mod tests {
         };
         let endpoint = futures::executor::block_on(resolver.resolve("policy", SocketKind::Rep))
             .unwrap_or_else(|err| panic!("same-host-uds resolver failed: {err}"));
-        assert_eq!(endpoint.endpoint_string(), "ipc:///run/hyprstream/policy.sock");
+        assert_eq!(
+            endpoint.endpoint_string(),
+            "ipc:///run/hyprstream/policy.sock"
+        );
     }
 
     #[test]
@@ -698,7 +715,10 @@ mod tests {
 
         // After drop, falls back to default
         let endpoint = global().endpoint("test-service", SocketKind::Rep);
-        assert_eq!(endpoint.endpoint_string(), "inproc://hyprstream/test-service");
+        assert_eq!(
+            endpoint.endpoint_string(),
+            "inproc://hyprstream/test-service"
+        );
         Ok(())
     }
 
@@ -801,5 +821,4 @@ mod tests {
         assert!(services.contains(&"svc1".to_owned()));
         assert!(services.contains(&"svc2".to_owned()));
     }
-
 }

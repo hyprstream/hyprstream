@@ -95,7 +95,10 @@ fn find_bitsandbytes_library(backend: Backend) -> Option<(PathBuf, String)> {
                 let name = name.to_string_lossy();
                 // Remove 'lib' prefix if present
                 let lib_name = name.strip_prefix("lib").unwrap_or(&name);
-                return Some((lib_path.parent().unwrap().to_path_buf(), lib_name.to_string()));
+                return Some((
+                    lib_path.parent().unwrap().to_path_buf(),
+                    lib_name.to_string(),
+                ));
             }
         }
     }
@@ -223,7 +226,10 @@ fn ensure_bitsandbytes_source() -> Option<PathBuf> {
 
     // Create deps directory
     if let Err(e) = std::fs::create_dir_all(&deps_dir) {
-        println!("cargo:warning=bitsandbytes-sys: Failed to create deps dir: {}", e);
+        println!(
+            "cargo:warning=bitsandbytes-sys: Failed to create deps dir: {}",
+            e
+        );
         return None;
     }
 
@@ -257,20 +263,49 @@ fn checkout_version(repo: &git2::Repository, version: &str) -> Result<(), git2::
     Ok(())
 }
 
+/// Detect the local GPU's gfx target via rocminfo so a source build of
+/// bitsandbytes compiles kernels for the *installed* accelerator. The
+/// historical default (`gfx90a`, MI210) produces binaries that cannot run on
+/// consumer APUs — e.g. gfx1151 / Strix Halo / Radeon 8060S — repeating the
+/// wrong-ISA silent-CPU-fallback class of bug seen in hyprstream #228.
+/// Mirrors the rocminfo detection in hyprstream.sh.
+#[cfg(feature = "build-from-source")]
+fn detect_rocm_arch() -> Option<String> {
+    let output = std::process::Command::new("rocminfo").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // rocminfo lists "Name: gfxXXXX" for each GPU agent (CPU agents name their
+    // model instead); take the first gfx-prefixed name.
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Name:"))
+        .map(str::trim)
+        .find(|name| name.starts_with("gfx"))
+        .map(str::to_owned)
+}
+
 /// Build bitsandbytes from source using cmake
 #[cfg(feature = "build-from-source")]
 fn build_bitsandbytes_from_source(backend: Backend) -> Option<(PathBuf, String)> {
     let source_path = ensure_bitsandbytes_source()?;
 
     let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_owned());
-    let rocm_arch = env::var("PYTORCH_ROCM_ARCH").unwrap_or_else(|_| "gfx90a".to_owned());
+    let rocm_arch = match env::var("PYTORCH_ROCM_ARCH") {
+        Ok(arch) => arch,
+        Err(_) => detect_rocm_arch().unwrap_or_else(|| "gfx90a".to_owned()),
+    };
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_dir = out_dir.join("bitsandbytes-build");
 
     // Create build directory
     if let Err(e) = std::fs::create_dir_all(&build_dir) {
-        println!("cargo:warning=bitsandbytes-sys: Failed to create build dir: {}", e);
+        println!(
+            "cargo:warning=bitsandbytes-sys: Failed to create build dir: {}",
+            e
+        );
         return None;
     }
 
@@ -294,11 +329,17 @@ fn build_bitsandbytes_from_source(backend: Backend) -> Option<(PathBuf, String)>
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            println!("cargo:warning=bitsandbytes-sys: cmake configure failed with {}", s);
+            println!(
+                "cargo:warning=bitsandbytes-sys: cmake configure failed with {}",
+                s
+            );
             return None;
         }
         Err(e) => {
-            println!("cargo:warning=bitsandbytes-sys: cmake configure error: {}", e);
+            println!(
+                "cargo:warning=bitsandbytes-sys: cmake configure error: {}",
+                e
+            );
             return None;
         }
     }
@@ -312,7 +353,10 @@ fn build_bitsandbytes_from_source(backend: Backend) -> Option<(PathBuf, String)>
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            println!("cargo:warning=bitsandbytes-sys: cmake build failed with {}", s);
+            println!(
+                "cargo:warning=bitsandbytes-sys: cmake build failed with {}",
+                s
+            );
             return None;
         }
         Err(e) => {
@@ -350,7 +394,10 @@ fn find_built_library(lib_dir: &Path, backend: Backend) -> Option<String> {
         }
     }
 
-    println!("cargo:warning=bitsandbytes-sys: Built library not found in {:?}", lib_dir);
+    println!(
+        "cargo:warning=bitsandbytes-sys: Built library not found in {:?}",
+        lib_dir
+    );
     None
 }
 
@@ -396,7 +443,10 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
 
     let backend = Backend::from_features();
-    println!("cargo:warning=bitsandbytes-sys: Using {:?} backend", backend);
+    println!(
+        "cargo:warning=bitsandbytes-sys: Using {:?} backend",
+        backend
+    );
 
     // Emit backend configuration
     match backend {

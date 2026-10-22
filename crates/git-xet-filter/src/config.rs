@@ -203,27 +203,34 @@ impl XetConfig {
     /// let storage = config.create_storage().await?;
     /// ```
     #[cfg(feature = "xet-storage")]
-    pub async fn create_storage(&self) -> crate::error::Result<Box<dyn crate::storage::StorageBackend>> {
+    pub async fn create_storage(
+        &self,
+    ) -> crate::error::Result<Box<dyn crate::storage::StorageBackend>> {
         #[cfg(feature = "gittorrent-transport")]
         if self.endpoint.starts_with("gittorrent://") {
             // Initialize gittorrent service and create storage with HTTPS fallback
-            let gt_config = hyprstream_p2p::service::GitTorrentConfig::load()
-                .map_err(|e| crate::error::XetError::new(
+            let gt_config = hyprstream_p2p::service::GitTorrentConfig::load().map_err(|e| {
+                crate::error::XetError::new(
                     crate::error::XetErrorKind::RuntimeError,
                     format!("Failed to load gittorrent config: {e}"),
-                ))?;
+                )
+            })?;
             let gt_service = std::sync::Arc::new(
                 hyprstream_p2p::service::GitTorrentService::new(gt_config)
                     .await
-                    .map_err(|e| crate::error::XetError::new(
-                        crate::error::XetErrorKind::RuntimeError,
-                        format!("Failed to start gittorrent: {e}"),
-                    ))?
+                    .map_err(|e| {
+                        crate::error::XetError::new(
+                            crate::error::XetErrorKind::RuntimeError,
+                            format!("Failed to start gittorrent: {e}"),
+                        )
+                    })?,
             );
             // Try to create HTTPS fallback storage
             let https_endpoint = format!(
                 "https://{}",
-                self.endpoint.strip_prefix("gittorrent://").unwrap_or(&self.endpoint)
+                self.endpoint
+                    .strip_prefix("gittorrent://")
+                    .unwrap_or(&self.endpoint)
             );
             let fallback_config = Self {
                 endpoint: https_endpoint,
@@ -236,9 +243,9 @@ impl XetConfig {
                     None
                 }
             };
-            return Ok(Box::new(
-                crate::gittorrent_storage::GittorrentStorage::new(gt_service, fallback),
-            ));
+            return Ok(Box::new(crate::gittorrent_storage::GittorrentStorage::new(
+                gt_service, fallback,
+            )));
         }
 
         #[cfg(not(feature = "gittorrent-transport"))]
@@ -297,8 +304,7 @@ mod tests {
     #[test]
     fn test_config_builder() {
         // No env var access, no lock needed
-        let config = XetConfig::new("https://custom.endpoint.dev")
-            .with_token("test_token");
+        let config = XetConfig::new("https://custom.endpoint.dev").with_token("test_token");
 
         assert_eq!(config.endpoint, "https://custom.endpoint.dev");
         assert_eq!(config.token, Some("test_token".to_owned()));
@@ -379,8 +385,7 @@ mod tests {
     #[test]
     fn test_debug_redacts_token() {
         // No env var access, no lock needed
-        let config = XetConfig::new("https://example.com")
-            .with_token("secret_token_12345");
+        let config = XetConfig::new("https://example.com").with_token("secret_token_12345");
 
         let debug_str = format!("{config:?}");
 

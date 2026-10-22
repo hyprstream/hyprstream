@@ -155,13 +155,19 @@ mod wasm {
     impl JsSigner {
         pub fn new(pubkey: &[u8], sign_fn: Function) -> Result<Self> {
             if pubkey.len() != 32 {
-                return Err(anyhow!("signer_pubkey must be 32 bytes, got {}", pubkey.len()));
+                return Err(anyhow!(
+                    "signer_pubkey must be 32 bytes, got {}",
+                    pubkey.len()
+                ));
             }
             let mut pk = [0u8; 32];
             pk.copy_from_slice(pubkey);
-            Ok(Self { pubkey: pk, sign_fn,
+            Ok(Self {
+                pubkey: pk,
+                sign_fn,
                 pq_pubkey: None,
-                pq_sign_fn: None, })
+                pq_sign_fn: None,
+            })
         }
 
         /// Construct a browser signer whose Ed25519 and ML-DSA-65 private
@@ -182,7 +188,7 @@ mod wasm {
     }
 
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl Signer for JsSigner {
         fn pubkey(&self) -> [u8; 32] {
             self.pubkey

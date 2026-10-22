@@ -133,7 +133,10 @@ impl CheckpointManager {
         if let Some(tracked) = existing {
             // Repository already registered - use its path
             let repo_path = PathBuf::from(&tracked.worktree_path);
-            info!("Using existing registered checkpoint repository at {:?}", repo_path);
+            info!(
+                "Using existing registered checkpoint repository at {:?}",
+                repo_path
+            );
 
             return Ok(Self {
                 config,
@@ -145,12 +148,8 @@ impl CheckpointManager {
         }
 
         // Create the repository and register it
-        let manager = Self::create_internal(
-            config,
-            Some(client.clone()),
-            Some(repo_name.to_owned()),
-        )
-        .await?;
+        let manager =
+            Self::create_internal(config, Some(client.clone()), Some(repo_name.to_owned())).await?;
 
         // Register with the registry
         let repo_id = RepoId::new();
@@ -159,7 +158,10 @@ impl CheckpointManager {
             .await
             .map_err(|e| Status::internal(format!("Failed to register checkpoint repo: {e}")))?;
 
-        info!("Registered checkpoint repository '{}' in registry", repo_name);
+        info!(
+            "Registered checkpoint repository '{}' in registry",
+            repo_name
+        );
 
         Ok(manager)
     }
@@ -173,11 +175,8 @@ impl CheckpointManager {
         info!("Initializing CheckpointManager");
 
         // Ensure base directory exists
-        std::fs::create_dir_all(&config.base_dir).map_err(|e| {
-            Status::internal(format!(
-                "Failed to create checkpoint directory: {e}"
-            ))
-        })?;
+        std::fs::create_dir_all(&config.base_dir)
+            .map_err(|e| Status::internal(format!("Failed to create checkpoint directory: {e}")))?;
 
         // Create or get the checkpoint repository
         let repo_path = config.base_dir.join("repo");
@@ -221,9 +220,8 @@ impl CheckpointManager {
 
         // Ensure tables directory exists
         let tables_dir = self.repo_path.join("tables");
-        std::fs::create_dir_all(&tables_dir).map_err(|e| {
-            Status::internal(format!("Failed to create tables directory: {e}"))
-        })?;
+        std::fs::create_dir_all(&tables_dir)
+            .map_err(|e| Status::internal(format!("Failed to create tables directory: {e}")))?;
 
         // Export each table to Parquet
         let mut table_checkpoints = Vec::new();
@@ -236,9 +234,7 @@ impl CheckpointManager {
             let parquet_path = tables_dir.join(format!("{table_name}.parquet"));
             debug!(table = %table_name, path = ?parquet_path, "Exporting table");
 
-            storage
-                .export_to_parquet(table_name, &parquet_path)
-                .await?;
+            storage.export_to_parquet(table_name, &parquet_path).await?;
 
             // Get file size
             let file_size = std::fs::metadata(&parquet_path)
@@ -269,9 +265,8 @@ impl CheckpointManager {
         let metadata_json = serde_json::to_string_pretty(&metadata).map_err(|e| {
             Status::internal(format!("Failed to serialize checkpoint metadata: {e}"))
         })?;
-        std::fs::write(&metadata_path, metadata_json).map_err(|e| {
-            Status::internal(format!("Failed to write checkpoint metadata: {e}"))
-        })?;
+        std::fs::write(&metadata_path, metadata_json)
+            .map_err(|e| Status::internal(format!("Failed to write checkpoint metadata: {e}")))?;
 
         // Commit the checkpoint
         let commit_id = self.commit_checkpoint(&metadata, name.as_deref()).await?;
@@ -313,15 +308,15 @@ impl CheckpointManager {
             .map_err(|e| Status::internal(format!("Failed to open repository: {e}")))?;
 
         // Stage all files using git2 directly
-        let mut index = repo.index().map_err(|e| {
-            Status::internal(format!("Failed to get index: {e}"))
-        })?;
-        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).map_err(|e| {
-            Status::internal(format!("Failed to stage files: {e}"))
-        })?;
-        index.write().map_err(|e| {
-            Status::internal(format!("Failed to write index: {e}"))
-        })?;
+        let mut index = repo
+            .index()
+            .map_err(|e| Status::internal(format!("Failed to get index: {e}")))?;
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .map_err(|e| Status::internal(format!("Failed to stage files: {e}")))?;
+        index
+            .write()
+            .map_err(|e| Status::internal(format!("Failed to write index: {e}")))?;
 
         let sig = GitManager::global()
             .create_signature(None, None)
@@ -335,15 +330,15 @@ impl CheckpointManager {
         );
 
         // Get tree from index
-        let mut index = repo.index().map_err(|e| {
-            Status::internal(format!("Failed to get index: {e}"))
-        })?;
-        let tree_id = index.write_tree().map_err(|e| {
-            Status::internal(format!("Failed to write tree: {e}"))
-        })?;
-        let tree = repo.find_tree(tree_id).map_err(|e| {
-            Status::internal(format!("Failed to find tree: {e}"))
-        })?;
+        let mut index = repo
+            .index()
+            .map_err(|e| Status::internal(format!("Failed to get index: {e}")))?;
+        let tree_id = index
+            .write_tree()
+            .map_err(|e| Status::internal(format!("Failed to write tree: {e}")))?;
+        let tree = repo
+            .find_tree(tree_id)
+            .map_err(|e| Status::internal(format!("Failed to find tree: {e}")))?;
 
         // Get parent commit if exists
         let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
@@ -384,13 +379,12 @@ impl CheckpointManager {
             .open()
             .map_err(|e| Status::internal(format!("Failed to open repository: {e}")))?;
 
-        let oid = git2::Oid::from_str(checkpoint_id).map_err(|e| {
-            Status::invalid_argument(format!("Invalid checkpoint ID: {e}"))
-        })?;
+        let oid = git2::Oid::from_str(checkpoint_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid checkpoint ID: {e}")))?;
 
-        let commit = repo.find_commit(oid).map_err(|e| {
-            Status::not_found(format!("Checkpoint not found: {e}"))
-        })?;
+        let commit = repo
+            .find_commit(oid)
+            .map_err(|e| Status::not_found(format!("Checkpoint not found: {e}")))?;
 
         // Reset to the checkpoint
         repo.reset(commit.as_object(), git2::ResetType::Hard, None)
@@ -398,12 +392,10 @@ impl CheckpointManager {
 
         // Read checkpoint metadata
         let metadata_path = self.repo_path.join("checkpoint.json");
-        let metadata_json = std::fs::read_to_string(&metadata_path).map_err(|e| {
-            Status::internal(format!("Failed to read checkpoint metadata: {e}"))
-        })?;
-        let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json).map_err(|e| {
-            Status::internal(format!("Failed to parse checkpoint metadata: {e}"))
-        })?;
+        let metadata_json = std::fs::read_to_string(&metadata_path)
+            .map_err(|e| Status::internal(format!("Failed to read checkpoint metadata: {e}")))?;
+        let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)
+            .map_err(|e| Status::internal(format!("Failed to parse checkpoint metadata: {e}")))?;
 
         // Import each table from Parquet
         for table in &metadata.tables {
@@ -435,10 +427,7 @@ impl CheckpointManager {
     }
 
     /// Start background checkpoint task
-    pub fn start_background(
-        self: Arc<Self>,
-        storage: Arc<DuckDbBackend>,
-    ) -> JoinHandle<()> {
+    pub fn start_background(self: Arc<Self>, storage: Arc<DuckDbBackend>) -> JoinHandle<()> {
         let interval = self.config.interval;
 
         tokio::spawn(async move {
@@ -447,7 +436,10 @@ impl CheckpointManager {
                 interval_timer.tick().await;
 
                 let checkpoint_name = format!("auto-{}", Utc::now().format("%Y%m%d-%H%M%S"));
-                match self.create_checkpoint(&storage, Some(checkpoint_name)).await {
+                match self
+                    .create_checkpoint(&storage, Some(checkpoint_name))
+                    .await
+                {
                     Ok(checkpoint) => {
                         info!(
                             checkpoint_id = %checkpoint.id(),

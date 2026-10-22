@@ -371,8 +371,8 @@ pub fn observe_spend_result(result: &SpendResult, stream_id: &str, unit: &UnitId
 pub(crate) mod tests {
     use super::*;
     use crate::services::ledger::CoseCheckpointSigner;
-    use std::sync::Arc;
     use hyprstream_ledger::{AccountSpec, IssueTransfer, LedgerBackend, MemLedger};
+    use std::sync::Arc;
 
     pub(crate) fn unit() -> UnitId {
         UnitId {
@@ -390,7 +390,16 @@ pub(crate) mod tests {
     /// emitter and the spawned handle (for balance inspection).
     pub(crate) async fn fixture(holders: &[(&str, u128)]) -> (InferenceSpendEmitter, LedgerHandle) {
         let cell = did("did:web:cell.test");
-        let mut backend = MemLedger::new(cell.clone());
+        // The mint is sealed against fixed key material, so the fixture holds
+        // the signing key and produces real authorizations — the same key the
+        // checkpoint signer below uses.
+        let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let mut backend = MemLedger::new(
+            cell.clone(),
+            Some(crate::services::ledger::enforcer::test_mint_authority(
+                &ed_sk,
+            )),
+        );
         let issuer_liab =
             AccountId::derive(&cell, &unit().issuer, &unit(), &Purpose::IssuerLiability).unwrap();
         backend
@@ -421,8 +430,10 @@ pub(crate) mod tests {
                     Purpose::Available,
                 ))
                 .unwrap();
-            backend
-                .credit(IssueTransfer {
+            crate::services::ledger::enforcer::test_mint(
+                &mut backend,
+                &ed_sk,
+                IssueTransfer {
                     // Monotonic, holder-distinct idempotency id per issuance.
                     id: TransferId(1_000 + idx as u128),
                     issuer_liability: issuer_liab,
@@ -431,15 +442,13 @@ pub(crate) mod tests {
                     amount: *credit,
                     grant_cid: None,
                     user_data: [0u8; 32],
-                })
-                .result
-                .unwrap();
+                },
+            )
+            .result
+            .unwrap();
         }
 
-        let signer = Arc::new(CoseCheckpointSigner::classical(
-            cell.clone(),
-            ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]),
-        ));
+        let signer = Arc::new(CoseCheckpointSigner::classical(cell.clone(), ed_sk.clone()));
         let handle = LedgerHandle::spawn(Box::new(backend), signer);
         let emitter = InferenceSpendEmitter::new(handle.clone(), cell, unit());
         (emitter, handle)

@@ -1,0 +1,45 @@
+[package]
+name = "hyprstream-decision-stub"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "System One P0.7: stub decision service — deterministic mock returning jev-1-shaped schema-valid answers behind the P3.5 Flight SQL/ADBC decide contract and the jev-1 JSON/HTTPS facade, plus wire-overhead floor measurement"
+
+# Test/eval tooling, not a production server: permissive-only leaf
+# (license-boundary.toml). Consumed by the SDK portability smoke tests and the
+# P0.4 eval harness; the real serving paths are P3.1 (inference service) and
+# P3.5 (hyprstream-flight decide operator).
+[dependencies]
+hyprstream-decision = { path = "../hyprstream-decision" }
+
+# Arrow/Flight must stay on the SAME majors as hyprstream-flight (arrow 56,
+# tonic 0.13) — RecordBatch/Flight types cross the boundary by type identity.
+arrow-array = "56.2.0"
+arrow-schema = "56.2.0"
+arrow-ipc = "56.2.0"
+arrow-flight = { version = "56.0.0", features = ["flight-sql-experimental"] }
+tonic = { version = "0.13", features = ["transport", "codegen", "prost", "server"] }
+prost = "0.13"
+tokio-stream = { version = "0.1.17", features = ["net"] }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

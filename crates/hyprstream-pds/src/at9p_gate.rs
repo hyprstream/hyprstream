@@ -208,9 +208,7 @@ pub fn verify_genesis_capsule(
 /// `did:at9p:` method prefix. Same purity guarantees.
 pub fn verify_did_at9p(did: &str, capsule_bytes: &[u8]) -> Result<VerifiedCapsule, GateError> {
     let cid512 = did.strip_prefix(DID_AT9P_PREFIX).ok_or_else(|| {
-        GateError::ClaimedId(anyhow::anyhow!(
-            "identifier is not a did:at9p DID: {did:?}"
-        ))
+        GateError::ClaimedId(anyhow::anyhow!("identifier is not a did:at9p DID: {did:?}"))
     })?;
     verify_genesis_capsule(cid512, capsule_bytes)
 }

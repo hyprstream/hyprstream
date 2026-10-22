@@ -15,7 +15,7 @@ use std::path::Path;
 
 use hyprstream_rpc_build::backend::CodegenBackend;
 use hyprstream_rpc_build::schema::types::{
-    ArmPayload, EnumDef, FieldDef, FieldSection, ParsedSchema, StructDef,
+    ArmPayload, EnumDef, FieldDef, FieldSection, ParsedSchema, ScopedClient, StructDef,
 };
 use hyprstream_rpc_build::util::{to_camel_case, to_pascal_case};
 
@@ -465,6 +465,127 @@ pub(crate) fn union_arm_data_type(sd: &StructDef, f: &FieldDef) -> String {
     } else {
         union_variant_data_type(f)
     }
+}
+
+/// Shared named-field fragments for a union-having struct's discriminated
+/// aliases. One `name: type` entry per non-union field, with the same
+/// nullability rule the parser result aliases use, so the input alias and the
+/// `*Result` alias stay structurally identical.
+pub(crate) fn shared_union_fields(s: &StructDef) -> Vec<String> {
+    s.non_union_fields()
+        .map(|f| {
+            let ts_type = capnp_to_ts_type(&f.type_name);
+            // Struct pointer fields may be null when the capnp pointer is null.
+            let ts_type = if f.section == FieldSection::Pointer
+                && !f.type_name.starts_with("List(")
+                && f.type_name != "Text"
+                && f.type_name != "Data"
+                && !is_primitive(&f.type_name)
+            {
+                format!("{ts_type} | null")
+            } else {
+                ts_type
+            };
+            format!("{}: {}", to_camel_case(&f.name), ts_type)
+        })
+        .collect()
+}
+
+/// Emit a typed discriminated-union alias: one arm per union variant (data
+/// type mirroring the parser output) plus the parser's `unknown` default arm,
+/// with any non-union fields shared into every arm. Shared by the interface
+/// emitter (input aliases) and the parser result aliases.
+pub(crate) fn emit_union_alias(
+    out: &mut String,
+    name: &str,
+    shared_fields: &[String],
+    arms: &[(String, String)],
+) {
+    let shared = shared_fields.join("; ");
+    let shared_prefix = if shared.is_empty() {
+        String::new()
+    } else {
+        format!("{shared}; ")
+    };
+    out.push_str(&format!("export type {name} =\n"));
+    for (variant, data_ty) in arms {
+        out.push_str(&format!(
+            "  | {{ {shared_prefix}variant: '{variant}'; data: {data_ty} }}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "  | {{ {shared_prefix}variant: 'unknown'; data: null }};\n\n"
+    ));
+}
+
+/// `true` when `sd` is a service or scoped request/response envelope — a
+/// struct with dedicated builder/parse paths (`builders.rs`, scoped response
+/// parsing) that never constructs or narrows the object type. Envelopes keep
+/// their legacy named-fields-only interface; every other union-having struct
+/// referenced as a data type must carry its union in the emitted type or the
+/// generated serializer/parser shapes disagree (#1616).
+pub(crate) fn is_service_envelope(schema: &ParsedSchema, sd: &StructDef) -> bool {
+    if schema
+        .request_struct
+        .as_ref()
+        .is_some_and(|rs| rs.name == sd.name)
+        || schema
+            .response_struct
+            .as_ref()
+            .is_some_and(|rs| rs.name == sd.name)
+    {
+        return true;
+    }
+    fn factory_names<'a>(scs: &'a [ScopedClient], out: &mut Vec<&'a str>) {
+        for sc in scs {
+            out.push(sc.factory_name.as_str());
+            factory_names(&sc.nested_clients, out);
+        }
+    }
+    let mut names = Vec::new();
+    factory_names(&schema.scoped_clients, &mut names);
+    schema.structs.iter().any(|s| {
+        s.fields
+            .iter()
+            .any(|f| names.contains(&f.name.as_str()) && f.type_name == sd.name)
+    })
+}
+
+/// `true` when struct `name` is referenced as a field, union-arm, group-leaf,
+/// or list element type anywhere in the schema.
+pub(crate) fn is_referenced_data_type(schema: &ParsedSchema, name: &str) -> bool {
+    schema.structs.iter().any(|s| {
+        s.fields.iter().any(|f| {
+            f.type_name == name
+                || extract_list_inner_type(&f.type_name).is_some_and(|i| i == name)
+                || extract_list_inner_type(&f.type_name)
+                    .and_then(extract_list_inner_type)
+                    .is_some_and(|i| i == name)
+        }) || s.union_arms.iter().any(|a| match &a.payload {
+            ArmPayload::Group(leaves) => leaves.iter().any(|f| f.type_name == name),
+            _ => false,
+        })
+    })
+}
+
+/// `true` when the emitted TypeScript for `sd` must be a discriminated-union
+/// alias rather than a named-fields-only interface.
+///
+/// Pure union envelopes are always aliases (existing behavior). A *mixed*
+/// struct (named fields + union) becomes an alias only when it is a referenced
+/// data type — service/scoped envelopes keep their legacy interface because
+/// their dedicated builder/parse paths never construct or narrow the object
+/// type. Without the alias, the generated request serializer switches on
+/// `variant`/`data` properties the interface does not declare, and the
+/// generated payload parser drops the union on the floor (#1616).
+pub(crate) fn emits_union_alias(schema: &ParsedSchema, sd: &StructDef) -> bool {
+    if !sd.has_union || sd.union_fields().next().is_none() {
+        return false;
+    }
+    if sd.non_union_fields().next().is_none() {
+        return true;
+    }
+    !is_service_envelope(schema, sd) && is_referenced_data_type(schema, &sd.name)
 }
 
 /// Build a TypeScript array literal from an enum's variants (camelCase names as strings).

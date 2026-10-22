@@ -135,6 +135,13 @@ struct PlacementState {
 }
 
 impl PlacementIndex {
+    /// Capacity-test fixture for an already verified/warm projection. Admission
+    /// itself is exercised separately with real signed repository fixtures.
+    #[cfg(all(test, not(target_arch = "wasm32"), feature = "valkey"))]
+    pub(crate) fn seed_warm_node_for_test(&self, did: String, facts: NodeFacts) {
+        self.state.write().nodes.insert(did, facts);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

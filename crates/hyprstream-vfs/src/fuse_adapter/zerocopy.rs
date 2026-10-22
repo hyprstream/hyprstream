@@ -29,7 +29,9 @@ pub struct MemWriter {
 
 impl MemWriter {
     pub fn with_capacity(cap: usize) -> Self {
-        Self { buf: Vec::with_capacity(cap) }
+        Self {
+            buf: Vec::with_capacity(cap),
+        }
     }
 
     pub fn into_inner(self) -> Vec<u8> {
@@ -51,7 +53,12 @@ impl Write for MemWriter {
 impl ZeroCopyWriter for MemWriter {
     /// Copy up to `count` bytes out of the backend file `f` (starting at `off`)
     /// into our buffer, staging through a heap chunk.
-    fn write_from(&mut self, f: &mut dyn FileReadWriteVolatile, count: usize, off: u64) -> io::Result<usize> {
+    fn write_from(
+        &mut self,
+        f: &mut dyn FileReadWriteVolatile,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
         let mut stage = vec![0u8; min(count, STAGE_CHUNK)];
         // SAFETY: `stage` is a live, exclusively-borrowed heap buffer for the
         // duration of the volatile read; no other accessor exists.
@@ -96,7 +103,12 @@ impl Read for MemReader<'_> {
 impl ZeroCopyReader for MemReader<'_> {
     /// Copy up to `count` bytes from our slice into the backend file `f` at
     /// `off`, staging through a heap chunk.
-    fn read_to(&mut self, f: &mut dyn FileReadWriteVolatile, count: usize, off: u64) -> io::Result<usize> {
+    fn read_to(
+        &mut self,
+        f: &mut dyn FileReadWriteVolatile,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
         let remaining = self.data.len() - self.pos;
         let take = min(min(count, remaining), STAGE_CHUNK);
         if take == 0 {

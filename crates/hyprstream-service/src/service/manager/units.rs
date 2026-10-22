@@ -41,6 +41,7 @@ pub const NODE_CREDENTIAL_NAMES: &[&str] = &[
     "quic-key",
     "quic-cert",
     "ca-pubkey",
+    "ca-mldsa-pubkey",
     "bootstrap-pubkeys",
 ];
 
@@ -54,17 +55,12 @@ pub const NODE_CREDENTIAL_NAMES: &[&str] = &[
 /// Note: `signing-key` is also in NODE_CREDENTIAL_NAMES (flat credstore) as
 /// the CA key for PolicyService. Non-policy services use SetLoadCredential
 /// to override with their independent per-service key.
-pub const SERVICE_CREDENTIAL_NAMES: &[&str] = &[
-    "signing-key",
-    "service-jwt",
-];
+pub const SERVICE_CREDENTIAL_NAMES: &[&str] = &["signing-key", "service-jwt"];
 
 /// Policy-service-only credentials.
 ///
 /// The CA private key is only available to PolicyService (the CA).
-pub const POLICY_CREDENTIAL_NAMES: &[&str] = &[
-    "ca-key",
-];
+pub const POLICY_CREDENTIAL_NAMES: &[&str] = &["ca-key"];
 
 /// All managed credential names (node + service).
 ///
@@ -84,6 +80,7 @@ pub const ALL_CREDENTIAL_NAMES: &[&str] = &[
     "quic-cert",
     "ca-key",
     "ca-pubkey",
+    "ca-mldsa-pubkey",
     "bootstrap-pubkeys",
     "service-jwt",
 ];
@@ -119,10 +116,7 @@ fn credential_directives(
         if SERVICE_CREDENTIAL_NAMES.contains(name) && service != "policy" {
             let plain_path = plain_creds.join(service).join(name);
             if plain_path.is_file() {
-                import_lines.push_str(&format!(
-                    "LoadCredential={name}:{}\n",
-                    plain_path.display()
-                ));
+                import_lines.push_str(&format!("LoadCredential={name}:{}\n", plain_path.display()));
                 continue;
             }
             if *name == "signing-key" {

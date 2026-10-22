@@ -138,7 +138,10 @@ mod tests {
         // Self-referencing fragment (`#z6Mk…`) — the common DID-URL VM id form.
         assert_eq!(did_key_to_ed25519(&format!("{base}#{mb}")).unwrap(), raw);
         // Query parameter.
-        assert_eq!(did_key_to_ed25519(&format!("{base}?versionId=1")).unwrap(), raw);
+        assert_eq!(
+            did_key_to_ed25519(&format!("{base}?versionId=1")).unwrap(),
+            raw
+        );
     }
 
     #[test]

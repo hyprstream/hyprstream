@@ -26,7 +26,11 @@ pub fn encode_frame(track: &str, payload: &[u8]) -> Vec<u8> {
         Err(_) => {
             #[cfg(target_arch = "wasm32")]
             web_sys::console::error_1(
-                &format!("[moq-worker] track name too long ({} bytes), dropping frame", t.len()).into(),
+                &format!(
+                    "[moq-worker] track name too long ({} bytes), dropping frame",
+                    t.len()
+                )
+                .into(),
             );
             return Vec::new();
         }
@@ -152,7 +156,7 @@ mod tests {
     fn decode_rejects_malformed() {
         assert_eq!(decode_frame(&[]), None); // empty
         assert_eq!(decode_frame(&[0, 0, 0, 0, 0]), None); // < 6 bytes
-        // track_len says 10 but buffer is too short:
+                                                          // track_len says 10 but buffer is too short:
         assert_eq!(decode_frame(&[10, 0, b'a', b'b', 0, 0]), None);
         // Valid header but truncated payload:
         let mut f = encode_frame("stream", b"hello");
@@ -195,6 +199,9 @@ mod tests {
         // A non-empty certHashes list with an undecodable entry must fail
         // closed, not silently drop the pin and fall back to system roots.
         let r = parse_reach(r#"{"url":"u","certHashes":["!!!not base64!!!"]}"#);
-        assert!(r.is_err(), "undecodable cert pin must be rejected, not skipped");
+        assert!(
+            r.is_err(),
+            "undecodable cert pin must be rejected, not skipped"
+        );
     }
 }

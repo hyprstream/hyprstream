@@ -142,6 +142,19 @@ fn composite_ledger_path(secrets_dir: &Path) -> PathBuf {
 fn composite_committed_path(dir: &Path) -> PathBuf {
     dir.join("jwt-composite-pairs.committed")
 }
+
+/// An existing composite commit marker means this store already has signing
+/// authority. Missing/unreadable rotation slots must not be mistaken for a
+/// first boot: generating replacement Ed/PQ keys would mutate the component
+/// state while the committed ledger still names the previous pair. Treat any
+/// marker entry (including a malformed or unreadable one) as committed so the
+/// normal restore path fails closed without creating keys.
+fn has_committed_composite_marker(dir: &Path) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(composite_committed_path(dir)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
 fn composite_committed_ledger_path(dir: &Path, commit: &CompositeCommit) -> PathBuf {
     dir.join(format!(
         "jwt-composite-pairs.committed-{}-{}.json",
@@ -332,6 +345,42 @@ fn component_state_digest_from_slots(
     URL_SAFE_NO_PAD.encode(digest.finalize())
 }
 
+/// Cheaply detect a component-key change before deciding that a rejected
+/// proposal is still stale. Slot persistence uses atomic file replacement, so
+/// identity plus modification time detects a new key without repeatedly
+/// deserializing private ML-DSA material on the verifier hot path.
+fn fingerprint_component_slot_files(
+    secrets_dir: &Path,
+    fingerprint: &mut Sha256,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let state_dir = rotation_state_dir(secrets_dir);
+    for dir in [secrets_dir, state_dir.as_path()] {
+        for family in ["jwt-signing-key", "ml-dsa-signing-key"] {
+            for slot in ["drain", "active", "lead"] {
+                for suffix in ["", ".meta"] {
+                    let path = dir.join(format!("{family}.{slot}{suffix}"));
+                    match std::fs::metadata(&path) {
+                        Ok(metadata) => {
+                            fingerprint.update([1]);
+                            fingerprint.update(metadata.dev().to_be_bytes());
+                            fingerprint.update(metadata.ino().to_be_bytes());
+                            fingerprint.update(metadata.len().to_be_bytes());
+                            fingerprint.update(metadata.mtime().to_be_bytes());
+                            fingerprint.update(metadata.mtime_nsec().to_be_bytes());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            fingerprint.update([0]);
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn component_state_digest(
     ed_store: &SigningKeyStore,
     pq_store: &MlDsaSigningKeyStore,
@@ -419,6 +468,8 @@ fn start_composite_authority_subscription(
         .spawn(move || {
             use nix::fcntl::{flock, FlockArg};
             use std::os::fd::AsRawFd;
+            let mut last_error: Option<String> = None;
+            let mut rejected_pending: Option<([u8; 32], std::time::Instant)> = None;
             loop {
                 if COMPOSITE_PUBLISHING.load(Ordering::Acquire) {
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -432,9 +483,23 @@ fn start_composite_authority_subscription(
                         .write(true)
                         .open(composite_ledger_lock_path(&secrets_dir))?;
                     flock(lock.as_raw_fd(), FlockArg::LockShared)?;
-                    let pending: CompositeLedger = serde_json::from_slice(&std::fs::read(
-                        composite_ledger_path(&secrets_dir),
-                    )?)?;
+                    let pending_bytes = std::fs::read(composite_ledger_path(&secrets_dir))?;
+                    let marker_bytes = std::fs::read(composite_committed_path(&secrets_dir))?;
+                    let mut fingerprint = Sha256::new();
+                    fingerprint.update(&pending_bytes);
+                    fingerprint.update(&marker_bytes);
+                    fingerprint_component_slot_files(&secrets_dir, &mut fingerprint)?;
+                    let fingerprint: [u8; 32] = fingerprint.finalize().into();
+                    if rejected_pending.as_ref().is_some_and(|(previous, at)| {
+                        *previous == fingerprint
+                            && at.elapsed() < std::time::Duration::from_secs(60)
+                    }) {
+                        // Neither the proposal nor its commit marker changed.
+                        // Retain the already-published authority without
+                        // repeatedly deserializing private signing keys.
+                        return Ok(());
+                    }
+                    let pending: CompositeLedger = serde_json::from_slice(&pending_bytes)?;
                     let ed = load_or_init_key_store(&secrets_dir, &OAuthConfig::default());
                     let pq = load_or_init_ml_dsa_key_store(&secrets_dir, &OAuthConfig::default());
                     // Acknowledgement means only that the proposed generation is
@@ -445,10 +510,13 @@ fn start_composite_authority_subscription(
                         let pq_slots = pq.0.blocking_read();
                         component_state_digest_from_slots(&ed_slots, &pq_slots, ca_key)
                     };
-                    anyhow::ensure!(
-                        pending.component_digest == local_digest,
-                        "pending composite ledger does not match local component authority"
-                    );
+                    if pending.component_digest != local_digest {
+                        rejected_pending = Some((fingerprint, std::time::Instant::now()));
+                        anyhow::bail!(
+                            "pending composite ledger does not match local component authority"
+                        );
+                    }
+                    rejected_pending = None;
                     let _staged = ledger_pairs_from_local_keys(&pending, &ed, &pq, ca_key, true)?;
                     super::identity_store::write_secret(
                         &subscribers,
@@ -472,10 +540,24 @@ fn start_composite_authority_subscription(
                     }
                     Ok(())
                 })();
-                if let Err(error) = load {
-                    tracing::warn!("composite authority reload failed closed: {error:#}");
+                match load {
+                    Ok(()) => {
+                        last_error = None;
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        if last_error.as_deref() != Some(&message) {
+                            tracing::warn!("composite authority reload failed closed: {message}");
+                            last_error = Some(message);
+                        }
+                        // A stale or interrupted pending generation cannot become
+                        // live authority. Retrying its expensive key-store load
+                        // every 25 ms can exhaust a small verifier host before a
+                        // publisher has a chance to replace the pending ledger.
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(25));
             }
         })?;
     Ok(())
@@ -663,6 +745,27 @@ async fn publish_composite_key_set(
     let persisted_digest = persisted
         .as_ref()
         .map(|ledger| ledger.component_digest.clone());
+    if persisted.is_none() {
+        // First bootstrap: every required active signing component must be
+        // loadable before any pending ledger, immutable snapshot, or commit
+        // marker is created. Publishing from an incomplete local signer set
+        // (a failed first-boot persistence, for example) would commit a
+        // generation with missing OAuth/Policy active pairs — and the commit
+        // marker then suppresses first-boot key generation on every restart,
+        // so a transient failure would require manual state recovery. With an
+        // existing commit marker this branch is skipped and the committed
+        // fail-closed behavior is unchanged.
+        let ed_active = ed_component_slots.active.is_some();
+        let pq_active = pq_component_slots.active.is_some();
+        anyhow::ensure!(
+            ed_active && pq_active,
+            "refusing to initialize composite authority from an incomplete \
+             local signer set (ed25519_active={} ml_dsa_active={}): resolve \
+             first-boot persistence and retry",
+            ed_active,
+            pq_active
+        );
+    }
     match (&persisted, expected_component_digest.as_deref()) {
         (Some(ledger), Some(expected)) => anyhow::ensure!(
             !ledger.component_digest.is_empty() && ledger.component_digest == expected,
@@ -696,18 +799,19 @@ async fn publish_composite_key_set(
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid persisted Ed25519 key length"))?;
         let ed_vk = ed25519_dalek::VerifyingKey::from_bytes(&ed_bytes)?;
-        let ed_signing =
-            if URL_SAFE_NO_PAD.encode(ca_key.verifying_key().to_bytes()) == record.ed25519_public {
-                Some(Arc::clone(&ca_key))
-            } else {
-                ed_slots
-                    .iter()
-                    .find(|slot| {
-                        URL_SAFE_NO_PAD.encode(slot.key.verifying_key().to_bytes())
-                            == record.ed25519_public
-                    })
-                    .map(|slot| Arc::clone(&slot.key))
-            };
+        let policy_ca_ed_matched =
+            URL_SAFE_NO_PAD.encode(ca_key.verifying_key().to_bytes()) == record.ed25519_public;
+        let ed_signing = if policy_ca_ed_matched {
+            Some(Arc::clone(&ca_key))
+        } else {
+            ed_slots
+                .iter()
+                .find(|slot| {
+                    URL_SAFE_NO_PAD.encode(slot.key.verifying_key().to_bytes())
+                        == record.ed25519_public
+                })
+                .map(|slot| Arc::clone(&slot.key))
+        };
         let role = if record.role == "policy" {
             CompositePairRole::Policy
         } else {
@@ -727,7 +831,14 @@ async fn publish_composite_key_set(
         if restoring_committed && state == CompositePairState::Active {
             anyhow::ensure!(
                 pq_signing.is_some() && ed_signing.is_some(),
-                "committed active composite signing pair is unavailable after restart"
+                "committed active composite signing pair is unavailable after restart: \
+                 kid={:?} role={:?} ed_component_available={} pq_component_available={} \
+                 policy_ca_ed_matched={}",
+                record.kid,
+                record.role,
+                ed_signing.is_some(),
+                pq_signing.is_some(),
+                policy_ca_ed_matched,
             );
         }
         pairs.push(match (pq_signing, ed_signing) {
@@ -763,11 +874,19 @@ async fn publish_composite_key_set(
                 })),
             "committed active composite signing authority is incomplete"
         );
+        let digest = persisted_digest.ok_or_else(|| {
+            anyhow::anyhow!("committed composite digest disappeared during restore")
+        })?;
         if persisted_version > current.version() {
-            let digest = persisted_digest.ok_or_else(|| {
-                anyhow::anyhow!("committed composite digest disappeared during restore")
-            })?;
             key_set.publish(persisted_version, digest, pairs)?;
+        } else {
+            // Standalone OAuth first installs this generation as a verifier in
+            // main. Restoring its local signer must attach the exact private
+            // handles without inventing a new ledger generation. Release our
+            // exclusive ledger lock before the attachment rechecks the commit
+            // under its own shared lock; the writer lock remains held.
+            drop(ledger_lock);
+            key_set.attach_committed_signing_keys(persisted_version, &digest, pairs)?;
         }
         #[cfg(not(test))]
         start_composite_authority_subscription(secrets_dir.to_path_buf(), ca_key.verifying_key())?;
@@ -1238,9 +1357,46 @@ fn generate_slot(nbf: i64, exp: i64) -> KeySlot {
 
 // ── Load or initialize slots at startup ────────────────────────────────────
 
+/// Serialize component reads/creation with other starters and slot mutations.
+/// A slot is two files, so atomic replacement of each file alone does not make
+/// first boot atomic. Every contender must re-read under this lock and adopt
+/// the durable winner, never publish a process-local losing key.
+///
+/// This is deliberately NOT the composite cycle/ledger lock: subscribers load
+/// slots while holding the ledger lock. Rotators release this short-lived lock
+/// before publication/acknowledgements, avoiding a ledger -> cycle inversion.
+fn lock_signing_slots(state_dir: &Path, nonblocking: bool) -> std::io::Result<std::fs::File> {
+    use nix::fcntl::{flock, FlockArg};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(state_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(state_dir.join("signing-slots.lock"))?;
+    flock(
+        file.as_raw_fd(),
+        if nonblocking {
+            FlockArg::LockExclusiveNonblock
+        } else {
+            FlockArg::LockExclusive
+        },
+    )?;
+    Ok(file)
+}
+
 /// Load all three JWT key slots from `secrets_dir`.
 ///
-/// If no active slot exists, generate one immediately (first boot).
+/// If no active slot exists, generate one immediately (first boot) — but only
+/// activate it when it persists; a persistence failure leaves the store
+/// without an active key rather than returning a process-only signer.
 /// Slot files: `jwt-signing-key.{active,drain,lead}` + `.meta` JSON.
 pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> SigningKeyStore {
     let now = chrono::Utc::now().timestamp();
@@ -1250,28 +1406,50 @@ pub fn load_or_init_key_store(secrets_dir: &Path, config: &OAuthConfig) -> Signi
     // Slots are state: read/write them via the writable state dir (#803),
     // falling back to the (possibly read-only, provisioned) secrets dir.
     let state_dir = rotation_state_dir(secrets_dir);
+    let _slot_lock = match lock_signing_slots(&state_dir, false) {
+        Ok(lock) => lock,
+        Err(error) => {
+            error!("Could not lock JWT signing slots: {error}; refusing initialization");
+            return SigningKeyStore::new(KeySlots::default());
+        }
+    };
+    let has_committed_authority = has_committed_composite_marker(secrets_dir);
     let drain = load_slot(&state_dir, "drain").or_else(|| load_slot(secrets_dir, "drain"));
     let mut active = load_slot(&state_dir, "active").or_else(|| load_slot(secrets_dir, "active"));
     let lead = load_slot(&state_dir, "lead").or_else(|| load_slot(secrets_dir, "lead"));
 
     if active.is_none() {
-        info!("No active JWT signing key found — generating on first boot");
-        let slot = generate_slot(now, now + active_secs);
-        if let Err(e) = persist_slot(&state_dir, "active", &slot) {
+        if has_committed_authority {
             error!(
-                "Could not persist active JWT key to '{}': {e}. The key is \
-                 process-ephemeral — every restart invalidates all issued tokens.",
-                state_dir.display()
+                "Committed composite authority exists but no active JWT signing slot is \
+                 available; refusing implicit key generation"
             );
         } else {
-            info!("Active JWT key generated (kid={})", slot.kid());
+            info!("No active JWT signing key found — generating on first boot");
+            let slot = generate_slot(now, now + active_secs);
+            // Disk-before-memory: the generated key becomes active only after
+            // its slot persisted. An unpersisted key is process-only — it can
+            // never be recovered after restart — so on failure the store stays
+            // without an active key instead of serving one.
+            match persist_slot(&state_dir, "active", &slot) {
+                Ok(()) => {
+                    info!("Active JWT key generated (kid={})", slot.kid());
+                    active = load_slot(&state_dir, "active");
+                }
+                Err(e) => error!(
+                    "Could not persist active JWT key to '{}': {e}. Refusing to \
+                     activate the unpersisted key; no active signer is available \
+                     until persistence succeeds on a restart.",
+                    state_dir.display()
+                ),
+            }
         }
-        active = Some(slot);
     }
 
     // If we have active but no lead and active is close to expiry, generate lead now.
-    let should_gen_lead =
-        lead.is_none() && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
+    let should_gen_lead = !has_committed_authority
+        && lead.is_none()
+        && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
     if should_gen_lead {
         let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
         let lead_exp = lead_nbf + active_secs;
@@ -1320,6 +1498,11 @@ pub fn load_or_init_root_identity_key_store(
     let mut active = load_slot(secrets_dir, "active");
     let lead = load_slot(secrets_dir, "lead");
 
+    // Documented follow-up (outside this repair): activation below is not
+    // gated on persistence success, unlike `load_or_init_key_store`. Recovery
+    // differs — the seed is the provisioned node identity key, reloadable
+    // from its own store — but the rotation slot can stay absent on disk
+    // until the next successful persist.
     if active.is_none() {
         let slot = KeySlot::new(initial_key, now, now + active_secs);
         if let Err(error) = persist_slot(secrets_dir, "active", &slot) {
@@ -1356,50 +1539,172 @@ pub fn load_or_init_root_identity_key_store(
 
 // ── Rotation logic ──────────────────────────────────────────────────────────
 
+/// Returns `true` when every signer slot this cycle touched finished fully
+/// restored (or promoted). `false` means a promotion rollback failed: the
+/// durable state is only partially restored, the old active signer stays
+/// recoverable in its drain-slot copy, and callers must not treat the cycle
+/// as a clean success. A later tick retries the queued lead.
 pub async fn rotate_jwt_keys(
     config: &OAuthConfig,
     secrets_dir: &Path,
     store: &SigningKeyStore,
     now: i64,
-) {
+) -> bool {
+    let state_dir = rotation_state_dir(secrets_dir);
+    let _slot_lock = match lock_signing_slots(&state_dir, true) {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!("Could not lock JWT signing slots; deferring rotation: {error}");
+            return false;
+        }
+    };
+    rotate_jwt_keys_in_state_dir(config, &state_dir, store, now).await
+}
+
+/// Rotation against an explicit state directory. Private test seam: passing a
+/// state dir that cannot hold files injects deterministic persistence
+/// failures without relying on permission bits.
+async fn rotate_jwt_keys_in_state_dir(
+    config: &OAuthConfig,
+    state_dir: &Path,
+    store: &SigningKeyStore,
+    now: i64,
+) -> bool {
     let mut slots = store.0.write().await;
 
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
     let drain_secs = config.drain_secs();
-    let state_dir = rotation_state_dir(secrets_dir);
 
     // 1. Promote lead → active if lead.nbf has passed.
-    if let Some(new_lead) = slots.lead.take().filter(|l| l.nbf <= now) {
-        let old_active = slots.active.take();
+    //
+    // Disk-before-memory: every persistence operation required to retain the
+    // old active signer (the durable drain write) and to durably install the
+    // new active signer must succeed before any in-memory slot changes. On a
+    // failure the previous active stays active in memory, the lead stays
+    // queued for the next tick, and no promotion is reported. The gate is
+    // successful completion of `persist_slot` (temp-file + rename); that is
+    // not proven power-loss durability, and key bytes and metadata remain two
+    // separate files (documented residuals of this repair).
+    if let Some(new_lead) = slots.lead.as_ref().filter(|l| l.nbf <= now).cloned() {
+        let old_active = slots.active.clone();
+        let old_drain = slots.drain.clone();
 
         info!("Promoting lead JWT key (kid={}) to active", new_lead.kid());
 
-        // Old active → drain (evict old drain first)
-        if let Some(prev_drain) = slots.drain.take() {
-            info!("Evicting drain JWT key (kid={})", prev_drain.kid());
-            delete_slot(&state_dir, "drain");
-        }
-        if let Some(old_active_slot) = old_active {
-            if let Err(e) = persist_slot(&state_dir, "drain", &old_active_slot) {
+        // Old active → drain, persisted first so a process that reloads
+        // between the writes can still verify the previous generation. The
+        // previous drain is not evicted up front: the atomic write replaces
+        // it, and it is restored if that write fails.
+        if let Some(ref old) = old_active {
+            if let Err(e) = persist_slot(state_dir, "drain", old) {
+                // A failed drain write can already have replaced the seed
+                // before its metadata write failed, so restoring (or
+                // removing) the previous drain is part of the rollback and
+                // its outcome must be confirmed before the cycle may claim
+                // fully restored state.
+                let drain_restored = if let Some(ref prev) = old_drain {
+                    persist_slot(state_dir, "drain", prev)
+                } else {
+                    delete_slot(state_dir, "drain");
+                    // Error-preserving removal proof: only a definite
+                    // NotFound for both files counts as removed; any other
+                    // metadata error leaves restoration unconfirmed.
+                    let (drain_key, drain_meta) = slot_paths(state_dir, "drain");
+                    let removed = [&drain_key, &drain_meta].iter().all(|path| {
+                        matches!(
+                            std::fs::symlink_metadata(path),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                        )
+                    });
+                    if !removed {
+                        Err(anyhow::anyhow!(
+                            "partial replacement drain slot still present after removal"
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                };
+                if let Err(drain_error) = drain_restored {
+                    error!(
+                        "Could not restore previous drain JWT key to '{}': \
+                         {drain_error}. The durable drain slot is not fully \
+                         restored; retaining the old active in memory and \
+                         retrying next tick.",
+                        state_dir.display()
+                    );
+                    return false;
+                }
                 error!(
-                    "Could not persist drain JWT key to '{}': {e}. Rotation state \
-                     will not survive restart.",
+                    "Could not persist drain JWT key to '{}': {e}. Retaining the \
+                     old active in memory; promotion will be retried next tick.",
                     state_dir.display()
                 );
+                return true;
             }
-            slots.drain = Some(old_active_slot);
         }
 
-        if let Err(e) = persist_slot(&state_dir, "active", &new_lead) {
+        if let Err(e) = persist_slot(state_dir, "active", &new_lead) {
+            // Roll back the active slot first, and only after that restore is
+            // confirmed touch the drain slot: the drain copy written above is
+            // the only durable copy of the old active signer, so a failing
+            // rollback must leave it in place for restart recovery instead of
+            // deleting or overwriting it with the previous drain.
+            let restored = match old_active {
+                Some(ref old) => persist_slot(state_dir, "active", old),
+                None => {
+                    delete_slot(state_dir, "active");
+                    Ok(())
+                }
+            };
+            if let Err(restore_error) = restored {
+                error!(
+                    "Could not restore active JWT key to '{}': {restore_error}. The \
+                     failed promotion left the old active signer only in its drain \
+                     slot; that recoverable copy is kept untouched and promotion \
+                     will be retried next tick.",
+                    state_dir.display()
+                );
+                return false;
+            }
+            if old_active.is_some() {
+                if let Some(ref prev) = old_drain {
+                    if let Err(drain_error) = persist_slot(state_dir, "drain", prev) {
+                        error!(
+                            "Could not restore previous drain JWT key to '{}': \
+                             {drain_error}. The old active signer is restored in the \
+                             active slot, but the durable drain slot may hold a \
+                             partial write; promotion will be retried next tick.",
+                            state_dir.display()
+                        );
+                        return false;
+                    }
+                } else {
+                    delete_slot(state_dir, "drain");
+                }
+            }
             error!(
-                "Could not persist active JWT key to '{}': {e}. The key is \
-                 process-ephemeral — every restart invalidates all issued tokens.",
+                "Could not persist active JWT key to '{}': {e}. Retaining the old \
+                 active in memory; promotion will be retried next tick.",
                 state_dir.display()
             );
+            return true;
         }
-        delete_slot(&state_dir, "lead");
+
+        // All persistence succeeded — swap the in-memory slots and clear the
+        // persisted lead slot.
+        if let Some(ref prev) = old_drain {
+            info!(
+                "Evicting previous drain JWT key (kid={}) during promotion",
+                prev.kid()
+            );
+        }
+        delete_slot(state_dir, "lead");
+        if let Some(old) = old_active {
+            slots.drain = Some(old);
+        }
         slots.active = Some(new_lead);
+        slots.lead = None;
     }
 
     // 2. Remove drain if drain window has closed.
@@ -1410,7 +1715,7 @@ pub async fn rotate_jwt_keys(
     {
         let kid = slots.drain.as_ref().map(KeySlot::kid).unwrap_or_default();
         info!("Removing expired drain JWT key (kid={kid})");
-        delete_slot(&state_dir, "drain");
+        delete_slot(state_dir, "drain");
         slots.drain = None;
     }
 
@@ -1426,7 +1731,7 @@ pub async fn rotate_jwt_keys(
                     new_lead.kid(),
                     new_lead.nbf
                 );
-                if let Err(e) = persist_slot(&state_dir, "lead", &new_lead) {
+                if let Err(e) = persist_slot(state_dir, "lead", &new_lead) {
                     error!(
                         "Could not persist lead JWT key to '{}': {e}. Rotation state \
                          will not survive restart.",
@@ -1437,6 +1742,7 @@ pub async fn rotate_jwt_keys(
             }
         }
     }
+    true
 }
 
 /// Rotate only the root-DID Ed25519 identity set.
@@ -1479,6 +1785,397 @@ pub struct RotationStores {
     pub composite_ca_key: Arc<SigningKey>,
 }
 
+/// The recovery transaction recorded when a rotation cycle defers composite
+/// publication: `committed_digest` names the marker-selected committed
+/// generation the cycle deferred against, and `states` contains only
+/// component digests computed from this process's in-memory stores. A fresh
+/// reload from mutable slot files is never certified as part of the failed
+/// cycle. A later tick may anchor publication only when its tick-start memory
+/// digest is in `states`, and the committed digest is still checked against
+/// the ledger. After restart, a matching reload may continue; a different
+/// reload remains untrusted and cannot advance the ledger. This prefers
+/// explicit repair over guessing which writer produced divergent disk state.
+#[derive(Clone, Serialize, Deserialize)]
+struct DeferredPredecessorRecord {
+    committed_digest: String,
+    states: Vec<String>,
+}
+
+static DEFERRED_PREDECESSOR_FALLBACK: parking_lot::RwLock<Option<DeferredPredecessorRecord>> =
+    parking_lot::RwLock::new(None);
+
+fn deferred_predecessor_path(secrets_dir: &Path) -> PathBuf {
+    rotation_state_dir(secrets_dir).join("jwt-composite-deferred-predecessor")
+}
+
+/// Cross-process serialization for one rotation cycle: component slot
+/// mutation, committed-predecessor validation, recovery-state capture and
+/// record lifecycle all happen while this lock is held, so no competing
+/// writer can interleave a component advance between them. The composite
+/// publisher's own ledger flock is acquired later, inside publication, so
+/// the lock order is cycle lock -> publisher lock and never the reverse.
+fn cycle_lock_path(secrets_dir: &Path) -> PathBuf {
+    rotation_state_dir(secrets_dir).join("jwt-composite-rotation-cycle.lock")
+}
+
+/// Read the recovery record. The in-process register is authoritative when
+/// present (it is set whenever the durable write could not be persisted);
+/// otherwise the durable file copy is parsed. A missing, unreadable, or
+/// malformed record reads as `None` — never as supersession.
+fn read_deferred_predecessor(secrets_dir: &Path) -> Option<DeferredPredecessorRecord> {
+    if let Some(record) = DEFERRED_PREDECESSOR_FALLBACK.read().clone() {
+        return Some(record);
+    }
+    let value = std::fs::read_to_string(deferred_predecessor_path(secrets_dir)).ok()?;
+    serde_json::from_str::<DeferredPredecessorRecord>(value.trim()).ok()
+}
+
+/// Persist the durable copy of the record; returns whether it was written.
+/// The in-process register retains the record until it is cleared or
+/// successfully advanced, so a failed durable write never loses the recovery
+/// transaction on its own.
+fn write_deferred_predecessor(secrets_dir: &Path, record: &DeferredPredecessorRecord) -> bool {
+    let state_dir = rotation_state_dir(secrets_dir);
+    match serde_json::to_vec(record) {
+        Ok(bytes) => super::identity_store::write_secret(
+            &state_dir,
+            "jwt-composite-deferred-predecessor",
+            &bytes,
+        )
+        .is_ok(),
+        Err(error) => {
+            warn!("could not serialize the deferred predecessor record: {error}");
+            false
+        }
+    }
+}
+
+fn clear_deferred_predecessor(secrets_dir: &Path) {
+    *DEFERRED_PREDECESSOR_FALLBACK.write() = None;
+    let _ = std::fs::remove_file(deferred_predecessor_path(secrets_dir));
+}
+
+/// One background rotation tick: rotate every algorithm store, refresh the
+/// published verifier snapshots, and — only when every rotation finished
+/// fully restored — republish the composite authority. A cycle that ended
+/// not fully restored (a failed promotion rollback) must not publish: the
+/// durable slots diverge from what memory would propose, so a staged pending
+/// ledger could never be acknowledged and would only strand a divergent
+/// proposal next to the retained prior authority.
+///
+/// When a cycle defers, the cycle records a recovery transaction: the
+/// committed component digest it deferred against (validated to match the
+/// marker-selected committed ledger) plus the certified component states it
+/// left behind (post-rotation memory and the durable disk state). A later
+/// all-restored tick anchors publication on the recorded committed digest
+/// only when its own tick-start memory digest is one of the certified
+/// states — proving its stores continue exactly that recorded transition;
+/// any other record is ignored, and stores that match nothing keep the
+/// pre-existing stale-authority rejection. Every anchored cycle advances
+/// the certified states to its own post-rotation outcome, so recovery
+/// survives chained deferrals, failed recovery publications, and restarts.
+/// The record is durable (survives restart), cleared on successful
+/// publication, retained on validation I/O errors, and discarded only after
+/// a verified supersession, followed by one retry anchored on current
+/// memory. Recovery therefore survives chained deferrals and failed
+/// recovery publications (each certified cycle re-certifies its own
+/// outcome); a restart recovers while the on-disk state still digests to a
+/// certified state and fail-closes (retaining prior authority) after a
+/// foreign writer mutates the shared slot files. Returns `true` when every
+/// rotation finished fully restored; a lock-contended tick skips without
+/// rotating and also returns `true` (the competing cycle owns the
+/// transition; this tick changes nothing).
+async fn run_rotation_cycle(
+    config: &OAuthConfig,
+    secrets_dir: &Path,
+    store: &SigningKeyStore,
+    extra: &RotationStores,
+    now: i64,
+) -> bool {
+    // Serialize the whole cycle against competing writers: slot mutation,
+    // predecessor validation, recovery-state capture and record lifecycle
+    // must not interleave with another process's cycle, or a captured state
+    // could certify a transition it did not produce. A contending writer
+    // skips its tick entirely and retries on the next interval. The
+    // publisher's ledger flock is acquired later, inside publication, so the
+    // lock order is cycle lock -> publisher lock and never the reverse.
+    let cycle_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(cycle_lock_path(secrets_dir))
+        .map_err(|error| {
+            warn!("could not open the rotation cycle lock: {error}");
+        });
+    let cycle_lock = match cycle_lock {
+        Ok(file) => file,
+        Err(()) => return true,
+    };
+    use nix::fcntl::{flock, FlockArg};
+    use std::os::fd::AsRawFd as _;
+    if let Err(error) = flock(cycle_lock.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
+        warn!(
+            "another rotation cycle holds the cycle lock; skipping this tick \
+             ({error})"
+        );
+        return true;
+    }
+
+    let pre_rotation_digest = if let Some(ref ml_dsa) = extra.ml_dsa {
+        Some(component_state_digest(store, ml_dsa, extra.composite_ca_key.verifying_key()).await)
+    } else {
+        None
+    };
+    let mut all_restored = rotate_jwt_keys(config, secrets_dir, store, now).await;
+    if !all_restored {
+        warn!(
+            "Ed25519 rotation ended not fully restored: a failed promotion \
+             rollback left the signer slots only partially restored; the old \
+             active signer remains active in memory and publication is \
+             deferred until a retry fully restores it"
+        );
+    }
+    // Keep the shared HTTP validator's published Ed25519 key set current after
+    // every rotation (drain evicted / lead promoted → active). Memory is
+    // unchanged on a not-restored cycle, so the previously published verifier
+    // state is retained there by construction.
+    refresh_ed25519_verifying_keys(store).await;
+    if let Some(ref es256) = extra.es256 {
+        rotate_es256_keys(config, secrets_dir, es256, now).await;
+        // C4 (#1170): re-seal the op-log head after the ES256
+        // promotion so cross-process readers (the registry's
+        // `PdsPublisher` under `--ipc`) observe the new active
+        // `#atproto` generation. Dedicated head-signing key + shared
+        // state dir; async because the ES256 store is a tokio RwLock
+        // (F1). C2 (#1168) seam — see `auth::op_log`.
+        if let Err(error) = super::op_log::advance_sealed_head(secrets_dir, es256).await {
+            error!(
+                "failed to re-seal op-log head after ES256 rotation; \
+                 cross-process readers will retain the prior generation: {error}"
+            );
+        }
+    }
+    if let (Some(ref ml_dsa), Some(pre_rotation)) = (&extra.ml_dsa, pre_rotation_digest.as_deref())
+    {
+        let pq_restored = rotate_ml_dsa_keys(config, secrets_dir, ml_dsa, now).await;
+        all_restored &= pq_restored;
+        if !pq_restored {
+            warn!(
+                "ML-DSA rotation ended not fully restored: a failed promotion \
+                 rollback left the signer slots only partially restored; the old \
+                 active signer remains active in memory and publication is \
+                 deferred until a retry fully restores it"
+            );
+        }
+        refresh_ml_dsa_verifying_keys(ml_dsa).await;
+        let post_memory =
+            component_state_digest(store, ml_dsa, extra.composite_ca_key.verifying_key()).await;
+        // The recovery record applies only when this tick's component memory
+        // is one of the certified states of the recorded deferred transition;
+        // a record describing some other transition is ignored (never used,
+        // never treated as supersession).
+        let retained = read_deferred_predecessor(secrets_dir);
+        let certified = retained
+            .as_ref()
+            .map(|record| record.states.iter().any(|state| state == pre_rotation))
+            .unwrap_or(false);
+        let anchor = match retained.as_ref() {
+            Some(record) if certified => {
+                info!(
+                    "anchoring deferred composite publication on the retained \
+                     committed predecessor"
+                );
+                Some(record.committed_digest.clone())
+            }
+            _ => None,
+        };
+        // Post-rotation component state: the cycle's in-memory outcome and the
+        // durable slot state (what a restarted process would reload). Anchored
+        // cycles certify this outcome as the transition's next state.
+        if all_restored {
+            let expected = anchor.as_deref().unwrap_or(pre_rotation);
+            match refresh_composite_key_set(
+                secrets_dir,
+                store,
+                ml_dsa,
+                Arc::clone(&extra.composite_ca_key),
+                config.drain_secs(),
+                expected,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if retained.is_some() {
+                        clear_deferred_predecessor(secrets_dir);
+                    }
+                }
+                Err(error) => {
+                    // Distinguish verified supersession from unavailable
+                    // authority: only a successfully read ledger whose digest
+                    // differs proves the recorded recovery transaction was
+                    // superseded by a competing publication. A read failure
+                    // retains the record and the prior authority. An anchored
+                    // (certified) cycle that failed to publish advances the
+                    // certified states to this tick's post-rotation outcome,
+                    // so the next tick can still anchor and publish.
+                    let superseded = retained.as_ref().map(|record| {
+                        read_committed_composite_ledger(secrets_dir)
+                            .map(|(_, ledger)| ledger.component_digest != record.committed_digest)
+                            .unwrap_or(false)
+                    });
+                    match (retained.as_ref(), superseded) {
+                        (Some(_record), Some(true)) => {
+                            // Verified supersession: the recorded committed
+                            // predecessor no longer matches the ledger.
+                            clear_deferred_predecessor(secrets_dir);
+                            warn!(
+                                "deferred composite predecessor superseded by a \
+                                 competing publication; retrying once anchored on \
+                                 current component memory"
+                            );
+                            if let Err(retry_error) = refresh_composite_key_set(
+                                secrets_dir,
+                                store,
+                                ml_dsa,
+                                Arc::clone(&extra.composite_ca_key),
+                                config.drain_secs(),
+                                pre_rotation,
+                            )
+                            .await
+                            {
+                                warn!(
+                                    "composite key-set publication failed; retaining \
+                                     prior authority: {retry_error}"
+                                );
+                            }
+                        }
+                        (Some(record), _) if certified => {
+                            // Anchored (certified) cycle whose publication
+                            // failed: advance the certified states to this
+                            // tick's own post-rotation memory outcome, keeping
+                            // the committed predecessor, so the next tick can
+                            // still anchor and publish the recovery. Only the
+                            // memory outcome is certified here: the durable
+                            // slot files this tick did not rewrite cannot be
+                            // proven to continue the transition (another
+                            // writer may have replaced them), so the disk
+                            // digest is never added by an advance.
+                            let advanced = DeferredPredecessorRecord {
+                                committed_digest: record.committed_digest.clone(),
+                                states: vec![post_memory.clone()],
+                            };
+                            if write_deferred_predecessor(secrets_dir, &advanced) {
+                                *DEFERRED_PREDECESSOR_FALLBACK.write() = None;
+                            } else {
+                                *DEFERRED_PREDECESSOR_FALLBACK.write() = Some(advanced);
+                            }
+                            warn!(
+                                "composite key-set publication failed; the certified \
+                                 recovery state advanced with this tick's rotations \
+                                 and publication will be retried"
+                            );
+                        }
+                        _ => {
+                            // An uncertified record must never acquire this
+                            // tick's outcome: the stale-authority rejection
+                            // stands, the retained record is left untouched
+                            // for its own writer, and the prior authority is
+                            // kept.
+                            warn!(
+                                "composite key-set publication failed; retaining prior \
+                                 authority: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            // Seed only from the state computed in this process. The
+            // pre-rotation digest must still match the committed ledger; an
+            // already-drifted store keeps the stale-authority rejection. Do
+            // not reload and certify mutable slot files: another writer may
+            // have changed them before this record was created. After a
+            // restart, a disk digest not in this record cannot authorize a
+            // retry; explicit repair is safer than guessing.
+            //
+            // A chained certified deferral (record present, memory still
+            // certified) advances the certified states to this tick's own
+            // memory outcome only when a family durably advanced; when the
+            // failure left the transition unchanged, the record is kept
+            // as-is. Durable slot files a tick did not rewrite cannot be
+            // proven to continue the transition (another writer may have
+            // replaced them between cycles), so their digest is never
+            // certified by an advance — restart recovery after such an
+            // advance fail-closes instead of authorizing a foreign state.
+            // A failed record write retains the record in memory, and the
+            // durable copy is retried on later ticks.
+            match retained.as_ref() {
+                None => {
+                    if let Ok((_, ledger)) = read_committed_composite_ledger(secrets_dir) {
+                        if ledger.component_digest == pre_rotation {
+                            let record = DeferredPredecessorRecord {
+                                committed_digest: pre_rotation.to_owned(),
+                                states: vec![post_memory.clone()],
+                            };
+                            if write_deferred_predecessor(secrets_dir, &record) {
+                                info!(
+                                    "composite publication deferred; committed predecessor \
+                                     and certified deferred states recorded for recovery"
+                                );
+                            } else {
+                                *DEFERRED_PREDECESSOR_FALLBACK.write() = Some(record);
+                                warn!(
+                                    "could not persist the deferred predecessor record; \
+                                     retaining it in memory for this process"
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(record) if certified => {
+                    let states = if post_memory == *pre_rotation {
+                        // Transition unchanged (the same failure repeated):
+                        // the recorded states already describe it.
+                        record.states.clone()
+                    } else {
+                        // A family durably advanced in this cycle: certify
+                        // only the memory outcome.
+                        vec![post_memory.clone()]
+                    };
+                    let advanced = DeferredPredecessorRecord {
+                        committed_digest: record.committed_digest.clone(),
+                        states,
+                    };
+                    if write_deferred_predecessor(secrets_dir, &advanced) {
+                        *DEFERRED_PREDECESSOR_FALLBACK.write() = None;
+                    } else {
+                        *DEFERRED_PREDECESSOR_FALLBACK.write() = Some(advanced);
+                    }
+                }
+                Some(_) => {
+                    // Uncertified record: it is not this tick's transition, so
+                    // it is left untouched. The durable copy of the in-process
+                    // register is refreshed (the register holds solely
+                    // certified-at-write-time records); a durable file copy is
+                    // left as-is.
+                    if !deferred_predecessor_path(secrets_dir).exists() {
+                        if let Some(record) = DEFERRED_PREDECESSOR_FALLBACK.read().clone() {
+                            write_deferred_predecessor(secrets_dir, &record);
+                        }
+                    }
+                }
+            }
+            warn!(
+                "rotation cycle ended not fully restored; deferring composite \
+                 key-set publication so the cycle cannot publish as successfully \
+                 restored"
+            );
+        }
+    }
+    all_restored
+}
+
 pub fn spawn_rotation_task(
     config: Arc<OAuthConfig>,
     secrets_dir: PathBuf,
@@ -1500,55 +2197,7 @@ pub fn spawn_rotation_task(
         loop {
             interval.tick().await;
             let now = chrono::Utc::now().timestamp();
-            let expected_component_digest = if let Some(ref ml_dsa) = extra.ml_dsa {
-                Some(
-                    component_state_digest(&store, ml_dsa, extra.composite_ca_key.verifying_key())
-                        .await,
-                )
-            } else {
-                None
-            };
-            rotate_jwt_keys(&config, &secrets_dir, &store, now).await;
-            // Keep the shared HTTP validator's published Ed25519 key set current
-            // after every rotation (drain evicted / lead promoted → active).
-            refresh_ed25519_verifying_keys(&store).await;
-            if let Some(ref es256) = extra.es256 {
-                rotate_es256_keys(&config, &secrets_dir, es256, now).await;
-                // C4 (#1170): re-seal the op-log head after the ES256
-                // promotion so cross-process readers (the registry's
-                // `PdsPublisher` under `--ipc`) observe the new active
-                // `#atproto` generation. Dedicated head-signing key + shared
-                // state dir; async because the ES256 store is a tokio RwLock
-                // (F1). C2 (#1168) seam — see `auth::op_log`.
-                if let Err(error) =
-                    super::op_log::advance_sealed_head(&secrets_dir, es256).await
-                {
-                    error!(
-                        "failed to re-seal op-log head after ES256 rotation; \
-                         cross-process readers will retain the prior generation: {error}"
-                    );
-                }
-            }
-            if let (Some(ref ml_dsa), Some(expected_component_digest)) =
-                (&extra.ml_dsa, expected_component_digest.as_deref())
-            {
-                rotate_ml_dsa_keys(&config, &secrets_dir, ml_dsa, now).await;
-                refresh_ml_dsa_verifying_keys(ml_dsa).await;
-                if let Err(error) = refresh_composite_key_set(
-                    &secrets_dir,
-                    &store,
-                    ml_dsa,
-                    Arc::clone(&extra.composite_ca_key),
-                    config.drain_secs(),
-                    expected_component_digest,
-                )
-                .await
-                {
-                    warn!(
-                        "composite key-set publication failed; retaining prior authority: {error}"
-                    );
-                }
-            }
+            run_rotation_cycle(&config, &secrets_dir, &store, &extra, now).await;
         }
     });
 }
@@ -1776,11 +2425,72 @@ pub fn load_or_init_es256_key_store(
     secrets_dir: &Path,
     config: &OAuthConfig,
 ) -> Es256SigningKeyStore {
+    match super::op_log::resolve_oplog_state_dir(secrets_dir) {
+        Ok(state_dir) => {
+            load_or_init_es256_key_store_with_oplog_state_dir(secrets_dir, config, &state_dir)
+        }
+        Err(error) => {
+            error!(
+                "Could not resolve durable ES256 operation-log authority: {error}; refusing implicit key generation"
+            );
+            load_or_init_es256_key_store_with_authority(secrets_dir, config, || true)
+        }
+    }
+}
+
+fn load_or_init_es256_key_store_with_oplog_state_dir(
+    secrets_dir: &Path,
+    config: &OAuthConfig,
+    oplog_state_dir: &Path,
+) -> Es256SigningKeyStore {
+    load_or_init_es256_key_store_with_authority(secrets_dir, config, || {
+        match has_es256_oplog_authority(oplog_state_dir) {
+            Ok(present) => present,
+            Err(error) => {
+                error!(
+                    "Could not inspect durable ES256 operation-log authority: {error}; refusing implicit key generation"
+                );
+                true
+            }
+        }
+    })
+}
+
+fn has_es256_oplog_authority(state_dir: &Path) -> std::io::Result<bool> {
+    use std::io::ErrorKind;
+
+    for name in [
+        super::op_log::SEALED_HEAD_FILENAME,
+        super::op_log::SEALED_HEAD_MAX_SEQ_FILENAME,
+        super::op_log::HEAD_VERIFYING_KEY_FILENAME,
+    ] {
+        match std::fs::symlink_metadata(state_dir.join(name)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn load_or_init_es256_key_store_with_authority(
+    secrets_dir: &Path,
+    config: &OAuthConfig,
+    has_durable_authority: impl FnOnce() -> bool,
+) -> Es256SigningKeyStore {
     let now = chrono::Utc::now().timestamp();
     let active_secs = config.active_secs();
     let lead_secs = config.lead_secs();
 
     let state_dir = rotation_state_dir(secrets_dir);
+    let _slot_lock = match lock_signing_slots(&state_dir, false) {
+        Ok(lock) => lock,
+        Err(error) => {
+            error!("Could not lock ES256 signing slots: {error}; refusing initialization");
+            return Es256SigningKeyStore::new(Es256KeySlots::default());
+        }
+    };
+    let has_durable_authority = has_durable_authority();
     let mut drain =
         load_es256_slot(&state_dir, "drain").or_else(|| load_es256_slot(secrets_dir, "drain"));
     let mut active =
@@ -1800,18 +2510,27 @@ pub fn load_or_init_es256_key_store(
     }
 
     if active.is_none() {
-        info!("No active ES256 signing key found — generating on first boot");
-        let slot = generate_es256_slot(now, now + active_secs);
-        if let Err(e) = persist_es256_slot(&state_dir, "active", &slot) {
+        if has_durable_authority {
             error!(
-                "Could not persist active ES256 key to '{}': {e}. The key is \
-                 process-ephemeral — every restart invalidates all issued tokens.",
-                state_dir.display()
+                "Durable ES256 operation-log authority exists but no active signing slot is \
+                 available; refusing implicit key generation"
             );
         } else {
-            info!("Active ES256 key generated (kid={})", slot.kid());
+            info!("No active ES256 signing key found — generating on first boot");
+            let slot = generate_es256_slot(now, now + active_secs);
+            match persist_es256_slot(&state_dir, "active", &slot) {
+                Ok(()) => {
+                    info!("Active ES256 key generated (kid={})", slot.kid());
+                    active = load_es256_slot(&state_dir, "active");
+                }
+                Err(error) => error!(
+                    "Could not persist active ES256 key to '{}': {error}. Refusing \
+                     to activate the unpersisted key; no active signer is available \
+                     until persistence succeeds on a restart.",
+                    state_dir.display()
+                ),
+            }
         }
-        active = Some(slot);
     }
 
     let should_gen_lead =
@@ -1856,6 +2575,13 @@ pub async fn rotate_es256_keys(
     now: i64,
 ) -> bool {
     let state_dir = rotation_state_dir(secrets_dir);
+    let _slot_lock = match lock_signing_slots(&state_dir, true) {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!("Could not lock ES256 signing slots; deferring rotation: {error}");
+            return false;
+        }
+    };
     rotate_es256_keys_in_state_dir(config, &state_dir, store, now).await
 }
 
@@ -1931,9 +2657,7 @@ async fn rotate_es256_keys_in_state_dir(
                         "ES256: failed to restore PDS head after promotion failure: {rollback_error}"
                     );
                 }
-                if let Err(rollback_error) =
-                    persist_es256_slot(state_dir, "active", old_active)
-                {
+                if let Err(rollback_error) = persist_es256_slot(state_dir, "active", old_active) {
                     warn!(
                         "ES256: failed to restore persisted active after promotion failure: {rollback_error}"
                     );
@@ -1942,9 +2666,7 @@ async fn rotate_es256_keys_in_state_dir(
                 delete_es256_slot(state_dir, "active");
             }
             if let Some(ref old_drain) = old_drain {
-                if let Err(rollback_error) =
-                    persist_es256_slot(state_dir, "drain", old_drain)
-                {
+                if let Err(rollback_error) = persist_es256_slot(state_dir, "drain", old_drain) {
                     warn!(
                         "ES256: failed to restore persisted drain after promotion failure: {rollback_error}"
                     );
@@ -2144,6 +2866,14 @@ mod ml_dsa_rotation {
         let lead_secs = config.lead_secs();
 
         let state_dir = rotation_state_dir(secrets_dir);
+        let _slot_lock = match lock_signing_slots(&state_dir, false) {
+            Ok(lock) => lock,
+            Err(error) => {
+                error!("Could not lock ML-DSA signing slots: {error}; refusing initialization");
+                return MlDsaSigningKeyStore::new(MlDsaKeySlots::default());
+            }
+        };
+        let has_committed_authority = has_committed_composite_marker(secrets_dir);
         let drain = load_ml_dsa_slot(&state_dir, "drain")
             .or_else(|| load_ml_dsa_slot(secrets_dir, "drain"));
         let mut active = load_ml_dsa_slot(&state_dir, "active")
@@ -2152,22 +2882,34 @@ mod ml_dsa_rotation {
             load_ml_dsa_slot(&state_dir, "lead").or_else(|| load_ml_dsa_slot(secrets_dir, "lead"));
 
         if active.is_none() {
-            info!("No active ML-DSA-65 signing key found — generating on first boot");
-            let slot = generate_ml_dsa_slot(now, now + active_secs);
-            if let Err(e) = persist_ml_dsa_slot(&state_dir, "active", &slot) {
+            if has_committed_authority {
                 error!(
-                    "Could not persist active ML-DSA key to '{}': {e}. The key is \
-                     process-ephemeral — every restart invalidates all issued tokens.",
-                    state_dir.display()
+                    "Committed composite authority exists but no active ML-DSA signing slot is \
+                     available; refusing implicit key generation"
                 );
             } else {
-                info!("Active ML-DSA-65 key generated");
+                info!("No active ML-DSA-65 signing key found — generating on first boot");
+                let slot = generate_ml_dsa_slot(now, now + active_secs);
+                // Disk-before-memory, matching `load_or_init_key_store`: the
+                // generated key activates only after its slot persisted.
+                match persist_ml_dsa_slot(&state_dir, "active", &slot) {
+                    Ok(()) => {
+                        info!("Active ML-DSA-65 key generated");
+                        active = load_ml_dsa_slot(&state_dir, "active");
+                    }
+                    Err(e) => error!(
+                        "Could not persist active ML-DSA key to '{}': {e}. Refusing \
+                         to activate the unpersisted key; no active signer is \
+                         available until persistence succeeds on a restart.",
+                        state_dir.display()
+                    ),
+                }
             }
-            active = Some(slot);
         }
 
-        let should_gen_lead =
-            lead.is_none() && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
+        let should_gen_lead = !has_committed_authority
+            && lead.is_none()
+            && active.as_ref().is_some_and(|a| a.exp - now < lead_secs);
         if should_gen_lead {
             let lead_nbf = active.as_ref().map(|a| a.exp).unwrap_or(now) - lead_secs;
             let lead_exp = lead_nbf + active_secs;
@@ -2193,51 +2935,162 @@ mod ml_dsa_rotation {
         })
     }
 
+    /// Returns `true` when every signer slot this cycle touched finished fully
+    /// restored (or promoted). `false` means a promotion rollback failed: the
+    /// durable state is only partially restored, the old active signer stays
+    /// recoverable in its drain-slot copy, and callers must not treat the
+    /// cycle as a clean success. A later tick retries the queued lead.
     pub async fn rotate_ml_dsa_keys(
         config: &OAuthConfig,
         secrets_dir: &Path,
         store: &MlDsaSigningKeyStore,
         now: i64,
-    ) {
+    ) -> bool {
+        let state_dir = rotation_state_dir(secrets_dir);
+        let _slot_lock = match lock_signing_slots(&state_dir, true) {
+            Ok(lock) => lock,
+            Err(error) => {
+                warn!("Could not lock ML-DSA signing slots; deferring rotation: {error}");
+                return false;
+            }
+        };
+        rotate_ml_dsa_keys_in_state_dir(config, &state_dir, store, now).await
+    }
+
+    /// Rotation against an explicit state directory. Private test seam: a
+    /// state dir that cannot hold files injects deterministic persistence
+    /// failures without relying on permission bits.
+    pub(super) async fn rotate_ml_dsa_keys_in_state_dir(
+        config: &OAuthConfig,
+        state_dir: &Path,
+        store: &MlDsaSigningKeyStore,
+        now: i64,
+    ) -> bool {
         let mut slots = store.0.write().await;
         let active_secs = config.active_secs();
         let lead_secs = config.lead_secs();
         let drain_secs = config.drain_secs();
-        let state_dir = rotation_state_dir(secrets_dir);
 
-        // Phase 1: promote lead → active
-        let lead_ready = slots.lead.as_ref().is_some_and(|lead| lead.nbf <= now);
-        if lead_ready {
-            if let Some(new_active) = slots.lead.take() {
-                if let Some(old_active) = slots.active.take() {
-                    delete_ml_dsa_slot(&state_dir, "drain");
-                    if let Err(e) = persist_ml_dsa_slot(&state_dir, "drain", &old_active) {
+        // Phase 1: promote lead → active. Same disk-before-memory contract as
+        // the Ed25519 rotation: the durable drain write (retaining the old
+        // active) and the durable active write (installing the new signer)
+        // must both succeed before any in-memory slot changes. On a failure
+        // the old active stays active in memory, the lead stays queued, the
+        // pre-promotion durable state is restored best-effort, and no
+        // promotion is reported. The gate is successful completion of
+        // `persist_ml_dsa_slot`; not proven power-loss durability (residual).
+        if let Some(new_active) = slots.lead.as_ref().filter(|lead| lead.nbf <= now).cloned() {
+            let old_active = slots.active.clone();
+            let old_drain = slots.drain.clone();
+
+            info!("ML-DSA: promoting lead to active");
+
+            if let Some(ref old) = old_active {
+                if let Err(e) = persist_ml_dsa_slot(state_dir, "drain", old) {
+                    // Mirror of the Ed25519 rollback: the restore (or removal)
+                    // of the previous drain is part of the rollback and its
+                    // outcome must be confirmed.
+                    let drain_restored = if let Some(ref prev) = old_drain {
+                        persist_ml_dsa_slot(state_dir, "drain", prev)
+                    } else {
+                        delete_ml_dsa_slot(state_dir, "drain");
+                        // Error-preserving removal proof, mirroring Ed25519.
+                        let (drain_key, drain_meta) = ml_dsa_slot_paths(state_dir, "drain");
+                        let removed = [&drain_key, &drain_meta].iter().all(|path| {
+                            matches!(
+                                std::fs::symlink_metadata(path),
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                            )
+                        });
+                        if !removed {
+                            Err(anyhow::anyhow!(
+                                "partial replacement drain slot still present after removal"
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    if let Err(drain_error) = drain_restored {
                         error!(
-                            "ML-DSA: failed to persist drain slot to '{}': {e}. Rotation \
-                             state will not survive restart.",
+                            "ML-DSA: could not restore previous drain slot to '{}': \
+                             {drain_error}. The durable drain slot is not fully \
+                             restored; retaining the old active in memory and \
+                             retrying next tick.",
                             state_dir.display()
                         );
+                        return false;
                     }
-                    slots.drain = Some(old_active);
-                }
-                if let Err(e) = persist_ml_dsa_slot(&state_dir, "active", &new_active) {
                     error!(
-                        "ML-DSA: failed to persist promoted active to '{}': {e}. The key \
-                         is process-ephemeral — every restart invalidates all issued \
-                         tokens.",
+                        "ML-DSA: failed to persist drain slot to '{}': {e}. Retaining \
+                         the old active in memory; promotion will be retried next \
+                         tick.",
                         state_dir.display()
                     );
+                    return true;
                 }
-                delete_ml_dsa_slot(&state_dir, "lead");
-                slots.active = Some(new_active);
-                info!("ML-DSA: promoted lead → active");
             }
+
+            if let Err(e) = persist_ml_dsa_slot(state_dir, "active", &new_active) {
+                // Roll back the active slot first, and only after that restore
+                // is confirmed touch the drain slot: the drain copy written
+                // above is the only durable copy of the old active signer, so
+                // a failing rollback must leave it in place for restart
+                // recovery instead of deleting or overwriting it with the
+                // previous drain.
+                let restored = match old_active {
+                    Some(ref old) => persist_ml_dsa_slot(state_dir, "active", old),
+                    None => {
+                        delete_ml_dsa_slot(state_dir, "active");
+                        Ok(())
+                    }
+                };
+                if let Err(restore_error) = restored {
+                    error!(
+                        "ML-DSA: could not restore active key to '{}': {restore_error}. \
+                         The failed promotion left the old active signer only in its \
+                         drain slot; that recoverable copy is kept untouched and \
+                         promotion will be retried next tick.",
+                        state_dir.display()
+                    );
+                    return false;
+                }
+                if old_active.is_some() {
+                    if let Some(ref prev) = old_drain {
+                        if let Err(drain_error) = persist_ml_dsa_slot(state_dir, "drain", prev) {
+                            error!(
+                                "ML-DSA: could not restore previous drain slot to '{}': \
+                                 {drain_error}. The old active signer is restored in the \
+                                 active slot, but the durable drain slot may hold a \
+                                 partial write; promotion will be retried next tick.",
+                                state_dir.display()
+                            );
+                            return false;
+                        }
+                    } else {
+                        delete_ml_dsa_slot(state_dir, "drain");
+                    }
+                }
+                error!(
+                    "ML-DSA: failed to persist promoted active to '{}': {e}. Retaining \
+                     the old active in memory; promotion will be retried next tick.",
+                    state_dir.display()
+                );
+                return true;
+            }
+
+            delete_ml_dsa_slot(state_dir, "lead");
+            if let Some(old) = old_active {
+                slots.drain = Some(old);
+            }
+            slots.active = Some(new_active);
+            slots.lead = None;
+            info!("ML-DSA: promoted lead → active");
         }
 
         // Phase 2: remove expired drain
         if let Some(ref drain) = slots.drain {
             if now >= drain.exp + drain_secs {
-                delete_ml_dsa_slot(&state_dir, "drain");
+                delete_ml_dsa_slot(state_dir, "drain");
                 slots.drain = None;
                 info!("ML-DSA: removed expired drain slot");
             }
@@ -2249,7 +3102,7 @@ mod ml_dsa_rotation {
                 let lead_nbf = active.exp - lead_secs;
                 let lead_exp = lead_nbf + active_secs;
                 let new_lead = generate_ml_dsa_slot(lead_nbf, lead_exp);
-                if let Err(e) = persist_ml_dsa_slot(&state_dir, "lead", &new_lead) {
+                if let Err(e) = persist_ml_dsa_slot(state_dir, "lead", &new_lead) {
                     error!(
                         "ML-DSA: failed to persist new lead to '{}': {e}. Rotation state \
                          will not survive restart.",
@@ -2261,6 +3114,7 @@ mod ml_dsa_rotation {
                 slots.lead = Some(new_lead);
             }
         }
+        true
     }
 }
 
@@ -2275,7 +3129,124 @@ pub use ml_dsa_rotation::{
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn committed_active_pair_failure_reports_safe_component_availability() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_DIAGNOSTIC_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::committed_active_pair_failure_reports_safe_component_availability",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let ca = Arc::new(SigningKey::from_bytes(&[0x61; 32]));
+        let ed = SigningKeyStore::new(KeySlots {
+            active: Some(KeySlot::new(
+                SigningKey::from_bytes(&[0x62; 32]),
+                now - 60,
+                now + 3600,
+            )),
+            ..KeySlots::default()
+        });
+        let pq = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            active: Some(ml_dsa_rotation::generate_ml_dsa_slot(now - 60, now + 3600)),
+            ..MlDsaKeySlots::default()
+        });
+        initialize_composite_key_set(dir.path(), &ed, &pq, Arc::clone(&ca), 300)
+            .await
+            .unwrap();
+        let commit: CompositeCommit =
+            serde_json::from_slice(&std::fs::read(composite_committed_path(dir.path())).unwrap())
+                .unwrap();
+        let immutable = composite_committed_ledger_path(dir.path(), &commit);
+        let mut ledger: CompositeLedger =
+            serde_json::from_slice(&std::fs::read(&immutable).unwrap()).unwrap();
+        let oauth = ledger
+            .pairs
+            .iter()
+            .find(|pair| pair.role == "oauth" && pair.state == "active")
+            .unwrap();
+
+        let missing_ed = SigningKeyStore::new(KeySlots::default());
+        let error =
+            initialize_composite_key_set(dir.path(), &missing_ed, &pq, Arc::clone(&ca), 300)
+                .await
+                .expect_err("missing committed OAuth Ed component must fail closed");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "committed active composite signing pair is unavailable after restart: \
+                 kid={:?} role={:?} ed_component_available=false pq_component_available=true \
+                 policy_ca_ed_matched=false",
+                oauth.kid, oauth.role,
+            )
+        );
+        assert!(!error.to_string().contains(&oauth.ed25519_public));
+        assert!(!error.to_string().contains(&oauth.ml_dsa_public));
+
+        // Put Policy first in this synthetic committed snapshot so the same
+        // restore check reports its CA match when the PQ component is absent.
+        ledger.pairs.sort_by_key(|pair| pair.role != "policy");
+        std::fs::write(&immutable, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        let policy = ledger
+            .pairs
+            .iter()
+            .find(|pair| pair.role == "policy" && pair.state == "active")
+            .unwrap();
+        let missing_pq = MlDsaSigningKeyStore::new(MlDsaKeySlots::default());
+        let error = initialize_composite_key_set(dir.path(), &ed, &missing_pq, ca, 300)
+            .await
+            .expect_err("missing committed Policy PQ component must fail closed");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "committed active composite signing pair is unavailable after restart: \
+                 kid={:?} role={:?} ed_component_available=true pq_component_available=false \
+                 policy_ca_ed_matched=true",
+                policy.kid, policy.role,
+            )
+        );
+        assert!(!error.to_string().contains(&policy.ed25519_public));
+        assert!(!error.to_string().contains(&policy.ml_dsa_public));
+    }
+
+    #[test]
+    fn rejected_composite_proposal_rechecks_replaced_component_slot() {
+        let dir = TempDir::new().unwrap();
+        let fingerprint = || {
+            let mut digest = Sha256::new();
+            fingerprint_component_slot_files(dir.path(), &mut digest).unwrap();
+            digest.finalize().to_vec()
+        };
+        let missing = fingerprint();
+        super::super::identity_store::write_secret(
+            dir.path(),
+            "jwt-signing-key.active",
+            b"first-component",
+        )
+        .unwrap();
+        let first = fingerprint();
+        assert_ne!(missing, first);
+        super::super::identity_store::write_secret(
+            dir.path(),
+            "jwt-signing-key.active",
+            b"second-component",
+        )
+        .unwrap();
+        assert_ne!(first, fingerprint());
+    }
 
     struct PermitFixtureAccountReads;
 
@@ -2306,18 +3277,13 @@ mod tests {
             hyprstream_pds::did_op::RecoveryKeyEnrollment::Declined,
             hyprstream_pds::did_op::HostKeyEnrollment::Absent,
         )?;
-        let name = hyprstream_pds::AllocatedAccountName::new(
-            label,
-            format!("did:web:{label}.{zone}"),
-        )?;
+        let name =
+            hyprstream_pds::AllocatedAccountName::new(label, format!("did:web:{label}.{zone}"))?;
         let mint = hyprstream_pds::HostedAccountMint::begin(name, rotations)?;
         let document = mint.seal_did_document(&format!("https://{zone}"))?;
-        let pending = mint.prepare_genesis(
-            document,
-            hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo,
-        )?;
-        let signature =
-            hyprstream_pds::did_op::sign_genesis(pending.unsigned_genesis(), &ed, &pq)?;
+        let pending =
+            mint.prepare_genesis(document, hyprstream_pds::did_op::GenesisRepoHead::EmptyRepo)?;
+        let signature = hyprstream_pds::did_op::sign_genesis(pending.unsigned_genesis(), &ed, &pq)?;
         let record = pending.seal(signature)?.record_bytes().to_vec();
         let root = hyprstream_vfs::SyntheticNode::dir().with_child(
             zone,
@@ -2332,12 +3298,10 @@ mod tests {
                 ),
             ),
         );
-        Ok(Arc::new(
-            hyprstream_pds_service::AccountRecordStore::new(
-                Arc::new(hyprstream_vfs::SyntheticMount::new(root)),
-                Arc::new(PermitFixtureAccountReads),
-            ),
-        ))
+        Ok(Arc::new(hyprstream_pds_service::AccountRecordStore::new(
+            Arc::new(hyprstream_vfs::SyntheticMount::new(root)),
+            Arc::new(PermitFixtureAccountReads),
+        )))
     }
 
     fn test_config() -> OAuthConfig {
@@ -2359,10 +3323,19 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl crate::services::RequestService for ProductionAuthorityVerifier {
+        fn decode_request_body(
+            &self,
+            signed_body: &[u8],
+        ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+            Ok(hyprstream_rpc::service::DecodedRequestBody::opaque(
+                signed_body.to_vec(),
+            ))
+        }
+
         async fn handle_request(
             &self,
             _ctx: &crate::services::EnvelopeContext,
-            _payload: &[u8],
+            _body: &hyprstream_rpc::service::DecodedRequestBody,
         ) -> anyhow::Result<(Vec<u8>, Option<crate::services::Continuation>)> {
             self.accepted.store(true, Ordering::Release);
             Ok((Vec::new(), None))
@@ -2419,14 +3392,14 @@ mod tests {
 
     fn policy_client_for_socket(
         dir: &Path,
-    ) -> anyhow::Result<crate::services::generated::policy_client::PolicyClient> {
+    ) -> anyhow::Result<hyprstream_rpc_std::policy_client::PolicyClient> {
         policy_client_for_named_socket(dir, "authority-policy.sock")
     }
 
     fn policy_client_for_named_socket(
         dir: &Path,
         socket: &str,
-    ) -> anyhow::Result<crate::services::generated::policy_client::PolicyClient> {
+    ) -> anyhow::Result<hyprstream_rpc_std::policy_client::PolicyClient> {
         use hyprstream_rpc::rpc_client::RpcClientImpl;
         use hyprstream_rpc::signer::LocalSigner;
         use hyprstream_rpc::transport::lazy_uds::LazyUdsTransport;
@@ -2436,7 +3409,9 @@ mod tests {
             Some(SigningKey::from_bytes(&[0x73; 32]).verifying_key()),
         )
         .with_response_verify_policy(hyprstream_rpc::crypto::CryptoPolicy::Classical);
-        Ok(crate::services::generated::policy_client::PolicyClient::new(Arc::new(rpc)))
+        Ok(hyprstream_rpc_std::policy_client::PolicyClient::new(
+            Arc::new(rpc),
+        ))
     }
 
     fn authority_process_dir() -> Option<PathBuf> {
@@ -2548,6 +3523,22 @@ mod tests {
         wait_path(&dir.join("done"));
     }
 
+    /// Publish the completed target snapshot in one rename-visible operation.
+    ///
+    /// The child readers use file existence as their readiness signal, so a
+    /// direct write can expose an empty file between create and completion.
+    /// Keep this helper test-only: it models the completed fixture handoff
+    /// without changing the production authority or rollback paths.
+    fn publish_target_authority(dir: &Path, target: &CompositeCommit) {
+        let bytes = serde_json::to_vec(target).unwrap();
+        let mut temporary = tempfile::NamedTempFile::new_in(dir).unwrap();
+        temporary.write_all(&bytes).unwrap();
+        temporary.flush().unwrap();
+        temporary
+            .persist(dir.join("target-authority.json"))
+            .unwrap();
+    }
+
     async fn mutate_authority_for_failure(
         ed: &SigningKeyStore,
         pq: &MlDsaSigningKeyStore,
@@ -2583,6 +3574,37 @@ mod tests {
         }
     }
 
+    /// Fixed classical primary key + base64url for the multiprocess issuance
+    /// requests (they mint user at+jwt, which v16 binds to an authoritative
+    /// primary suite).
+    fn test_primary_key() -> [u8; 32] {
+        [0x66; 32]
+    }
+    fn test_user_pub_key_b64() -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        URL_SAFE_NO_PAD.encode(test_primary_key())
+    }
+    /// A permissive isolated primary resolver (any subject → the fixed classical
+    /// key) — the fixture equivalent of WS-C's enrollment store for these
+    /// multiprocess authority tests.
+    fn test_permissive_primary_resolver(
+    ) -> Arc<dyn crate::services::policy::PrimaryEnrollmentResolver> {
+        struct R;
+        impl crate::services::policy::PrimaryEnrollmentResolver for R {
+            fn primary_group(
+                &self,
+                _principal: &str,
+                _tenant: &str,
+            ) -> Option<crate::services::policy::PrimaryGroup> {
+                Some(crate::services::policy::PrimaryGroup {
+                    suite_id: hyprstream_rpc::auth::SUITE_CLASSICAL_ED25519.to_owned(),
+                    ordered_component_keys: vec![test_primary_key().to_vec()],
+                })
+            }
+        }
+        Arc::new(R)
+    }
+
     #[test]
     fn composite_oauth_production_process() {
         let Some(dir) = authority_process_dir() else {
@@ -2593,6 +3615,28 @@ mod tests {
             .block_on(async {
                 install_signing_authority(&dir, true).await?;
                 wait_path(&dir.join("authority-policy.sock"));
+                // Mirror production `init_process_authority_stores`: a non-policy
+                // process (this OAuth child) publishes RPC-client authority
+                // stores that DELEGATE to the canonical policy-owned authority
+                // over the policy socket — never private in-memory stores, which
+                // the separate policy process (where `issue_token` actually runs)
+                // could not see. A fresh sid registered here therefore crosses
+                // RPC into the canonical registry that `handle_issue_token`
+                // validates against, and issued-token verification checks the
+                // same canonical revocation store. Fail-closed is preserved: an
+                // unreachable authority answers not-active / revoked. Isolated to
+                // this re-exec'd single-test subprocess — the main-binary
+                // invocation of this fn early-returns above before reaching here.
+                let _ = hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                    crate::services::revocation::PolicyAuthoritySessionRegistry::new(
+                        policy_client_for_socket(&dir)?,
+                    ),
+                ));
+                let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                    crate::services::revocation::PolicyAuthorityRevocationStore::new(
+                        policy_client_for_socket(&dir)?,
+                    ),
+                ));
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
                 let address = listener.local_addr()?;
                 let mut config = test_config();
@@ -2603,7 +3647,7 @@ mod tests {
                         Ok(bytes::Bytes::new())
                     }));
                 hyprstream_rpc::dial::register_inproc("multiprocess-unused-discovery", &unused);
-                let discovery = crate::services::DiscoveryClient::for_local_endpoint_bootstrap(
+                let discovery = hyprstream_rpc_std::discovery_client::DiscoveryClient::for_local_endpoint_bootstrap(
                     "inproc://multiprocess-unused-discovery",
                     SigningKey::from_bytes(&[0x76; 32]),
                     SigningKey::from_bytes(&[0x77; 32]).verifying_key(),
@@ -2624,6 +3668,16 @@ mod tests {
                     },
                 )
                 .await?;
+                let hosted_store = hosted_account_store("multiprocess-oauth", "example.test")?;
+                // The production account store warms its signed hosted-DID
+                // index during startup.  This isolated multi-process fixture
+                // constructs the store directly, so warm the same index before
+                // the OAuth child accepts its first authorization-code exchange.
+                hosted_store
+                    .refresh_hosted_did_index(&hyprstream_rpc::Subject::new(
+                        hyprstream_pds_service::OAUTH_ACCOUNT_RESOLVER_SUBJECT,
+                    ))
+                    .await?;
                 let state = Arc::new(
                     crate::services::oauth::state::OAuthState::new(
                         &config,
@@ -2635,10 +3689,7 @@ mod tests {
                     .with_hosted_account_zone(crate::account::AccountZone::new(
                         "example.test",
                     )?)
-                    .with_hosted_account_store(hosted_account_store(
-                        "multiprocess-oauth",
-                        "example.test",
-                    )?),
+                    .with_hosted_account_store(hosted_store),
                 );
                 let verifier = "multiprocess-pkce-verifier";
                 let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
@@ -2694,6 +3745,20 @@ mod tests {
         runtime
             .block_on(async {
                 install_signing_authority(&dir, true).await?;
+                // Canonical policy-owned authority stores (v16 §3.3): the policy
+                // process owns the single session registry and credential
+                // revocation store. Every other process delegates to it over RPC
+                // (see the OAuth child's PolicyAuthority* stores), so a sid the
+                // OAuth child registers crosses RPC into THIS registry, which
+                // `handle_issue_token` then validates against. Published before
+                // the PolicyService serves. Isolated to this re-exec'd
+                // single-test subprocess.
+                let _ = hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                    hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+                ));
+                let _ = hyprstream_rpc::auth::set_global_credential_revocation_store(Arc::new(
+                    hyprstream_rpc::auth::InMemoryCredentialRevocationStore::new(),
+                ));
                 let db = dir.join(format!("policy-db-{}", std::process::id()));
                 std::fs::create_dir_all(&db)?;
                 let policy_manager = Arc::new(
@@ -2721,7 +3786,16 @@ mod tests {
                         dir.join("authority-policy.sock"),
                     ),
                 )
-                .with_default_audience("multiprocess".to_owned());
+                .with_default_audience("multiprocess".to_owned())
+                // Production-equivalent key source: signing resolves the
+                // composite authority through the configured JwtKeySource (the
+                // `ClusterKeySource` ledger defaults to the process-global
+                // authority this subprocess configures).
+                .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
+                    "multiprocess".to_owned(),
+                )))
+                .with_primary_enrollment_resolver(test_permissive_primary_resolver());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let shutdown_server = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
@@ -2733,16 +3807,20 @@ mod tests {
                 wait_for_target_authority(&dir);
                 std::fs::write(dir.join("converged-policy"), b"1")?;
                 let token = policy_client_for_socket(&dir)?
-                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                    .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("multiprocess-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile:
+                            hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
                     .token;
@@ -2852,7 +3930,12 @@ mod tests {
                     git2db,
                     hyprstream_rpc::transport::TransportConfig::ipc(dir.join("stale-policy.sock")),
                 )
-                .with_default_audience("multiprocess".to_owned());
+                .with_default_audience("multiprocess".to_owned())
+                .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
+                    "multiprocess".to_owned(),
+                )))
+                .with_primary_enrollment_resolver(test_permissive_primary_resolver());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let shutdown_server = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
@@ -2861,16 +3944,20 @@ mod tests {
                 });
                 wait_path(&dir.join("stale-policy.sock"));
                 let result = policy_client_for_named_socket(&dir, "stale-policy.sock")?
-                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                    .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("stale-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile:
+                            hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await;
                 anyhow::ensure!(result.is_err(), "stale PolicyService minted a token");
@@ -3013,7 +4100,12 @@ mod tests {
                     git2db,
                     hyprstream_rpc::transport::TransportConfig::ipc(dir.join(socket)),
                 )
-                .with_default_audience("multiprocess".to_owned());
+                .with_default_audience("multiprocess".to_owned())
+                .with_jwt_key_source(Arc::new(hyprstream_rpc::auth::ClusterKeySource::new(
+                    SigningKey::from_bytes(&[0x73; 32]).verifying_key(),
+                    "multiprocess".to_owned(),
+                )))
+                .with_primary_enrollment_resolver(test_permissive_primary_resolver());
                 let shutdown = Arc::new(tokio::sync::Notify::new());
                 let shutdown_server = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
@@ -3022,16 +4114,20 @@ mod tests {
                 });
                 wait_path(&dir.join(socket));
                 let token = policy_client_for_named_socket(&dir, socket)?
-                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                    .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("restart-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile:
+                            hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
                     .token;
@@ -3156,18 +4252,23 @@ mod tests {
         // Capture a pre-rotation token through the booted OAuth HTTP endpoint;
         // it is used later to prove the committed drain remains usable.
         let oauth_url = std::fs::read_to_string(dir.path().join("oauth-http-url")).unwrap();
-        let old_token = runtime.block_on(async {
+        let old_token = runtime
+            .block_on(async {
                 policy_client_for_socket(dir.path())?
-                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                    .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("pre-rotation-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile:
+                            hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?;
                 let client = reqwest::Client::new();
@@ -3193,7 +4294,9 @@ mod tests {
                     .get("access_token")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
-                .ok_or_else(|| anyhow::anyhow!("pre-rotation OAuth response omitted access_token"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("pre-rotation OAuth response omitted access_token")
+                    })?;
                 let replay = client
                     .post(format!("{oauth_url}/oauth/token"))
                     .form(&authorization_code_form)
@@ -3211,7 +4314,8 @@ mod tests {
                     "authorization-code replay was not rejected as invalid_grant: {replay_body}"
                 );
                 anyhow::Ok(token)
-        }).unwrap();
+            })
+            .unwrap();
         std::fs::write(dir.path().join("old-oauth-token"), old_token).unwrap();
 
         persist_slot(dir.path(), "drain", &old_ed).unwrap();
@@ -3270,11 +4374,7 @@ mod tests {
             serde_json::to_vec(&ledger_after_rotation).unwrap(),
             "legacy migration changed mutable B before pending C was staged"
         );
-        std::fs::write(
-            dir.path().join("target-authority.json"),
-            serde_json::to_vec(&committed).unwrap(),
-        )
-        .unwrap();
+        publish_target_authority(dir.path(), &committed);
         for process in ["oauth", "policy", "jwks", "rpc"] {
             wait_path(&dir.path().join(format!("converged-{process}")));
         }
@@ -3346,9 +4446,9 @@ mod tests {
             .collect();
         for kid in active_kids {
             assert!(jwks["keys"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
+                .as_array()
+                .unwrap()
+                .iter()
                 .any(|key| { key.get("kid").and_then(serde_json::Value::as_str) == Some(kid) }));
         }
 
@@ -3389,16 +4489,20 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("pending-timeout OAuth token missing"))?
                     .to_owned();
                 let policy = policy_client_for_socket(dir.path())?
-                    .issue_token(&crate::services::generated::policy_client::IssueToken {
+                    .issue_token(&hyprstream_rpc_std::policy_client::IssueToken {
                         requested_scopes: Some(vec!["read".to_owned()]),
                         ttl: Some(60),
                         audience: Some("multiprocess".to_owned()),
                         subject: Some("timeout-policy".to_owned()),
-                        user_pub_key: None,
+                        user_pub_key: Some(test_user_pub_key_b64()),
                         dpop_jkt: None,
                         issuer: None,
                         tenant: None,
                         require_clearance: false,
+                        session_id: None,
+                        issuance_profile:
+                            hyprstream_rpc_std::policy_client::IssueTokenProfile::Rfc8693,
+                        client_id: Some("hyprstream-oauth-client-1".to_owned()),
                     })
                     .await?
                     .token;
@@ -3500,9 +4604,9 @@ mod tests {
                 .any(|committed_pair| committed_pair.kid == candidate.kid)
         }) {
             assert!(!post_crash_jwks["keys"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
+                .as_array()
+                .unwrap()
+                .iter()
                 .any(|key| key["kid"].as_str() == Some(pending_only.kid.as_str())));
         }
         let _ = (timeout_oauth_token, timeout_policy_token, post_crash_token);
@@ -3583,6 +4687,78 @@ mod tests {
             vk.is_some(),
             "active key should be present after first boot"
         );
+    }
+
+    #[test]
+    fn committed_marker_with_missing_slots_does_not_bootstrap_replacement_keys() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let marker = composite_committed_path(dir.path());
+        // The guard is intentionally based on marker presence, not successful
+        // parsing: malformed committed metadata is not permission to mint a
+        // different authority.
+        std::fs::write(&marker, b"committed but unreadable").unwrap();
+
+        let ed = load_or_init_key_store(dir.path(), &config);
+        let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(rt.block_on(ed.active_verifying_key_bytes()).is_none());
+        assert!(rt.block_on(pq.active_key()).is_none());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"committed but unreadable");
+        for name in [
+            "jwt-signing-key.active",
+            "jwt-signing-key.active.meta",
+            "jwt-signing-key.lead",
+            "jwt-signing-key.lead.meta",
+            "ml-dsa-signing-key.active",
+            "ml-dsa-signing-key.active.meta",
+            "ml-dsa-signing-key.lead",
+            "ml-dsa-signing-key.lead.meta",
+        ] {
+            assert!(
+                !dir.path().join(name).exists(),
+                "committed store unexpectedly created {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_marker_does_not_generate_missing_lead_slots() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+        let marker = composite_committed_path(dir.path());
+        std::fs::write(&marker, b"committed").unwrap();
+        persist_slot(
+            dir.path(),
+            "active",
+            &KeySlot::new(SigningKey::from_bytes(&[0x71; 32]), now - 60, now + 1),
+        )
+        .unwrap();
+        ml_dsa_rotation::persist_ml_dsa_slot(
+            dir.path(),
+            "active",
+            &ml_dsa_rotation::generate_ml_dsa_slot(now - 60, now + 1),
+        )
+        .unwrap();
+
+        let ed = load_or_init_key_store(dir.path(), &config);
+        let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        assert!(ed.0.read().await.active.is_some());
+        assert!(ed.0.read().await.lead.is_none());
+        assert!(pq.0.read().await.active.is_some());
+        assert!(pq.0.read().await.lead.is_none());
+        for name in [
+            "jwt-signing-key.lead",
+            "jwt-signing-key.lead.meta",
+            "ml-dsa-signing-key.lead",
+            "ml-dsa-signing-key.lead.meta",
+        ] {
+            assert!(
+                !dir.path().join(name).exists(),
+                "committed store unexpectedly created {name}"
+            );
+        }
     }
 
     #[test]
@@ -3707,6 +4883,495 @@ mod tests {
         );
     }
 
+    // ── Disk-before-memory promotion ───────────────────────────────────────
+    //
+    // Operator invariant under repair: a generated or promoted signing key
+    // becomes active in memory only after its slot persistence reports
+    // success. Failure injection is a filesystem fixture — a directory
+    // planted at the slot path, or a state dir that is a regular file — which
+    // stays deterministic under root, unlike permission-bit tricks.
+
+    #[tokio::test]
+    async fn first_boot_persistence_failure_leaves_no_active_ed25519_key() {
+        // The production composite boundary mutates the process-global
+        // key-set version/snapshot; a mutex cannot reset that state between
+        // tests. Re-execute this test in its own process (fresh globals),
+        // mirroring the other composite-global tests in this module.
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_FIRST_BOOT_ED_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::first_boot_persistence_failure_leaves_no_active_ed25519_key",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        // write_secret persists via rename onto this path; renaming a file
+        // onto a directory fails for every user, including root.
+        std::fs::create_dir(dir.path().join("jwt-signing-key.active")).unwrap();
+
+        let store = load_or_init_key_store(dir.path(), &config);
+        assert!(
+            store.active_verifying_key_bytes().await.is_none(),
+            "an unpersisted generated key must not be exposed as active"
+        );
+        assert!(
+            !dir.path().join("jwt-signing-key.active.meta").exists(),
+            "no slot metadata may exist when the key bytes failed to persist"
+        );
+
+        // Production composite-initialization boundary with a healthy ML-DSA
+        // counterpart: an incomplete first-boot store must fail the
+        // initialization instead of committing partial authority.
+        let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let error = initialize_composite_key_set(
+            dir.path(),
+            &store,
+            &pq,
+            Arc::new(SigningKey::from_bytes(&[0x5A; 32])),
+            30,
+        )
+        .await
+        .expect_err("incomplete first-boot store must not create composite authority");
+        assert!(
+            error.to_string().contains("incomplete local signer set"),
+            "unexpected initialization error: {error:#}"
+        );
+        assert!(
+            !dir.path().join("jwt-composite-pairs.json").exists(),
+            "no pending ledger may be created from an incomplete store"
+        );
+        assert!(
+            !dir.path().join("jwt-composite-pairs.committed").exists(),
+            "no commit marker may be created from an incomplete store"
+        );
+        let snapshots = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("jwt-composite-pairs.committed-")
+            })
+            .count();
+        assert_eq!(
+            snapshots, 0,
+            "no immutable committed snapshot may be created from an incomplete store"
+        );
+
+        // Remove the injected failure and recover with fresh stores through
+        // the same production boundary.
+        std::fs::remove_dir(dir.path().join("jwt-signing-key.active")).unwrap();
+        let fresh_ed = load_or_init_key_store(dir.path(), &config);
+        let fresh_pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        initialize_composite_key_set(
+            dir.path(),
+            &fresh_ed,
+            &fresh_pq,
+            Arc::new(SigningKey::from_bytes(&[0x5A; 32])),
+            30,
+        )
+        .await
+        .expect("normal initialization must succeed once persistence recovers");
+        assert!(dir.path().join("jwt-composite-pairs.json").exists());
+        assert!(dir.path().join("jwt-composite-pairs.committed").exists());
+    }
+
+    #[tokio::test]
+    async fn ed25519_rotation_keeps_active_when_drain_persist_fails() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 1,
+        );
+        let lead_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1, // nbf already passed
+            now + 14 * 86400,
+        );
+        let drain_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 45 * 86400,
+            now + 5 * 86400,
+        );
+        let active_vk = active_slot.verifying_key_bytes();
+        let lead_vk = lead_slot.verifying_key_bytes();
+        let drain_vk = drain_slot.verifying_key_bytes();
+
+        let store = SigningKeyStore::new(KeySlots {
+            drain: Some(drain_slot),
+            active: Some(active_slot),
+            lead: Some(lead_slot),
+        });
+
+        // Deterministic seam: this state dir is a regular file, so the first
+        // promotion write (old active → drain) fails.
+        let broken_state = dir.path().join("not-a-directory");
+        std::fs::write(&broken_state, b"file").unwrap();
+        rotate_jwt_keys_in_state_dir(&config, &broken_state, &store, now).await;
+
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.active.as_ref().map(KeySlot::verifying_key_bytes),
+            Some(active_vk),
+            "the old active must remain the in-memory active signer"
+        );
+        assert_eq!(
+            slots.lead.as_ref().map(KeySlot::verifying_key_bytes),
+            Some(lead_vk),
+            "the queued lead must stay in memory for the next tick"
+        );
+        assert_eq!(
+            slots.drain.as_ref().map(KeySlot::verifying_key_bytes),
+            Some(drain_vk),
+            "a failed promotion must not evict the in-memory drain"
+        );
+        drop(slots);
+
+        // Persistence recovers: the queued lead promotes and the promoted
+        // active is on disk before it is served from memory.
+        rotate_jwt_keys_in_state_dir(&config, dir.path(), &store, now).await;
+        assert_eq!(
+            store.active_verifying_key_bytes().await,
+            Some(lead_vk),
+            "the queued lead must promote once persistence succeeds"
+        );
+        let persisted = load_slot(dir.path(), "active").expect("promoted active must be persisted");
+        assert_eq!(
+            persisted.verifying_key_bytes(),
+            lead_vk,
+            "memory promotion must follow the durable active write"
+        );
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.drain.as_ref().map(KeySlot::verifying_key_bytes),
+            Some(active_vk),
+            "the old active becomes drain only after its persist succeeded"
+        );
+        assert!(slots.lead.is_none());
+        assert!(!dir.path().join("jwt-signing-key.lead").exists());
+    }
+
+    #[tokio::test]
+    async fn ed25519_rotation_keeps_active_when_active_persist_fails() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 1,
+        );
+        let lead_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1,
+            now + 14 * 86400,
+        );
+        let active_vk = active_slot.verifying_key_bytes();
+        let lead_vk = lead_slot.verifying_key_bytes();
+        persist_slot(dir.path(), "lead", &lead_slot).unwrap();
+
+        let store = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(active_slot),
+            lead: Some(lead_slot),
+        });
+
+        // The drain write succeeds (old active → drain) but the promoted
+        // active write fails before its seed lands: its slot path is a
+        // directory. The rollback restore fails the same way, so the cycle
+        // reports not-restored and keeps the durable drain copy of the old
+        // active signer for restart recovery.
+        std::fs::create_dir(dir.path().join("jwt-signing-key.active")).unwrap();
+        let restored = rotate_jwt_keys_in_state_dir(&config, dir.path(), &store, now).await;
+        assert!(
+            !restored,
+            "a failed rollback must report the stores as not fully restored"
+        );
+
+        assert_eq!(
+            store.active_verifying_key_bytes().await,
+            Some(active_vk),
+            "the failed new key must not be exposed as active in memory"
+        );
+        {
+            let slots = store.0.read().await;
+            assert!(slots.lead.is_some(), "the lead stays queued for retry");
+            assert!(
+                slots.drain.is_none(),
+                "in-memory drain must not change before every write succeeded"
+            );
+        }
+        assert_eq!(
+            load_slot(dir.path(), "drain")
+                .expect("the drain copy of the old active must survive a failed rollback")
+                .verifying_key_bytes(),
+            active_vk,
+            "a failed rollback must not erase the recoverable old active signer"
+        );
+        assert!(
+            dir.path().join("jwt-signing-key.active").is_dir()
+                && load_slot(dir.path(), "active").is_none(),
+            "the active slot must not be durably replaced by the failed key; until the retry lands, the old active survives in memory and in drain"
+        );
+
+        // Remove the obstruction; the queued lead promotes on the next tick.
+        std::fs::remove_dir(dir.path().join("jwt-signing-key.active")).unwrap();
+        rotate_jwt_keys_in_state_dir(&config, dir.path(), &store, now).await;
+        assert_eq!(store.active_verifying_key_bytes().await, Some(lead_vk));
+        assert_eq!(
+            load_slot(dir.path(), "active")
+                .expect("promoted active must be persisted")
+                .verifying_key_bytes(),
+            lead_vk,
+            "memory promotion must be preceded by the durable active write"
+        );
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.drain.as_ref().map(KeySlot::verifying_key_bytes),
+            Some(active_vk)
+        );
+        assert!(slots.lead.is_none());
+    }
+
+    #[tokio::test]
+    async fn ed25519_failed_rollback_preserves_recoverable_active_in_drain() {
+        // The production composite boundary mutates the process-global
+        // key-set version/snapshot; a mutex cannot reset that state between
+        // tests. Re-execute this test in its own process (fresh globals),
+        // mirroring the other composite-global tests in this module.
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ED_ROLLBACK_RECOVERY_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ed25519_failed_rollback_preserves_recoverable_active_in_drain",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        for prev_drain_present in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let config = test_config();
+            let now = chrono::Utc::now().timestamp();
+
+            let active_slot = KeySlot::new(
+                SigningKey::generate(&mut rand::rngs::OsRng),
+                now - 14 * 86400,
+                now + 6 * 3600,
+            );
+            let lead_slot = KeySlot::new(
+                SigningKey::generate(&mut rand::rngs::OsRng),
+                now - 1, // nbf already passed
+                now + 14 * 86400,
+            );
+            let active_seed = active_slot.key.to_bytes();
+            let active_vk = active_slot.verifying_key_bytes();
+            let lead_vk = lead_slot.verifying_key_bytes();
+            persist_slot(dir.path(), "active", &active_slot).unwrap();
+            persist_slot(dir.path(), "lead", &lead_slot).unwrap();
+            let prev_drain = if prev_drain_present {
+                let drain = KeySlot::new(
+                    SigningKey::generate(&mut rand::rngs::OsRng),
+                    now - 60 * 86400,
+                    now - 45 * 86400,
+                );
+                persist_slot(dir.path(), "drain", &drain).unwrap();
+                Some(drain)
+            } else {
+                None
+            };
+
+            let store = SigningKeyStore::new(KeySlots {
+                drain: prev_drain.clone(),
+                active: Some(active_slot),
+                lead: Some(lead_slot),
+            });
+
+            // Commit real authority through the production writer: the
+            // committed OAuth active pair names exactly this Ed25519 signer.
+            let pq_store = load_or_init_ml_dsa_key_store(dir.path(), &config);
+            let ca_key = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+            initialize_composite_key_set(dir.path(), &store, &pq_store, Arc::clone(&ca_key), 30)
+                .await
+                .expect("healthy starting authority must initialize composite");
+            let (commit_before, ledger_before) =
+                read_committed_composite_ledger(dir.path()).unwrap();
+            let oauth_active_ed = ledger_before
+                .pairs
+                .iter()
+                .find(|record| record.role == "oauth" && record.state == "active")
+                .expect("initialized authority must carry an active OAuth pair");
+            assert_eq!(
+                oauth_active_ed.ed25519_public,
+                URL_SAFE_NO_PAD.encode(active_vk),
+                "prior_drain={prev_drain_present}: the committed active pair must \
+                 name the old active Ed25519 signer"
+            );
+
+            // Deterministic partial write: the promotion's seed rename onto
+            // `jwt-signing-key.active` succeeds but every metadata persistence
+            // at `jwt-signing-key.active.meta` fails (directory obstruction).
+            // The promoted active fails on its metadata write, and the
+            // rollback of the old active fails the same way — after its seed
+            // has been restored.
+            let meta_path = dir.path().join("jwt-signing-key.active.meta");
+            std::fs::remove_file(&meta_path).unwrap();
+            std::fs::create_dir(&meta_path).unwrap();
+
+            let restored = rotate_jwt_keys_in_state_dir(&config, dir.path(), &store, now).await;
+            assert!(
+                !restored,
+                "prior_drain={prev_drain_present}: a failed rollback must report \
+                 the stores as not fully restored"
+            );
+
+            // Memory is unchanged: old active still active, lead queued.
+            let slots = store.0.read().await;
+            assert_eq!(
+                slots.active.as_ref().map(KeySlot::verifying_key_bytes),
+                Some(active_vk),
+                "prior_drain={prev_drain_present}: the old active must remain the \
+                 in-memory active signer"
+            );
+            assert_eq!(
+                slots.lead.as_ref().map(KeySlot::verifying_key_bytes),
+                Some(lead_vk),
+                "prior_drain={prev_drain_present}: the lead must stay queued"
+            );
+            assert_eq!(
+                slots.drain.as_ref().map(KeySlot::verifying_key_bytes),
+                prev_drain.as_ref().map(KeySlot::verifying_key_bytes),
+                "prior_drain={prev_drain_present}: memory drain must not change \
+                 before the rollback is confirmed"
+            );
+            drop(slots);
+
+            // The drain slot keeps the only complete durable copy of the old
+            // active signer — not deleted, not overwritten with the previous
+            // drain generation.
+            let recovered = load_slot(dir.path(), "drain").expect(
+                "prior_drain={prev_drain_present}: drain copy of the old active \
+                 must survive a failed rollback",
+            );
+            assert_eq!(
+                recovered.verifying_key_bytes(),
+                active_vk,
+                "prior_drain={prev_drain_present}: failed rollback must not erase \
+                 the recoverable old active signer"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("jwt-signing-key.active")).unwrap(),
+                active_seed,
+                "prior_drain={prev_drain_present}: the rollback must have restored \
+                 the old active seed before failing on metadata"
+            );
+            assert!(
+                load_slot(dir.path(), "active").is_none(),
+                "prior_drain={prev_drain_present}: the active slot is incomplete \
+                 without its metadata and must not load"
+            );
+
+            // A fresh reload — as after a restart, with the real commit marker
+            // present so no implicit generation may run — still recovers the
+            // signer required by committed authority from the drain slot,
+            // before any retry is attempted and without reusing the in-memory
+            // store.
+            let fresh = load_or_init_key_store(dir.path(), &config);
+            {
+                let fresh_slots = fresh.0.read().await;
+                assert_eq!(
+                    fresh_slots.drain.as_ref().map(KeySlot::verifying_key_bytes),
+                    Some(active_vk),
+                    "prior_drain={prev_drain_present}: fresh reload must still have \
+                     the committed old active signer recoverable in drain"
+                );
+                assert!(
+                    fresh_slots.active.is_none(),
+                    "prior_drain={prev_drain_present}: the torn active slot must not \
+                     load as a usable signer"
+                );
+            }
+
+            // The production restore resolver — the same initialization the
+            // oauth/policy services run at startup — must rebuild the
+            // committed active pair from the recovered slots. The only
+            // surviving Ed25519 copy of the committed signer is the drain
+            // slot, so this fails (with the #1713-style restart error) if a
+            // rollback erased it.
+            let fresh_pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+            initialize_composite_key_set(dir.path(), &fresh, &fresh_pq, Arc::clone(&ca_key), 30)
+                .await
+                .expect(
+                    "prior_drain={prev_drain_present}: committed authority must restore \
+                 from the recovered drain slot after a failed rollback",
+                );
+            let (commit_after, ledger_after) = read_committed_composite_ledger(dir.path()).unwrap();
+            assert_eq!(
+                commit_after.version, commit_before.version,
+                "prior_drain={prev_drain_present}: recovery must not need a new \
+                 committed generation"
+            );
+            assert_eq!(
+                commit_after.component_digest,
+                commit_before.component_digest
+            );
+            let oauth_active_ed_after = ledger_after
+                .pairs
+                .iter()
+                .find(|record| record.role == "oauth" && record.state == "active")
+                .expect("restored authority must still carry an active OAuth pair");
+            assert_eq!(
+                oauth_active_ed_after.ed25519_public,
+                URL_SAFE_NO_PAD.encode(active_vk),
+                "prior_drain={prev_drain_present}: restored committed authority \
+                 must still name the recovered old active signer"
+            );
+
+            // Only now remove the injected failure: a retry from the fresh
+            // store promotes the queued lead while the recovered old active
+            // survives in drain.
+            std::fs::remove_dir(&meta_path).unwrap();
+            let retried = rotate_jwt_keys_in_state_dir(&config, dir.path(), &fresh, now).await;
+            assert!(
+                retried,
+                "prior_drain={prev_drain_present}: the retry must fully restore and \
+                 promote"
+            );
+            assert_eq!(
+                fresh.active_verifying_key_bytes().await,
+                Some(lead_vk),
+                "prior_drain={prev_drain_present}: the queued lead promotes after \
+                 recovery"
+            );
+            let slots = fresh.0.read().await;
+            assert_eq!(
+                slots.drain.as_ref().map(KeySlot::verifying_key_bytes),
+                Some(active_vk),
+                "prior_drain={prev_drain_present}: the recovered old active must \
+                 survive the retry in drain"
+            );
+            assert!(slots.lead.is_none());
+        }
+    }
+
     // ── ES256 store tests ──────────────────────────────────────────────────
 
     #[test]
@@ -3716,6 +5381,139 @@ mod tests {
         let store = load_or_init_es256_key_store(dir.path(), &config);
         let key = store.active_key();
         assert!(key.is_some());
+    }
+
+    #[test]
+    fn es256_missing_active_with_durable_oplog_authority_does_not_regenerate() {
+        for marker in [
+            super::super::op_log::SEALED_HEAD_FILENAME,
+            super::super::op_log::SEALED_HEAD_MAX_SEQ_FILENAME,
+            super::super::op_log::HEAD_VERIFYING_KEY_FILENAME,
+        ] {
+            let root = TempDir::new().unwrap();
+            let secrets_dir = root.path().join("credentials");
+            let oplog_dir = root.path().join("oplog-state");
+            std::fs::create_dir(&secrets_dir).unwrap();
+            std::fs::create_dir(&oplog_dir).unwrap();
+            std::fs::write(oplog_dir.join(marker), b"existing authority marker").unwrap();
+
+            let store = load_or_init_es256_key_store_with_oplog_state_dir(
+                &secrets_dir,
+                &test_config(),
+                &oplog_dir,
+            );
+            assert!(store.active_key().is_none(), "marker={marker}");
+            assert!(
+                load_es256_slot(&secrets_dir, "active").is_none(),
+                "marker={marker}"
+            );
+            assert!(
+                load_es256_slot(&secrets_dir, "drain").is_none(),
+                "marker={marker}"
+            );
+            assert!(
+                load_es256_slot(&secrets_dir, "lead").is_none(),
+                "marker={marker}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn es256_failed_first_boot_persistence_can_recover_without_published_marker() {
+        let root = TempDir::new().unwrap();
+        let secrets_dir = root.path().join("credentials");
+        let oplog_dir = root.path().join("oplog-state");
+        std::fs::create_dir(&secrets_dir).unwrap();
+        std::fs::create_dir(&oplog_dir).unwrap();
+
+        // The seed write succeeds, but making the metadata destination a
+        // directory forces the second half of the active-slot write to fail.
+        let blocked_metadata = secrets_dir.join("es256-signing-key.active.meta");
+        std::fs::create_dir(&blocked_metadata).unwrap();
+        let failed_boot = load_or_init_es256_key_store_with_oplog_state_dir(
+            &secrets_dir,
+            &test_config(),
+            &oplog_dir,
+        );
+        assert!(failed_boot.active_key().is_none());
+
+        assert!(super::super::op_log::advance_sealed_head_with_state_dir(
+            &secrets_dir,
+            &oplog_dir,
+            &failed_boot,
+        )
+        .await
+        .is_err());
+        assert!(!oplog_dir
+            .join(super::super::op_log::HEAD_VERIFYING_KEY_FILENAME)
+            .exists());
+        assert!(!oplog_dir
+            .join(super::super::op_log::SEALED_HEAD_FILENAME)
+            .exists());
+
+        // After the transient obstruction is repaired, first boot can
+        // complete normally without deleting any operation-log marker.
+        std::fs::remove_dir(&blocked_metadata).unwrap();
+        let recovered = load_or_init_es256_key_store_with_oplog_state_dir(
+            &secrets_dir,
+            &test_config(),
+            &oplog_dir,
+        );
+        assert!(recovered.active_key().is_some());
+        super::super::op_log::advance_sealed_head_with_state_dir(
+            &secrets_dir,
+            &oplog_dir,
+            &recovered,
+        )
+        .await
+        .unwrap();
+        assert!(oplog_dir
+            .join(super::super::op_log::HEAD_VERIFYING_KEY_FILENAME)
+            .exists());
+        assert!(oplog_dir
+            .join(super::super::op_log::SEALED_HEAD_FILENAME)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn advance_oplog_does_not_reload_unpromoted_es256_disk_candidate() {
+        let root = TempDir::new().unwrap();
+        let secrets_dir = root.path().join("credentials");
+        let oplog_dir = root.path().join("oplog-state");
+        std::fs::create_dir(&secrets_dir).unwrap();
+        std::fs::create_dir(&oplog_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let retained = generate_es256_slot(now - 120, now + 86_400);
+        let rejected_candidate = generate_es256_slot(now, now + 172_800);
+        let retained_kid = retained.kid();
+        persist_es256_slot(&secrets_dir, "active", &rejected_candidate).unwrap();
+        persist_es256_slot(&secrets_dir, "drain", &retained).unwrap();
+
+        // Simulate a failed rotation rollback: the candidate remains in the
+        // durable active path, but the store correctly retains the old key.
+        let store = Es256SigningKeyStore::new(Es256KeySlots {
+            drain: None,
+            active: Some(retained),
+            lead: Some(rejected_candidate),
+        });
+        store.bind_secrets_dir(secrets_dir.clone());
+        assert_eq!(store.active_slot().unwrap().kid(), retained_kid);
+
+        super::super::op_log::advance_sealed_head_with_state_dir(&secrets_dir, &oplog_dir, &store)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.active_slot().unwrap().kid(),
+            retained_kid,
+            "op-log advancement must not reload an unpromoted disk candidate"
+        );
+        let head: super::super::op_log::SealedOpLogHead = serde_json::from_slice(
+            &std::fs::read(oplog_dir.join(super::super::op_log::SEALED_HEAD_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(head.active_kid, retained_kid);
     }
 
     #[test]
@@ -3985,6 +5783,1967 @@ mod tests {
         assert!(slots.lead.is_none());
     }
 
+    fn ml_dsa_slot_vk_bytes(slot: &ml_dsa_rotation::MlDsaKeySlot) -> Vec<u8> {
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&slot.verifying_key())
+    }
+
+    fn ml_dsa_key_vk_bytes(key: &hyprstream_rpc::crypto::pq::MlDsaSigningKey) -> Vec<u8> {
+        hyprstream_rpc::crypto::pq::ml_dsa_vk_bytes(&ml_dsa::Keypair::verifying_key(key).clone())
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_first_boot_persistence_failure_leaves_no_active_key() {
+        // The production composite boundary mutates the process-global
+        // key-set version/snapshot; a mutex cannot reset that state between
+        // tests. Re-execute this test in its own process (fresh globals),
+        // mirroring the other composite-global tests in this module.
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_FIRST_BOOT_ML_DSA_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ml_dsa_first_boot_persistence_failure_leaves_no_active_key",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        // write_secret persists via rename onto this path; renaming a file
+        // onto a directory fails for every user, including root.
+        std::fs::create_dir(dir.path().join("ml-dsa-signing-key.active")).unwrap();
+
+        let store = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        assert!(
+            store.active_key().await.is_none(),
+            "an unpersisted generated ML-DSA key must not be exposed as active"
+        );
+        assert!(
+            !dir.path().join("ml-dsa-signing-key.active.meta").exists(),
+            "no slot metadata may exist when the key bytes failed to persist"
+        );
+
+        // Production composite-initialization boundary with a healthy Ed25519
+        // counterpart: the symmetric first-boot failure must fail the
+        // initialization instead of committing authority without an active
+        // ML-DSA component.
+        let ed = load_or_init_key_store(dir.path(), &config);
+        let error = initialize_composite_key_set(
+            dir.path(),
+            &ed,
+            &store,
+            Arc::new(SigningKey::from_bytes(&[0x5A; 32])),
+            30,
+        )
+        .await
+        .expect_err("incomplete first-boot store must not create composite authority");
+        assert!(
+            error.to_string().contains("incomplete local signer set"),
+            "unexpected initialization error: {error:#}"
+        );
+        assert!(
+            !dir.path().join("jwt-composite-pairs.json").exists(),
+            "no pending ledger may be created from an incomplete store"
+        );
+        assert!(
+            !dir.path().join("jwt-composite-pairs.committed").exists(),
+            "no commit marker may be created from an incomplete store"
+        );
+        let snapshots = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("jwt-composite-pairs.committed-")
+            })
+            .count();
+        assert_eq!(
+            snapshots, 0,
+            "no immutable committed snapshot may be created from an incomplete store"
+        );
+
+        // Remove the injected failure and recover with fresh stores through
+        // the same production boundary.
+        std::fs::remove_dir(dir.path().join("ml-dsa-signing-key.active")).unwrap();
+        let fresh_ed = load_or_init_key_store(dir.path(), &config);
+        let fresh_pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        initialize_composite_key_set(
+            dir.path(),
+            &fresh_ed,
+            &fresh_pq,
+            Arc::new(SigningKey::from_bytes(&[0x5A; 32])),
+            30,
+        )
+        .await
+        .expect("normal initialization must succeed once persistence recovers");
+        assert!(dir.path().join("jwt-composite-pairs.json").exists());
+        assert!(dir.path().join("jwt-composite-pairs.committed").exists());
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_rotation_keeps_active_when_drain_persist_fails() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active = ml_dsa_rotation::generate_ml_dsa_slot(now - 14 * 86400, now + 1);
+        let lead = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        let drain = ml_dsa_rotation::generate_ml_dsa_slot(now - 45 * 86400, now + 5 * 86400);
+        let active_vk = ml_dsa_slot_vk_bytes(&active);
+        let lead_vk = ml_dsa_slot_vk_bytes(&lead);
+        let drain_vk = ml_dsa_slot_vk_bytes(&drain);
+
+        let store = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: Some(drain),
+            active: Some(active),
+            lead: Some(lead),
+        });
+
+        // Deterministic seam: this state dir is a regular file, so the first
+        // promotion write (old active → drain) fails.
+        let broken_state = dir.path().join("not-a-directory");
+        std::fs::write(&broken_state, b"file").unwrap();
+        ml_dsa_rotation::rotate_ml_dsa_keys_in_state_dir(&config, &broken_state, &store, now).await;
+
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.active.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(active_vk.clone()),
+            "the old active must remain the in-memory active signer"
+        );
+        assert_eq!(
+            slots.lead.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(lead_vk.clone()),
+            "the queued lead must stay in memory for the next tick"
+        );
+        assert_eq!(
+            slots.drain.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(drain_vk.clone()),
+            "a failed promotion must not evict the in-memory drain"
+        );
+        drop(slots);
+
+        // Persistence recovers: the queued lead promotes and the promoted
+        // active is on disk before it is served from memory.
+        ml_dsa_rotation::rotate_ml_dsa_keys_in_state_dir(&config, dir.path(), &store, now).await;
+        let persisted = ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "active")
+            .expect("promoted active must be persisted");
+        assert_eq!(
+            ml_dsa_slot_vk_bytes(&persisted),
+            lead_vk,
+            "memory promotion must follow the durable active write"
+        );
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.active.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(lead_vk),
+            "the queued lead must promote once persistence succeeds"
+        );
+        assert_eq!(
+            slots.drain.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(active_vk),
+            "the old active becomes drain only after its persist succeeded"
+        );
+        assert!(slots.lead.is_none());
+        assert!(!dir.path().join("ml-dsa-signing-key.lead").exists());
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_rotation_keeps_active_when_active_persist_fails() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let active = ml_dsa_rotation::generate_ml_dsa_slot(now - 14 * 86400, now + 1);
+        let lead = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        let active_vk = ml_dsa_slot_vk_bytes(&active);
+        let lead_vk = ml_dsa_slot_vk_bytes(&lead);
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "lead", &lead).unwrap();
+
+        let store = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: Some(active),
+            lead: Some(lead),
+        });
+
+        // The drain write succeeds (old active → drain) but the promoted
+        // active write fails: its slot path is a directory. The old active
+        // lives only in memory here, which is exactly what the rollback and
+        // the retry rely on.
+        std::fs::create_dir(dir.path().join("ml-dsa-signing-key.active")).unwrap();
+        let restored =
+            ml_dsa_rotation::rotate_ml_dsa_keys_in_state_dir(&config, dir.path(), &store, now)
+                .await;
+        assert!(
+            !restored,
+            "a failed rollback must report the stores as not fully restored"
+        );
+
+        assert_eq!(
+            store.active_key().await.as_deref().map(ml_dsa_key_vk_bytes),
+            Some(active_vk.clone()),
+            "the failed new key must not be exposed as active in memory"
+        );
+        {
+            let slots = store.0.read().await;
+            assert!(slots.lead.is_some(), "the lead stays queued for retry");
+            assert!(
+                slots.drain.is_none(),
+                "in-memory drain must not change before every write succeeded"
+            );
+        }
+        assert_eq!(
+            ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "drain")
+                .map(|slot| ml_dsa_slot_vk_bytes(&slot)),
+            Some(active_vk.clone()),
+            "a failed rollback must not erase the drain copy of the old active \
+             signer"
+        );
+        assert!(
+            dir.path().join("ml-dsa-signing-key.active").is_dir()
+                && ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "active").is_none(),
+            "the active slot must not be durably replaced by the failed key; \
+             until the retry lands, the old active survives in memory and in \
+             drain"
+        );
+
+        // Remove the obstruction; the queued lead promotes on the next tick.
+        std::fs::remove_dir(dir.path().join("ml-dsa-signing-key.active")).unwrap();
+        ml_dsa_rotation::rotate_ml_dsa_keys_in_state_dir(&config, dir.path(), &store, now).await;
+        assert_eq!(
+            store.active_key().await.as_deref().map(ml_dsa_key_vk_bytes),
+            Some(lead_vk.clone()),
+            "the queued lead must promote once persistence succeeds"
+        );
+        let persisted = ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "active")
+            .expect("promoted active must be persisted");
+        assert_eq!(
+            ml_dsa_key_vk_bytes(persisted.key.as_ref()),
+            lead_vk,
+            "memory promotion must be preceded by the durable active write"
+        );
+        let slots = store.0.read().await;
+        assert_eq!(
+            slots.drain.as_ref().map(ml_dsa_slot_vk_bytes),
+            Some(active_vk),
+            "the old active becomes drain only after its persist succeeded"
+        );
+        assert!(slots.lead.is_none());
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_failed_rollback_preserves_recoverable_active_in_drain() {
+        // The production composite boundary mutates the process-global
+        // key-set version/snapshot; a mutex cannot reset that state between
+        // tests. Re-execute this test in its own process (fresh globals),
+        // mirroring the other composite-global tests in this module.
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ML_DSA_ROLLBACK_RECOVERY_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ml_dsa_failed_rollback_preserves_recoverable_active_in_drain",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        for prev_drain_present in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let config = test_config();
+            let now = chrono::Utc::now().timestamp();
+
+            // Generous validity margins: this test may run on a slow or
+            // suspended machine, and restore resolution skips expired
+            // committed records.
+            let active = ml_dsa_rotation::generate_ml_dsa_slot(now - 14 * 86400, now + 6 * 3600);
+            let lead = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+            let active_vk = ml_dsa_slot_vk_bytes(&active);
+            let lead_vk = ml_dsa_slot_vk_bytes(&lead);
+            ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "active", &active).unwrap();
+            ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "lead", &lead).unwrap();
+            let prev_drain = if prev_drain_present {
+                let drain =
+                    ml_dsa_rotation::generate_ml_dsa_slot(now - 60 * 86400, now - 45 * 86400);
+                ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "drain", &drain).unwrap();
+                Some(drain)
+            } else {
+                None
+            };
+
+            let store = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+                drain: prev_drain.clone(),
+                active: Some(active),
+                lead: Some(lead),
+            });
+
+            // Commit real authority through the production writer: the
+            // committed OAuth active pair names exactly this ML-DSA signer.
+            let ed_store = load_or_init_key_store(dir.path(), &config);
+            let ca_key = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+            initialize_composite_key_set(dir.path(), &ed_store, &store, Arc::clone(&ca_key), 30)
+                .await
+                .expect("healthy starting authority must initialize composite");
+            let (commit_before, ledger_before) =
+                read_committed_composite_ledger(dir.path()).unwrap();
+            let oauth_active_pq = ledger_before
+                .pairs
+                .iter()
+                .find(|record| record.role == "oauth" && record.state == "active")
+                .expect("initialized authority must carry an active OAuth pair");
+            assert_eq!(
+                oauth_active_pq.ml_dsa_public,
+                URL_SAFE_NO_PAD.encode(&active_vk),
+                "prior_drain={prev_drain_present}: the committed active pair must \
+                 name the old active ML-DSA signer"
+            );
+
+            // Deterministic partial write, mirroring the Ed25519 scenario: the
+            // promotion's seed rename succeeds but every metadata persistence
+            // at `ml-dsa-signing-key.active.meta` fails, so the promoted
+            // active and its rollback both fail after the seed write.
+            let meta_path = dir.path().join("ml-dsa-signing-key.active.meta");
+            std::fs::remove_file(&meta_path).unwrap();
+            std::fs::create_dir(&meta_path).unwrap();
+
+            let restored =
+                ml_dsa_rotation::rotate_ml_dsa_keys_in_state_dir(&config, dir.path(), &store, now)
+                    .await;
+            assert!(
+                !restored,
+                "prior_drain={prev_drain_present}: a failed rollback must report \
+                 the stores as not fully restored"
+            );
+
+            let slots = store.0.read().await;
+            assert_eq!(
+                slots.active.as_ref().map(ml_dsa_slot_vk_bytes),
+                Some(active_vk.clone()),
+                "prior_drain={prev_drain_present}: the old active must remain the \
+                 in-memory active signer"
+            );
+            assert_eq!(
+                slots.lead.as_ref().map(ml_dsa_slot_vk_bytes),
+                Some(lead_vk.clone()),
+                "prior_drain={prev_drain_present}: the lead must stay queued"
+            );
+            assert_eq!(
+                slots.drain.as_ref().map(ml_dsa_slot_vk_bytes),
+                prev_drain.as_ref().map(ml_dsa_slot_vk_bytes),
+                "prior_drain={prev_drain_present}: memory drain must not change \
+                 before the rollback is confirmed"
+            );
+            drop(slots);
+
+            let recovered = ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "drain").expect(
+                "prior_drain={prev_drain_present}: drain copy of the old active \
+                 must survive a failed rollback",
+            );
+            assert_eq!(
+                ml_dsa_slot_vk_bytes(&recovered),
+                active_vk,
+                "prior_drain={prev_drain_present}: failed rollback must not erase \
+                 the recoverable old active signer"
+            );
+            assert!(
+                ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "active").is_none(),
+                "prior_drain={prev_drain_present}: the active slot is incomplete \
+                 without its metadata and must not load"
+            );
+
+            // Fresh reload with the real commit marker present: the old active
+            // signer stays recoverable from drain, before any retry.
+            let fresh = load_or_init_ml_dsa_key_store(dir.path(), &config);
+            {
+                let fresh_slots = fresh.0.read().await;
+                assert_eq!(
+                    fresh_slots.drain.as_ref().map(ml_dsa_slot_vk_bytes),
+                    Some(active_vk.clone()),
+                    "prior_drain={prev_drain_present}: fresh reload must still have \
+                     the committed old active signer recoverable in drain"
+                );
+                assert!(
+                    fresh_slots.active.is_none(),
+                    "prior_drain={prev_drain_present}: the torn active slot must not \
+                     load as a usable signer"
+                );
+            }
+
+            // The production restore resolver must rebuild the committed
+            // active pair from the recovered slots: the only surviving ML-DSA
+            // copy of the committed signer is the drain slot, so this fails
+            // (with the #1713-style restart error) if a rollback erased it.
+            let fresh_ed = load_or_init_key_store(dir.path(), &config);
+            initialize_composite_key_set(dir.path(), &fresh_ed, &fresh, Arc::clone(&ca_key), 30)
+                .await
+                .expect(
+                    "prior_drain={prev_drain_present}: committed authority must restore \
+                 from the recovered drain slot after a failed rollback",
+                );
+            let (commit_after, ledger_after) = read_committed_composite_ledger(dir.path()).unwrap();
+            assert_eq!(
+                commit_after.version, commit_before.version,
+                "prior_drain={prev_drain_present}: recovery must not need a new \
+                 committed generation"
+            );
+            assert_eq!(
+                commit_after.component_digest,
+                commit_before.component_digest
+            );
+            let oauth_active_pq_after = ledger_after
+                .pairs
+                .iter()
+                .find(|record| record.role == "oauth" && record.state == "active")
+                .expect("restored authority must still carry an active OAuth pair");
+            assert_eq!(
+                oauth_active_pq_after.ml_dsa_public,
+                URL_SAFE_NO_PAD.encode(&active_vk),
+                "prior_drain={prev_drain_present}: restored committed authority \
+                 must still name the recovered old active signer"
+            );
+
+            // Remove the injected failure and retry from the fresh store.
+            std::fs::remove_dir(&meta_path).unwrap();
+            let retried =
+                ml_dsa_rotation::rotate_ml_dsa_keys_in_state_dir(&config, dir.path(), &fresh, now)
+                    .await;
+            assert!(
+                retried,
+                "prior_drain={prev_drain_present}: the retry must fully restore and \
+                 promote"
+            );
+            assert_eq!(
+                fresh.active_key().await.as_deref().map(ml_dsa_key_vk_bytes),
+                Some(lead_vk),
+                "prior_drain={prev_drain_present}: the queued lead promotes after \
+                 recovery"
+            );
+            let slots = fresh.0.read().await;
+            assert_eq!(
+                slots.drain.as_ref().map(ml_dsa_slot_vk_bytes),
+                Some(active_vk),
+                "prior_drain={prev_drain_present}: the recovered old active must \
+                 survive the retry in drain"
+            );
+            assert!(slots.lead.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_rollback_defers_composite_publication() {
+        // The production composite boundary mutates the process-global
+        // key-set version/snapshot; a mutex cannot reset that state between
+        // tests. Re-execute this test in its own process (fresh globals),
+        // mirroring the other composite-global tests in this module.
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_PUBLICATION_GATE_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::failed_rollback_defers_composite_publication",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        // Healthy ML-DSA store; the Ed25519 promotion below fails its rollback
+        // via a directory obstruction at the active slot metadata path.
+        let pq_store = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
+        let active_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 1,
+        );
+        let lead_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1,
+            now + 14 * 86400,
+        );
+        persist_slot(dir.path(), "active", &active_slot).unwrap();
+        persist_slot(dir.path(), "lead", &lead_slot).unwrap();
+        let ed_store = Arc::new(SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(active_slot),
+            lead: Some(lead_slot),
+        }));
+
+        let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+        initialize_composite_key_set(dir.path(), &ed_store, &pq_store, Arc::clone(&ca), 30)
+            .await
+            .expect("a fully available signer set must initialize composite authority");
+        let (commit_before, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        let pending_before = std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap();
+        let snapshot_version_before = hyprstream_rpc::auth::global_composite_key_set()
+            .snapshot()
+            .version();
+
+        let meta_path = dir.path().join("jwt-signing-key.active.meta");
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+
+        let extra = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&pq_store)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+        run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+
+        // The cycle must not publish as successfully restored: committed
+        // authority, the pending ledger, and the live composite snapshot all
+        // retain the prior generation.
+        let (commit_after, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(
+            commit_after.version, commit_before.version,
+            "a not-fully-restored cycle must not advance the commit marker"
+        );
+        assert_eq!(
+            commit_after.component_digest, commit_before.component_digest,
+            "a not-fully-restored cycle must not change the committed digest"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before,
+            "a not-fully-restored cycle must not restate the pending ledger"
+        );
+        assert_eq!(
+            hyprstream_rpc::auth::global_composite_key_set()
+                .snapshot()
+                .version(),
+            snapshot_version_before,
+            "a not-fully-restored cycle must not publish to the live key set"
+        );
+        // The committed predecessor is durably recorded for the recovery tick.
+        assert_eq!(
+            read_deferred_predecessor(dir.path()).map(|record| record.committed_digest.clone()),
+            Some(commit_before.component_digest.clone()),
+            "a deferring cycle must retain the committed predecessor digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn ed25519_restart_mismatch_fails_closed() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ED_RESTART_MISMATCH_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ed25519_restart_mismatch_fails_closed",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        // Healthy ML-DSA store with its own ready lead; Ed25519 store whose
+        // promotion will fail its rollback in the first cycle.
+        let pq_store = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
+        let new_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        let pq_lead = ml_dsa_rotation::MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: pq_store.active_key().await.map(|key| {
+                ml_dsa_rotation::MlDsaKeySlot::new((*key).clone(), now - 3600, now + 14 * 86400)
+            }),
+            lead: Some(new_pq.clone()),
+        });
+        let old_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 6 * 3600,
+        );
+        let new_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1,
+            now + 14 * 86400,
+        );
+        persist_slot(dir.path(), "active", &old_ed).unwrap();
+        persist_slot(dir.path(), "lead", &new_ed).unwrap();
+        let ed_store = Arc::new(SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(old_ed.clone()),
+            lead: Some(new_ed.clone()),
+        }));
+
+        let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+        // Initialize with exactly the stores cycle 1 consumes, so the
+        // committed digest matches the cycle's pre-rotation component state
+        // (queued leads included) and the predecessor seeding validates.
+        initialize_composite_key_set(dir.path(), &ed_store, &pq_lead, Arc::clone(&ca), 30)
+            .await
+            .expect("healthy starting authority must initialize composite");
+        let (commit_before, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        let pending_before = std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap();
+        let snapshot_version_before = hyprstream_rpc::auth::global_composite_key_set()
+            .snapshot()
+            .version();
+
+        // Cycle 1: the ML-DSA lead promotes while the Ed25519 promotion fails
+        // its rollback. Publication is deferred and the committed predecessor
+        // digest is retained for the recovery tick.
+        let meta_path = dir.path().join("jwt-signing-key.active.meta");
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+        let extra = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::new(pq_lead)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+        let all_restored = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(
+            !all_restored,
+            "the mixed cycle must report not fully restored"
+        );
+        let (commit_deferred, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(commit_deferred.version, commit_before.version);
+        assert_eq!(
+            commit_deferred.component_digest,
+            commit_before.component_digest
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before,
+            "a deferred cycle must not restate the pending ledger"
+        );
+        assert_eq!(
+            hyprstream_rpc::auth::global_composite_key_set()
+                .snapshot()
+                .version(),
+            snapshot_version_before,
+            "a deferred cycle must not publish to the live key set"
+        );
+        assert_eq!(
+            read_deferred_predecessor(dir.path()).map(|record| record.committed_digest.clone()),
+            Some(commit_before.component_digest.clone()),
+            "the committed predecessor digest must be retained across the \
+             deferred cycle"
+        );
+
+        // Clear the write obstruction and reload. The slot state may not
+        // match what this process certified in memory, so restart must not
+        // infer authority from the files. Even after the marker becomes
+        // readable again, the ledger digest gate must keep this state from
+        // being published.
+        std::fs::remove_dir(&meta_path).unwrap();
+        let fresh_ed = Arc::new(load_or_init_key_store(dir.path(), &config));
+        let fresh_pq = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
+        let extra_fresh = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&fresh_pq)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+        let initial_record = read_deferred_predecessor(dir.path()).unwrap();
+        let reloaded_digest =
+            component_state_digest(&fresh_ed, &fresh_pq, ca.verifying_key()).await;
+        assert!(
+            !initial_record.states.contains(&reloaded_digest),
+            "a restart reload not certified by this process must remain untrusted"
+        );
+        let marker_path = dir.path().join("jwt-composite-pairs.committed");
+        let marker_bytes = std::fs::read(&marker_path).unwrap();
+        std::fs::write(&marker_path, b"corrupt").unwrap();
+        // The rotation succeeds; the publication fails on the corrupt
+        // committed marker and must not commit anything.
+        let _failed_cycle =
+            run_rotation_cycle(&config, dir.path(), &fresh_ed, &extra_fresh, now).await;
+        // Ledger access restored: the committed generation is untouched, the
+        // record is retained, and its certified states advanced to the
+        // recovery tick's own post-rotation outcome.
+        std::fs::write(&marker_path, &marker_bytes).unwrap();
+        let (commit_failed, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(
+            commit_failed.version, commit_before.version,
+            "a failed recovery publication must not advance the committed \
+             generation"
+        );
+        let record_after_failure = read_deferred_predecessor(dir.path())
+            .expect("a failed recovery publication must retain the record");
+        assert_eq!(
+            record_after_failure.committed_digest, commit_before.component_digest,
+            "the retained record must keep the committed predecessor"
+        );
+        assert_eq!(
+            record_after_failure.states, initial_record.states,
+            "an untrusted restart state must not be added to the recovery record"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before,
+            "the failed recovery publication must not restate the pending ledger"
+        );
+
+        // A readable marker does not make the mismatching restart state
+        // trustworthy. The attempt remains fail-closed and preserves the
+        // last committed authority for operator recovery.
+        std::fs::write(&marker_path, &marker_bytes).unwrap();
+        let recovered = run_rotation_cycle(&config, dir.path(), &fresh_ed, &extra_fresh, now).await;
+        assert!(
+            recovered,
+            "the tick after a failed recovery publication must publish"
+        );
+        let (commit_after, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(commit_after.version, commit_before.version);
+        assert_eq!(
+            commit_after.component_digest,
+            commit_before.component_digest
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before
+        );
+        assert!(read_deferred_predecessor(dir.path()).is_some());
+        assert_eq!(
+            hyprstream_rpc::auth::global_composite_key_set()
+                .snapshot()
+                .version(),
+            snapshot_version_before
+        );
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_restart_mismatch_fails_closed() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ML_DSA_RESTART_MISMATCH_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ml_dsa_restart_mismatch_fails_closed",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        // Healthy Ed25519 store with its own ready lead; ML-DSA store whose
+        // promotion will fail its rollback in the first cycle.
+        let ed_store = Arc::new(load_or_init_key_store(dir.path(), &config));
+        let new_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1,
+            now + 14 * 86400,
+        );
+        let ed_lead = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: ed_store
+                .active_key()
+                .await
+                .map(|key| KeySlot::new((*key).clone(), now - 3600, now + 14 * 86400)),
+            lead: Some(new_ed.clone()),
+        });
+        let old_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 14 * 86400, now + 6 * 3600);
+        let new_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "active", &old_pq).unwrap();
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "lead", &new_pq).unwrap();
+        let pq_store = Arc::new(MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: Some(old_pq.clone()),
+            lead: Some(new_pq.clone()),
+        }));
+
+        let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+        // Initialize with exactly the stores cycle 1 consumes, so the
+        // committed digest matches the cycle's pre-rotation component state
+        // (queued leads included) and the predecessor seeding validates.
+        initialize_composite_key_set(dir.path(), &ed_lead, &pq_store, Arc::clone(&ca), 30)
+            .await
+            .expect("healthy starting authority must initialize composite");
+        let (commit_before, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        let pending_before = std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap();
+        let snapshot_version_before = hyprstream_rpc::auth::global_composite_key_set()
+            .snapshot()
+            .version();
+
+        // Cycle 1: the Ed25519 lead promotes while the ML-DSA promotion fails
+        // its rollback. Publication is deferred.
+        let meta_path = dir.path().join("ml-dsa-signing-key.active.meta");
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+        let extra = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&pq_store)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+        let all_restored = run_rotation_cycle(&config, dir.path(), &ed_lead, &extra, now).await;
+        assert!(
+            !all_restored,
+            "the mixed cycle must report not fully restored"
+        );
+        let (commit_deferred, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(commit_deferred.version, commit_before.version);
+        assert_eq!(
+            commit_deferred.component_digest,
+            commit_before.component_digest
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before,
+            "a deferred cycle must not restate the pending ledger"
+        );
+        assert_eq!(
+            hyprstream_rpc::auth::global_composite_key_set()
+                .snapshot()
+                .version(),
+            snapshot_version_before,
+            "a deferred cycle must not publish to the live key set"
+        );
+        assert_eq!(
+            read_deferred_predecessor(dir.path()).map(|record| record.committed_digest.clone()),
+            Some(commit_before.component_digest.clone()),
+            "the committed predecessor digest must be retained across the \
+             deferred cycle"
+        );
+
+        // Clear the write obstruction and reload. If the loaded state does
+        // not match what this process certified, restart must not infer
+        // authority from the slot files. A readable marker later does not
+        // make that mismatching state trusted.
+        std::fs::remove_dir(&meta_path).unwrap();
+        let fresh_ed = Arc::new(load_or_init_key_store(dir.path(), &config));
+        let fresh_pq = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
+        let extra_fresh = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&fresh_pq)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+        let initial_record = read_deferred_predecessor(dir.path()).unwrap();
+        let reloaded_digest =
+            component_state_digest(&fresh_ed, &fresh_pq, ca.verifying_key()).await;
+        assert!(
+            !initial_record.states.contains(&reloaded_digest),
+            "a restart reload not certified by this process must remain untrusted"
+        );
+        let marker_path = dir.path().join("jwt-composite-pairs.committed");
+        let marker_bytes = std::fs::read(&marker_path).unwrap();
+        std::fs::write(&marker_path, b"corrupt").unwrap();
+        // The rotation succeeds; the publication fails on the corrupt
+        // committed marker and must not commit anything.
+        let _failed_cycle =
+            run_rotation_cycle(&config, dir.path(), &fresh_ed, &extra_fresh, now).await;
+        // Ledger access restored: the committed generation is untouched, the
+        // record is retained, and its certified states advanced to the
+        // recovery tick's own post-rotation outcome.
+        std::fs::write(&marker_path, &marker_bytes).unwrap();
+        let (commit_failed, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(
+            commit_failed.version, commit_before.version,
+            "a failed recovery publication must not advance the committed \
+             generation"
+        );
+        let record_after_failure = read_deferred_predecessor(dir.path())
+            .expect("a failed recovery publication must retain the record");
+        assert_eq!(
+            record_after_failure.committed_digest, commit_before.component_digest,
+            "the retained record must keep the committed predecessor"
+        );
+        assert_eq!(
+            record_after_failure.states, initial_record.states,
+            "an untrusted restart state must not be added to the recovery record"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before,
+            "the failed recovery publication must not restate the pending ledger"
+        );
+
+        // A readable marker does not make the mismatching restart state
+        // trustworthy. The retry preserves the committed authority and waits
+        // for explicit repair.
+        std::fs::write(&marker_path, &marker_bytes).unwrap();
+        let recovered = run_rotation_cycle(&config, dir.path(), &fresh_ed, &extra_fresh, now).await;
+        assert!(
+            recovered,
+            "the rotation operation itself should remain usable"
+        );
+        let (commit_after, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(commit_after.version, commit_before.version);
+        assert_eq!(
+            commit_after.component_digest,
+            commit_before.component_digest
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before
+        );
+        assert!(read_deferred_predecessor(dir.path()).is_some());
+        assert_eq!(
+            hyprstream_rpc::auth::global_composite_key_set()
+                .snapshot()
+                .version(),
+            snapshot_version_before,
+            "the restart mismatch must not publish new signer authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn ed25519_failed_drain_rollback_defers_publication() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ED_DRAIN_ROLLBACK_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ed25519_failed_drain_rollback_defers_publication",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        for prev_drain_present in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let config = test_config();
+            let now = chrono::Utc::now().timestamp();
+
+            let pq_store = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
+            let active_slot = KeySlot::new(
+                SigningKey::generate(&mut rand::rngs::OsRng),
+                now - 14 * 86400,
+                now + 6 * 3600,
+            );
+            let lead_slot = KeySlot::new(
+                SigningKey::generate(&mut rand::rngs::OsRng),
+                now - 1,
+                now + 14 * 86400,
+            );
+            let active_vk = active_slot.verifying_key_bytes();
+            let lead_vk = lead_slot.verifying_key_bytes();
+            let prev_drain = if prev_drain_present {
+                let drain = KeySlot::new(
+                    SigningKey::generate(&mut rand::rngs::OsRng),
+                    now - 60 * 86400,
+                    now - 45 * 86400,
+                );
+                persist_slot(dir.path(), "drain", &drain).unwrap();
+                Some(drain)
+            } else {
+                None
+            };
+            persist_slot(dir.path(), "active", &active_slot).unwrap();
+            persist_slot(dir.path(), "lead", &lead_slot).unwrap();
+
+            let ed_store = SigningKeyStore::new(KeySlots {
+                drain: prev_drain.clone(),
+                active: Some(active_slot),
+                lead: Some(lead_slot),
+            });
+
+            let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+            initialize_composite_key_set(dir.path(), &ed_store, &pq_store, Arc::clone(&ca), 30)
+                .await
+                .expect("healthy starting authority must initialize composite");
+            let (commit_before, _) = read_committed_composite_ledger(dir.path()).unwrap();
+            let pending_before =
+                std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap();
+            let snapshot_version_before = hyprstream_rpc::auth::global_composite_key_set()
+                .snapshot()
+                .version();
+
+            // Deterministic partial drain write: the old-active-to-drain seed
+            // rename succeeds but the drain metadata persistence fails, and
+            // the previous-drain restoration (prev present) or the partial
+            // replacement removal (prev absent) fails on the same metadata
+            // path, so restoration cannot be confirmed.
+            let meta_path = dir.path().join("jwt-signing-key.drain.meta");
+            if meta_path.exists() {
+                std::fs::remove_file(&meta_path).unwrap();
+            }
+            std::fs::create_dir(&meta_path).unwrap();
+
+            let extra = RotationStores {
+                es256: None,
+                ml_dsa: Some(Arc::clone(&pq_store)),
+                composite_ca_key: Arc::clone(&ca),
+            };
+            let all_restored =
+                run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+            assert!(
+                !all_restored,
+                "prior_drain={prev_drain_present}: an unconfirmed previous-drain \
+                 restoration must report the stores as not fully restored"
+            );
+
+            let slots = ed_store.0.read().await;
+            assert_eq!(
+                slots.active.as_ref().map(KeySlot::verifying_key_bytes),
+                Some(active_vk),
+                "prior_drain={prev_drain_present}: the old active must remain the \
+                 in-memory active signer"
+            );
+            assert_eq!(
+                slots.lead.as_ref().map(KeySlot::verifying_key_bytes),
+                Some(lead_vk),
+                "prior_drain={prev_drain_present}: the lead must stay queued"
+            );
+            assert_eq!(
+                slots.drain.as_ref().map(KeySlot::verifying_key_bytes),
+                prev_drain.as_ref().map(KeySlot::verifying_key_bytes),
+                "prior_drain={prev_drain_present}: memory drain must not change"
+            );
+            drop(slots);
+
+            assert!(
+                load_slot(dir.path(), "drain").is_none(),
+                "prior_drain={prev_drain_present}: the torn drain slot must not load"
+            );
+
+            // The failed cleanup/restore must defer publication exactly like
+            // the active-rollback failure: committed, pending, and live
+            // authority all retain the prior generation.
+            let (commit_after, _) = read_committed_composite_ledger(dir.path()).unwrap();
+            assert_eq!(commit_after.version, commit_before.version);
+            assert_eq!(
+                commit_after.component_digest,
+                commit_before.component_digest
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+                pending_before,
+                "a not-fully-restored cycle must not restate the pending ledger"
+            );
+            assert_eq!(
+                hyprstream_rpc::auth::global_composite_key_set()
+                    .snapshot()
+                    .version(),
+                snapshot_version_before,
+                "a not-fully-restored cycle must not publish to the live key set"
+            );
+            assert_eq!(
+                read_deferred_predecessor(dir.path()).map(|record| record.committed_digest.clone()),
+                Some(commit_before.component_digest.clone()),
+                "a deferring cycle must retain the committed predecessor digest"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ml_dsa_failed_drain_rollback_defers_publication() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ML_DSA_DRAIN_ROLLBACK_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ml_dsa_failed_drain_rollback_defers_publication",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        for prev_drain_present in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let config = test_config();
+            let now = chrono::Utc::now().timestamp();
+
+            let ed_store = Arc::new(load_or_init_key_store(dir.path(), &config));
+            let active = ml_dsa_rotation::generate_ml_dsa_slot(now - 14 * 86400, now + 6 * 3600);
+            let lead = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+            let active_vk = ml_dsa_slot_vk_bytes(&active);
+            let lead_vk = ml_dsa_slot_vk_bytes(&lead);
+            let prev_drain = if prev_drain_present {
+                let drain =
+                    ml_dsa_rotation::generate_ml_dsa_slot(now - 60 * 86400, now - 45 * 86400);
+                ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "drain", &drain).unwrap();
+                Some(drain)
+            } else {
+                None
+            };
+            ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "active", &active).unwrap();
+            ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "lead", &lead).unwrap();
+
+            let pq_store = Arc::new(MlDsaSigningKeyStore::new(MlDsaKeySlots {
+                drain: prev_drain.clone(),
+                active: Some(active),
+                lead: Some(lead),
+            }));
+
+            let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+            initialize_composite_key_set(dir.path(), &ed_store, &pq_store, Arc::clone(&ca), 30)
+                .await
+                .expect("healthy starting authority must initialize composite");
+            let (commit_before, _) = read_committed_composite_ledger(dir.path()).unwrap();
+            let pending_before =
+                std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap();
+            let snapshot_version_before = hyprstream_rpc::auth::global_composite_key_set()
+                .snapshot()
+                .version();
+
+            // Deterministic partial drain write, mirroring the Ed25519 case.
+            let meta_path = dir.path().join("ml-dsa-signing-key.drain.meta");
+            if meta_path.exists() {
+                std::fs::remove_file(&meta_path).unwrap();
+            }
+            std::fs::create_dir(&meta_path).unwrap();
+
+            let extra = RotationStores {
+                es256: None,
+                ml_dsa: Some(Arc::clone(&pq_store)),
+                composite_ca_key: Arc::clone(&ca),
+            };
+            let all_restored =
+                run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+            assert!(
+                !all_restored,
+                "prior_drain={prev_drain_present}: an unconfirmed previous-drain \
+                 restoration must report the stores as not fully restored"
+            );
+
+            let slots = pq_store.0.read().await;
+            assert_eq!(
+                slots.active.as_ref().map(ml_dsa_slot_vk_bytes),
+                Some(active_vk.clone()),
+                "prior_drain={prev_drain_present}: the old active must remain the \
+                 in-memory active signer"
+            );
+            assert_eq!(
+                slots.lead.as_ref().map(ml_dsa_slot_vk_bytes),
+                Some(lead_vk.clone()),
+                "prior_drain={prev_drain_present}: the lead must stay queued"
+            );
+            assert_eq!(
+                slots.drain.as_ref().map(ml_dsa_slot_vk_bytes),
+                prev_drain.as_ref().map(ml_dsa_slot_vk_bytes),
+                "prior_drain={prev_drain_present}: memory drain must not change"
+            );
+            drop(slots);
+
+            assert!(
+                ml_dsa_rotation::load_ml_dsa_slot(dir.path(), "drain").is_none(),
+                "prior_drain={prev_drain_present}: the torn drain slot must not load"
+            );
+
+            let (commit_after, _) = read_committed_composite_ledger(dir.path()).unwrap();
+            assert_eq!(commit_after.version, commit_before.version);
+            assert_eq!(
+                commit_after.component_digest,
+                commit_before.component_digest
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+                pending_before,
+                "a not-fully-restored cycle must not restate the pending ledger"
+            );
+            assert_eq!(
+                hyprstream_rpc::auth::global_composite_key_set()
+                    .snapshot()
+                    .version(),
+                snapshot_version_before,
+                "a not-fully-restored cycle must not publish to the live key set"
+            );
+            assert_eq!(
+                read_deferred_predecessor(dir.path()).map(|record| record.committed_digest.clone()),
+                Some(commit_before.component_digest.clone()),
+                "a deferring cycle must retain the committed predecessor digest"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ed25519_stale_anchor_does_not_authorize_publication() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ED_STALE_ANCHOR_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ed25519_stale_anchor_does_not_authorize_publication",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let pq_store = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
+        // The active slot sits outside the lead-generation window so this
+        // no-op cycle does not publish a newly generated lead over the
+        // foreign-record assertion below.
+        let active_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 8 * 86400,
+        );
+        persist_slot(dir.path(), "active", &active_slot).unwrap();
+        let ed_store = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(active_slot),
+            lead: None,
+        });
+
+        let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+        initialize_composite_key_set(dir.path(), &ed_store, &pq_store, Arc::clone(&ca), 30)
+            .await
+            .expect("healthy starting authority must initialize composite");
+        let (commit_before, ledger_before) = read_committed_composite_ledger(dir.path()).unwrap();
+        let oauth_before = ledger_before
+            .pairs
+            .iter()
+            .find(|record| record.role == "oauth" && record.state == "active")
+            .expect("initialized authority must carry an active OAuth pair")
+            .clone();
+
+        // Another writer's recovery record: its certified deferred state is a
+        // foreign stale component state, and its committed digest is the
+        // current one. The writer of this test process holds stores that are
+        // the committed generation itself, so the continuity check must
+        // reject the record (its deferred state is not this process's
+        // tick-start memory) and no stale publication may be staged.
+        let foreign_ed = load_or_init_key_store(&dir.path().join("foreign-ed"), &config);
+        let foreign_pq = load_or_init_ml_dsa_key_store(&dir.path().join("foreign-pq"), &config);
+        let foreign_state =
+            component_state_digest(&foreign_ed, &foreign_pq, ca.verifying_key()).await;
+        let record = DeferredPredecessorRecord {
+            committed_digest: commit_before.component_digest.clone(),
+            states: vec![foreign_state],
+        };
+        assert!(
+            write_deferred_predecessor(dir.path(), &record),
+            "the test fixture must be able to record a foreign anchor"
+        );
+
+        let extra = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&pq_store)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+        let all_restored = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(all_restored);
+
+        // No stale publication: the committed generation still names this
+        // process's active OAuth pair, and the foreign component state never
+        // entered the ledger.
+        let (commit_after, ledger_after) = read_committed_composite_ledger(dir.path()).unwrap();
+        let oauth_active_after = ledger_after
+            .pairs
+            .iter()
+            .find(|record| record.role == "oauth" && record.state == "active")
+            .expect("authority must still carry an active OAuth pair");
+        assert_eq!(
+            oauth_active_after.ed25519_public, oauth_before.ed25519_public,
+            "a foreign certified state must not replace the committed OAuth \
+             signer"
+        );
+        assert_ne!(
+            oauth_active_after.ed25519_public,
+            URL_SAFE_NO_PAD.encode(foreign_ed.active_verifying_key_bytes().await.unwrap()),
+            "the foreign stale component state must never be published"
+        );
+        assert_eq!(
+            commit_after.component_digest, commit_before.component_digest,
+            "an ignored record must not change the committed digest"
+        );
+        assert!(
+            read_deferred_predecessor(dir.path()).is_none(),
+            "the successful publication clears the ignored record"
+        );
+    }
+
+    #[tokio::test]
+    async fn ed25519_stale_writer_ticks_do_not_certify_or_publish() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ED_STALE_WRITER_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ed25519_stale_writer_ticks_do_not_certify_or_publish",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        // Writer A: healthy ML-DSA store; Ed25519 store whose promotion fails
+        // its rollback in cycle 1 (mixed cycle), seeding a real deferred
+        // record.
+        let pq_store = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
+        let old_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 6 * 3600,
+        );
+        let new_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1,
+            now + 14 * 86400,
+        );
+        let new_ed_vk = new_ed.verifying_key_bytes();
+        persist_slot(dir.path(), "active", &old_ed).unwrap();
+        persist_slot(dir.path(), "lead", &new_ed).unwrap();
+        let ed_store = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(old_ed),
+            lead: Some(new_ed),
+        });
+
+        let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+        initialize_composite_key_set(dir.path(), &ed_store, &pq_store, Arc::clone(&ca), 30)
+            .await
+            .expect("healthy starting authority must initialize composite");
+        let (commit_before, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        let pending_before = std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap();
+        let snapshot_version_before = hyprstream_rpc::auth::global_composite_key_set()
+            .snapshot()
+            .version();
+
+        // Simulate a stale writer having changed the shared ML-DSA slot
+        // files before this process records its first deferred cycle. The
+        // current process's in-memory store still has the committed key; the
+        // reload digest below must not be certified from disk.
+        let foreign_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 30 * 86400, now + 8 * 86400);
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "active", &foreign_pq).unwrap();
+
+        let meta_path = dir.path().join("jwt-signing-key.active.meta");
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+        let extra = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&pq_store)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+        let all_restored = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(
+            !all_restored,
+            "the mixed cycle must defer and record its certified states"
+        );
+        let seeded = read_deferred_predecessor(dir.path())
+            .expect("the deferring cycle must retain a recovery record");
+        assert_eq!(
+            seeded.committed_digest, commit_before.component_digest,
+            "the record must anchor on the current committed generation"
+        );
+        assert_eq!(
+            seeded.states.len(),
+            1,
+            "only this process's memory state is recorded"
+        );
+        let foreign_reload = {
+            let reloaded_ed = load_or_init_key_store(dir.path(), &config);
+            let reloaded_pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+            component_state_digest(&reloaded_ed, &reloaded_pq, ca.verifying_key()).await
+        };
+        assert_ne!(
+            foreign_reload, seeded.states[0],
+            "the mutable slot state predated this record and is not trusted"
+        );
+        assert!(
+            !seeded.states.contains(&foreign_reload),
+            "a foreign reload must never be certified into the first record"
+        );
+        let certified_states = seeded.states.clone();
+
+        // Stale writer B: stores from a different (non-member) component
+        // generation, no due work, so both of its ticks are all-restored
+        // no-ops whose tick-start digest is not certified.
+        let stale_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 30 * 86400,
+            now + 8 * 86400,
+        );
+        let stale_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 30 * 86400, now + 8 * 86400);
+        let stale_ed_store = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(stale_ed),
+            lead: None,
+        });
+        let stale_pq_store = Arc::new(MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: Some(stale_pq),
+            lead: None,
+        }));
+        let stale_extra = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&stale_pq_store)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+
+        // Two all-restored stale-writer ticks: each supplies its own (stale)
+        // expectation, fails the digest gate against the committed ledger,
+        // and must neither publish nor certify its outcome into the record.
+        for tick in 1..=2 {
+            let all_restored =
+                run_rotation_cycle(&config, dir.path(), &stale_ed_store, &stale_extra, now).await;
+            assert!(
+                all_restored,
+                "stale tick {tick}: the no-op writer is restored"
+            );
+            let (commit_after_tick, _ledger_after_tick) =
+                read_committed_composite_ledger(dir.path()).unwrap();
+            assert_eq!(
+                commit_after_tick.version, commit_before.version,
+                "stale tick {tick}: a rejected stale writer must not advance the \
+                 committed generation"
+            );
+            assert_eq!(
+                commit_after_tick.component_digest, commit_before.component_digest,
+                "stale tick {tick}: the committed digest must not change"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+                pending_before,
+                "stale tick {tick}: the pending ledger must be untouched"
+            );
+            assert_eq!(
+                hyprstream_rpc::auth::global_composite_key_set()
+                    .snapshot()
+                    .version(),
+                snapshot_version_before,
+                "stale tick {tick}: a rejected stale writer must not publish to \
+                 the live key set"
+            );
+            let record = read_deferred_predecessor(dir.path())
+                .expect("stale tick {tick}: the recovery record must survive");
+            assert_eq!(
+                record.committed_digest, seeded.committed_digest,
+                "stale tick {tick}: the recorded committed predecessor must be \
+                 preserved"
+            );
+            assert_eq!(
+                record.states, certified_states,
+                "stale tick {tick}: the stale writer's outcome must never be \
+                 certified into the record"
+            );
+        }
+
+        // The legitimate writer still recovers: its certified state anchors
+        // publication of the intended generation, and the record is cleared.
+        std::fs::remove_dir(&meta_path).unwrap();
+        let recovered = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(recovered, "the certified writer must recover and publish");
+        let (commit_recovered, ledger_recovered) =
+            read_committed_composite_ledger(dir.path()).unwrap();
+        assert!(
+            commit_recovered.version > commit_before.version,
+            "the certified recovery must publish a new committed generation"
+        );
+        let oauth_active = ledger_recovered
+            .pairs
+            .iter()
+            .find(|record| record.role == "oauth" && record.state == "active")
+            .expect("the published generation must carry an active OAuth pair");
+        assert_eq!(
+            oauth_active.ed25519_public,
+            URL_SAFE_NO_PAD.encode(new_ed_vk),
+            "the published generation must carry the recovered Ed25519 signer"
+        );
+        assert!(read_deferred_predecessor(dir.path()).is_none());
+    }
+
+    #[tokio::test]
+    async fn ed25519_foreign_disk_state_never_certified() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_FOREIGN_DISK_STATE_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ed25519_foreign_disk_state_never_certified",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        // Writer A: healthy ML-DSA store with a ready lead (it promotes in
+        // the mixed cycle); Ed25519 store whose promotion fails its rollback.
+        let pq_store = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
+        let new_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        let pq_lead = Arc::new(MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: pq_store.active_key().await.map(|key| {
+                ml_dsa_rotation::MlDsaKeySlot::new((*key).clone(), now - 3600, now + 14 * 86400)
+            }),
+            lead: Some(new_pq.clone()),
+        }));
+        let old_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 6 * 3600,
+        );
+        let new_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1,
+            now + 14 * 86400,
+        );
+        let new_ed_vk = new_ed.verifying_key_bytes();
+        let new_pq_vk = ml_dsa_slot_vk_bytes(&new_pq);
+        persist_slot(dir.path(), "active", &old_ed).unwrap();
+        persist_slot(dir.path(), "lead", &new_ed).unwrap();
+        let ed_store = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(old_ed),
+            lead: Some(new_ed),
+        });
+
+        let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+        // Initialize with exactly the stores cycle 1 consumes (queued leads
+        // included), so the committed digest matches cycle 1's pre-rotation
+        // component state and the predecessor seeding validates.
+        initialize_composite_key_set(dir.path(), &ed_store, &pq_lead, Arc::clone(&ca), 30)
+            .await
+            .expect("healthy starting authority must initialize composite");
+        let (commit_before, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        let pending_before = std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap();
+        let snapshot_version_before = hyprstream_rpc::auth::global_composite_key_set()
+            .snapshot()
+            .version();
+
+        // Cycle 1: the mixed cycle defers and records the committed
+        // predecessor plus its certified states.
+        let meta_path = dir.path().join("jwt-signing-key.active.meta");
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+        let extra = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&pq_lead)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+        let all_restored = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(!all_restored, "the mixed cycle must defer");
+        let seeded = read_deferred_predecessor(dir.path())
+            .expect("the deferring cycle must retain a recovery record");
+        assert_eq!(
+            seeded.committed_digest, commit_before.component_digest,
+            "the record must anchor on the current committed generation"
+        );
+        assert_eq!(
+            seeded.states.len(),
+            1,
+            "only process-computed state recorded"
+        );
+
+        // The transient Ed25519 obstruction clears before writer B runs.
+        std::fs::remove_dir(&meta_path).unwrap();
+
+        // Writer B: the same pre-promotion Ed25519 slots as the committed
+        // generation, but a different stale ML-DSA slot set with its own
+        // ready lead. B promotes both families (successful due promotions),
+        // writes its outcome to the shared disk, and its publication is
+        // rejected by the digest gate (its captured predecessor differs).
+        let new_ed_b = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1,
+            now + 14 * 86400,
+        );
+        let new_pq_b = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        let new_pq_b_vk = ml_dsa_slot_vk_bytes(&new_pq_b);
+        let ed_b = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: ed_store
+                .active_key()
+                .await
+                .map(|key| KeySlot::new((*key).clone(), now - 3600, now + 14 * 86400)),
+            lead: Some(new_ed_b.clone()),
+        });
+        let pq_b = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: Some(ml_dsa_rotation::generate_ml_dsa_slot(
+                now - 3600,
+                now + 14 * 86400,
+            )),
+            lead: Some(new_pq_b.clone()),
+        });
+        let extra_b = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::new(pq_b)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+        let b_restored = run_rotation_cycle(&config, dir.path(), &ed_b, &extra_b, now).await;
+        assert!(b_restored, "writer B's own rotations must succeed");
+
+        // Writer A's certified recovery tick: its memory is certified, but
+        // its ML-DSA rotation has no due work and leaves writer B's disk
+        // slots untouched. The publication is forced to fail (corrupt
+        // committed marker), and the advance must certify only writer A's
+        // own memory outcome — never writer B's durable outcome.
+        let marker_path = dir.path().join("jwt-composite-pairs.committed");
+        let marker_bytes = std::fs::read(&marker_path).unwrap();
+        std::fs::write(&marker_path, b"corrupt").unwrap();
+        let all_restored = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(
+            all_restored,
+            "writer A's rotation is restored; only its publication fails"
+        );
+        let record = read_deferred_predecessor(dir.path())
+            .expect("the recovery record must survive the failed publication");
+        assert_eq!(
+            record.committed_digest, commit_before.component_digest,
+            "the record must keep the committed predecessor"
+        );
+        // Writer A's memory outcome includes the ML-DSA store the cycle
+        // rotates (pq_lead), which advanced in the mixed cycle.
+        let post_memory = component_state_digest(&ed_store, &pq_lead, ca.verifying_key()).await;
+        assert_eq!(
+            record.states,
+            vec![post_memory.clone()],
+            "the advance must certify only writer A's own memory outcome"
+        );
+        let foreign_reload = {
+            let reloaded_ed = load_or_init_key_store(dir.path(), &config);
+            let reloaded_pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+            component_state_digest(&reloaded_ed, &reloaded_pq, ca.verifying_key()).await
+        };
+        assert_ne!(
+            foreign_reload, post_memory,
+            "writer B's disk slots must still be on disk for this regression"
+        );
+        assert!(
+            !record.states.contains(&foreign_reload),
+            "the durable state left by the rejected writer must never be \
+             certified into the record"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before,
+            "the failed publication must not restate the pending ledger"
+        );
+        assert_eq!(
+            hyprstream_rpc::auth::global_composite_key_set()
+                .snapshot()
+                .version(),
+            snapshot_version_before,
+            "the failed publication must not publish to the live key set"
+        );
+
+        // Ledger access restored: the committed generation is untouched by
+        // the failed publication.
+        std::fs::write(&marker_path, &marker_bytes).unwrap();
+        let (commit_recovered_check, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(
+            commit_recovered_check.version, commit_before.version,
+            "the failed publication must not advance the committed generation"
+        );
+
+        // Retry writer B: its tick-start digest is still not certified, so it
+        // can neither publish nor advance the record; committed and live
+        // authority remain the retained generation.
+        let b_retry = run_rotation_cycle(&config, dir.path(), &ed_b, &extra_b, now).await;
+        assert!(b_retry, "writer B's no-op tick is restored");
+        let (commit_b_retry, ledger_b_retry) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(commit_b_retry.version, commit_before.version);
+        let oauth_b = ledger_b_retry
+            .pairs
+            .iter()
+            .find(|record| record.role == "oauth" && record.state == "active")
+            .expect("authority must still carry an active OAuth pair");
+        assert_ne!(
+            oauth_b.ml_dsa_public,
+            URL_SAFE_NO_PAD.encode(&new_pq_b_vk),
+            "writer B's stale ML-DSA outcome must never become committed \
+             authority"
+        );
+        assert_eq!(
+            read_deferred_predecessor(dir.path())
+                .expect("the record must survive writer B's retry")
+                .states,
+            vec![post_memory.clone()],
+            "writer B's retry must not certify its outcome into the record"
+        );
+
+        // Ledger access restored: writer A's next tick anchors on the
+        // certified memory state and publishes the recovered generation.
+        std::fs::write(&marker_path, &marker_bytes).unwrap();
+        let recovered = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(
+            recovered,
+            "writer A's certified tick must recover and publish"
+        );
+        let (commit_recovered, ledger_recovered) =
+            read_committed_composite_ledger(dir.path()).unwrap();
+        assert!(
+            commit_recovered.version > commit_before.version,
+            "the certified recovery must publish a new committed generation"
+        );
+        let oauth_recovered = ledger_recovered
+            .pairs
+            .iter()
+            .find(|record| record.role == "oauth" && record.state == "active")
+            .expect("the published generation must carry an active OAuth pair");
+        assert_eq!(
+            oauth_recovered.ed25519_public,
+            URL_SAFE_NO_PAD.encode(new_ed_vk),
+            "the published generation must carry the recovered Ed25519 signer"
+        );
+        assert_eq!(
+            oauth_recovered.ml_dsa_public,
+            URL_SAFE_NO_PAD.encode(&new_pq_vk),
+            "the published generation must carry the promoted ML-DSA signer"
+        );
+        assert!(read_deferred_predecessor(dir.path()).is_none());
+    }
+
+    #[tokio::test]
+    async fn ed25519_chained_deferral_never_certifies_reload() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_ED_CHAINED_DEFER_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::ed25519_chained_deferral_never_certifies_reload",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        // Bootstrap the ML-DSA active slot on disk (the store handle itself
+        // is rebuilt below with its ready lead).
+        load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let old_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 6 * 3600,
+        );
+        let new_ed = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 1,
+            now + 14 * 86400,
+        );
+        let old_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 3600, now + 14 * 86400);
+        let new_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        persist_slot(dir.path(), "active", &old_ed).unwrap();
+        persist_slot(dir.path(), "lead", &new_ed).unwrap();
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "active", &old_pq).unwrap();
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "lead", &new_pq).unwrap();
+        let ed_store = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(old_ed),
+            lead: Some(new_ed),
+        });
+        let pq_store = MlDsaSigningKeyStore::new(MlDsaKeySlots {
+            drain: None,
+            active: Some(old_pq),
+            lead: Some(new_pq),
+        });
+
+        let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+        initialize_composite_key_set(dir.path(), &ed_store, &pq_store, Arc::clone(&ca), 30)
+            .await
+            .expect("healthy starting authority must initialize composite");
+        let (commit_before, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        let pending_before = std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap();
+
+        let meta_path = dir.path().join("jwt-signing-key.active.meta");
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+        let pq_store = Arc::new(pq_store);
+        let extra = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&pq_store)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+
+        // Cycle 1: mixed cycle (Ed25519 rollback fails, ML-DSA promotes)
+        // defers and seeds {committed, [memory]}.
+        let deferred1 = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(!deferred1, "cycle 1 must defer");
+        let seeded =
+            read_deferred_predecessor(dir.path()).expect("cycle 1 must retain a recovery record");
+        assert_eq!(seeded.states.len(), 1, "seed records process memory only");
+        let seeded_mem_digest =
+            component_state_digest(&ed_store, &pq_store, ca.verifying_key()).await;
+        assert_eq!(
+            seeded.states,
+            vec![seeded_mem_digest.clone()],
+            "the seed must match only this process's computed memory"
+        );
+
+        // Cycle 2: consecutive not-fully-restored certified cycle. The
+        // transition is unchanged, so the record must be kept as-is; nothing
+        // new enters the certified states.
+        let deferred2 = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(!deferred2, "cycle 2 must defer again (same obstruction)");
+        let advanced = read_deferred_predecessor(dir.path())
+            .expect("the record must survive the chained deferral");
+        assert_eq!(
+            advanced.committed_digest, commit_before.component_digest,
+            "the chained deferral must keep the committed predecessor"
+        );
+        assert_eq!(
+            advanced.states, seeded.states,
+            "an unchanged chained deferral must keep the record as-is"
+        );
+
+        // Writer B's contamination analogue: a foreign ML-DSA active slot
+        // written to the shared state dir between certified cycles (the
+        // Ed25519 side stays torn under its own obstruction, as in the
+        // captured-transition state the record describes).
+        let foreign_pq = ml_dsa_rotation::generate_ml_dsa_slot(now - 1, now + 14 * 86400);
+        ml_dsa_rotation::persist_ml_dsa_slot(dir.path(), "active", &foreign_pq).unwrap();
+        let foreign_reload = {
+            let reloaded_ed = load_or_init_key_store(dir.path(), &config);
+            let reloaded_pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+            component_state_digest(&reloaded_ed, &reloaded_pq, ca.verifying_key()).await
+        };
+        assert_ne!(
+            foreign_reload, seeded_mem_digest,
+            "fixture: the foreign disk state must differ from the certified \
+             memory outcome"
+        );
+
+        // Cycle 3: the failure persists (the meta obstruction is still in
+        // place). The tick is certified (memory unchanged), its rotations
+        // durably advance a family only if due work exists - here none - and
+        // the chained advance must never certify the foreign durable state.
+        let deferred3 = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(!deferred3, "cycle 3 must defer again (same obstruction)");
+        let after_foreign = read_deferred_predecessor(dir.path())
+            .expect("the record must survive the third deferral");
+        assert_eq!(
+            after_foreign.committed_digest, commit_before.component_digest,
+            "the committed predecessor must be preserved"
+        );
+        assert!(
+            !after_foreign.states.contains(&foreign_reload),
+            "the foreign durable state left by another writer must never be \
+             certified into the record"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before,
+            "deferred cycles must not touch the pending ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_cycle_lock_serializes_writers() {
+        const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_CYCLE_LOCK_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::key_rotation::tests::rotation_cycle_lock_serializes_writers",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let now = chrono::Utc::now().timestamp();
+
+        let pq_store = Arc::new(load_or_init_ml_dsa_key_store(dir.path(), &config));
+        let active_slot = KeySlot::new(
+            SigningKey::generate(&mut rand::rngs::OsRng),
+            now - 14 * 86400,
+            now + 6 * 3600,
+        );
+        persist_slot(dir.path(), "active", &active_slot).unwrap();
+        let ed_store = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: Some(active_slot),
+            lead: None,
+        });
+
+        let ca: Arc<SigningKey> = Arc::new(SigningKey::from_bytes(&[0x5A; 32]));
+        initialize_composite_key_set(dir.path(), &ed_store, &pq_store, Arc::clone(&ca), 30)
+            .await
+            .expect("healthy starting authority must initialize composite");
+        let (commit_before, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        let pending_before = std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap();
+
+        // A competing writer holding the cycle lock makes this tick skip
+        // entirely: no rotation, no record lifecycle, no publication.
+        let cycle_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(cycle_lock_path(dir.path()))
+            .unwrap();
+        use nix::fcntl::{flock, FlockArg};
+        use std::os::fd::AsRawFd as _;
+        flock(cycle_lock.as_raw_fd(), FlockArg::LockExclusiveNonblock).unwrap();
+
+        let extra = RotationStores {
+            es256: None,
+            ml_dsa: Some(Arc::clone(&pq_store)),
+            composite_ca_key: Arc::clone(&ca),
+        };
+        let skipped = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(
+            skipped,
+            "a lock-contended cycle must skip without reporting not-restored"
+        );
+        let (commit_skipped, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert_eq!(commit_skipped.version, commit_before.version);
+        assert_eq!(
+            std::fs::read(dir.path().join("jwt-composite-pairs.json")).unwrap(),
+            pending_before,
+            "a skipped cycle must not touch the pending ledger"
+        );
+
+        // Lock released: the next tick runs normally and may publish.
+        drop(cycle_lock);
+        let ran = run_rotation_cycle(&config, dir.path(), &ed_store, &extra, now).await;
+        assert!(ran, "an uncontended cycle must run and stay restored");
+        let (commit_ran, _) = read_committed_composite_ledger(dir.path()).unwrap();
+        assert!(
+            commit_ran.version >= commit_before.version,
+            "an uncontended cycle must not regress the committed authority"
+        );
+    }
+
     #[tokio::test]
     async fn committed_marker_failures_never_reinitialize_from_mutable_authority() {
         const ISOLATED: &str = "HYPRSTREAM_COMPOSITE_FAIL_CLOSED_TEST";
@@ -4073,6 +7832,221 @@ mod tests {
                 "failure materialized staged C as committed authority"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn committed_verifier_generation_restores_local_signer_without_rotation() {
+        const PHASE: &str = "HYPRSTREAM_COMPOSITE_SIGNER_ATTACH_TEST";
+        const DIRECTORY: &str = "HYPRSTREAM_COMPOSITE_SIGNER_ATTACH_DIR";
+        let phase = std::env::var(PHASE).unwrap_or_default();
+        if phase.is_empty() {
+            let dir = TempDir::new().unwrap();
+            for phase in ["bootstrap", "restore"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "auth::key_rotation::tests::committed_verifier_generation_restores_local_signer_without_rotation", "--nocapture"])
+                    .env(PHASE, phase).env(DIRECTORY, dir.path()).status().unwrap();
+                assert!(status.success(), "{phase} subprocess failed");
+            }
+            return;
+        }
+        let dir = std::path::PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+        let config = test_config();
+        let ca = Arc::new(SigningKey::from_bytes(&[0x69; 32]));
+        let ed = load_or_init_key_store(&dir, &config);
+        let pq = load_or_init_ml_dsa_key_store(&dir, &config);
+        if phase == "bootstrap" {
+            initialize_composite_key_set(&dir, &ed, &pq, ca, 300)
+                .await
+                .unwrap();
+            return;
+        }
+        let marker = std::fs::read(composite_committed_path(&dir)).unwrap();
+        let (commit, _) = read_committed_composite_ledger(&dir).unwrap();
+        let immutable_path = composite_committed_ledger_path(&dir, &commit);
+        let immutable = std::fs::read(&immutable_path).unwrap();
+        // Exact production order: main restores verifier-only N, then the
+        // OAuth factory restores the local signing authority at that same N.
+        restore_composite_verifying_key_set(&dir, &ed, &pq, ca.verifying_key())
+            .await
+            .unwrap();
+        let keys = hyprstream_rpc::auth::global_composite_key_set();
+        use hyprstream_rpc::auth::CompositePairRole;
+        let before = keys.mint_snapshot().unwrap();
+        assert!(before
+            .active_signing_pair(CompositePairRole::OAuth)
+            .is_none());
+        for _ in 0..2 {
+            initialize_composite_key_set(&dir, &ed, &pq, Arc::clone(&ca), 300)
+                .await
+                .unwrap();
+            let after = keys.mint_snapshot().unwrap();
+            assert_eq!(after.version(), before.version());
+            assert_eq!(after.component_digest(), before.component_digest());
+            for role in [CompositePairRole::OAuth, CompositePairRole::Policy] {
+                assert!(after.active_signing_pair(role).is_some());
+            }
+        }
+        // Matching file metadata is insufficient: missing local components
+        // must still fail closed instead of manufacturing a signing identity.
+        let absent = SigningKeyStore::new(KeySlots {
+            drain: None,
+            active: None,
+            lead: None,
+        });
+        assert!(initialize_composite_key_set(&dir, &absent, &pq, ca, 300)
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(composite_committed_path(&dir)).unwrap(),
+            marker
+        );
+        assert_eq!(std::fs::read(immutable_path).unwrap(), immutable);
+    }
+
+    #[tokio::test]
+    async fn first_boot_slot_lock_failure_never_creates_or_activates_keys() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("signing-slots.lock")).unwrap();
+        let config = test_config();
+        let ed = load_or_init_key_store(dir.path(), &config);
+        let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let es = load_or_init_es256_key_store(dir.path(), &config);
+        assert!(ed.0.read().await.active.is_none());
+        assert!(pq.active_key().await.is_none());
+        assert!(es.0.read().active.is_none());
+        for family in ["jwt", "ml-dsa", "es256"] {
+            assert!(!dir
+                .path()
+                .join(format!("{family}-signing-key.active"))
+                .exists());
+        }
+        assert!(
+            initialize_composite_key_set(dir.path(), &ed, &pq, authority_ca_key(), 300)
+                .await
+                .is_err()
+        );
+        assert!(!composite_committed_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn first_boot_slot_lock_defers_rotation_without_mutation() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config();
+        let ed = load_or_init_key_store(dir.path(), &config);
+        let pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let es = load_or_init_es256_key_store(dir.path(), &config);
+        let ca = authority_ca_key();
+        let before = component_state_digest(&ed, &pq, ca.verifying_key()).await;
+        let es_before = es.0.read().active.as_ref().unwrap().kid();
+        let lock = lock_signing_slots(dir.path(), false).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(!rotate_jwt_keys(&config, dir.path(), &ed, now).await);
+        assert!(!rotate_ml_dsa_keys(&config, dir.path(), &pq, now).await);
+        assert!(!rotate_es256_keys(&config, dir.path(), &es, now).await);
+        assert_eq!(
+            component_state_digest(&ed, &pq, ca.verifying_key()).await,
+            before
+        );
+        drop(lock);
+        let reloaded_ed = load_or_init_key_store(dir.path(), &config);
+        let reloaded_pq = load_or_init_ml_dsa_key_store(dir.path(), &config);
+        let reloaded_es = load_or_init_es256_key_store(dir.path(), &config);
+        assert_eq!(
+            component_state_digest(&reloaded_ed, &reloaded_pq, ca.verifying_key()).await,
+            before
+        );
+        assert_eq!(
+            reloaded_es.0.read().active.as_ref().unwrap().kid(),
+            es_before
+        );
+        assert!(rotate_jwt_keys(&config, dir.path(), &ed, now).await);
+        assert!(rotate_ml_dsa_keys(&config, dir.path(), &pq, now).await);
+    }
+
+    #[tokio::test]
+    async fn first_boot_slot_creation_is_serialized_across_processes() {
+        use nix::fcntl::{flock, FlockArg};
+        use std::os::fd::AsRawFd;
+
+        const CHILD: &str = "HYPRSTREAM_FIRST_BOOT_SLOT_CHILD";
+        const DIRECTORY: &str = "HYPRSTREAM_FIRST_BOOT_SLOT_DIR";
+        const TEST: &str =
+            "auth::key_rotation::tests::first_boot_slot_creation_is_serialized_across_processes";
+        if let Ok(child) = std::env::var(CHILD) {
+            let dir = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+            std::fs::write(dir.join(format!("{child}.ready")), b"ready").unwrap();
+            let config = test_config();
+            // Match service startup: PQ before Ed, then the factory's ES256.
+            let pq = load_or_init_ml_dsa_key_store(&dir, &config);
+            let ed = load_or_init_key_store(&dir, &config);
+            let es = load_or_init_es256_key_store(&dir, &config);
+            let ca = authority_ca_key();
+            initialize_composite_key_set(&dir, &ed, &pq, Arc::clone(&ca), 300)
+                .await
+                .unwrap();
+            // Only public identity digests leave this disposable test process.
+            let digest = component_state_digest(&ed, &pq, ca.verifying_key()).await;
+            let es_kid = es.0.read().active.as_ref().unwrap().kid();
+            std::fs::write(
+                dir.join(format!("{child}.done")),
+                format!("{digest}:{es_kid}"),
+            )
+            .unwrap();
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("signing-slots.lock"))
+            .unwrap();
+        flock(lock.as_raw_fd(), FlockArg::LockExclusive).unwrap();
+        let spawn = |name: &str| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, name)
+                .env(DIRECTORY, dir.path())
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn("first");
+        let mut second = spawn("second");
+        wait_path(&dir.path().join("first.ready"));
+        wait_path(&dir.path().join("second.ready"));
+        // The old initializer ignores this held interprocess lock and writes
+        // active slots. Check the causal boundary before releasing either child.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let wrote_while_locked = ["jwt", "ml-dsa", "es256"].iter().any(|family| {
+            dir.path()
+                .join(format!("{family}-signing-key.active"))
+                .exists()
+        });
+        drop(lock);
+        assert!(first.wait().unwrap().success());
+        assert!(second.wait().unwrap().success());
+        assert!(
+            !wrote_while_locked,
+            "slot creation ignored the interprocess lock"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("first.done")).unwrap(),
+            std::fs::read(dir.path().join("second.done")).unwrap(),
+            "concurrent starters must adopt the same durable component identities"
+        );
+        let marker = std::fs::read(composite_committed_path(dir.path())).unwrap();
+        let mut restarted = spawn("restarted");
+        assert!(restarted.wait().unwrap().success());
+        assert_eq!(
+            std::fs::read(dir.path().join("first.done")).unwrap(),
+            std::fs::read(dir.path().join("restarted.done")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(composite_committed_path(dir.path())).unwrap(),
+            marker
+        );
     }
 
     #[tokio::test]
@@ -4262,8 +8236,8 @@ mod tests {
         .await
         .unwrap();
         assert!(hyprstream_rpc::auth::global_composite_key_set()
-                .snapshot()
-                .pair(&old_kid)
+            .snapshot()
+            .pair(&old_kid)
             .is_none());
     }
 }

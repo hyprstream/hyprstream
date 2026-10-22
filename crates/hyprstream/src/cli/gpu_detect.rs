@@ -4,9 +4,7 @@
 //! maps driver versions to CUDA/ROCm compatibility, and detects the
 //! current run mode (AppImage, bare binary, development).
 
-use hyprstream_tui::wizard::backend::{
-    EnvironmentInfo, GpuKind, LibtorchVariant, RunMode,
-};
+use hyprstream_tui::wizard::backend::{EnvironmentInfo, GpuKind, LibtorchVariant, RunMode};
 use std::path::Path;
 use tracing::debug;
 

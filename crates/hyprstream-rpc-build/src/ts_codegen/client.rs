@@ -100,9 +100,10 @@ pub fn generate_client(out: &mut String, service_name: &str, schema: &ParsedSche
             .request_struct
             .as_ref()
             .and_then(|request| {
-                request.fields.iter().find(|field| {
-                    field.name == variant.name && field.discriminant_value != 0xFFFF
-                })
+                request
+                    .fields
+                    .iter()
+                    .find(|field| field.name == variant.name && field.discriminant_value != 0xFFFF)
             })
             .map(|field| field.discriminant_value)
             .expect("generated TypeScript method must have a root union discriminator");
@@ -494,6 +495,12 @@ mod browser_binding_tests {
             vfs_bulk: false,
             vfs_hidden: false,
             vfs_mac: String::new(),
+            dispatch_mac: String::new(),
+            dispatch_public: String::new(),
+            mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         }
     }
 
@@ -503,6 +510,7 @@ mod browser_binding_tests {
             type_name: "Void".to_owned(),
             description: String::new(),
             fixed_size: None,
+            max_len: None,
             optional: false,
             slot_offset: 0,
             section: FieldSection::Data,

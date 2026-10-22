@@ -195,8 +195,8 @@ pub fn parse_exchange_response(body: &str) -> Result<ExchangedToken> {
         !resp.access_token.is_empty(),
         "token-exchange response omitted access_token"
     );
-    let token_type = TokenType::parse(resp.token_type.as_deref())
-        .map_err(|e| anyhow!("token-exchange {e}"))?;
+    let token_type =
+        TokenType::parse(resp.token_type.as_deref()).map_err(|e| anyhow!("token-exchange {e}"))?;
     if let Some(issued) = &resp.issued_token_type {
         ensure!(
             issued == ISSUED_TOKEN_TYPE,
@@ -271,7 +271,10 @@ pub fn parse_session_context(body: &str) -> Result<SessionContext> {
             context.did.is_none() && context.tenant.is_none() && !context.can_act_locally
         }
     };
-    ensure!(valid, "session context contains inconsistent viewer authority");
+    ensure!(
+        valid,
+        "session context contains inconsistent viewer authority"
+    );
     Ok(context)
 }
 
@@ -419,10 +422,10 @@ pub fn decide_nonce_outcome(
 #[cfg(target_arch = "wasm32")]
 mod fetch {
     use super::{
-        assemble_dpop_proof, decide_nonce_outcome, ed25519_dpop_signing_input,
-        exchange_form_body, generate_dpop_jti, parse_exchange_response, parse_session_context,
-        verify_sender_bound_token, BROWSER_PUBLIC_CLIENT_ID, ExchangedToken, NonceOutcome,
-        SessionContext, SESSION_EXCHANGE_PATH, WHOAMI_PATH,
+        assemble_dpop_proof, decide_nonce_outcome, ed25519_dpop_signing_input, exchange_form_body,
+        generate_dpop_jti, parse_exchange_response, parse_session_context, percent_encode,
+        verify_sender_bound_token, ExchangedToken, NonceOutcome, SessionContext,
+        BROWSER_PUBLIC_CLIENT_ID, SESSION_EXCHANGE_PATH, WHOAMI_PATH,
     };
     use anyhow::{anyhow, ensure, Context, Result};
     use wasm_bindgen::JsCast as _;
@@ -500,9 +503,8 @@ mod fetch {
     ) -> Result<String> {
         let iat = chrono::Utc::now().timestamp();
         let jti = generate_dpop_jti();
-        let (signing_input, _) = ed25519_dpop_signing_input(
-            pubkey, htm, htu, iat, &jti, ath, nonce,
-        )?;
+        let (signing_input, _) =
+            ed25519_dpop_signing_input(pubkey, htm, htu, iat, &jti, ath, nonce)?;
         // Call the JS sign callback: sign_fn(Uint8Array) → Promise<Uint8Array(64)>.
         let input_array = js_sys::Uint8Array::from(signing_input.as_bytes());
         let result = sign_fn
@@ -517,7 +519,10 @@ mod fetch {
         let signature_array: js_sys::Uint8Array = signature_value
             .dyn_into()
             .map_err(|_| anyhow!("DPoP sign callback returned non-Uint8Array"))?;
-        Ok(assemble_dpop_proof(&signing_input, &signature_array.to_vec()))
+        Ok(assemble_dpop_proof(
+            &signing_input,
+            &signature_array.to_vec(),
+        ))
     }
 
     /// POST an RFC 8693 token-exchange grant to `{exchange_endpoint}/oauth/token`
@@ -599,8 +604,7 @@ mod fetch {
 
             let request = web_sys::Request::new_with_str_and_init(url.as_str(), &init)
                 .map_err(|e| anyhow!("token-exchange request construction failed: {e:?}"))?;
-            let window =
-                web_sys::window().ok_or_else(|| anyhow!("browser window unavailable"))?;
+            let window = web_sys::window().ok_or_else(|| anyhow!("browser window unavailable"))?;
             let response_value = JsFuture::from(window.fetch_with_request(&request))
                 .await
                 .map_err(|e| anyhow!("token-exchange fetch failed: {e:?}"))?;
@@ -615,7 +619,13 @@ mod fetch {
 
             // RFC 9449 §8 nonce lifecycle, decided by the same pure function
             // the native tests exercise directly (#1425 r1 P1#4).
-            match decide_nonce_outcome(attempt, response_ok, status, &text, fresh_nonce_header.as_deref()) {
+            match decide_nonce_outcome(
+                attempt,
+                response_ok,
+                status,
+                &text,
+                fresh_nonce_header.as_deref(),
+            ) {
                 NonceOutcome::Success => {}
                 NonceOutcome::RetryWithNonce(fresh) => {
                     current_nonce = Some(fresh);
@@ -720,10 +730,107 @@ mod fetch {
         }
         parse_session_context(&text)
     }
+
+    /// Revoke an access token (RFC 7009, `POST {exchange_endpoint}/oauth/revoke`).
+    ///
+    /// Per RFC 7009 §2.2 the server always responds 200 whether or not the
+    /// token was valid, so the only error this returns is a transport
+    /// failure — the caller cannot distinguish "revoked" from
+    /// "server unreachable" from the response alone. `BrowserSession::revoke`
+    /// treats the session as unusable locally regardless of this outcome: a
+    /// client that cannot confirm revocation must not keep trusting the
+    /// token it just tried to kill.
+    pub async fn revoke_access_token(exchange_endpoint: &str, access_token: &str) -> Result<()> {
+        let mut url = parse_origin(exchange_endpoint)?;
+        url.set_path("/oauth/revoke");
+
+        let body = format!(
+            "token={}&token_type_hint=access_token",
+            percent_encode(access_token)
+        );
+
+        let headers = web_sys::Headers::new()
+            .map_err(|e| anyhow!("revoke header construction failed: {e:?}"))?;
+        headers
+            .set("content-type", "application/x-www-form-urlencoded")
+            .map_err(|e| anyhow!("revoke content-type set failed: {e:?}"))?;
+
+        let init = web_sys::RequestInit::new();
+        init.set_method("POST");
+        init.set_body(&js_sys::JsString::from(body.as_str()));
+        init.set_headers(headers.as_ref());
+        init.set_cache(web_sys::RequestCache::NoStore);
+        init.set_credentials(web_sys::RequestCredentials::SameOrigin);
+        init.set_redirect(web_sys::RequestRedirect::Error);
+
+        let request = web_sys::Request::new_with_str_and_init(url.as_str(), &init)
+            .map_err(|e| anyhow!("revoke request construction failed: {e:?}"))?;
+        let window = web_sys::window().ok_or_else(|| anyhow!("browser window unavailable"))?;
+        let response_value = JsFuture::from(window.fetch_with_request(&request))
+            .await
+            .map_err(|e| anyhow!("revoke fetch failed: {e:?}"))?;
+        let response: web_sys::Response = response_value
+            .dyn_into()
+            .map_err(|_| anyhow!("revoke fetch returned a non-Response"))?;
+        if !response.ok() {
+            return Err(anyhow!(
+                "revoke endpoint returned HTTP {}",
+                response.status()
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use fetch::{fetch_exchange_token, fetch_session_context, fetch_session_exchange};
+pub use fetch::{
+    fetch_exchange_token, fetch_session_context, fetch_session_exchange, revoke_access_token,
+};
+
+// ============================================================================
+// BrowserSession support — pure, native-testable
+// ============================================================================
+
+/// Classify a `fetch_exchange_token` (or `verify_sender_bound_token`) failure
+/// message into a stable error code for `hyprstream-rpc-std::browser_session`.
+///
+/// Every input reaches this function only because the exchange already
+/// failed (`Err`) — this is a labeling convenience on top of an already
+/// fail-closed exchange, not a gate that could itself fail open. An
+/// unrecognized message shape still classifies (as `"transport_error"`); it
+/// is never treated as success.
+///
+/// Classification is substring matching against the exact message shapes
+/// those functions produce today — covered by unit tests below against
+/// literal message strings so a wording change upstream is caught rather
+/// than silently misclassified.
+pub fn classify_exchange_error_code(message: &str) -> &'static str {
+    if message.contains("\"invalid_dpop_proof\"") {
+        "invalid_dpop_proof"
+    } else if message.contains("already used") {
+        "replay"
+    } else if message.contains("cnf.jkt does not match")
+        || message.contains("sender binding is missing")
+    {
+        "dpop_key_mismatch"
+    } else if message.contains("requires token_type: DPoP") {
+        "sender_binding_missing"
+    } else if message.contains("HTTP 401") {
+        "expired_or_revoked_subject"
+    } else if message.contains("HTTP 400") {
+        "invalid_request"
+    } else {
+        "transport_error"
+    }
+}
+
+/// Compute the absolute expiry (`Date.now()`-domain milliseconds) for a
+/// token whose `expires_in` (seconds, RFC 6749 §5.1) is `expires_in_secs`
+/// relative to `now_ms`. A non-positive `expires_in` clamps to `now_ms`
+/// (already expired) rather than underflowing.
+pub fn expires_at_ms(now_ms: f64, expires_in_secs: i64) -> f64 {
+    now_ms + (expires_in_secs.max(0) as f64) * 1000.0
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -798,7 +905,10 @@ mod tests {
         let token = dpop_bound_token(&pubkey, TokenType::Bearer);
         let err = verify_sender_bound_token(&token, &pubkey)
             .expect_err("a Bearer response must be rejected by the sender-bound fetch");
-        assert!(err.to_string().contains("DPoP"), "unexpected error: {err:#}");
+        assert!(
+            err.to_string().contains("DPoP"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
@@ -809,7 +919,10 @@ mod tests {
         let token = dpop_bound_token(&attacker_pubkey, TokenType::Dpop);
         let err = verify_sender_bound_token(&token, &pubkey)
             .expect_err("a token bound to a foreign key must be rejected");
-        assert!(err.to_string().contains("cnf.jkt"), "unexpected error: {err:#}");
+        assert!(
+            err.to_string().contains("cnf.jkt"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
@@ -825,7 +938,10 @@ mod tests {
         };
         let err = verify_sender_bound_token(&token, &pubkey)
             .expect_err("a token with no cnf.jkt at all must be rejected");
-        assert!(err.to_string().contains("cnf.jkt"), "unexpected error: {err:#}");
+        assert!(
+            err.to_string().contains("cnf.jkt"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
@@ -840,9 +956,16 @@ mod tests {
     #[test]
     fn ed25519_dpop_signing_input_has_correct_shape() {
         let pubkey = [0x42; 32];
-        let (signing_input, _header) =
-            ed25519_dpop_signing_input(&pubkey, "POST", "https://as.example/oauth/token", 1700000000, "jti-1", None, None)
-                .unwrap();
+        let (signing_input, _header) = ed25519_dpop_signing_input(
+            &pubkey,
+            "POST",
+            "https://as.example/oauth/token",
+            1700000000,
+            "jti-1",
+            None,
+            None,
+        )
+        .unwrap();
         // Two dots → three segments (header.payload.???).
         assert_eq!(signing_input.matches('.').count(), 1);
         let (h, p) = signing_input.split_once('.').unwrap();
@@ -858,16 +981,29 @@ mod tests {
         assert_eq!(payload["htu"], "https://as.example/oauth/token");
         assert_eq!(payload["iat"], 1700000000);
         assert_eq!(payload["jti"], "jti-1");
-        assert!(payload.get("ath").is_none(), "ath must be absent when not provided");
-        assert!(payload.get("nonce").is_none(), "nonce must be absent when not provided");
+        assert!(
+            payload.get("ath").is_none(),
+            "ath must be absent when not provided"
+        );
+        assert!(
+            payload.get("nonce").is_none(),
+            "nonce must be absent when not provided"
+        );
     }
 
     #[test]
     fn ed25519_dpop_signing_input_includes_ath_and_nonce() {
         let pubkey = [0x11; 32];
-        let (signing_input, _) =
-            ed25519_dpop_signing_input(&pubkey, "GET", "https://rpc.example/v1/models", 1, "j", Some("ath-hash"), Some("nonce-val"))
-                .unwrap();
+        let (signing_input, _) = ed25519_dpop_signing_input(
+            &pubkey,
+            "GET",
+            "https://rpc.example/v1/models",
+            1,
+            "j",
+            Some("ath-hash"),
+            Some("nonce-val"),
+        )
+        .unwrap();
         let (_, p) = signing_input.split_once('.').unwrap();
         let payload: serde_json::Value =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(p).unwrap()).unwrap();
@@ -909,9 +1045,8 @@ mod tests {
         let pubkey = [0x65; 32];
         let jkt = ed25519_dpop_jkt(&pubkey);
         // The server computes the same RFC 7638 thumbprint for an OKP Ed25519 key.
-        let expected = crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 {
-            x: &pubkey,
-        });
+        let expected =
+            crate::auth::jwk_thumbprint(&crate::auth::JwkThumbprintInput::Ed25519 { x: &pubkey });
         assert_eq!(jkt, expected);
     }
 
@@ -991,7 +1126,8 @@ mod tests {
     fn nonce_expired_status_is_not_retried() {
         // A 401 (e.g. expired access/refresh token) is not a use_dpop_nonce
         // shape and must not be retried regardless of body content.
-        let outcome = decide_nonce_outcome(0, false, 401, "{\"error\":\"use_dpop_nonce\"}", Some("n"));
+        let outcome =
+            decide_nonce_outcome(0, false, 401, "{\"error\":\"use_dpop_nonce\"}", Some("n"));
         assert_eq!(outcome, NonceOutcome::Failed);
     }
 
@@ -1116,5 +1252,82 @@ mod tests {
             r#"{"did":"did:web:alice.example","kind":"federated","tenant":"client-asserted","canActLocally":true}"#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn classifies_invalid_dpop_proof() {
+        let code = classify_exchange_error_code(
+            r#"token-exchange endpoint returned HTTP 400: {"error":"invalid_dpop_proof","error_description":"DPoP proof verification failed"}"#,
+        );
+        assert_eq!(code, "invalid_dpop_proof");
+    }
+
+    #[test]
+    fn classifies_replay() {
+        let code = classify_exchange_error_code(
+            r#"token-exchange endpoint returned HTTP 401: {"error":"invalid_token","error_description":"ATProto service-auth JWT already used"}"#,
+        );
+        assert_eq!(code, "replay");
+    }
+
+    #[test]
+    fn classifies_dpop_key_mismatch() {
+        let code = classify_exchange_error_code(
+            "exchanged token cnf.jkt does not match the browser DPoP key",
+        );
+        assert_eq!(code, "dpop_key_mismatch");
+    }
+
+    #[test]
+    fn classifies_missing_cnf_jkt_as_dpop_key_mismatch() {
+        let code = classify_exchange_error_code(
+            "exchanged token carries no cnf.jkt; sender binding is missing",
+        );
+        assert_eq!(code, "dpop_key_mismatch");
+    }
+
+    #[test]
+    fn classifies_missing_sender_binding() {
+        let code = classify_exchange_error_code(
+            "sender-bound browser exchange requires token_type: DPoP; got Bearer or an omitted token_type",
+        );
+        assert_eq!(code, "sender_binding_missing");
+    }
+
+    #[test]
+    fn classifies_expired_or_revoked_subject() {
+        let code = classify_exchange_error_code(
+            r#"token-exchange endpoint returned HTTP 401: {"error":"invalid_token","error_description":"subject token expired"}"#,
+        );
+        assert_eq!(code, "expired_or_revoked_subject");
+    }
+
+    #[test]
+    fn classifies_invalid_request() {
+        let code = classify_exchange_error_code(
+            r#"token-exchange endpoint returned HTTP 400: {"error":"invalid_request","error_description":"subject_token_type is required"}"#,
+        );
+        assert_eq!(code, "invalid_request");
+    }
+
+    #[test]
+    fn unrecognized_shape_still_classifies_as_transport_error() {
+        let code = classify_exchange_error_code("network fetch failed: connection reset");
+        assert_eq!(code, "transport_error");
+    }
+
+    #[test]
+    fn expires_at_ms_is_in_the_future_for_a_positive_ttl() {
+        assert_eq!(expires_at_ms(1_000.0, 300), 1_000.0 + 300_000.0);
+    }
+
+    #[test]
+    fn expires_at_ms_clamps_negative_ttl_to_now() {
+        assert_eq!(expires_at_ms(1_000.0, -10), 1_000.0);
+    }
+
+    #[test]
+    fn expires_at_ms_clamps_zero_ttl_to_now() {
+        assert_eq!(expires_at_ms(1_000.0, 0), 1_000.0);
     }
 }

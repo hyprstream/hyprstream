@@ -290,17 +290,98 @@ fn document_names_at9p(document: &Value, at9p_did: &str) -> bool {
         .is_some_and(|aliases| aliases.iter().any(|alias| alias.as_str() == Some(at9p_did)))
 }
 
-/// Extract the deployment CA from the primary hybrid subject key that signed
-/// the GATE-verified capsule.
+fn missing_deployment_reach_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach; \
+         the pinned did:at9p must be an ANCHOR capsule signed by the deployment CA, not a node's \
+         own identity capsule (e.g. the `#pds` capsule a node's OAuth service renders for \
+         itself) — mint one with `hyprstream trust mint-anchor-capsule` and publish it \
+         (with its did.json) under the deployment well-known directory"
+    )
+}
+
+/// Enforce the deployment-specific, closed anchor-capsule profile.
+///
+/// Generic at9p capsules intentionally have set semantics and may carry
+/// rotation or delegation material. A deployment anchor is narrower: every
+/// signed claim must be one the anchor minter and this resolver consume.
+fn validate_deployment_anchor_profile(
+    verified: &VerifiedCapsule,
+    configured_did_web: &str,
+) -> Result<()> {
+    let body = &verified.capsule().body;
+    anyhow::ensure!(
+        body.subject_keys.len() == 1,
+        "closed deployment-anchor profile violation: subjectKeys must contain exactly one pinned-Hybrid signer (got {})",
+        body.subject_keys.len()
+    );
+    // A node's ordinary `#pds` capsule is the most likely wrong input here.
+    // Keep the closed-profile violation as the primary rejection while retaining
+    // the dedicated operator guidance that explains how to mint the missing
+    // deployment anchor. When a valid #ns entry exists alongside extras, the
+    // cardinality check below still rejects it as an over-broad profile.
+    let service = body
+        .services
+        .iter()
+        .find(|service| {
+            service.id == DEPLOYMENT_REACH_SERVICE
+                && service.service_type == ServiceType::NinePExport
+        })
+        .ok_or_else(missing_deployment_reach_error)
+        .context(
+            "closed deployment-anchor profile violation: capsule must contain a #ns NinePExport deployment-reach service",
+        )?;
+    anyhow::ensure!(
+        body.services.len() == 1,
+        "closed deployment-anchor profile violation: services must contain exactly one #ns NinePExport entry (got {})",
+        body.services.len()
+    );
+    let aliases = body.also_known_as.as_deref().unwrap_or_default();
+    anyhow::ensure!(
+        aliases.len() == 1 && aliases[0] == configured_did_web,
+        "closed deployment-anchor profile violation: alsoKnownAs must contain exactly the configured did:web {configured_did_web:?}"
+    );
+    anyhow::ensure!(
+        body.next_key_commitments.is_empty(),
+        "closed deployment-anchor profile violation: nextKeyCommitments are forbidden"
+    );
+    anyhow::ensure!(
+        body.label_hints.is_none(),
+        "closed deployment-anchor profile violation: labelHints are forbidden"
+    );
+    anyhow::ensure!(
+        body.delegations.is_none(),
+        "closed deployment-anchor profile violation: delegations are forbidden"
+    );
+    anyhow::ensure!(
+        body.witnesses.is_none(),
+        "closed deployment-anchor profile violation: witnesses are forbidden"
+    );
+    anyhow::ensure!(
+        service.endpoint.export.is_none(),
+        "closed deployment-anchor profile violation: the #ns endpoint export field is forbidden"
+    );
+    match service.endpoint.transport {
+        At9pTransport::Iroh => {}
+        At9pTransport::Quic => anyhow::ensure!(
+            service.endpoint.node_id.is_none() && service.endpoint.relay.is_none(),
+            "closed deployment-anchor profile violation: QUIC #ns endpoints must not carry iroh nodeId or relay fields"
+        ),
+        ref other => bail!(
+            "closed deployment-anchor profile violation: #ns transport must be iroh or quic (got {other:?})"
+        ),
+    }
+    Ok(())
+}
+
+/// Extract the deployment CA from the sole hybrid subject key that signed the
+/// GATE-verified, closed-profile capsule.
 fn ca_key_from_capsule(verified: &VerifiedCapsule) -> Result<HybridDeploymentCa> {
-    let primary = verified
-        .capsule()
-        .body
-        .subject_keys
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("GATE-verified capsule has no subject key"))?;
-    HybridDeploymentCa::from_public_key_bytes(&primary.ed25519_pub, &primary.mldsa65_pub)
-        .context("capsule primary subject key is not a valid hybrid deployment CA")
+    let [subject] = verified.capsule().body.subject_keys.as_slice() else {
+        bail!("closed deployment-anchor profile violation: subjectKeys must contain exactly one pinned-Hybrid signer");
+    };
+    HybridDeploymentCa::from_public_key_bytes(&subject.ed25519_pub, &subject.mldsa65_pub)
+        .context("capsule sole subject key is not a valid hybrid deployment CA")
 }
 
 /// Extract Discovery reach from the capsule's typed `#ns` service. The
@@ -316,11 +397,7 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
             service.id == DEPLOYMENT_REACH_SERVICE
                 && service.service_type == ServiceType::NinePExport
         })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "capsule has no NinePExport service entry {DEPLOYMENT_REACH_SERVICE:?} for deployment reach"
-            )
-        })?;
+        .ok_or_else(missing_deployment_reach_error)?;
     match entry.endpoint.transport {
         At9pTransport::Iroh => {
             let node_id_multibase = entry.endpoint.node_id.as_deref().ok_or_else(|| {
@@ -352,16 +429,42 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
             // WebPKI policy, and certificate hashes) for that exact
             // capsule-bound socket. Those mechanics cannot select application
             // identity: the signed ping is still pinned independently.
+            //
+            // A hostname-based document URI (`https://host:port`) decodes to
+            // an unspecified address with only the port populated, so the match
+            // accepts either an exact address equality or a port-only match
+            // when the document entry carries an unspecified IP.
             let document_transport = hyprstream_rpc::did_web::transport_entries(document)
                 .into_iter()
                 .map(|decoded| decoded.config)
                 .find(|config| {
                     matches!(
                         &config.endpoint,
-                        EndpointType::Quic { addr, .. } if *addr == address
+                        EndpointType::Quic { addr, .. }
+                            if *addr == address
+                                || (addr.ip().is_unspecified() && addr.port() == address.port())
                     )
+                })
+                .map(|mut config| {
+                    // A hostname-based document URI decodes to an unspecified
+                    // IP with only the port populated. The capsule carries the
+                    // real dial address, so substitute it: without this rewrite
+                    // the config would dial 0.0.0.0:port and never connect,
+                    // turning a verified capsule into an unusable one.
+                    if let EndpointType::Quic { addr, .. } = &mut config.endpoint {
+                        if addr.ip().is_unspecified() {
+                            *addr = address;
+                        }
+                    }
+                    config
                 });
             Ok(document_transport.unwrap_or_else(|| {
+                tracing::warn!(
+                    "capsule QUIC reach {} has no matching QuicTransport entry in the did:web \
+                     document; falling back to bare-IP dial without SNI or certificate pins — \
+                     the deployment will not be reachable via hostname or WebPKI-validated TLS",
+                    address
+                );
                 TransportConfig::quic(address, address.ip().to_string()).with_connect_mode()
             }))
         }
@@ -371,13 +474,53 @@ fn reach_from_capsule(verified: &VerifiedCapsule, document: &Value) -> Result<Tr
     }
 }
 
-pub(crate) async fn verify_did_anchored_document(
+/// Deployment material an anchor capsule contributes, once the capsule and the
+/// `did:web` document have mutually attested to each other.
+///
+/// This is the verification-only half of the DID-anchored bootstrap — the part
+/// a minting ceremony can self-check offline, before publication and before any
+/// registry credential or authority log exists.
+#[derive(Clone, Debug)]
+pub struct VerifiedAnchorMaterial {
+    /// The GATE-verified `did:at9p` the document reciprocally names.
+    pub at9p_did: String,
+    /// Raw hybrid deployment root taken from the capsule's primary subject
+    /// key: the 32-byte Ed25519 key followed by the 1952-byte ML-DSA-65 key,
+    /// the same layout the OS-owned `deployment-ca.hybrid` pin uses.
+    pub deployment_ca_public: Vec<u8>,
+    /// Deployment reach decoded from the capsule's `#ns` NinePExport entry.
+    pub discovery_transport: TransportConfig,
+}
+
+/// Verify an anchor capsule against its `did:web` document through the
+/// production resolution path, without needing the registry credential or
+/// authority log the live bootstrap also fetches.
+///
+/// Minting ceremonies call this on their own output: material this rejects is
+/// material a node would refuse at boot.
+pub async fn verify_anchor_material(
     anchors: &DidAnchors,
     document: &Value,
     capsule_source: Arc<dyn CapsuleSource>,
-    registry_credential: String,
-    authority_log: DeploymentAuthorityLog,
-) -> Result<DidAnchoredTrust> {
+) -> Result<VerifiedAnchorMaterial> {
+    let (identity, ca, discovery_transport) =
+        resolve_anchor_pair(anchors, document, capsule_source).await?;
+    let mut deployment_ca_public = ca.ed25519_bytes().to_vec();
+    deployment_ca_public.extend_from_slice(&ca.ml_dsa_65_bytes());
+    Ok(VerifiedAnchorMaterial {
+        at9p_did: identity.at9p_did.as_str().to_owned(),
+        deployment_ca_public,
+        discovery_transport,
+    })
+}
+
+/// Shared core of the DID-anchored trust decision: reciprocal naming, the
+/// capsule GATE, and the CA + reach the GATE-verified capsule carries.
+async fn resolve_anchor_pair(
+    anchors: &DidAnchors,
+    document: &Value,
+    capsule_source: Arc<dyn CapsuleSource>,
+) -> Result<(AuthoritativeIdentity, HybridDeploymentCa, TransportConfig)> {
     anyhow::ensure!(
         document.get("id").and_then(Value::as_str) == Some(anchors.cluster_did_web.as_str()),
         "did:web document id does not match configured cluster_did_web"
@@ -398,6 +541,8 @@ pub(crate) async fn verify_did_anchored_document(
         "mutual-alias resolver did not preserve configured at9p authority"
     );
 
+    validate_deployment_anchor_profile(&verified, &anchors.cluster_did_web)?;
+
     // The document contributes only the reciprocal identifier vouch above.
     // Everything installed is content-bound to the configured did:at9p pin.
     let ca_verifying_key = ca_key_from_capsule(&verified)?;
@@ -409,7 +554,22 @@ pub(crate) async fn verify_did_anchored_document(
         ),
         "capsule deployment reach is not a network transport"
     );
+    Ok((
+        authoritative_identity,
+        ca_verifying_key,
+        discovery_transport,
+    ))
+}
 
+pub(crate) async fn verify_did_anchored_document(
+    anchors: &DidAnchors,
+    document: &Value,
+    capsule_source: Arc<dyn CapsuleSource>,
+    registry_credential: String,
+    authority_log: DeploymentAuthorityLog,
+) -> Result<DidAnchoredTrust> {
+    let (authoritative_identity, ca_verifying_key, discovery_transport) =
+        resolve_anchor_pair(anchors, document, capsule_source).await?;
     Ok(DidAnchoredTrust {
         ca_verifying_key,
         discovery_transport,
@@ -472,9 +632,10 @@ mod tests {
     use ed25519_dalek::{Signer as _, SigningKey};
     use hyprstream_crypto::pq::{ml_dsa_generate_keypair, ml_dsa_vk_bytes, MlDsaSigningKey};
     use hyprstream_pds::at9p::{
-        CapsuleBody, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType, Transport,
-        ML_DSA65_PUBLIC_KEY_LEN,
+        CapsuleBody, Delegation, HybridKeyPair, ServiceEndpoint, ServiceEntry, ServiceType,
+        Transport, ML_DSA65_PUBLIC_KEY_LEN,
     };
+    use hyprstream_pds::at9p_gate::verify_did_at9p;
     use hyprstream_pds::at9p_sign::sign_capsule;
     use hyprstream_pds::dag_cbor::DagCbor;
     use hyprstream_rpc::{
@@ -488,6 +649,7 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::net::SocketAddr;
 
     struct FixedCapsuleSource(Vec<u8>);
 
@@ -744,6 +906,49 @@ mod tests {
         capsule_with_carrier(classical_alias, tag, Some([0xC0; 32]))
     }
 
+    fn anchor_body(classical_alias: &str, signer: &CapsuleSigner) -> CapsuleBody {
+        let mut endpoint = ServiceEndpoint::new(Transport::Iroh, "iroh://anchor").unwrap();
+        endpoint.node_id = Some(multikey(&[0xC0; 32]));
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![signer.pair.clone()], vec![service]).unwrap();
+        body.also_known_as = Some(vec![classical_alias.to_owned()]);
+        body
+    }
+
+    fn signed_capsule(body: CapsuleBody, signer: &CapsuleSigner) -> (Vec<u8>, String) {
+        let capsule = sign_capsule(body, &signer.ed, &signer.pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let did = format!("did:at9p:{}", capsule.cid512().unwrap());
+        (bytes, did)
+    }
+
+    async fn closed_profile_error(web: &str, bytes: Vec<u8>, at9p: String) -> anyhow::Error {
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
+        };
+        verify_anchor_material(
+            &anchors,
+            &document(web, Some(&at9p)),
+            Arc::new(FixedCapsuleSource(bytes)),
+        )
+        .await
+        .expect_err("non-profile anchor capsule unexpectedly accepted")
+    }
+
+    fn assert_closed_profile_error(error: &anyhow::Error, field: &str) {
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("closed deployment-anchor profile violation"),
+            "failure did not come from the closed profile: {chain}"
+        );
+        assert!(
+            chain.contains(field),
+            "closed-profile failure did not identify {field}: {chain}"
+        );
+    }
+
     fn document(web: &str, at9p: Option<&str>) -> Value {
         let mut document = json!({ "id": web });
         if let Some(at9p) = at9p {
@@ -871,33 +1076,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutual_alias_accepts_at9p_as_authoritative() {
+    async fn closed_anchor_profile_preserves_the_exact_minted_deployment_ca() {
         let web = "did:web:cluster.example";
-        let (bytes, at9p) = capsule(web, 4);
+        let signer = capsule_signer(4);
+        let mut deployment_ca = signer.pair.ed25519_pub.clone();
+        deployment_ca.extend_from_slice(&signer.pair.mldsa65_pub);
+        let (bytes, at9p) = signed_capsule(anchor_body(web, &signer), &signer);
         let anchors = DidAnchors {
             cluster_at9p_did: at9p.clone(),
             cluster_did_web: web.to_owned(),
             extra_root_cert_pem: None,
         };
-        let trust = verify_did_anchored_document(
+        let verified = verify_anchor_material(
             &anchors,
             &document(web, Some(&at9p)),
             Arc::new(FixedCapsuleSource(bytes)),
-            "unused-test-credential".to_owned(),
-            unused_authority_log(),
         )
         .await
         .unwrap();
-        assert_eq!(trust.authoritative_identity.at9p_did.as_str(), at9p);
-        assert_eq!(trust.authoritative_identity.classical_did.as_str(), web);
-        assert_eq!(trust.ca_verifying_key.ed25519_bytes(), capsule_ca(4));
+        assert_eq!(verified.at9p_did, at9p);
         assert_eq!(
-            trust.ca_verifying_key.ml_dsa_65_bytes().len(),
-            ML_DSA65_PUBLIC_KEY_LEN
+            verified.deployment_ca_public, deployment_ca,
+            "resolved deployment CA must be byte-identical to deployment-ca.hybrid"
         );
-        match trust.discovery_transport.endpoint {
+        assert_eq!(
+            verified.deployment_ca_public.len(),
+            32 + ML_DSA65_PUBLIC_KEY_LEN
+        );
+        match verified.discovery_transport.endpoint {
             EndpointType::Iroh { node_id, .. } => assert_eq!(node_id, [0xC0; 32]),
             other => panic!("expected iroh reach from capsule, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_anchor_profile_rejects_two_subject_keys_signed_by_the_second() {
+        let web = "did:web:cluster.example";
+        let untrusted_first = capsule_signer(0x41);
+        let actual_signer = capsule_signer(0x42);
+        let mut body = anchor_body(web, &actual_signer);
+        body.subject_keys = vec![untrusted_first.pair, actual_signer.pair.clone()];
+        let (bytes, at9p) = signed_capsule(body, &actual_signer);
+
+        verify_did_at9p(&at9p, &bytes)
+            .expect("generic set-semantic GATE must accept the second subject as signer");
+        let error = closed_profile_error(web, bytes, at9p).await;
+        assert_closed_profile_error(&error, "subjectKeys");
+    }
+
+    #[tokio::test]
+    async fn closed_anchor_profile_rejects_an_extra_service() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(0x43);
+        let mut body = anchor_body(web, &signer);
+        let endpoint = ServiceEndpoint::new(Transport::Https, "https://pds.example").unwrap();
+        body.services
+            .push(ServiceEntry::new("#pds", ServiceType::AtprotoPds, endpoint).unwrap());
+        let (bytes, at9p) = signed_capsule(body, &signer);
+
+        verify_did_at9p(&at9p, &bytes).expect("extra-service capsule must pass generic GATE");
+        let error = closed_profile_error(web, bytes, at9p).await;
+        assert_closed_profile_error(&error, "services");
+    }
+
+    #[tokio::test]
+    async fn closed_anchor_profile_rejects_an_extra_alias() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(0x44);
+        let mut body = anchor_body(web, &signer);
+        body.also_known_as = Some(vec![
+            web.to_owned(),
+            "did:web:unexpected.example".to_owned(),
+        ]);
+        let (bytes, at9p) = signed_capsule(body, &signer);
+
+        verify_did_at9p(&at9p, &bytes).expect("extra-alias capsule must pass generic GATE");
+        let error = closed_profile_error(web, bytes, at9p).await;
+        assert_closed_profile_error(&error, "alsoKnownAs");
+    }
+
+    #[tokio::test]
+    async fn closed_anchor_profile_rejects_forbidden_signed_authority_metadata() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(0x45);
+
+        let mut next_key = anchor_body(web, &signer);
+        next_key
+            .next_key_commitments
+            .push(signer.pair.commitment_digest());
+        let mut label_hints = anchor_body(web, &signer);
+        label_hints.label_hints = Some(vec!["deployment".to_owned()]);
+        let mut delegations = anchor_body(web, &signer);
+        delegations.delegations = Some(vec![Delegation::new(
+            "operator",
+            "did:web:delegate.example",
+            vec!["admin".to_owned()],
+        )
+        .unwrap()]);
+        let mut witnesses = anchor_body(web, &signer);
+        witnesses.witnesses = Some(vec!["did:web:witness.example".to_owned()]);
+
+        for (field, body) in [
+            ("nextKeyCommitments", next_key),
+            ("labelHints", label_hints),
+            ("delegations", delegations),
+            ("witnesses", witnesses),
+        ] {
+            let (bytes, at9p) = signed_capsule(body, &signer);
+            verify_did_at9p(&at9p, &bytes)
+                .unwrap_or_else(|error| panic!("{field} capsule must pass generic GATE: {error}"));
+            let error = closed_profile_error(web, bytes, at9p).await;
+            assert_closed_profile_error(&error, field);
         }
     }
 
@@ -1081,6 +1370,122 @@ mod tests {
                 assert_eq!(auth.accept_cert_hashes(), &[[0xA5; 32]]);
             }
             other => panic!("expected capsule-bound QUIC reach, got {other:?}"),
+        }
+    }
+
+    /// When the document QUIC entry uses a hostname URI (decoding to an
+    /// unspecified IP) and the port matches the capsule's real address, the
+    /// port-match relaxation must fire AND the returned config must dial the
+    /// capsule's real socket address — not `0.0.0.0:port`.
+    ///
+    /// Removing the address-rewrite in `reach_from_capsule` turns this test
+    /// red: the config would dial an unspecified address and never connect.
+    #[tokio::test]
+    async fn quic_port_match_with_hostname_uri_rewrites_dial_address() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(7);
+        let capsule_addr: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let endpoint =
+            ServiceEndpoint::new(Transport::Quic, format!("quic://{capsule_addr}")).unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![signer.pair], vec![service]).unwrap();
+        body.also_known_as = Some(vec![web.to_owned()]);
+        let capsule = sign_capsule(body, &signer.ed, &signer.pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let at9p = format!("did:at9p:{}", capsule.cid512().unwrap());
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
+        };
+        let channel_auth =
+            hyprstream_rpc::transport::QuicServerAuth::pinned(vec![[0xB7; 32]]).unwrap();
+        let mut document = document(web, Some(&at9p));
+        // Hostname URI decodes to 0.0.0.0:443 — port matches, IP does not.
+        document["service"] = json!([{
+            "id": format!("{web}#quic"),
+            "type": "QuicTransport",
+            "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
+                "https://staging.example.com:443",
+                &channel_auth,
+                &["hyprstream-rpc/1"],
+            ),
+        }]);
+
+        let trust = verify_did_anchored_document(
+            &anchors,
+            &document,
+            Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
+            unused_authority_log(),
+        )
+        .await
+        .expect("hostname-URI port match must verify");
+        match trust.discovery_transport.endpoint {
+            EndpointType::Quic { addr, auth, .. } => {
+                assert_eq!(
+                    addr, capsule_addr,
+                    "dial address must be the capsule's real socket, not 0.0.0.0"
+                );
+                assert!(!auth.require_web_pki());
+                assert_eq!(auth.accept_cert_hashes(), &[[0xB7; 32]]);
+            }
+            other => panic!("expected capsule-bound QUIC reach, got {other:?}"),
+        }
+    }
+
+    /// When the document QUIC entry's port does NOT match the capsule's address
+    /// (and the IP is unspecified from a hostname URI), no entry matches and the
+    /// resolver falls back to a bare-IP dial without SNI or certificate pins.
+    #[tokio::test]
+    async fn quic_neither_port_nor_address_match_falls_back_to_bare_ip() {
+        let web = "did:web:cluster.example";
+        let signer = capsule_signer(9);
+        let capsule_addr: SocketAddr = "203.0.113.20:443".parse().unwrap();
+        let endpoint =
+            ServiceEndpoint::new(Transport::Quic, format!("quic://{capsule_addr}")).unwrap();
+        let service = ServiceEntry::new("#ns", ServiceType::NinePExport, endpoint).unwrap();
+        let mut body = CapsuleBody::new(vec![signer.pair], vec![service]).unwrap();
+        body.also_known_as = Some(vec![web.to_owned()]);
+        let capsule = sign_capsule(body, &signer.ed, &signer.pq).unwrap();
+        let bytes = capsule.to_dag_cbor().unwrap();
+        let at9p = format!("did:at9p:{}", capsule.cid512().unwrap());
+        let anchors = DidAnchors {
+            cluster_at9p_did: at9p.clone(),
+            cluster_did_web: web.to_owned(),
+            extra_root_cert_pem: None,
+        };
+        let channel_auth =
+            hyprstream_rpc::transport::QuicServerAuth::pinned(vec![[0xC9; 32]]).unwrap();
+        let mut document = document(web, Some(&at9p));
+        // Port 8443 does not match the capsule's port 443.
+        document["service"] = json!([{
+            "id": format!("{web}#quic"),
+            "type": "QuicTransport",
+            "serviceEndpoint": hyprstream_rpc::service_entry::encode_quic(
+                "https://staging.example.com:8443",
+                &channel_auth,
+                &["hyprstream-rpc/1"],
+            ),
+        }]);
+
+        let trust = verify_did_anchored_document(
+            &anchors,
+            &document,
+            Arc::new(FixedCapsuleSource(bytes)),
+            "unused-test-credential".to_owned(),
+            unused_authority_log(),
+        )
+        .await
+        .expect("fallback to bare-IP dial must still verify");
+        match trust.discovery_transport.endpoint {
+            EndpointType::Quic { addr, auth, .. } => {
+                // Fallback: bare capsule address, WebPKI default, no cert pins.
+                assert_eq!(addr, capsule_addr);
+                assert!(auth.require_web_pki());
+                assert!(auth.accept_cert_hashes().is_empty());
+            }
+            other => panic!("expected fallback QUIC reach, got {other:?}"),
         }
     }
 }

@@ -223,6 +223,11 @@ fn generate_trait_method(
     } else {
         return_type
     };
+    let stream_cfg = if is_streaming {
+        quote! { #[cfg(not(target_arch = "wasm32"))] }
+    } else {
+        TokenStream::new()
+    };
 
     // Determine params from the request variant type
     let params = match variant.type_name.as_str() {
@@ -247,6 +252,7 @@ fn generate_trait_method(
     };
 
     Some(quote! {
+        #stream_cfg
         async fn #method_name(&self #(, #params)*) -> anyhow::Result<#return_type>;
     })
 }
@@ -568,6 +574,7 @@ fn generate_trait_method_impl(
     if is_streaming {
         // Streaming trait impl: generate ephemeral keypair, call raw method, construct MoqStreamHandle
         Some(quote! {
+            #[cfg(not(target_arch = "wasm32"))]
             async fn #method_name(&self #(, #params)*) -> anyhow::Result<hyprstream_rpc::moq_stream::MoqStreamHandle> {
                 let (client_secret, client_pubkey) = hyprstream_rpc::crypto::generate_ephemeral_keypair();
                 let client_pubkey_bytes: [u8; 32] = client_pubkey.to_bytes();
@@ -581,13 +588,15 @@ fn generate_trait_method_impl(
                 let (mac_key, enc_key, topic) = hyprstream_rpc::derive_client_stream_keys(
                     &client_secret, &client_pubkey_bytes, &info.dh_public,
                 )?;
-                // #274: subscribe over the resolved `reach` (the same-host UDS
-                // fast path is preferred automatically when co-located).
+                // #274: subscribe over the resolved `reach`; UDS is available
+                // only when the service advertised no dialable network reach.
                 // #358: pass the service-signed `qos` so direct-vs-relay topology
                 // is selected from it (relay-first for retained/fan-out streams).
-                // #321: enc_key opens the transport-AEAD-sealed Tagged blocks.
-                Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::networked(
+                // #321: enc_key opens the transport-AEAD-sealed Tagged blocks;
+                // retain the RPC-authenticated server witness for Iroh admission.
+                Ok(hyprstream_rpc::moq_stream::MoqStreamHandle::networked_with_server_identity(
                     info.announced_at, &info.qos, info.broadcast_path, mac_key, enc_key, topic,
+                    info.moql_server_identity,
                 ))
             }
         })
@@ -603,6 +612,74 @@ fn generate_trait_method_impl(
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor Generation (Phase 2b)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Generate constructors that are safe to ship with the portable client.
+///
+/// Resolver authority is deliberately not linked into the contract crate. A
+/// host must use the explicit [`Client::from_provider`] API and supply its own
+/// deployment-specific provider.
+pub fn generate_portable_constructors(service_name: &str) -> TokenStream {
+    let pascal = to_pascal_case(service_name);
+    let client_name = format_ident!("{}Client", pascal);
+    let service_name_lit = service_name;
+
+    quote! {
+        #[cfg(not(target_arch = "wasm32"))]
+        impl #client_name {
+            /// Construct a client for a co-located service discovered through
+            /// the explicitly registered local endpoint.
+            pub fn for_local_bootstrap(
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                let registry = hyprstream_rpc::registry::try_global()
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "EndpointRegistry not initialized — local bootstrap requires registry::init()"
+                    ))?;
+                let transport = registry.registered_endpoint(
+                    #service_name_lit,
+                    hyprstream_rpc::registry::SocketKind::Rep,
+                ).ok_or_else(|| anyhow::anyhow!(
+                    "local bootstrap requires an explicitly registered service endpoint"
+                ))?;
+                Self::for_local_transport_bootstrap(&transport, signing_key, destination, token)
+            }
+
+            /// Construct a client from an explicit local endpoint string.
+            pub fn for_local_endpoint_bootstrap(
+                endpoint: &str,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                let transport = hyprstream_rpc::transport::TransportConfig::from_endpoint(endpoint);
+                Self::for_local_transport_bootstrap(&transport, signing_key, destination, token)
+            }
+
+            /// Construct a client from a typed local transport.
+            pub fn for_local_transport_bootstrap(
+                transport: &hyprstream_rpc::transport::TransportConfig,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                destination: hyprstream_rpc::crypto::VerifyingKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                anyhow::ensure!(
+                    matches!(
+                        &transport.endpoint,
+                        hyprstream_rpc::transport::EndpointType::Inproc { .. }
+                            | hyprstream_rpc::transport::EndpointType::Ipc { .. }
+                            | hyprstream_rpc::transport::EndpointType::SystemdFd { .. }
+                    ),
+                    "local bootstrap refuses network transport; use the identity-bound provider",
+                );
+                let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
+                let rpc = hyprstream_rpc::dial::dial(transport, signer, Some(destination), token)?;
+                Ok(Self::new(rpc))
+            }
+        }
+    }
+}
 
 /// Generate `new` and `with_endpoint` constructors on the client struct.
 ///
@@ -649,8 +726,8 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
             /// Create a new client connected to a specific endpoint string
             /// (`inproc://…` / `ipc://…`). Parsed to a `TransportConfig` and routed
             /// through [`hyprstream_rpc::dial::dial`] — the one place transport
-            /// selection happens. For networked (quic/iroh) targets, prefer
-            /// [`Self::from_resolver`], which carries the full auth config.
+            /// selection happens. Networked targets must be constructed with
+            /// [`Self::from_provider`] and an application-owned provider.
             pub fn for_local_endpoint_bootstrap(
                 endpoint: &str,
                 signing_key: hyprstream_rpc::crypto::SigningKey,
@@ -696,19 +773,6 @@ pub fn generate_constructors(service_name: &str) -> TokenStream {
                 let signer = hyprstream_rpc::signer::LocalSigner::new(signing_key);
                 let rpc = hyprstream_rpc::dial::dial(transport, signer, Some(destination), token)?;
                 Ok(Self::new(rpc))
-            }
-
-            /// Ordinary production construction path through the identity-bound
-            /// checkpoint/PDS resolver installed after Discovery bootstrap.
-            pub fn from_resolver(
-                signing_key: hyprstream_rpc::crypto::SigningKey,
-                token: Option<String>,
-            ) -> anyhow::Result<Self> {
-                Ok(Self::new(hyprstream_discovery::production_rpc_client(
-                    Self::SERVICE_NAME,
-                    signing_key,
-                    token,
-                )?))
             }
 
             /// Create a client from an `IdentityProvider` with automatic endpoint resolution.
@@ -952,9 +1016,35 @@ pub fn generate_client(
             pub fn new(client: std::sync::Arc<dyn hyprstream_rpc::RpcClient>) -> Self {
                 Self { client, call_options: hyprstream_rpc::CallOptions::default() }
             }
+
+            /// Construct this typed client through an application-supplied
+            /// [`hyprstream_rpc::RpcClientProvider`].  Resolver authority and
+            /// endpoint policy stay outside the portable contract crate.
+            pub fn from_provider(
+                provider: &dyn hyprstream_rpc::RpcClientProvider,
+                signing_key: hyprstream_rpc::crypto::SigningKey,
+                token: Option<String>,
+            ) -> anyhow::Result<Self> {
+                Ok(Self::new(provider.rpc_client(Self::SERVICE_NAME, signing_key, token)?))
+            }
             #[must_use]
             pub fn with_delegated_bearer(mut self, token: impl Into<String>) -> Self {
                 self.call_options.delegated_bearer = Some(token.into());
+                self
+            }
+
+            /// Set this client's DIRECT bearer for every call.
+            ///
+            /// Unlike [`Self::with_delegated_bearer`], the token travels as the
+            /// envelope's own JWT — the caller is asserting the token as ITS
+            /// verified credential, and the receiving service's holder/cnf
+            /// binding applies against this client's signing key. Used for
+            /// caller-authored credentials (e.g. the Model→Inference
+            /// `iw+jwt` internal work order); never for relaying a foreign
+            /// holder's token.
+            #[must_use]
+            pub fn with_bearer(mut self, token: impl Into<String>) -> Self {
+                self.call_options.jwt = Some(token.into());
                 self
             }
 
@@ -971,6 +1061,10 @@ pub fn generate_client(
             pub fn request(&self) -> hyprstream_rpc::RequestBuilder<'_> {
                 let builder =
                     hyprstream_rpc::RequestBuilder::for_service(&self.client, Self::SERVICE_NAME);
+                let builder = match &self.call_options.jwt {
+                    Some(token) => builder.jwt(token.clone()),
+                    None => builder,
+                };
                 match &self.call_options.delegated_bearer {
                     Some(token) => builder.delegated_bearer(token.clone()),
                     None => builder,
@@ -984,7 +1078,7 @@ pub fn generate_client(
             }
 
             /// Send a generated request with its canonical schema method id.
-            async fn call_with_method(
+            pub async fn call_with_method(
                 &self,
                 method_discriminator: u16,
                 payload: Vec<u8>,
@@ -1004,7 +1098,7 @@ pub fn generate_client(
             }
 
             /// Send a generated streaming request with its schema method id.
-            async fn call_streaming_with_method(
+            pub async fn call_streaming_with_method(
                 &self,
                 method_discriminator: u16,
                 payload: Vec<u8>,
@@ -1773,15 +1867,16 @@ mod resolved_service_codegen_tests {
     use super::generate_constructors;
 
     #[test]
-    fn generated_clients_use_atomic_resolved_service_for_production() {
+    fn generated_clients_require_explicit_provider_for_production() {
         let generated = generate_constructors("model").to_string();
-        assert!(generated.contains("production_rpc_client"));
+        assert!(!generated.contains("production_rpc_client"));
         assert!(!generated.contains("SelectedService"));
         assert!(!generated.contains("ServiceResolver"));
         assert!(!generated.contains("try_global_service"));
         assert!(!generated.contains("from_service_resolver"));
         assert!(!generated.contains("ResolvedRpcClient"));
         assert!(!generated.contains("from_installed_resolver"));
+        assert!(!generated.contains("from_resolver"));
         assert_eq!(
             generated
                 .matches("local bootstrap refuses network transport")
@@ -1795,13 +1890,37 @@ mod resolved_service_codegen_tests {
     }
 
     #[test]
+    fn generated_request_builder_preserves_both_client_auth_options() {
+        let source = include_str!("client.rs");
+        let request_start = source
+            .find("pub fn request(&self) -> hyprstream_rpc::RequestBuilder")
+            .expect("generated client template must define request()");
+        let request_end = source[request_start..]
+            .find("/// Send a raw request")
+            .expect("request() must end before raw call generation");
+        let generated = &source[request_start..request_start + request_end];
+        assert!(
+            generated.contains("match &self.call_options.jwt"),
+            "a generated client with_bearer token must reach request()"
+        );
+        assert!(
+            generated.contains("builder.jwt(token.clone())"),
+            "request() must carry the direct bearer into its per-call builder"
+        );
+        assert!(
+            generated.contains("match &self.call_options.delegated_bearer"),
+            "request() must retain delegated-bearer propagation"
+        );
+    }
+
+    #[test]
     fn application_call_graph_limits_local_bootstrap_to_explicit_bootstrap_paths() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(std::path::Path::parent)
             .expect("workspace root");
         let source_root = root.join("crates/hyprstream/src");
-        let mut ordinary = 0usize;
+        let mut explicit = 0usize;
         let mut stack = vec![source_root];
         while let Some(path) = stack.pop() {
             for entry in std::fs::read_dir(path).expect("read application source") {
@@ -1811,7 +1930,12 @@ mod resolved_service_codegen_tests {
                     stack.push(path);
                 } else if path.extension().and_then(|v| v.to_str()) == Some("rs") {
                     let source = std::fs::read_to_string(&path).expect("read Rust source");
-                    ordinary += source.matches("::from_resolver(").count();
+                    explicit += source.matches("::from_provider(").count();
+                    assert!(
+                        !source.contains("::from_resolver("),
+                        "compatibility resolver constructor remains in {}",
+                        path.display(),
+                    );
                     if !path.ends_with("services/policy.rs") {
                         assert!(
                             !source.contains(".resolve_service_key("),
@@ -1846,9 +1970,6 @@ mod resolved_service_codegen_tests {
                 }
             }
         }
-        assert!(
-            ordinary >= 50,
-            "ordinary installed-resolver migration regressed"
-        );
+        assert!(explicit >= 50, "explicit provider migration regressed");
     }
 }

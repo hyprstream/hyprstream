@@ -152,10 +152,7 @@ impl CapnpType {
     pub fn is_list(&self) -> bool {
         matches!(
             self,
-            Self::ListText
-                | Self::ListData
-                | Self::ListPrimitive(_)
-                | Self::ListStruct(_)
+            Self::ListText | Self::ListData | Self::ListPrimitive(_) | Self::ListStruct(_)
         )
     }
 
@@ -176,7 +173,6 @@ impl CapnpType {
                 | Self::Float64
         )
     }
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,8 +215,32 @@ mod tests {
         vec![StructDef {
             name: "ModelInfo".into(),
             fields: vec![
-                FieldDef { name: "name".into(), type_name: "Text".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Pointer, discriminant_value: 0xFFFF, serde_rename: None, domain_type: None },
-                FieldDef { name: "size".into(), type_name: "UInt64".into(), description: String::new(), fixed_size: None, optional: false, slot_offset: 0, section: FieldSection::Data, discriminant_value: 0xFFFF, serde_rename: None, domain_type: None },
+                FieldDef {
+                    name: "name".into(),
+                    type_name: "Text".into(),
+                    description: String::new(),
+                    fixed_size: None,
+                    max_len: None,
+                    optional: false,
+                    slot_offset: 0,
+                    section: FieldSection::Pointer,
+                    discriminant_value: 0xFFFF,
+                    serde_rename: None,
+                    domain_type: None,
+                },
+                FieldDef {
+                    name: "size".into(),
+                    type_name: "UInt64".into(),
+                    description: String::new(),
+                    fixed_size: None,
+                    max_len: None,
+                    optional: false,
+                    slot_offset: 0,
+                    section: FieldSection::Data,
+                    discriminant_value: 0xFFFF,
+                    serde_rename: None,
+                    domain_type: None,
+                },
             ],
             has_union: false,
             domain_type: None,
@@ -253,8 +273,14 @@ mod tests {
 
     #[test]
     fn classify_lists() {
-        assert_eq!(CapnpType::classify_primitive("List(Text)"), CapnpType::ListText);
-        assert_eq!(CapnpType::classify_primitive("List(Data)"), CapnpType::ListData);
+        assert_eq!(
+            CapnpType::classify_primitive("List(Text)"),
+            CapnpType::ListText
+        );
+        assert_eq!(
+            CapnpType::classify_primitive("List(Data)"),
+            CapnpType::ListData
+        );
         assert_eq!(
             CapnpType::classify_primitive("List(ModelInfo)"),
             CapnpType::ListStruct("ModelInfo".into())
@@ -324,7 +350,10 @@ mod tests {
             CapnpType::ListStruct("ModelInfo".into()).rust_owned_type(),
             "Vec<ModelInfo>"
         );
-        assert_eq!(CapnpType::Struct("ModelInfo".into()).rust_owned_type(), "ModelInfo");
+        assert_eq!(
+            CapnpType::Struct("ModelInfo".into()).rust_owned_type(),
+            "ModelInfo"
+        );
         assert_eq!(CapnpType::Enum("Status".into()).rust_owned_type(), "Status");
     }
 
@@ -360,5 +389,4 @@ mod tests {
         assert_eq!(to_snake_case("helloWorld"), "hello_world");
         assert_eq!(to_snake_case("HTTPRequest"), "http_request");
     }
-
 }

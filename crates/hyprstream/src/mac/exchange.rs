@@ -1,5 +1,5 @@
 //! **MAC S6 — runtime grant path: UCAN grant-request → access/refresh tokens.**
-//! Ticket #572 of the native-MAC epic (#547).
+//! Part of the native-MAC program.
 //!
 //! This is the **runtime** companion to S5's compile-time UCAN→Casbin/TE compiler.
 //! S5 compiles an *approved* UCAN into a ceiling (a `CompiledPolicy` +
@@ -67,14 +67,20 @@
 //! token minting live in `services::oauth::token_exchange` and call into
 //! [`evaluate_grant`] here.
 //!
-//! **Deferred (documented TODOs, fail-closed until landed):**
+//! **Deferred (fail-closed until landed):**
 //! - Full escalation tiers (static Casbin / agentic / admin-UDF amendment) —
-//!   see [`GrantDecision::Escalate`] and the `TODO(#572-escalation)` markers.
+//!   see [`GrantDecision::Escalate`].
 //! - Refresh-token rotation with re-evaluation plumbing end-to-end (the
 //!   `evaluate_grant` call on refresh is wired; rotation storage is the OAuth
-//!   layer's job) — `TODO(#572-refresh-rotation)`.
-//! - Revocation propagation into the grant path (jti blocklist check at grant
-//!   time) — `TODO(#572-revocation)`.
+//!   layer's job).
+//!
+//! Revocation propagation into the grant path (the former
+//! `TODO(#572-revocation)`) is closed by construction: every credential the
+//! grant path mints carries an issuer-scoped `jti` and is checked against the
+//! canonical revocation authority at every verification point; interactive
+//! refresh chains carry a session ID whose revocation prevents refresh
+//! without consuming the credential; and UCAN-grant refresh entries are
+//! single-use, re-evaluated here, and deletable through `/oauth/revoke`.
 
 use hyprstream_rpc::auth::mac::{
     SecurityContext, SecurityLabel, SubjectContextClaims, VerifiedKeyMaterial,
@@ -183,9 +189,9 @@ pub enum GrantDecision {
     /// and a sender-binding is present. The contained [`GrantedAccess`] is what
     /// the token minting layer encodes.
     Permit(GrantedAccess),
-    /// The request exceeds the grant ceiling. Routed to the escalation tier
-    /// (TODO(#572-escalation)); until the tiered-decision lands this is a
-    /// denial. `requested` is the over-ceiling capability for diagnostics.
+    /// The request exceeds the grant ceiling. Routed to the escalation tier;
+    /// until the tiered-decision lands this is a denial. `requested` is the
+    /// over-ceiling capability for diagnostics.
     Escalate { requested: Capability },
 }
 
@@ -337,11 +343,10 @@ pub fn evaluate_grant<V: UcanVerifier + ?Sized>(
         }
         // Over-ceiling. This is the escalation tier ingress. S6 does NOT
         // auto-escalate: a request beyond the ceiling is denied pending a
-        // ceiling amendment via the (deferred) tiered decision.
-        // TODO(#572-escalation): route to the tiered decision (static Casbin /
-        //   agentic / admin-UDF — authority-owned, MAC-bounded). Until that
-        //   lands, over-ceiling is a hard denial via the caller's
-        //   `insufficient_scope` response.
+        // ceiling amendment via the (deferred) tiered decision (static
+        // Casbin / agentic / admin-UDF — authority-owned, MAC-bounded).
+        // Until that lands, over-ceiling is a hard denial via the caller's
+        // `insufficient_scope` response.
         Decision::Deny | Decision::Escalate => Err(GrantError::OverCeiling {
             requested: Capability::with_caveats(
                 request.resource.clone(),
@@ -358,9 +363,9 @@ pub fn evaluate_grant<V: UcanVerifier + ?Sized>(
 /// Refresh is NOT a free re-mint. The presenter must re-present the grant (the
 /// ceiling may have been amended or revoked since the access token was minted),
 /// and the same [`evaluate_grant`] gates run again. This is a thin forwarder
-/// today — the name exists so the refresh path has an obvious, audited call site
-/// distinct from the initial mint, and so the deferred rotation logic
-/// (TODO(#572-refresh-rotation)) has a home.
+/// today — the name exists so the refresh path has an obvious, audited call
+/// site distinct from the initial mint, and so the deferred rotation logic
+/// has a home.
 ///
 /// SECURITY: the refresh MUST supply a fresh DPoP proof (`sender_bound` from a
 /// new proof, not carried over) and the same `now`-threading rules apply.
@@ -439,21 +444,23 @@ fn audit_grant_outcome(
 ) -> Result<GrantDecision, GrantError> {
     use crate::auth::scope_action_from_name;
     use crate::mac::audit::{AuditRecord, DecisionReason, DelegationPrincipal};
-    use crate::mac::te::{
-        ACTION_UNRECOGNIZED, Action, GRANT_PATH_OBJECT, GRANT_PATH_SUBJECT,
-    };
+    use crate::mac::te::{Action, ACTION_UNRECOGNIZED, GRANT_PATH_OBJECT, GRANT_PATH_SUBJECT};
     use hyprstream_rpc::auth::mac::SecurityLabel;
 
     let (decision, reason) = match result {
         Ok(GrantDecision::Permit(_)) => (Decision::Permit, DecisionReason::Permit),
-        Ok(GrantDecision::Escalate { .. }) => (Decision::Escalate, DecisionReason::GrantOverCeiling),
+        Ok(GrantDecision::Escalate { .. }) => {
+            (Decision::Escalate, DecisionReason::GrantOverCeiling)
+        }
         Err(GrantError::Chain(_)) => (Decision::Deny, DecisionReason::GrantChainInvalid),
         Err(GrantError::OverCeiling { .. }) => (Decision::Deny, DecisionReason::GrantOverCeiling),
         Err(GrantError::InsufficientClearance) => (Decision::Deny, DecisionReason::GrantFloorDeny),
         Err(GrantError::MissingSenderBinding) => {
             (Decision::Deny, DecisionReason::GrantMissingSenderBinding)
         }
-        Err(GrantError::UnlabeledSubject) => (Decision::Deny, DecisionReason::GrantUnlabeledSubject),
+        Err(GrantError::UnlabeledSubject) => {
+            (Decision::Deny, DecisionReason::GrantUnlabeledSubject)
+        }
         Err(GrantError::EmptyGrant) => (Decision::Deny, DecisionReason::GrantEmptyGrant),
         // Constructed below, never as the pre-audit decision — but exhaustive
         // match requires a reachable-if-mis-called arm. Records as a deny.
@@ -464,7 +471,7 @@ fn audit_grant_outcome(
         .map(Action::from)
         .unwrap_or(ACTION_UNRECOGNIZED);
     let record = AuditRecord {
-        seq: 0,          // the sink (WalAuditStore) assigns the real seq.
+        seq: 0,               // the sink (WalAuditStore) assigns the real seq.
         prev_hash: [0u8; 32], // the sink assigns the real chain link.
         ts_unix_nanos: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -474,7 +481,9 @@ fn audit_grant_outcome(
         generation: 0, // grant decisions are not TE-matrix-generation-versioned.
         policy_hash: None,
         subject_type: GRANT_PATH_SUBJECT,
-        subject_clearance: subject.map(|s| *s.clearance()).unwrap_or_else(SecurityLabel::bottom),
+        subject_clearance: subject
+            .map(|s| *s.clearance())
+            .unwrap_or_else(SecurityLabel::bottom),
         // #680/#681: on a delegated grant the delegator (authority source) is
         // recorded here; `subject_clearance` above is the effective met context
         // the gates evaluated. Same GRANT_PATH_SUBJECT sentinel type — the
@@ -507,7 +516,9 @@ fn audit_grant_outcome(
                 let _ = sink.record(&deny_record);
                 Err(GrantError::AuditUnavailable)
             } else {
-                tracing::error!("MAC grant-path audit write failed on a Deny decision (deny still enforced)");
+                tracing::error!(
+                    "MAC grant-path audit write failed on a Deny decision (deny still enforced)"
+                );
                 result.clone()
             }
         }
@@ -1171,7 +1182,8 @@ mod tests {
             }
         }
         fn fail_next_write(&self) {
-            self.fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.fail_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         fn records(&self) -> Vec<crate::mac::audit::AuditRecord> {
             self.records.lock().clone()
@@ -1182,7 +1194,10 @@ mod tests {
             &self,
             record: &crate::mac::audit::AuditRecord,
         ) -> Result<(), crate::mac::audit::AuditError> {
-            if self.fail_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
                 return Err(crate::mac::audit::AuditError::Io("injected failure".into()));
             }
             self.records.lock().push(record.clone());
@@ -1244,7 +1259,11 @@ mod tests {
         // The delegator (authority source): a DISTINCT clearance from the met
         // subject (`cleared_subject` is Secret/{0,1}), so the record must not
         // conflate the two.
-        let delegator = SecurityContext::new(Level::Secret, comps(&[0, 1, 2]), VerifiedKeyMaterial::PqHybrid);
+        let delegator = SecurityContext::new(
+            Level::Secret,
+            comps(&[0, 1, 2]),
+            VerifiedKeyMaterial::PqHybrid,
+        );
 
         let decision = audited_evaluate_grant(
             &grant,

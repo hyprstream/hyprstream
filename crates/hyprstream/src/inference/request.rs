@@ -4,9 +4,9 @@
 //! LocalInferenceClient and LocalInferenceService via channels.
 
 use crate::config::GenerationResult;
-use crate::runtime::GenerationRequest;
-use crate::runtime::ModelInfo;
 use crate::training::TenantDeltaConfig;
+use hyprstream_rpc_std::inference_client::GenerationRequest;
+use hyprstream_rpc_std::inference_client::ModelInfo;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
@@ -19,7 +19,6 @@ use super::response::StreamStats;
 /// For streaming generation, we use mpsc channels for chunks.
 pub enum InferenceRequest {
     // === Generation ===
-
     /// Non-streaming generation request.
     Generate {
         request: GenerationRequest,
@@ -41,7 +40,6 @@ pub enum InferenceRequest {
     },
 
     // === Model Info ===
-
     /// Get model information.
     ModelInfo {
         reply: oneshot::Sender<Result<ModelInfo, InferenceError>>,
@@ -61,7 +59,6 @@ pub enum InferenceRequest {
     },
 
     // === LoRA Operations ===
-
     /// Create LoRA adapter structure.
     CreateLora {
         config: TenantDeltaConfig,
@@ -91,7 +88,6 @@ pub enum InferenceRequest {
     },
 
     // === Session Management ===
-
     /// Set active session for KV cache isolation.
     SetSession {
         session_id: String,
@@ -110,7 +106,6 @@ pub enum InferenceRequest {
     },
 
     // === Embeddings ===
-
     /// Compute embeddings for images.
     Embed {
         images: Vec<Vec<u8>>,
@@ -118,7 +113,6 @@ pub enum InferenceRequest {
     },
 
     // === Health ===
-
     /// Health check request.
     HealthCheck {
         reply: oneshot::Sender<Result<(), InferenceError>>,
@@ -134,20 +128,34 @@ impl std::fmt::Debug for InferenceRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Generate { request, .. } => {
-                write!(f, "InferenceRequest::Generate {{ prompt_len: {} }}",
-                       request.prompt.len())
+                write!(
+                    f,
+                    "InferenceRequest::Generate {{ prompt_len: {} }}",
+                    request.prompt.len()
+                )
             }
             Self::GenerateStream { request, .. } => {
-                write!(f, "InferenceRequest::GenerateStream {{ prompt_len: {} }}",
-                       request.prompt.len())
+                write!(
+                    f,
+                    "InferenceRequest::GenerateStream {{ prompt_len: {} }}",
+                    request.prompt.len()
+                )
             }
             Self::ModelInfo { .. } => write!(f, "InferenceRequest::ModelInfo"),
             Self::IsReady { .. } => write!(f, "InferenceRequest::IsReady"),
             Self::ApplyChatTemplate { messages, .. } => {
-                write!(f, "InferenceRequest::ApplyChatTemplate {{ messages: {} }}", messages.len())
+                write!(
+                    f,
+                    "InferenceRequest::ApplyChatTemplate {{ messages: {} }}",
+                    messages.len()
+                )
             }
             Self::CreateLora { config, .. } => {
-                write!(f, "InferenceRequest::CreateLora {{ rank: {} }}", config.rank)
+                write!(
+                    f,
+                    "InferenceRequest::CreateLora {{ rank: {} }}",
+                    config.rank
+                )
             }
             Self::LoadLora { path, .. } => {
                 write!(f, "InferenceRequest::LoadLora {{ path: {path:?} }}")
@@ -158,11 +166,17 @@ impl std::fmt::Debug for InferenceRequest {
             Self::UnloadLora { .. } => write!(f, "InferenceRequest::UnloadLora"),
             Self::HasLora { .. } => write!(f, "InferenceRequest::HasLora"),
             Self::SetSession { session_id, .. } => {
-                write!(f, "InferenceRequest::SetSession {{ session_id: {session_id:?} }}")
+                write!(
+                    f,
+                    "InferenceRequest::SetSession {{ session_id: {session_id:?} }}"
+                )
             }
             Self::ClearSession { .. } => write!(f, "InferenceRequest::ClearSession"),
             Self::ReleaseSession { session_id, .. } => {
-                write!(f, "InferenceRequest::ReleaseSession {{ session_id: {session_id:?} }}")
+                write!(
+                    f,
+                    "InferenceRequest::ReleaseSession {{ session_id: {session_id:?} }}"
+                )
             }
             Self::Embed { images, .. } => {
                 write!(f, "InferenceRequest::Embed {{ images: {} }}", images.len())

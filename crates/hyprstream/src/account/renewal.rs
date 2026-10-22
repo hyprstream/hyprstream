@@ -101,7 +101,11 @@ pub fn classify(
     // A recent issuance failure is always at least Critical.
     let last_failed = matches!(last_result, Some(Err(_)));
     let Some(not_after) = handle.not_after() else {
-        return if last_failed { CertHealth::Critical } else { CertHealth::Unissued };
+        return if last_failed {
+            CertHealth::Critical
+        } else {
+            CertHealth::Unissued
+        };
     };
     let remaining = not_after - now;
     if remaining.is_negative() {
@@ -142,13 +146,7 @@ impl CertHealthMonitor {
         unprovisioned: bool,
     ) -> CertHealth {
         let now = OffsetDateTime::now_utc();
-        let state = classify(
-            handle,
-            last_result,
-            now,
-            &self.thresholds,
-            unprovisioned,
-        );
+        let state = classify(handle, last_result, now, &self.thresholds, unprovisioned);
         match state {
             CertHealth::Ok | CertHealth::Unprovisioned => {
                 tracing::debug!(
@@ -273,10 +271,7 @@ impl CertRenewer {
                     }
                 };
                 if due {
-                    let res = self
-                        .issuer
-                        .issue(zone, &self.cfg, self.dns.as_ref())
-                        .await;
+                    let res = self.issuer.issue(zone, &self.cfg, self.dns.as_ref()).await;
                     match &res {
                         Ok(c) => {
                             info!(
@@ -303,7 +298,6 @@ impl CertRenewer {
         }
     }
 }
-
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -342,12 +336,18 @@ mod tests {
         let (tx, empty) = CertHandle::channel();
         drop(tx);
         assert_eq!(classify(&empty, None, now, &t, false), CertHealth::Unissued);
-        assert_eq!(classify(&empty, None, now, &t, true), CertHealth::Unprovisioned);
+        assert_eq!(
+            classify(&empty, None, now, &t, true),
+            CertHealth::Unprovisioned
+        );
 
         // Last failure escalates a still-valid cert to Critical.
         let h = handle_with_cert(now + time::Duration::days(60));
         let err: Result<IssuedCert, IssuanceError> = Err(IssuanceError::Unprovisioned("x".into()));
-        assert_eq!(classify(&h, Some(&err), now, &t, false), CertHealth::Critical);
+        assert_eq!(
+            classify(&h, Some(&err), now, &t, false),
+            CertHealth::Critical
+        );
 
         // Regression (#1182 review): a failed renewal inside the warn band must
         // NOT be downgraded to ExpiringSoon — the documented OR-semantics say a
@@ -368,8 +368,8 @@ mod tests {
         let issuer = Arc::new(NullWildcardCertIssuer) as Arc<dyn WildcardCertIssuer>;
         let dns = Arc::new(UnconfiguredDnsProvider::new()) as Arc<dyn DnsProvider>;
         let (sender, handle) = CertHandle::channel();
-        let renewer = CertRenewer::new(cfg, issuer, dns, sender, handle)
-            .with_tick(Duration::from_millis(10));
+        let renewer =
+            CertRenewer::new(cfg, issuer, dns, sender, handle).with_tick(Duration::from_millis(10));
         // Run briefly then drop; we only assert it does not panic on an
         // unprovisioned deployment.
         let task = tokio::spawn(async move {

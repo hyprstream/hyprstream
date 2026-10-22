@@ -64,7 +64,9 @@ mod bridge;
 mod policy;
 mod protocol;
 
-pub use bridge::{AllowAllPolicy, DbusBridgeConfig, DbusBridgeService, DenyAllPolicy, PolicyChecker};
+pub use bridge::{
+    AllowAllPolicy, DbusBridgeConfig, DbusBridgeService, DenyAllPolicy, PolicyChecker,
+};
 pub use policy::{container_subject, DbusOperation, DbusResource};
 pub use protocol::{
     BusType, DbusCallRequest, DbusCallResponse, DbusError, DbusGetPropertyRequest, DbusRequest,

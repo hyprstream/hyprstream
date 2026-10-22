@@ -29,11 +29,19 @@
 
 #[cfg(feature = "xet-storage")]
 use async_trait::async_trait;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 #[cfg(feature = "xet-storage")]
 use data::{FileDownloader, FileUploadSession, XetFileInfo};
+#[cfg(feature = "xet-storage")]
+use tokio::io::AsyncWrite;
 
 use crate::error::{Result, XetError, XetErrorKind};
 
@@ -127,6 +135,107 @@ pub struct XetStorage {
     downloader: Arc<FileDownloader>,
 }
 
+/// Sequential CAS output that refuses writes beyond a caller-provided byte
+/// ceiling. Unlike a post-download metadata check, this bounds bytes reaching
+/// the private projection even when a CAS object disagrees with its pointer.
+#[cfg(feature = "xet-storage")]
+struct BoundedFileWriter {
+    file: std::fs::File,
+    limit: u64,
+    written: u64,
+}
+
+#[cfg(feature = "xet-storage")]
+impl BoundedFileWriter {
+    fn create(path: &Path, limit: u64) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(Self {
+            file,
+            limit,
+            written: 0,
+        })
+    }
+}
+
+#[cfg(feature = "xet-storage")]
+impl AsyncWrite for BoundedFileWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let Some(end) = self.written.checked_add(buf.len() as u64) else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CAS output size overflow",
+            )));
+        };
+        if end > self.limit {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CAS output exceeds {0}-byte limit", self.limit),
+            )));
+        }
+        loop {
+            match self.file.write(buf) {
+                Ok(written) => {
+                    self.written += written as u64;
+                    return Poll::Ready(Ok(written));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(self.file.flush())
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(self.file.flush())
+    }
+}
+
+#[cfg(all(test, feature = "xet-storage"))]
+mod bounded_output_tests {
+    use super::BoundedFileWriter;
+    use std::io;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn oversized_cas_chunk_is_rejected_before_file_growth() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let output = temp.path().join("bounded-output");
+        let mut writer = BoundedFileWriter::create(&output, 4)?;
+
+        assert!(writer.write_all(b"oversized").await.is_err());
+        writer.flush().await?;
+        drop(writer);
+        assert_eq!(std::fs::metadata(&output)?.len(), 0);
+        assert_eq!(std::fs::read(&output)?, b"");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn understated_pointer_cannot_write_past_declared_size() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let output = temp.path().join("bounded-output");
+        let mut writer = BoundedFileWriter::create(&output, 4)?;
+
+        writer.write_all(b"1234").await?;
+        assert!(writer.write_all(b"5").await.is_err());
+        writer.flush().await?;
+        drop(writer);
+        assert_eq!(std::fs::read(&output)?, b"1234");
+        assert_eq!(std::fs::metadata(&output)?.len(), 4);
+        Ok(())
+    }
+}
+
 #[cfg(feature = "xet-storage")]
 impl XetStorage {
     /// Create a new XET storage backend with the given configuration.
@@ -182,17 +291,15 @@ impl XetStorage {
     /// This is more efficient than writing to a temp file first when the data
     /// is already in memory (e.g., from tensor serialization).
     pub async fn clean_bytes(&self, data: &[u8]) -> Result<String> {
-        let (xet_info, _metrics) = data::data_client::clean_bytes(
-            self.upload_session.clone(),
-            data.to_vec(),
-        )
-        .await
-        .map_err(|e| {
-            XetError::new(
-                XetErrorKind::UploadFailed,
-                format!("Clean bytes failed: {e}"),
-            )
-        })?;
+        let (xet_info, _metrics) =
+            data::data_client::clean_bytes(self.upload_session.clone(), data.to_vec())
+                .await
+                .map_err(|e| {
+                    XetError::new(
+                        XetErrorKind::UploadFailed,
+                        format!("Clean bytes failed: {e}"),
+                    )
+                })?;
 
         xet_info.as_pointer_file().map_err(|e| {
             XetError::new(
@@ -239,6 +346,76 @@ impl XetStorage {
             })?;
 
         Ok(())
+    }
+
+    /// Download a pointer into a new file while enforcing `max_output_bytes`
+    /// at each sequential write. This is intended for callers that must bound
+    /// untrusted or stale pointer metadata before the payload reaches disk.
+    pub async fn smudge_file_bounded(
+        &self,
+        pointer: &str,
+        output_path: &Path,
+        max_output_bytes: u64,
+    ) -> Result<u64> {
+        let info: XetFileInfo = serde_json::from_str(pointer).map_err(|e| {
+            XetError::new(
+                XetErrorKind::InvalidPointer,
+                format!("Invalid pointer JSON: {e}"),
+            )
+        })?;
+        if info.file_size() > max_output_bytes {
+            return Err(XetError::new(
+                XetErrorKind::InvalidPointer,
+                format!("Pointer size exceeds {max_output_bytes}-byte output limit"),
+            ));
+        }
+        let hash = info.merkle_hash().map_err(|e| {
+            XetError::new(
+                XetErrorKind::InvalidPointer,
+                format!("Invalid merkle hash: {e}"),
+            )
+        })?;
+        self.smudge_hash_to_file_bounded(&hash, output_path, max_output_bytes)
+            .await
+    }
+
+    /// Download content by Merkle hash using a strict write-time byte ceiling.
+    pub async fn smudge_hash_to_file_bounded(
+        &self,
+        hash: &merklehash::MerkleHash,
+        output_path: &Path,
+        max_output_bytes: u64,
+    ) -> Result<u64> {
+        let writer = BoundedFileWriter::create(output_path, max_output_bytes).map_err(|e| {
+            XetError::new(
+                XetErrorKind::IoError,
+                format!("Create bounded CAS output: {e}"),
+            )
+        })?;
+        let output: cas_client::SequentialOutput = Box::new(writer);
+        let written = self
+            .downloader
+            .smudge_file_from_hash_sequential(
+                hash,
+                output_path.to_string_lossy().into(),
+                output,
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| {
+                XetError::new(
+                    XetErrorKind::DownloadFailed,
+                    format!("Bounded smudge to file failed: {e}"),
+                )
+            })?;
+        if written > max_output_bytes {
+            return Err(XetError::new(
+                XetErrorKind::DownloadFailed,
+                "CAS downloader reported bytes beyond its enforced output limit",
+            ));
+        }
+        Ok(written)
     }
 
     /// Download from XET pointer to memory
@@ -366,11 +543,12 @@ impl XetStorage {
 #[async_trait]
 impl StorageBackend for XetStorage {
     async fn clean_file(&self, path: &Path) -> Result<String> {
-        let (xet_info, _metrics) = data::data_client::clean_file(self.upload_session.clone(), path, "")
-            .await
-            .map_err(|e| {
-                XetError::new(XetErrorKind::UploadFailed, format!("Clean failed: {e}"))
-            })?;
+        let (xet_info, _metrics) =
+            data::data_client::clean_file(self.upload_session.clone(), path, "")
+                .await
+                .map_err(|e| {
+                    XetError::new(XetErrorKind::UploadFailed, format!("Clean failed: {e}"))
+                })?;
 
         xet_info.as_pointer_file().map_err(|e| {
             XetError::new(

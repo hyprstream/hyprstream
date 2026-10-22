@@ -62,11 +62,7 @@ fn mint_aud(signing: &SigningKey, sub: &str) -> String {
     jwt::encode(&claims, signing)
 }
 
-fn build_server() -> Result<(
-    web_transport_quinn::Server,
-    std::net::SocketAddr,
-    Vec<u8>,
-)> {
+fn build_server() -> Result<(web_transport_quinn::Server, std::net::SocketAddr, Vec<u8>)> {
     let cert_key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
     let cert_der = cert_key.cert.der().to_vec();
     let key_der = cert_key.key_pair.serialize_der();
@@ -479,10 +475,5 @@ async fn relay_authenticated_own_tenant_publish_succeeds() -> Result<()> {
 /// Compile-time check that the documented public API surface is wired.
 #[test]
 fn authz_surface_is_public() {
-    fn _assert(
-        _a: MoqConnectAuthz,
-        _r: VerifiedSubjectTenantResolver,
-        _p: PeerIdentity,
-    ) {
-    }
+    fn _assert(_a: MoqConnectAuthz, _r: VerifiedSubjectTenantResolver, _p: PeerIdentity) {}
 }

@@ -188,7 +188,12 @@ async fn test_branch_delete() -> Result<(), Box<dyn std::error::Error>> {
     let mgr = repo.branch();
 
     // Get the current branch name (could be main or master)
-    let default_branch = mgr.current().await?.ok_or("No current branch")?.name.clone();
+    let default_branch = mgr
+        .current()
+        .await?
+        .ok_or("No current branch")?
+        .name
+        .clone();
 
     // Create and checkout a temporary branch from HEAD
     mgr.create::<&str>("temp-branch", None).await?;
@@ -294,8 +299,7 @@ async fn test_remote_add_and_list() -> Result<(), Box<dyn std::error::Error>> {
     assert!(remotes.iter().any(|r| r.name == "origin"));
 
     // Add backup remote
-    mgr.add("backup", "https://backup.com/repo.git")
-        .await?;
+    mgr.add("backup", "https://backup.com/repo.git").await?;
 
     // Should now have both
     let remotes = mgr.list().await?;
@@ -329,7 +333,10 @@ async fn test_remote_set_url() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify URL changed
     let remotes = mgr.list().await?;
-    let origin = remotes.iter().find(|r| r.name == "origin").ok_or("origin remote not found")?;
+    let origin = remotes
+        .iter()
+        .find(|r| r.name == "origin")
+        .ok_or("origin remote not found")?;
     assert_eq!(origin.url, new_url);
     Ok(())
 }
@@ -354,8 +361,7 @@ async fn test_remote_rename() -> Result<(), Box<dyn std::error::Error>> {
     let mgr = repo.remote();
 
     // Add a remote
-    mgr.add("backup", "https://backup.com/repo.git")
-        .await?;
+    mgr.add("backup", "https://backup.com/repo.git").await?;
 
     // Rename it
     mgr.rename("backup", "mirror").await?;
@@ -451,10 +457,8 @@ async fn test_multi_remote_setup() -> Result<(), Box<dyn std::error::Error>> {
 
     // Setup multiple remotes (simulating distributed setup)
     mgr.add("p2p", "gittorrent://peer/repo").await?;
-    mgr.add("backup", "https://backup.com/repo.git")
-        .await?;
-    mgr.add("mirror", "https://mirror.org/repo.git")
-        .await?;
+    mgr.add("backup", "https://backup.com/repo.git").await?;
+    mgr.add("mirror", "https://mirror.org/repo.git").await?;
 
     // List all remotes
     let remotes = mgr.list().await?;

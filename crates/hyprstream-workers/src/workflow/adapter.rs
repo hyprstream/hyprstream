@@ -12,8 +12,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::Result;
 use super::service::WorkflowService;
+use crate::error::Result;
 
 /// A subscriber adapter watches events and dispatches workflows.
 ///
@@ -31,9 +31,5 @@ pub trait SubscriberAdapter: Send + Sync {
     /// 1. Subscribe to relevant event topics
     /// 2. Loop: receive event → match handlers → dispatch workflows
     /// 3. Exit cleanly when `cancel` is triggered
-    async fn run(
-        &self,
-        service: Arc<WorkflowService>,
-        cancel: CancellationToken,
-    ) -> Result<()>;
+    async fn run(&self, service: Arc<WorkflowService>, cancel: CancellationToken) -> Result<()>;
 }

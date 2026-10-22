@@ -10,19 +10,82 @@ pub mod server;
 // Re-export main configuration types
 pub use server::{CorsConfig, SamplingParamDefaults, ServerConfig, ServerConfigBuilder};
 
+// The records/repository RDS binding type lives in `hyprstream-pds` so the
+// discovery crate's accepted-state authority shares the same audited
+// resolution and verify-full validation code. Re-exported here so every
+// existing `crate::config::RdsConfig` path keeps resolving.
+pub use hyprstream_pds::rds::RdsConfig;
+
+// Inference-facing config types moved to `hyprstream-inference` (Wave B decomposition);
+// re-exported here so every existing `crate::config::...` path keeps resolving.
+pub use hyprstream_inference::config::{
+    default_lora_rank, default_target_modules, FinishReason, GenerationConfig, GenerationResult,
+    HyprstreamTrainingConfig, ModelConfig, RuntimeConfig, TTTMetrics, TTTTrainingConfig,
+    TrainingMode,
+};
+
 // Export root configuration and builder (defined below in this module)
 // Note: HyprConfig and HyprConfigBuilder are exported automatically as pub structs
 
-use crate::runtime::generation_metrics::GenerationQualityMetrics;
 use crate::storage::paths::StoragePaths;
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use zeroize::{Zeroize, Zeroizing};
 
+/// Process-wide validated configuration snapshot (#1585).
+///
+/// Binary startup installs the configuration it parsed and validated (from an
+/// explicit `--config` file or the default locations) into this write-once
+/// slot BEFORE any resolver, factory, or service thread runs. Every later
+/// [`HyprConfig::load()`] — including the reloads inside service factories and
+/// network modules that used to re-read XDG defaults and silently drop an
+/// explicit `--config` deployment's settings — then observes that one pinned
+/// snapshot instead of re-deriving a divergent configuration.
+///
+/// The slot is immutable once written: there is no runtime mutation path, and
+/// the snapshot replaces an unchanged-contract reload rather than authorizing
+/// anything by itself (checkpoint, trust, Policy, and service-key validation
+/// all stay exactly where they were). Tests that need a different
+/// configuration run in isolated child processes.
+static PINNED_CONFIG: OnceLock<HyprConfig> = OnceLock::new();
+
+/// Install the process-wide validated configuration snapshot (write-once).
+///
+/// Returns `true` when this call installed the snapshot; `false` when an
+/// earlier install won (first write wins, matching the
+/// `install_envelope_verify_config` precedent). Callers at the single binary
+/// startup site may ignore the result.
+pub fn install_pinned_config(config: HyprConfig) -> bool {
+    PINNED_CONFIG.set(config).is_ok()
+}
+
+/// The installed validated configuration snapshot, if startup pinned one.
+pub fn pinned_config() -> Option<&'static HyprConfig> {
+    PINNED_CONFIG.get()
+}
+
+/// Canonical absolute provenance of the operator's explicit config selector
+/// (CLI `--config` or the `HYPRSTREAM_CONFIG` env), installed by binary
+/// startup before the first load (#1585). Library code that launches services
+/// (bootstrap, wizard) forwards exactly this value to
+/// [`crate::cli::handle_service_start`] so children load the same file;
+/// `None` means defaults-resolution. Write-once, like the snapshot.
+static EXPLICIT_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Install the canonical explicit config selector provenance (write-once).
+pub fn install_explicit_config_path(path: PathBuf) -> bool {
+    EXPLICIT_CONFIG_PATH.set(path).is_ok()
+}
+
+/// The canonical explicit selector, if the operator supplied one.
+pub fn explicit_config_path() -> Option<&'static PathBuf> {
+    EXPLICIT_CONFIG_PATH.get()
+}
+
 /// Unified configuration for the Hyprstream system
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HyprConfig {
     /// HTTP server configuration
     #[serde(default)]
@@ -80,10 +143,6 @@ pub struct HyprConfig {
     /// HuggingFace-XET CAS HTTP face configuration (epic #654)
     #[serde(default)]
     pub xet: XetConfig,
-
-    /// Credential-free `did:at9p` login-assertion verification HTTPS face (#1114).
-    #[serde(default)]
-    pub at9p_verify: At9pVerifyConfig,
 
     /// Arrow Flight SQL server configuration
     #[serde(default)]
@@ -213,6 +272,33 @@ pub struct HyprConfig {
     #[cfg(feature = "ledger")]
     #[serde(default)]
     pub ledger: crate::services::ledger::LedgerConfig,
+
+    /// Records/repository RDS (Multi-AZ Postgres) configuration (#1257).
+    ///
+    /// This is the records role's TOML-only binding. It is not a generic or
+    /// shared credential interface: deployment renders this role's explicit
+    /// URL and CA paths into `[rds]`. When unset, the record store falls back
+    /// to its local backend (RocksDB); when set, the Postgres backend is
+    /// selected and is FATAL-on-unavailable — never a silent local fallback.
+    ///
+    /// **D2 invariant** (`ARCH-recursive-federation-verdict-fable.md`): the
+    /// signed, content-addressed record/op-log bytes remain the authoritative
+    /// source of truth; the RDS rows are a projection-free KV shell over those
+    /// exact signed bytes, never a normalization of them.
+    #[serde(default)]
+    pub rds: RdsConfig,
+
+    /// Postgres URL for the durable ledger backend (PAY-01 #1389).
+    /// When set and the `postgres-ledger` feature is compiled, the factory
+    /// constructs PostgresLedger. When empty/unset, MemLedger is used (dev/test).
+    #[cfg(feature = "postgres-ledger")]
+    #[serde(default)]
+    pub ledger_postgres_url: Option<String>,
+
+    /// Connection pool size for the PostgresLedger backend. Default 4.
+    #[cfg(feature = "postgres-ledger")]
+    #[serde(default)]
+    pub ledger_postgres_pool_size: Option<usize>,
 }
 
 /// Persistent secrets storage configuration.
@@ -240,7 +326,9 @@ impl SecretsConfig {
     /// `HyprConfig::resolve_secrets_dir_for()` so env/config/XDG precedence is
     /// applied uniformly for all secret material.
     pub fn resolve_dir(&self, config_dir: &Path) -> PathBuf {
-        self.path.clone().unwrap_or_else(|| config_dir.join("credentials"))
+        self.path
+            .clone()
+            .unwrap_or_else(|| config_dir.join("credentials"))
     }
 
     /// Return the default secrets directory when no config is available.
@@ -378,8 +466,12 @@ impl TlsConfig {
     }
 }
 
-fn default_tls_enabled() -> bool { true }
-fn default_tls_server_name() -> String { "localhost".to_owned() }
+fn default_tls_enabled() -> bool {
+    true
+}
+fn default_tls_server_name() -> String {
+    "localhost".to_owned()
+}
 
 /// QUIC/WebTransport transport configuration.
 ///
@@ -396,6 +488,14 @@ fn default_tls_server_name() -> String { "localhost".to_owned() }
 /// cert_path = ""
 /// key_path = ""
 /// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeNetworkProfile {
+    #[default]
+    Compatibility,
+    NetworkIrohRequired,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicConfig {
     /// Whether QUIC/WebTransport is enabled (defaults to true)
@@ -427,6 +527,39 @@ pub struct QuicConfig {
     #[serde(default = "default_iroh_enabled")]
     pub iroh: bool,
 
+    /// Explicit native deployment profile. `network-iroh-required` forbids a
+    /// native QUIC/local fallback but does not disable the browser edge.
+    #[serde(default)]
+    pub native_network_profile: NativeNetworkProfile,
+
+    /// Separate Event producer grants, keyed by service NAME (not DID) so the
+    /// allowlist survives service-identity churn. Admission resolves the peer
+    /// DID → service name through the accepted-state authority, then checks
+    /// name membership. Tenant membership alone grants no ingress; an empty
+    /// set leaves every peer read-only. Names must be registered factory
+    /// services — validation fails at startup otherwise.
+    ///
+    /// #1652: this replaces the DID-valued grant list, and native admission
+    /// tenants are no longer configured at all — the former DID-keyed
+    /// `moql_subject_tenants` map embedded deployment DIDs in this write-once
+    /// file and went stale at every service-identity re-initialization. The
+    /// tenant is now DERIVED at admission time from the checkpointed
+    /// accepted-state store (accepted state ∩ the factory roster ⇒ `local`,
+    /// foreign records denied); see `hyprstream_discovery::admission_roster`.
+    /// A leftover `[quic.moql_subject_tenants]` table in an old file is
+    /// ignored.
+    #[serde(default)]
+    pub event_publishers: std::collections::BTreeSet<String>,
+
+    /// Explicit remote Streams ingress, separate from Event permissions.
+    /// Deliberately empty by design (#1652): no production writer emits it, an
+    /// empty set cannot go stale, and admitted native peers stay read-only on
+    /// Streams. Unlike `event_publishers` this stays DID-keyed — it is unused
+    /// policy, so re-keying it by service name is deferred to its first real
+    /// use. Non-empty entries name peer DIDs.
+    #[serde(default)]
+    pub stream_publishers: std::collections::BTreeSet<String>,
+
     /// #358: the producer-chosen moq RELAY this node rendezvouses through, as a
     /// dialable URI (`https://host:port` for the relay's WebTransport `/moq`
     /// endpoint, or an iroh node URI). Empty = direct-only (the baseline). When
@@ -447,15 +580,54 @@ impl Default for QuicConfig {
             cert_path: String::new(),
             key_path: String::new(),
             iroh: default_iroh_enabled(),
+            native_network_profile: NativeNetworkProfile::Compatibility,
+            event_publishers: Default::default(),
+            stream_publishers: Default::default(),
             relay: String::new(),
         }
     }
 }
 
 impl QuicConfig {
+    pub fn iroh_required(&self) -> bool {
+        self.native_network_profile == NativeNetworkProfile::NetworkIrohRequired
+    }
+
+    pub fn validate_native_network_profile(&self) -> anyhow::Result<()> {
+        if self.iroh_required() {
+            anyhow::ensure!(
+                self.enabled,
+                "network-iroh-required requires [quic] enabled = true so native Iroh can bind"
+            );
+            anyhow::ensure!(
+                self.iroh,
+                "network-iroh-required rejects [quic] iroh = false"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1652: `event_publishers` is keyed by service NAME. A name that is not
+    /// a registered factory service can never match an admitted peer, so it is
+    /// rejected loudly here — at startup, not as a silent read-only surprise
+    /// (this is also what catches a stale DID-valued list from a pre-#1652
+    /// config file: DIDs are not factory names).
+    pub fn validate_admission_policy(&self) -> anyhow::Result<()> {
+        for name in &self.event_publishers {
+            anyhow::ensure!(
+                hyprstream_service::get_factory(name).is_some(),
+                "quic.event_publishers lists {name:?}, which is not a registered service name; \
+                 entries are factory service names (not DIDs) since #1652"
+            );
+        }
+        Ok(())
+    }
+
     /// Parse bind_addr into a SocketAddr.
     pub fn socket_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
-        self.bind_addr.parse().map_err(|e| anyhow::anyhow!("invalid quic.bind_addr '{}': {}", self.bind_addr, e))
+        self.bind_addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid quic.bind_addr '{}': {}", self.bind_addr, e))
     }
 
     /// Check if self-signed certificate should be generated.
@@ -512,10 +684,12 @@ impl QuicConfig {
             Ok((vec![materials.cert_der], materials.key_der))
         } else {
             // Load from files
-            let cert_pem = std::fs::read(&self.cert_path)
-                .map_err(|e| anyhow::anyhow!("failed to read cert_path '{}': {}", self.cert_path, e))?;
-            let key_pem = std::fs::read(&self.key_path)
-                .map_err(|e| anyhow::anyhow!("failed to read key_path '{}': {}", self.key_path, e))?;
+            let cert_pem = std::fs::read(&self.cert_path).map_err(|e| {
+                anyhow::anyhow!("failed to read cert_path '{}': {}", self.cert_path, e)
+            })?;
+            let key_pem = std::fs::read(&self.key_path).map_err(|e| {
+                anyhow::anyhow!("failed to read key_path '{}': {}", self.key_path, e)
+            })?;
 
             // Parse ALL certs from PEM (leaf + intermediates + CA)
             let cert_chain: Vec<Vec<u8>> = rustls_pemfile::certs(&mut &cert_pem[..])
@@ -525,7 +699,10 @@ impl QuicConfig {
                 .map(|c| c.to_vec())
                 .collect();
             if cert_chain.is_empty() {
-                return Err(anyhow::anyhow!("no certificate found in {}", self.cert_path));
+                return Err(anyhow::anyhow!(
+                    "no certificate found in {}",
+                    self.cert_path
+                ));
             }
 
             let key_der = Zeroizing::new(
@@ -559,6 +736,7 @@ impl QuicConfig {
             serde_json::to_vec(&meta).unwrap_or_default()
         });
         Ok(hyprstream_rpc::service::QuicLoopConfig {
+            announcement_cancellation: tokio_util::sync::CancellationToken::new(),
             cert_chain,
             key_der,
             bind_addr: addr,
@@ -568,21 +746,36 @@ impl QuicConfig {
             // #410: iroh is the primary production transport (on by default).
             // This minimal builder mirrors the daemon bootstrap default; the
             // full `QuicSharedConfig` path in `main.rs` honours `[quic] iroh`.
-            iroh_enabled: default_iroh_enabled(),
+            iroh_enabled: self.iroh,
+            iroh_required: self.iroh_required(),
             on_iroh_bound: None,
             // #358: relay rendezvous is provisioned by the daemon bootstrap
             // (`QuicSharedConfig`), not this minimal builder. Direct-only here.
             moq_relay: None,
+            moq_relay_server_identity: None,
+            // #1027: admission material is provisioned by the daemon bootstrap
+            // (`QuicSharedConfig`), not this minimal builder.
+            moq_admission: None,
+            moq_ingress_authorizer: None,
+            moq_admission_proof: None,
         })
     }
 }
 
-fn default_quic_enabled() -> bool { true }
+fn default_quic_enabled() -> bool {
+    true
+}
 /// #410: iroh substrate is the PRIMARY production transport — on by default.
 /// The quinn-only baseline is the legacy path; opt out with `[quic] iroh = false`.
-fn default_iroh_enabled() -> bool { true }
-fn default_quic_bind_addr() -> String { "0.0.0.0:4433".to_owned() }
-fn default_quic_server_name() -> String { "localhost".to_owned() }
+fn default_iroh_enabled() -> bool {
+    true
+}
+fn default_quic_bind_addr() -> String {
+    "0.0.0.0:4433".to_owned()
+}
+fn default_quic_server_name() -> String {
+    "localhost".to_owned()
+}
 
 /// JWT token issuance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -598,13 +791,17 @@ impl Default for TokenConfig {
     fn default() -> Self {
         Self {
             default_ttl_seconds: 172_800, // 48 hours
-            max_ttl_seconds: 172_800,    // 48 hours
+            max_ttl_seconds: 172_800,     // 48 hours
         }
     }
 }
 
-fn default_token_ttl() -> u32 { 172_800 }    // 48 hours
-fn default_max_token_ttl() -> u32 { 172_800 } // 48 hours
+fn default_token_ttl() -> u32 {
+    172_800
+} // 48 hours
+fn default_max_token_ttl() -> u32 {
+    172_800
+} // 48 hours
 
 /// OpenAI-compatible HTTP API configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -684,9 +881,15 @@ fn resource_url_host(bind_host: &str) -> &str {
     }
 }
 
-fn default_oai_host() -> String { "0.0.0.0".to_owned() }
-fn default_oai_port() -> u16 { 6789 }
-fn default_oai_timeout() -> u64 { 300 }
+fn default_oai_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_oai_port() -> u16 {
+    6789
+}
+fn default_oai_timeout() -> u64 {
+    300
+}
 
 /// XetService configuration — HuggingFace-XET CAS HTTP face.
 ///
@@ -743,75 +946,24 @@ impl XetConfig {
             } else {
                 "http"
             };
-            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            let host = if self.host == "0.0.0.0" {
+                "localhost"
+            } else {
+                &self.host
+            };
             format!("{scheme}://{host}:{}", self.port)
         }
     }
 }
 
-fn default_xet_host() -> String { "0.0.0.0".to_owned() }
-fn default_xet_port() -> u16 { 6792 }
-
-/// Credential-free HTTPS verification face for `did:at9p` login assertions
-/// (#1114). A distinct listener with no cookies, no `Authorization`, and no
-/// session middleware — the whole security argument for a separate face. See
-/// `services::at9p_verify` for the trust boundary and where/why it is mounted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct At9pVerifyConfig {
-    /// Whether the face is served. Disabled by default: opt in where needed
-    /// (the www-cyberdione-ai login page is the first consumer).
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Host address for the HTTP listener.
-    #[serde(default = "default_at9p_verify_host")]
-    pub host: String,
-
-    /// Port for the HTTP listener. Default 6793 (oai=6789, mcp=6790,
-    /// oauth=6791, xet=6792).
-    #[serde(default = "default_at9p_verify_port")]
-    pub port: u16,
-
-    /// TLS certificate path (optional; falls back to the global `[tls]` config).
-    #[serde(default)]
-    pub tls_cert: Option<PathBuf>,
-
-    /// TLS private key path (optional; falls back to the global `[tls]` config).
-    #[serde(default)]
-    pub tls_key: Option<PathBuf>,
-
-    /// Symmetric freshness window for a liveness `issued_at`, in seconds. The
-    /// holder's claimed signing instant must be within this many seconds of
-    /// the verifier's clock (in either direction).
-    #[serde(default = "default_at9p_verify_skew")]
-    pub max_skew_seconds: u64,
-
-    /// Maximum accepted challenge length, in bytes. Caps preimage-amplification
-    /// before any cryptographic work.
-    #[serde(default = "default_at9p_verify_challenge_bytes")]
-    pub max_challenge_bytes: usize,
+fn default_xet_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_xet_port() -> u16 {
+    6792
 }
 
-impl Default for At9pVerifyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            host: default_at9p_verify_host(),
-            port: default_at9p_verify_port(),
-            tls_cert: None,
-            tls_key: None,
-            max_skew_seconds: default_at9p_verify_skew(),
-            max_challenge_bytes: default_at9p_verify_challenge_bytes(),
-        }
-    }
-}
-
-fn default_at9p_verify_host() -> String { "0.0.0.0".to_owned() }
-fn default_at9p_verify_port() -> u16 { 6793 }
-fn default_at9p_verify_skew() -> u64 { 300 }
-fn default_at9p_verify_challenge_bytes() -> usize { 256 }
-
-/// Arrow Flight SQL server configuration
+/// /// Arrow Flight SQL server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlightConfig {
     /// Host address for Flight SQL server
@@ -873,8 +1025,12 @@ impl FlightConfig {
     }
 }
 
-fn default_flight_host() -> String { "0.0.0.0".to_owned() }
-fn default_flight_port() -> u16 { 50051 }
+fn default_flight_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_flight_port() -> u16 {
+    50051
+}
 
 /// MCP service configuration (Model Context Protocol)
 ///
@@ -938,14 +1094,22 @@ impl MCPConfig {
             } else {
                 "http"
             };
-            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            let host = if self.host == "0.0.0.0" {
+                "localhost"
+            } else {
+                &self.host
+            };
             format!("{scheme}://{host}:{}", self.http_port)
         }
     }
 }
 
-fn default_mcp_host() -> String { "0.0.0.0".to_owned() }
-fn default_mcp_port() -> u16 { 6790 }
+fn default_mcp_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_mcp_port() -> u16 {
+    6790
+}
 
 /// Configuration for a trusted external OIDC issuer.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -963,9 +1127,40 @@ pub struct TrustedIssuerConfig {
     /// Only use for internal networks or local development. Never enable in production.
     #[serde(default)]
     pub allow_http: bool,
+    /// Additional accepted Federate client class beside the hardcoded staging
+    /// www pin (the TUI harness). Issuer-scoped: only consulted when this
+    /// entry's key is the Federate issuer origin (`https://login.federate.to`).
+    /// Absent = current behavior: the hardcoded staging client is the only
+    /// accepted class (backward compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federate_tui_client: Option<FederateClientClassConfig>,
 }
 
-fn default_jwks_cache_ttl() -> u64 { 300 }
+/// A second accepted Federate client class (W1: the client-side TUI harness).
+///
+/// Carries the same source-verification invariants as the hardcoded staging
+/// www pin; it only selects the pinned `client_id`/`aud` and the Dex
+/// connector pin. The `client_id` MUST NOT equal the reserved staging client
+/// (`cyberdione-www-staging`) so the reserved-credential predicate — which
+/// matches that exact `(iss, client_id)` pair — can never fire for this
+/// class. This states predicate-level reservation behavior only; the output
+/// credential profile and dispatch are owned by W1.3/W1.4.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederateClientClassConfig {
+    /// OAuth `client_id` of the public client registered at the issuer.
+    pub client_id: String,
+    /// Expected `aud` (single string or single-element array) of the source
+    /// ID token for this class. Usually equal to `client_id` for a public
+    /// OIDC client; `azp` must always equal `client_id`.
+    pub aud: String,
+    /// Pinned Dex `connector_id` for this class. Defaults to `atproto`.
+    #[serde(default)]
+    pub connector_id: Option<String>,
+}
+
+fn default_jwks_cache_ttl() -> u64 {
+    300
+}
 
 /// Configuration for a trusted mesh peer's post-quantum signing identity (#157).
 ///
@@ -1039,10 +1234,18 @@ impl Default for ClaimMapping {
     }
 }
 
-fn default_claim_sub() -> String { "sub".into() }
-fn default_claim_name() -> Option<String> { Some("name".into()) }
-fn default_claim_email() -> Option<String> { Some("email".into()) }
-fn default_claim_email_verified() -> Option<String> { Some("email_verified".into()) }
+fn default_claim_sub() -> String {
+    "sub".into()
+}
+fn default_claim_name() -> Option<String> {
+    Some("name".into())
+}
+fn default_claim_email() -> Option<String> {
+    Some("email".into())
+}
+fn default_claim_email_verified() -> Option<String> {
+    Some("email_verified".into())
+}
 
 /// Configuration for an external OIDC provider (login delegation).
 ///
@@ -1106,7 +1309,9 @@ pub struct OidcProviderConfig {
     pub clock_skew_seconds: u64,
 }
 
-fn default_pkce_supported() -> bool { true }
+fn default_pkce_supported() -> bool {
+    true
+}
 
 impl OidcProviderConfig {
     pub fn effective_authorization_endpoint(&self) -> Option<&str> {
@@ -1143,7 +1348,9 @@ impl OidcProviderConfig {
 fn default_oidc_scopes() -> Vec<String> {
     vec!["openid".into(), "profile".into(), "email".into()]
 }
-fn default_clock_skew() -> u64 { 60 }
+fn default_clock_skew() -> u64 {
+    60
+}
 
 /// How to map an external OIDC identity to a local hyprstream subject.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1413,26 +1620,20 @@ impl Default for OAuthConfig {
 impl OAuthConfig {
     /// Active key lifetime in seconds (`_secs` override wins over `_days * 86400`).
     pub fn active_secs(&self) -> i64 {
-        self.jwt_key_active_secs.map_or_else(
-            || i64::from(self.jwt_key_active_days) * 86400,
-            i64::from,
-        )
+        self.jwt_key_active_secs
+            .map_or_else(|| i64::from(self.jwt_key_active_days) * 86400, i64::from)
     }
 
     /// Lead pre-generation window in seconds.
     pub fn lead_secs(&self) -> i64 {
-        self.jwt_key_lead_secs.map_or_else(
-            || i64::from(self.jwt_key_lead_days) * 86400,
-            i64::from,
-        )
+        self.jwt_key_lead_secs
+            .map_or_else(|| i64::from(self.jwt_key_lead_days) * 86400, i64::from)
     }
 
     /// Drain retention window in seconds.
     pub fn drain_secs(&self) -> i64 {
-        self.jwt_key_drain_secs.map_or_else(
-            || i64::from(self.jwt_key_drain_days) * 86400,
-            i64::from,
-        )
+        self.jwt_key_drain_secs
+            .map_or_else(|| i64::from(self.jwt_key_drain_days) * 86400, i64::from)
     }
 
     /// Rotation check interval (default 6 hours).
@@ -1452,20 +1653,29 @@ impl OAuthConfig {
             } else {
                 "http"
             };
-            let host = if self.host == "0.0.0.0" { "localhost" } else { &self.host };
+            let host = if self.host == "0.0.0.0" {
+                "localhost"
+            } else {
+                &self.host
+            };
             format!("{scheme}://{host}:{}", self.port)
         }
     }
 }
 
-fn default_oauth_host() -> String { "0.0.0.0".to_owned() }
-fn default_oauth_port() -> u16 { 6791 }
+fn default_oauth_host() -> String {
+    "0.0.0.0".to_owned()
+}
+fn default_oauth_port() -> u16 {
+    6791
+}
 
-/// Which backend stores user credentials and refresh tokens.
+/// Which backend stores account credentials.
 ///
-/// `Pglite` selects the shared embedded PGlite/Postgres relational store for
-/// the **account system of record** (UserStore). Token and device stores
-/// remain on RocksDB/Valkey — a pglite TokenStore does not exist.
+/// `Pglite` selects the embedded relational store; `Postgres` selects the
+/// networked RDS relational store. Token and device stores remain independent
+/// RocksDB/Valkey services — neither relational UserStore implements a token
+/// store.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialsBackend {
@@ -1473,6 +1683,8 @@ pub enum CredentialsBackend {
     Valkey,
     /// Relational UserStore on the shared #1351 PGlite substrate.
     Pglite,
+    /// Networked relational UserStore on the RDS Postgres substrate.
+    Postgres,
 }
 
 fn default_credentials_backend() -> CredentialsBackend {
@@ -1484,8 +1696,8 @@ impl CredentialsBackend {
     /// UserStore columns as plaintext.
     pub fn ensure_allowed_for_build(self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self == Self::Pglite,
-            "encrypted credential storage requires credentials.backend = \"pglite\""
+            matches!(self, Self::Pglite | Self::Postgres),
+            "encrypted credential storage requires credentials.backend = \"pglite\" or \"postgres\""
         );
         Ok(())
     }
@@ -1498,15 +1710,22 @@ pub struct ValkeyCredentialsConfig {
     pub url: String,
 }
 
-fn default_valkey_url() -> String { "redis://127.0.0.1:6379".to_owned() }
+fn default_valkey_url() -> String {
+    "redis://127.0.0.1:6379".to_owned()
+}
 
 impl Default for ValkeyCredentialsConfig {
-    fn default() -> Self { Self { url: default_valkey_url() } }
+    fn default() -> Self {
+        Self {
+            url: default_valkey_url(),
+        }
+    }
 }
 
 /// Credentials storage configuration.
 ///
-/// Selects the backend for user profiles, pubkeys, and refresh tokens.
+/// Selects the backend for user profiles and pubkeys. OAuth refresh tokens use
+/// their independent token store.
 ///
 /// # Example TOML
 /// ```toml
@@ -1544,12 +1763,24 @@ fn default_oauth_scopes() -> Vec<String> {
         "write:*:*".to_owned(),
     ]
 }
-fn default_oauth_token_ttl() -> u32 { 3600 }
-fn default_refresh_token_ttl() -> u32 { 2_628_000 } // 730 hours (~30 days)
-fn default_client_jwks_uri_cache_ttl() -> u64 { 3600 } // 1 hour
-fn default_jwt_key_active_days() -> u32 { 14 }
-fn default_jwt_key_lead_days() -> u32 { 7 }
-fn default_jwt_key_drain_days() -> u32 { 30 }
+fn default_oauth_token_ttl() -> u32 {
+    3600
+}
+fn default_refresh_token_ttl() -> u32 {
+    2_628_000
+} // 730 hours (~30 days)
+fn default_client_jwks_uri_cache_ttl() -> u64 {
+    3600
+} // 1 hour
+fn default_jwt_key_active_days() -> u32 {
+    14
+}
+fn default_jwt_key_lead_days() -> u32 {
+    7
+}
+fn default_jwt_key_drain_days() -> u32 {
+    30
+}
 
 /// StreamService configuration
 ///
@@ -1591,12 +1822,24 @@ impl Default for RpcServerConfig {
     }
 }
 
-fn default_rpc_stream_limit() -> usize { hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT }
-fn default_rpc_connection_limit() -> usize { hyprstream_rpc::transport::rpc_session::DEFAULT_CONNECTION_LIMIT }
-fn default_rpc_request_read_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::REQUEST_READ_TIMEOUT.as_secs() }
-fn default_rpc_handshake_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::HANDSHAKE_TIMEOUT.as_secs() }
-fn default_rpc_stopped_grace_secs() -> u64 { hyprstream_rpc::transport::rpc_session::STOPPED_GRACE.as_secs() }
-fn default_rpc_drain_timeout_secs() -> u64 { hyprstream_rpc::transport::rpc_session::DRAIN_TIMEOUT.as_secs() }
+fn default_rpc_stream_limit() -> usize {
+    hyprstream_rpc::transport::rpc_session::DEFAULT_STREAM_LIMIT
+}
+fn default_rpc_connection_limit() -> usize {
+    hyprstream_rpc::transport::rpc_session::DEFAULT_CONNECTION_LIMIT
+}
+fn default_rpc_request_read_timeout_secs() -> u64 {
+    hyprstream_rpc::transport::rpc_session::REQUEST_READ_TIMEOUT.as_secs()
+}
+fn default_rpc_handshake_timeout_secs() -> u64 {
+    hyprstream_rpc::transport::rpc_session::HANDSHAKE_TIMEOUT.as_secs()
+}
+fn default_rpc_stopped_grace_secs() -> u64 {
+    hyprstream_rpc::transport::rpc_session::STOPPED_GRACE.as_secs()
+}
+fn default_rpc_drain_timeout_secs() -> u64 {
+    hyprstream_rpc::transport::rpc_session::DRAIN_TIMEOUT.as_secs()
+}
 
 impl RpcServerConfig {
     /// Convert to the `hyprstream_rpc` wire type consumed by server builders.
@@ -1676,9 +1919,15 @@ impl Default for StreamingConfig {
     }
 }
 
-fn default_max_pending_per_topic() -> usize { 1000 }
-fn default_message_ttl_secs() -> u64 { 30 }
-fn default_compact_interval_secs() -> u64 { 5 }
+fn default_max_pending_per_topic() -> usize {
+    1000
+}
+fn default_message_ttl_secs() -> u64 {
+    30
+}
+fn default_compact_interval_secs() -> u64 {
+    5
+}
 fn default_broadcast_announce_timeout_secs() -> u64 {
     hyprstream_rpc::moq_stream::BROADCAST_ANNOUNCE_TIMEOUT.as_secs()
 }
@@ -1707,10 +1956,18 @@ impl Default for StorageConfig {
         // Try to get XDG-compliant paths, fall back to current directory
         let (models_dir, loras_dir, cache_dir, config_dir) = match StoragePaths::new() {
             Ok(storage_paths) => (
-                storage_paths.models_dir().unwrap_or_else(|_| PathBuf::from("./models")),
-                storage_paths.loras_dir().unwrap_or_else(|_| PathBuf::from("./loras")),
-                storage_paths.cache_dir().unwrap_or_else(|_| PathBuf::from("./cache")),
-                storage_paths.config_dir().unwrap_or_else(|_| PathBuf::from("./config")),
+                storage_paths
+                    .models_dir()
+                    .unwrap_or_else(|_| PathBuf::from("./models")),
+                storage_paths
+                    .loras_dir()
+                    .unwrap_or_else(|_| PathBuf::from("./loras")),
+                storage_paths
+                    .cache_dir()
+                    .unwrap_or_else(|_| PathBuf::from("./cache")),
+                storage_paths
+                    .config_dir()
+                    .unwrap_or_else(|_| PathBuf::from("./config")),
             ),
             Err(e) => {
                 tracing::warn!("XDG paths unavailable: {}, using local directories", e);
@@ -1746,6 +2003,125 @@ pub struct RegistryServiceConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+    /// In-daemon at9p service-identity renewal. The registry is the sole
+    /// record-store writer, so its process hosts the renewal timer.
+    #[serde(default)]
+    pub at9p_renewal: At9pRenewalConfig,
+}
+
+/// Minimum accepted service-identity lifetime: shared by the offline
+/// provisioner's `--valid-for-seconds` clamp and the in-daemon renewal TTL.
+pub const MIN_SERVICE_IDENTITY_TTL_SECS: i64 = 600;
+
+/// Maximum accepted service-identity lifetime: 90 days. The at9p chain layer
+/// has no maximum TTL of its own — this ceiling is provisioner-side policy.
+/// 90 days satisfies the anchor-TTL ≥ 3× worst-case-deploy-gap policy for the
+/// 30-day delegated-signer ceremony cadence, and the in-daemon renewal loop
+/// (`services::at9p_renewal`) renews at the half-TTL point so a live daemon
+/// never approaches it.
+pub const MAX_SERVICE_IDENTITY_TTL_SECS: i64 = 7_776_000;
+
+/// In-daemon at9p service-identity renewal (`[registry.at9p_renewal]`).
+///
+/// The renewal timer reuses the boot provisioner's mint core against the
+/// daemon's LIVE store/ingest handles: same DIDs forever, `epoch+1`
+/// successors, same on-volume key, no-op inside the half-TTL window. The
+/// deployment credential/UCAN is checked exactly once per process start —
+/// never per tick — so a running daemon renews for its process lifetime;
+/// restarts still gate on the deployment credential (unchanged).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct At9pRenewalConfig {
+    /// Check interval in seconds (default 6 h, the JWT key-rotation check
+    /// cadence). Every tick renews due identities AND re-exports the roster
+    /// projection, so `roster_stale` in host-side monitoring means the loop
+    /// died, not merely that nothing was due.
+    #[serde(default)]
+    pub check_interval_secs: Option<u64>,
+    /// TTL stamped onto minted successors, seconds. Defaults to 24 h —
+    /// defensively inside the 86,400-second roster-lifetime bound that
+    /// host-side native-config/monitor tooling still enforces, so an
+    /// unset key can never mint a successor the deployed guard classifies
+    /// as `invalid_roster`. A longer TTL (up to
+    /// [`MAX_SERVICE_IDENTITY_TTL_SECS`], validated against the same range
+    /// as the CLI clamp) is an explicit opt-in that must be paired with the
+    /// host-side guard widening in the same rollout.
+    ///
+    /// Deployments provisioning identities with a longer boot-time
+    /// `--valid-for-seconds` MUST set this key to match: the timer mints
+    /// successors with the CONFIG TTL, so an unset key against 90-day
+    /// boot-minted identities would contract the next renewal window to
+    /// 24 h (still renewed, never expired — but the long margin is lost).
+    #[serde(default)]
+    pub valid_for_secs: Option<i64>,
+    /// Roster.json re-export path. `None` derives
+    /// `<data_dir>/config/native-network/roster.json` — the projection the
+    /// host-side renewal monitor reads. The boot-time
+    /// `--roster-export roster.candidate.json` flow is unaffected: this path
+    /// is the promoted projection, refreshed every tick.
+    #[serde(default)]
+    pub roster_export: Option<std::path::PathBuf>,
+}
+
+impl At9pRenewalConfig {
+    /// Resolved check interval (default 6 h), floor-clamped to 60 s so a
+    /// misconfigured near-zero interval cannot spin the loop.
+    pub fn check_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.check_interval_secs.unwrap_or(6 * 3600).max(60))
+    }
+
+    /// Resolved renewal TTL, validated against the provisioner's clamp range.
+    /// Defaults to 24 h (see the field docs for the defensive rationale).
+    pub fn valid_for_seconds(&self) -> anyhow::Result<i64> {
+        const DEFAULT_RENEWAL_TTL_SECS: i64 = 86_400;
+        let ttl = self.valid_for_secs.unwrap_or(DEFAULT_RENEWAL_TTL_SECS);
+        anyhow::ensure!(
+            (MIN_SERVICE_IDENTITY_TTL_SECS..=MAX_SERVICE_IDENTITY_TTL_SECS).contains(&ttl),
+            "[registry.at9p_renewal] valid_for_secs must be {}..{} seconds",
+            MIN_SERVICE_IDENTITY_TTL_SECS,
+            MAX_SERVICE_IDENTITY_TTL_SECS
+        );
+        Ok(ttl)
+    }
+
+    /// Cross-validated (check interval, renewal TTL) pair: the check interval
+    /// must stay strictly below half the TTL AND below the host-side roster
+    /// freshness window (24 h). Liveness argument: an identity minted at T
+    /// with TTL V becomes due at T + V/2; ticks fire every i, so the first
+    /// due tick lands by T + V/2 + i with remaining life V/2 - i — positive
+    /// only while i < V/2. At i ≥ V/2 a schedule exists where the head
+    /// expires before any due tick, and an expired accepted head can never be
+    /// renewed (admission requires a fresh predecessor). The roster freshness
+    /// bound: the projection's `generated_at` refreshes only on a tick, and
+    /// host-side monitoring flags `roster_stale` once it ages past 24 h, so
+    /// an interval of a day or more would report a healthy loop as stale —
+    /// breaking the documented "stale roster means the timer died" signal.
+    /// Refuses at registry startup rather than renewing too slowly to matter.
+    pub fn validated(&self) -> anyhow::Result<(std::time::Duration, i64)> {
+        const ROSTER_FRESHNESS_WINDOW_SECS: u64 = 86_400;
+        let ttl = self.valid_for_seconds()?;
+        let interval = self.check_interval();
+        let half_ttl = u64::try_from(ttl / 2).unwrap_or(0);
+        anyhow::ensure!(
+            interval.as_secs() < half_ttl,
+            "[registry.at9p_renewal] check_interval_secs ({}) must be < half of \
+             valid_for_secs ({}/2 = {}): a slower tick lets an identity pass its \
+             half-TTL window and expire before renewal, and an expired head has \
+             no authorized successor path",
+            interval.as_secs(),
+            ttl,
+            half_ttl
+        );
+        anyhow::ensure!(
+            interval.as_secs() < ROSTER_FRESHNESS_WINDOW_SECS,
+            "[registry.at9p_renewal] check_interval_secs ({}) must be < {}: the roster \
+             projection's generated_at refreshes only on a tick and host-side \
+             monitoring flags roster_stale past 24 h, so a day-or-slower tick \
+             would report a healthy timer as stale",
+            interval.as_secs(),
+            ROSTER_FRESHNESS_WINDOW_SECS
+        );
+        Ok((interval, ttl))
+    }
 }
 
 /// Policy service configuration.
@@ -1754,6 +2130,28 @@ pub struct PolicyServiceConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+    /// Optional signed MAC boot artifacts. Supported for OS-owned deployments
+    /// with a chain-enrolled Policy authority; invalid artifacts abort startup.
+    #[serde(default)]
+    pub boot_policy: Option<MacBootPolicyConfig>,
+}
+
+/// Both independently provisioned artifacts and their expected policy pin are
+/// mandatory when configured. Keep this generation/hash pin in the
+/// OS-owned deployment configuration, outside the replaceable artifact
+/// directory. Deploy a new pin and matching artifacts as one release; a
+/// mismatch fails startup closed. Recovery restores the matching backed-up
+/// config and artifacts. Lowering the pin is an explicit rollback decision.
+/// Trust keys are never supplied by these files or this configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacBootPolicyConfig {
+    pub policy_path: PathBuf,
+    pub approval_path: PathBuf,
+    pub expected_generation: u64,
+    /// Hex-encoded 32-byte compiled policy hash, independently pinned by the
+    /// OS-owned deployment configuration.
+    pub expected_policy_hash: String,
 }
 
 /// Discovery service configuration.
@@ -1762,6 +2160,10 @@ pub struct DiscoveryServiceConfig {
     /// QUIC/WebTransport port. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
     #[serde(default)]
     pub quic_port: Option<u16>,
+    /// Volatile Discovery state. Memory is the single-process/WASM default;
+    /// active-active deployments must select Valkey or tiered memory+Valkey.
+    #[serde(default)]
+    pub state: hyprstream_discovery::DiscoveryStateConfig,
 }
 
 /// TUI display server configuration.
@@ -1781,9 +2183,15 @@ pub struct TuiServiceConfig {
     pub wt_cert_validity_days: u32,
 }
 
-fn default_tui_max_sessions() -> u32 { 16 }
-fn default_tui_scrollback() -> usize { 2000 }
-fn default_tui_wt_cert_days() -> u32 { 14 }
+fn default_tui_max_sessions() -> u32 {
+    16
+}
+fn default_tui_scrollback() -> usize {
+    2000
+}
+fn default_tui_wt_cert_days() -> u32 {
+    14
+}
 
 impl Default for TuiServiceConfig {
     fn default() -> Self {
@@ -1838,7 +2246,7 @@ impl Default for MetricsConfig {
 pub struct ServicesConfig {
     /// Services to start automatically at startup (ipc-systemd mode)
     ///
-    /// Default: ["registry", "policy", "worker", "event"]
+    /// Default: the factories compiled into the standard service roster.
     #[serde(default = "default_startup_services")]
     pub startup: Vec<String>,
 }
@@ -1853,38 +2261,30 @@ impl Default for ServicesConfig {
 
 /// Default list of services to start at startup
 fn default_startup_services() -> Vec<String> {
-    vec![
-        "event".to_owned(),     // Must start first (message bus)
-        "registry".to_owned(),  // Model registry
-        "policy".to_owned(),    // Authorization
-        "streams".to_owned(),       // Streaming proxy with JWT validation
-        "notification".to_owned(),  // Encrypted notification relay (uses streams)
-        "worker".to_owned(),        // Container workloads
-        "model".to_owned(),         // Model management (publishes to notification)
-        "oauth".to_owned(),     // OAuth 2.1 authorization server
-        "oai".to_owned(),       // OpenAI-compatible HTTP API
-        "flight".to_owned(),    // Arrow Flight SQL server
+    let mut services = vec![
+        "event".to_owned(),    // Must start first (message bus)
+        "registry".to_owned(), // Model registry
+        "policy".to_owned(),   // Authorization
+        "streams".to_owned(),  // Streaming proxy with JWT validation
+        "worker".to_owned(),   // Container workloads
+        "model".to_owned(),    // Model management
+        "oauth".to_owned(),    // OAuth 2.1 authorization server
+        "oai".to_owned(),      // OpenAI-compatible HTTP API
+    ];
+    #[cfg(feature = "metrics")]
+    {
+        services.push("flight".to_owned()); // Arrow Flight SQL server
+    }
+    services.extend([
         "discovery".to_owned(), // Endpoint discovery (RFC 9728 metadata)
         "mcp".to_owned(),       // Model Context Protocol service
         "tui".to_owned(),       // Terminal multiplexer display server
-        "metrics".to_owned(),   // Metrics ingest and query (DuckDB/DataFusion)
-    ]
-}
-
-/// Model loading and identification
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    /// Path to model file
-    pub path: PathBuf,
-    /// Model identifier (e.g., "qwen2-1.5b")
-    pub name: String,
-    /// Architecture type ("llama", "qwen", etc.)
-    pub architecture: String,
-    /// Expected parameter count
-    pub parameters: Option<u64>,
-    /// QUIC/WebTransport port for model service. None = no QUIC, Some(0) = ephemeral, Some(N) = explicit.
-    #[serde(default)]
-    pub quic_port: Option<u16>,
+    ]);
+    #[cfg(feature = "metrics")]
+    {
+        services.push("metrics".to_owned()); // Metrics ingest and query
+    }
+    services
 }
 
 /// Configuration for one deployable, CPU-only inference process.
@@ -1955,8 +2355,14 @@ impl InferenceServerConfig {
             "inference.model_path is not a directory: {}",
             self.model_path.display()
         );
-        anyhow::ensure!(!self.model_ref.trim().is_empty(), "inference.model_ref is required");
-        anyhow::ensure!(!self.tenant.trim().is_empty(), "inference.tenant is required");
+        anyhow::ensure!(
+            !self.model_ref.trim().is_empty(),
+            "inference.model_ref is required"
+        );
+        anyhow::ensure!(
+            !self.tenant.trim().is_empty(),
+            "inference.tenant is required"
+        );
         let advertise_addr = self.advertise_addr.ok_or_else(|| {
             anyhow::anyhow!(
                 "inference.advertise_addr is required for network-addressable browser MoQ"
@@ -1996,9 +2402,7 @@ impl InferenceServerConfig {
     pub fn verify_materialized_oid(&self) -> anyhow::Result<()> {
         let model_path = self.model_path.canonicalize()?;
         let repository = git2::Repository::discover(&model_path).map_err(|error| {
-            anyhow::anyhow!(
-                "inference.model_path is not in a Git checkout: {error}"
-            )
+            anyhow::anyhow!("inference.model_path is not in a Git checkout: {error}")
         })?;
         let checkout = repository
             .workdir()
@@ -2052,304 +2456,6 @@ impl InferenceServerConfig {
     }
 }
 
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            path: PathBuf::new(),
-            name: String::new(),
-            architecture: String::new(),
-            parameters: None,
-            quic_port: None,
-        }
-    }
-}
-
-/// Runtime execution configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeConfig {
-    /// Context window size
-    pub context_length: usize,
-    /// Maximum context length override for KV cache allocation.
-    /// None = use model's max_position_embeddings (can be very large, e.g., 40K tokens)
-    /// Some(n) = cap KV cache at n tokens (significantly reduces GPU memory)
-    pub max_context: Option<u32>,
-    /// KV cache quantization type (None, INT8, NF4, FP4).
-    /// Reduces GPU memory by 50-75% at slight quality cost.
-    #[serde(default)]
-    pub kv_quant_type: crate::runtime::KVQuantType,
-    /// Batch processing size
-    pub batch_size: usize,
-    /// CPU threads (None = auto-detect)
-    pub cpu_threads: Option<usize>,
-    /// Use GPU acceleration
-    pub use_gpu: bool,
-    /// GPU device ID (None = auto-detect, typically device 0).
-    ///
-    /// Legacy single-GPU selector. For multi-GPU, prefer [`Self::devices`];
-    /// this field remains the back-compat fallback when `devices` is empty.
-    pub gpu_device_id: Option<usize>,
-    /// Explicit set of GPU device indices for multi-GPU (#313, epic #310).
-    ///
-    /// Empty = unset → fall back to the single [`Self::gpu_device_id`] /
-    /// `HYPRSTREAM_GPU_DEVICE` (existing single-GPU behavior is unchanged).
-    /// Parsed from `HYPRSTREAM_GPU_DEVICES` (comma-separated, e.g. `0,1`).
-    /// Resolution + validation lives in [`Self::resolve_device_indices`] and is
-    /// consumed by `runtime::DevicePool`.
-    #[serde(default)]
-    pub devices: Vec<usize>,
-    /// Fail fast when a *requested* GPU is unavailable instead of silently
-    /// downgrading to CPU (#315, epic #310).
-    ///
-    /// A process told to run on GPU 3 that silently lands on CPU tanks a pipeline
-    /// split, so strictness is the safe default for the multi-GPU path. This only
-    /// affects the case where a GPU was *explicitly* requested (`use_gpu` with an
-    /// explicit `gpu_device_id`/`devices`); pure auto-detect (`use_gpu` with no
-    /// device requested) still falls back to CPU so the legacy single-GPU
-    /// "use a GPU if there is one" behavior is unchanged.
-    /// Defaults to `true`; override with `HYPRSTREAM_STRICT_DEVICE=0`.
-    #[serde(default = "default_strict_device")]
-    pub strict_device: bool,
-    /// GPU layers to offload (None = auto)
-    pub gpu_layers: Option<usize>,
-    /// Use memory mapping for model files
-    pub mmap: bool,
-    /// KV cache size in MB
-    pub kv_cache_size_mb: usize,
-    /// Precision mode (BF16/FP16/FP32/FP8)
-    pub precision_mode: Option<String>,
-    // NEW: Concurrency and timeout settings
-    pub max_concurrent_loads: usize,
-    pub max_concurrent_generations: usize,
-    pub default_generation_timeout_ms: u64,
-    pub default_model_load_timeout_ms: u64,
-
-    /// Continuous / in-flight batching (#329, epic #310). **Default: off.**
-    ///
-    /// When enabled, the inference scheduler groups concurrent decode steps of
-    /// same-tenant-delta sequences into a single batched forward (Llama only).
-    /// When off, each stream runs the unchanged batch=1 decode path. Override
-    /// with `HYPRSTREAM_CONTINUOUS_BATCH` (truthy = on). Off by default while the
-    /// scheduler wiring lands incrementally — the batched kernel is correctness-
-    /// gated by `batched_ragged_decode_matches_serial`.
-    #[serde(default = "default_continuous_batching")]
-    pub continuous_batching: bool,
-    /// Max sequences fused into one batched decode step when
-    /// [`Self::continuous_batching`] is on (spike default 16). Tunable via
-    /// `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
-    #[serde(default = "default_continuous_batch_max")]
-    pub continuous_batch_max: usize,
-}
-
-/// Default for [`RuntimeConfig::continuous_batching`]: off unless
-/// `HYPRSTREAM_CONTINUOUS_BATCH` is set truthy (#329). Off is the safe default —
-/// the batch=1 path is the verified reference.
-fn default_continuous_batching() -> bool {
-    std::env::var("HYPRSTREAM_CONTINUOUS_BATCH")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
-/// Default for [`RuntimeConfig::continuous_batch_max`] (#329): 16 (spike rec),
-/// overridable via `HYPRSTREAM_CONTINUOUS_BATCH_MAX`.
-fn default_continuous_batch_max() -> usize {
-    std::env::var("HYPRSTREAM_CONTINUOUS_BATCH_MAX")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(16)
-}
-
-/// Default for [`RuntimeConfig::strict_device`]: strict (fail-fast) unless
-/// `HYPRSTREAM_STRICT_DEVICE` is set to a falsy value. Strictness is the safe
-/// default for the multi-GPU path (#315).
-fn default_strict_device() -> bool {
-    std::env::var("HYPRSTREAM_STRICT_DEVICE")
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
-        .unwrap_or(true)
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        // Check environment variables for runtime configuration
-        // Precedence: CLI args > env vars (read here) > hardcoded defaults.
-        // Environment variables set initial defaults; CLI args may override them later.
-        let gpu_device_id = std::env::var("HYPRSTREAM_GPU_DEVICE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
-
-        // `devices` is populated leniently here (Default cannot return errors);
-        // the authoritative strict parse + validation lives in
-        // `RuntimeConfig::resolve_device_indices`, which re-reads the env var and
-        // turns parse errors into hard errors.
-        let devices = std::env::var("HYPRSTREAM_GPU_DEVICES")
-            .ok()
-            .and_then(|s| Self::parse_device_list(&s).ok())
-            .unwrap_or_default();
-
-        let max_context = std::env::var("HYPRSTREAM_MAX_CONTEXT")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok());
-
-        let kv_quant_type = std::env::var("HYPRSTREAM_KV_QUANT")
-            .ok()
-            .and_then(|s| match s.to_lowercase().as_str() {
-                "int8" => Some(crate::runtime::KVQuantType::Int8),
-                "nf4" => Some(crate::runtime::KVQuantType::Nf4),
-                "fp4" => Some(crate::runtime::KVQuantType::Fp4),
-                "none" | "" => Some(crate::runtime::KVQuantType::None),
-                _ => None,
-            })
-            .unwrap_or(crate::runtime::KVQuantType::None);
-
-        Self {
-            context_length: 4096,
-            max_context,
-            kv_quant_type,
-            batch_size: 512,
-            cpu_threads: None,
-            use_gpu: true,
-            gpu_device_id, // From env or None (auto-detect device 0)
-            devices,       // From HYPRSTREAM_GPU_DEVICES or empty (→ fall back to gpu_device_id)
-            strict_device: default_strict_device(),
-            gpu_layers: None,
-            mmap: true,
-            kv_cache_size_mb: 2048,
-            precision_mode: Some("auto".to_owned()),
-            max_concurrent_loads: 2,
-            max_concurrent_generations: 10,
-            default_generation_timeout_ms: 120000, // 2 minutes
-            default_model_load_timeout_ms: 300000, // 5 minutes
-            continuous_batching: default_continuous_batching(),
-            continuous_batch_max: default_continuous_batch_max(),
-        }
-    }
-}
-
-impl RuntimeConfig {
-    /// Parse a comma-separated GPU device list (e.g. `"0,1"`), strictly.
-    ///
-    /// Whitespace around entries is trimmed. Any non-numeric entry, or a
-    /// trailing/empty field (e.g. `"0,"` or `"0,,1"`), is a hard error — there
-    /// is no silent default. Returns the parsed indices (possibly with
-    /// duplicates; dedup/validation is the caller's job).
-    fn parse_device_list(raw: &str) -> anyhow::Result<Vec<usize>> {
-        raw.split(',')
-            .map(|part| {
-                let trimmed = part.trim();
-                trimmed.parse::<usize>().map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid GPU device index {trimmed:?} in HYPRSTREAM_GPU_DEVICES={raw:?}: {e}"
-                    )
-                })
-            })
-            .collect()
-    }
-
-    /// Resolve the explicitly-requested *multi-GPU* device set, fail-fast.
-    ///
-    /// This is the seam the multi-GPU foundation uses to decide whether to engage
-    /// the new `DevicePool` path. It considers **only** the explicit multi-GPU
-    /// inputs and deliberately excludes the legacy single [`Self::gpu_device_id`]
-    /// so that existing single-GPU behavior is left entirely on its old code
-    /// path (#313 introduces the pool without changing single-GPU runtime
-    /// behavior). Precedence:
-    ///
-    /// 1. `HYPRSTREAM_GPU_DEVICES` env var (re-parsed here strictly, so a
-    ///    malformed value is a hard error rather than a silent fallback).
-    /// 2. The [`Self::devices`] field (e.g. from a config file / CLI).
-    ///
-    /// Returns `Ok(None)` when no explicit multi-GPU set was requested,
-    /// `Ok(Some(indices))` (non-empty, duplicate-free) otherwise, and `Err` on
-    /// parse errors or duplicate indices.
-    pub fn resolve_explicit_multi_device_indices(&self) -> anyhow::Result<Option<Vec<usize>>> {
-        // (1) env var wins and is parsed strictly here. An absent or
-        //     empty/whitespace-only value is treated as "unset" so resolution
-        //     falls through to (2) the struct field (config file / CLI).
-        let env_raw = std::env::var("HYPRSTREAM_GPU_DEVICES").ok();
-        let env_trimmed = env_raw.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let indices = match env_trimmed {
-            Some(raw) => Self::parse_device_list(raw)?,
-            None => self.devices.clone(),
-        };
-
-        Self::validate_index_set(indices)
-    }
-
-    /// Resolve the GPU device indices to use, fail-fast, including the legacy
-    /// single-GPU fallback.
-    ///
-    /// This is the full-precedence resolver consumed by
-    /// `runtime::DevicePool::from_config`. It is
-    /// [`Self::resolve_explicit_multi_device_indices`] plus a final fallback to
-    /// the legacy single [`Self::gpu_device_id`] (mapped to a one-element set),
-    /// preserving back-compat for callers that build a pool directly from config.
-    ///
-    /// `Ok(None)` means nothing was requested (caller should auto-detect).
-    pub fn resolve_device_indices(&self) -> anyhow::Result<Option<Vec<usize>>> {
-        if let Some(indices) = self.resolve_explicit_multi_device_indices()? {
-            return Ok(Some(indices));
-        }
-        // Legacy single-GPU selector as the final fallback.
-        match self.gpu_device_id {
-            Some(id) => Self::validate_index_set(vec![id]),
-            None => Ok(None),
-        }
-    }
-
-    /// Shared post-processing for a resolved index list: empty → `None`, reject
-    /// duplicates, otherwise `Some(indices)`.
-    fn validate_index_set(indices: Vec<usize>) -> anyhow::Result<Option<Vec<usize>>> {
-        if indices.is_empty() {
-            return Ok(None);
-        }
-        let mut seen = std::collections::HashSet::with_capacity(indices.len());
-        for &idx in &indices {
-            if !seen.insert(idx) {
-                return Err(anyhow::anyhow!(
-                    "duplicate GPU device index {idx} in requested set {indices:?}"
-                ));
-            }
-        }
-        Ok(Some(indices))
-    }
-}
-
-/// Text generation parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerationConfig {
-    /// Maximum tokens to generate
-    pub max_tokens: usize,
-    /// Sampling temperature (0.0-2.0)
-    pub temperature: f32,
-    /// Nucleus sampling threshold
-    pub top_p: f32,
-    /// Top-k sampling limit
-    pub top_k: Option<usize>,
-    /// Repetition penalty
-    pub repeat_penalty: f32,
-    /// Stop sequences
-    pub stop_tokens: Vec<String>,
-    /// Random seed for reproducible generation
-    pub seed: Option<u32>,
-    /// Enable streaming output
-    pub stream: bool,
-}
-
-impl Default for GenerationConfig {
-    fn default() -> Self {
-        Self {
-            max_tokens: 2048,
-            temperature: 0.7,
-            top_p: 0.9,
-            top_k: Some(40),
-            repeat_penalty: 1.1,
-            stop_tokens: vec!["</s>".to_owned(), "<|endoftext|>".to_owned()],
-            seed: None,
-            stream: false,
-        }
-    }
-}
-
 /// Application-level LoRA settings (TOML config: enabled, max_adapters, etc.)
 ///
 /// This is distinct from `TenantDeltaConfig` which configures LoRA weight parameters.
@@ -2375,7 +2481,6 @@ impl Default for LoraAppConfig {
         }
     }
 }
-
 
 /// Builder for Hyprstream configuration
 pub struct HyprConfigBuilder {
@@ -2509,7 +2614,6 @@ impl HyprConfigBuilder {
             token: self.token,
             oai: self.oai,
             xet: Default::default(),
-            at9p_verify: Default::default(),
             flight: self.flight,
             mcp: self.mcp,
             oauth: self.oauth,
@@ -2533,6 +2637,11 @@ impl HyprConfigBuilder {
             account: self.account,
             #[cfg(feature = "ledger")]
             ledger: Default::default(),
+            rds: Default::default(),
+            #[cfg(feature = "postgres-ledger")]
+            ledger_postgres_url: None,
+            #[cfg(feature = "postgres-ledger")]
+            ledger_postgres_pool_size: None,
         }
     }
 
@@ -2555,8 +2664,26 @@ impl HyprConfig {
         HyprConfigBuilder::new()
     }
 
+    // Keep list parsing restricted to fields that are actually lists. In particular,
+    // issuer URLs and other scalar strings must retain their existing parsing.
+    fn environment_source() -> Environment {
+        Environment::with_prefix("HYPRSTREAM")
+            .separator("__")
+            .try_parsing(true)
+            .list_separator(",")
+            .with_list_parse_key("oauth.cors.allowed_origins")
+    }
+
     /// Load configuration using the config crate with XDG directories and environment variables
+    ///
+    /// When binary startup pinned a validated snapshot ([`install_pinned_config`]),
+    /// that snapshot IS the process configuration: the XDG/env re-derivation is
+    /// skipped so factory and service-module reloads can never diverge from the
+    /// `--config` file main already loaded and validated.
     pub fn load() -> Result<Self, ConfigError> {
+        if let Some(pinned) = PINNED_CONFIG.get() {
+            return Ok(pinned.clone());
+        }
         let storage = StoragePaths::new().map_err(|e| {
             ConfigError::Message(format!("Failed to initialize storage paths: {e}"))
         })?;
@@ -2574,7 +2701,7 @@ impl HyprConfig {
             .add_source(File::from(config_dir.join("config.json")).required(false))
             .add_source(File::from(config_dir.join("config.yaml")).required(false))
             // Load from environment variables with HYPRSTREAM__ prefix (double underscore for nesting)
-            .add_source(Environment::with_prefix("HYPRSTREAM").separator("__").try_parsing(true));
+            .add_source(Self::environment_source());
 
         // Build and deserialize configuration
         let mut hypr_config: HyprConfig = settings.build()?.try_deserialize()?;
@@ -2628,6 +2755,31 @@ impl HyprConfig {
 
     /// Validate the entire configuration
     pub fn validate(&self) -> anyhow::Result<()> {
+        // #1652: name-keyed native admission policy must reference real
+        // factory services. Checked before anything else so a stale
+        // DID-valued event publisher list fails at startup, not as silent
+        // read-only ingress.
+        self.quic.validate_admission_policy()?;
+
+        // Ledger production mode (PAY-01): turns the deliberately-inert
+        // development defaults into startup failures, so a production node
+        // cannot come up with credit enforcement silently disabled or with a
+        // volatile accounting backend.
+        //
+        // Both the ledger config and its DSN are feature-gated, and they are
+        // gated independently: a build with `ledger` but not `postgres-ledger`
+        // has nowhere to configure a durable backend, so it reports no DSN and
+        // production validation fails — which is the correct answer, since such
+        // a build cannot serve a durable ledger at all.
+        #[cfg(feature = "ledger")]
+        {
+            #[cfg(feature = "postgres-ledger")]
+            let postgres_url = self.ledger_postgres_url.as_deref();
+            #[cfg(not(feature = "postgres-ledger"))]
+            let postgres_url: Option<&str> = None;
+            self.ledger.validate_for_production(postgres_url)?;
+        }
+
         // Validate model config
         if !self.model.path.as_os_str().is_empty() && !self.model.path.exists() {
             anyhow::bail!(
@@ -2771,7 +2923,8 @@ impl HyprConfig {
             if let Some(ref hex_key) = cfg.signing_key {
                 let mut bytes = hex::decode(hex_key)
                     .map_err(|e| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: invalid hex: {e}"))?;
-                let mut arr: [u8; 32] = bytes.as_slice()
+                let mut arr: [u8; 32] = bytes
+                    .as_slice()
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("HYPRSTREAM__SIGNING_KEY: expected 32 bytes"))?;
                 let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
@@ -2792,11 +2945,12 @@ impl HyprConfig {
     ) -> anyhow::Result<Option<(ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey)>> {
         if let Ok(cfg) = Self::load() {
             if let Some(ref hex_key) = cfg.oauth.user_signing_key {
-                let mut bytes = hex::decode(hex_key)
-                    .map_err(|e| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}"))?;
-                let mut arr: [u8; 32] = bytes.as_slice()
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes"))?;
+                let mut bytes = hex::decode(hex_key).map_err(|e| {
+                    anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: invalid hex: {e}")
+                })?;
+                let mut arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                    anyhow::anyhow!("HYPRSTREAM__OAUTH__USER_SIGNING_KEY: expected 32 bytes")
+                })?;
                 let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
                 bytes.zeroize();
                 arr.zeroize();
@@ -2817,7 +2971,8 @@ impl HyprConfig {
         config.model.name = model_path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("unknown").to_owned();
+            .unwrap_or("unknown")
+            .to_owned();
         config.model.architecture = "auto".to_owned(); // Auto-detect from model
 
         // Update storage paths to use XDG directories
@@ -2905,7 +3060,9 @@ pub struct SamplingParams {
 
 impl SamplingParams {
     /// Load model-specific config from a model directory
-    pub async fn from_model_path(model_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn from_model_path(
+        model_path: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let gen_config_path = model_path.join("generation_config.json");
         if gen_config_path.exists() {
             let content = tokio::fs::read_to_string(&gen_config_path).await?;
@@ -2928,23 +3085,60 @@ impl SamplingParams {
     /// Parse HuggingFace generation_config.json format
     fn from_generation_config(config: &serde_json::Value) -> Self {
         Self {
-            temperature: config.get("temperature").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            top_k: config.get("top_k").and_then(serde_json::Value::as_u64).map(|v| v as usize),
-            top_p: config.get("top_p").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            repeat_penalty: config.get("repetition_penalty").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            max_tokens: config.get("max_new_tokens").and_then(serde_json::Value::as_u64).map(|v| v as usize)
-                .or_else(|| config.get("max_length").and_then(serde_json::Value::as_u64).map(|v| v as usize)),
-            length_penalty: config.get("length_penalty").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            typical_p: config.get("typical_p").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            epsilon_cutoff: config.get("epsilon_cutoff").and_then(serde_json::Value::as_f64).map(|v| v as f32),
-            eta_cutoff: config.get("eta_cutoff").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+            temperature: config
+                .get("temperature")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            top_k: config
+                .get("top_k")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize),
+            top_p: config
+                .get("top_p")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            repeat_penalty: config
+                .get("repetition_penalty")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            max_tokens: config
+                .get("max_new_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize)
+                .or_else(|| {
+                    config
+                        .get("max_length")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|v| v as usize)
+                }),
+            length_penalty: config
+                .get("length_penalty")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            typical_p: config
+                .get("typical_p")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            epsilon_cutoff: config
+                .get("epsilon_cutoff")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
+            eta_cutoff: config
+                .get("eta_cutoff")
+                .and_then(serde_json::Value::as_f64)
+                .map(|v| v as f32),
             do_sample: config.get("do_sample").and_then(serde_json::Value::as_bool),
             stop_tokens: config.get("eos_token_id").and_then(|v| {
                 if let Some(arr) = v.as_array() {
-                    let tokens: Vec<String> = arr.iter()
+                    let tokens: Vec<String> = arr
+                        .iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
-                    if tokens.is_empty() { None } else { Some(tokens) }
+                    if tokens.is_empty() {
+                        None
+                    } else {
+                        Some(tokens)
+                    }
                 } else {
                     None
                 }
@@ -2980,8 +3174,11 @@ impl SamplingParams {
     ///
     /// Applies `SamplingParams` fields as `Option<T>` — `None` means "not specified",
     /// letting the engine use its defaults.
-    pub fn into_generation_request(self, prompt: String) -> crate::services::generated::inference_client::GenerationRequest {
-        crate::services::generated::inference_client::GenerationRequest {
+    pub fn into_generation_request(
+        self,
+        prompt: String,
+    ) -> hyprstream_rpc_std::inference_client::GenerationRequest {
+        hyprstream_rpc_std::inference_client::GenerationRequest {
             prompt,
             max_tokens: self.max_tokens.map(|v| v as u32),
             temperature: self.temperature,
@@ -3058,9 +3255,461 @@ impl From<&crate::config::server::SamplingParamDefaults> for SamplingParams {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn at9p_renewal_interval_must_outrun_half_ttl() {
+        // Defaults: 6 h check vs 24 h TTL — inside every bound, and the
+        // default TTL stays within the 86,400 s roster-lifetime bound that
+        // deployed host-side guards still enforce (an unset key must never
+        // mint a successor the guard classifies invalid_roster).
+        let defaults = At9pRenewalConfig::default();
+        let (interval, ttl) = match defaults.validated() {
+            Ok(pair) => pair,
+            Err(error) => panic!("defaults validate: {error}"),
+        };
+        assert_eq!(interval.as_secs(), 6 * 3600);
+        assert_eq!(ttl, 86_400);
+        // Minimum supported TTL (600 s → half = 300 s) with the default 6 h
+        // interval lets an identity expire between due ticks: refuse.
+        let slow = At9pRenewalConfig {
+            valid_for_secs: Some(MIN_SERVICE_IDENTITY_TTL_SECS),
+            ..Default::default()
+        };
+        let error = match slow.validated() {
+            Ok(_) => panic!("6h check vs 10m TTL must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("half of valid_for_secs"),
+            "{error}"
+        );
+        // Interval at exactly half the TTL still leaves a schedule where the
+        // head expires on the tick boundary: refuse strictly below only.
+        let boundary = At9pRenewalConfig {
+            valid_for_secs: Some(600),
+            check_interval_secs: Some(300),
+            ..Default::default()
+        };
+        assert!(boundary.validated().is_err());
+        // One second inside the window renews with positive remaining life.
+        let inside = At9pRenewalConfig {
+            valid_for_secs: Some(600),
+            check_interval_secs: Some(299),
+            ..Default::default()
+        };
+        let (inside_interval, _) = match inside.validated() {
+            Ok(pair) => pair,
+            Err(error) => panic!("inside window: {error}"),
+        };
+        assert_eq!(inside_interval.as_secs(), 299);
+        // A two-day interval satisfies the half-TTL bound against an
+        // explicit 90 d TTL but starves the roster freshness signal: the
+        // projection's generated_at refreshes only on a tick, and
+        // host-side monitoring flags roster_stale past 24 h — refuse at or
+        // above a day.
+        let slow_but_renewable = At9pRenewalConfig {
+            valid_for_secs: Some(MAX_SERVICE_IDENTITY_TTL_SECS),
+            check_interval_secs: Some(2 * 86_400),
+            ..Default::default()
+        };
+        let error = match slow_but_renewable.validated() {
+            Ok(_) => panic!("two-day interval must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("roster_stale"), "{error}");
+        let day_boundary = At9pRenewalConfig {
+            valid_for_secs: Some(MAX_SERVICE_IDENTITY_TTL_SECS),
+            check_interval_secs: Some(86_400),
+            ..Default::default()
+        };
+        assert!(day_boundary.validated().is_err());
+        let just_under_a_day = At9pRenewalConfig {
+            valid_for_secs: Some(MAX_SERVICE_IDENTITY_TTL_SECS),
+            check_interval_secs: Some(86_399),
+            ..Default::default()
+        };
+        assert!(just_under_a_day.validated().is_ok());
+        // Out-of-range TTL is still refused by the clamp validation.
+        let bad_ttl = At9pRenewalConfig {
+            valid_for_secs: Some(MAX_SERVICE_IDENTITY_TTL_SECS + 1),
+            ..Default::default()
+        };
+        assert!(bad_ttl.validated().is_err());
+    }
+
+    #[test]
+    fn default_startup_services_are_available_in_this_build() {
+        let startup = super::default_startup_services();
+        assert!(
+            !startup.iter().any(|name| name == "notification"),
+            "the removed notification service must not remain in the default roster"
+        );
+        for name in &startup {
+            assert!(
+                hyprstream_service::get_factory(name).is_some(),
+                "default service {name} must have a factory in this build"
+            );
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            assert!(startup.iter().any(|name| name == "flight"));
+            assert!(startup.iter().any(|name| name == "metrics"));
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            assert!(!startup.iter().any(|name| name == "flight"));
+            assert!(!startup.iter().any(|name| name == "metrics"));
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_origin_list_from_environment_preserves_scalars() -> anyhow::Result<()> {
+        use axum::{
+            body::Body,
+            http::{header, Request},
+            routing::get,
+            Router,
+        };
+        use tower::ServiceExt;
+
+        for origins in [
+            "https://staging-amp.hyprstream.com",
+            "https://staging-amp.hyprstream.com,https://second.example",
+            " https://staging-amp.hyprstream.com , https://second.example\t",
+        ] {
+            // Use a private source map, never mutate the test process environment.
+            let source = [
+                ("HYPRSTREAM__OAUTH__CORS__ALLOWED_ORIGINS", origins),
+                ("HYPRSTREAM__OAUTH__CORS__ENABLED", "true"),
+                ("HYPRSTREAM__OAUTH__CORS__ALLOW_CREDENTIALS", "true"),
+                ("HYPRSTREAM__OAUTH__CORS__PERMISSIVE_HEADERS", "false"),
+                (
+                    "HYPRSTREAM__OAUTH__EXTERNAL_URL",
+                    "https://discovery.staging.lab.hyprstream.com",
+                ),
+                ("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+            let cfg: HyprConfig = config::Config::builder()
+                .add_source(config::Config::try_from(&HyprConfig::default())?)
+                .add_source(HyprConfig::environment_source().source(Some(source)))
+                .build()?
+                .try_deserialize()?;
+            assert_eq!(
+                cfg.oauth.cors.allowed_origins,
+                origins.split(',').map(str::trim).collect::<Vec<_>>()
+            );
+            assert!(cfg.oauth.cors.enabled);
+            assert!(cfg.oauth.cors.allow_credentials);
+            assert!(!cfg.oauth.cors.permissive_headers);
+            assert_eq!(
+                cfg.oauth.external_url.as_deref(),
+                Some("https://discovery.staging.lab.hyprstream.com")
+            );
+            assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
+
+            let app = Router::new()
+                .route("/probe", get(|| async { "ok" }))
+                .layer(crate::server::middleware::cors_layer(&cfg.oauth.cors));
+            for origin in cfg
+                .oauth
+                .cors
+                .allowed_origins
+                .iter()
+                .map(String::as_str)
+                .chain(["https://not-allowed.example"])
+            {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/probe")
+                            .header(header::ORIGIN, origin)
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                let allowed = cfg
+                    .oauth
+                    .cors
+                    .allowed_origins
+                    .iter()
+                    .any(|value| value == origin);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                        .and_then(|value| value.to_str().ok()),
+                    allowed.then_some(origin)
+                );
+                if allowed {
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("true")
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a `HyprConfig` from a private env-source map with the OAuth CORS
+    /// list at `origins`, never mutating the test process environment.
+    fn cors_cfg_from_env(origins: &str) -> anyhow::Result<HyprConfig> {
+        let source = [
+            ("HYPRSTREAM__OAUTH__CORS__ALLOWED_ORIGINS", origins),
+            ("HYPRSTREAM__OAUTH__CORS__ENABLED", "true"),
+            ("HYPRSTREAM__OAUTH__CORS__ALLOW_CREDENTIALS", "true"),
+            ("HYPRSTREAM__OAUTH__CORS__PERMISSIVE_HEADERS", "false"),
+            (
+                "HYPRSTREAM__OAUTH__EXTERNAL_URL",
+                "https://discovery.staging.lab.hyprstream.com",
+            ),
+            ("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        Ok(config::Config::builder()
+            .add_source(config::Config::try_from(&HyprConfig::default())?)
+            .add_source(HyprConfig::environment_source().source(Some(source)))
+            .build()?
+            .try_deserialize()?)
+    }
+
+    /// Drive the real `cors_layer` middleware with an `Origin` request and
+    /// return the `(access-control-allow-origin, access-control-allow-credentials)`
+    /// header values it emits.
+    async fn cors_probe(
+        cfg: &HyprConfig,
+        origin: &str,
+    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+        use axum::{
+            body::Body,
+            http::{header, Request},
+            routing::get,
+            Router,
+        };
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(crate::server::middleware::cors_layer(&cfg.oauth.cors));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header(header::ORIGIN, origin)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let header_str = |name: header::HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        Ok((
+            header_str(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            header_str(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+        ))
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_env_empty_whitespace_or_separator_only_falls_back_to_localhost(
+    ) -> anyhow::Result<()> {
+        // An empty, whitespace-only, or separators-only value must trim+filter
+        // to an empty vector so the middleware's localhost fallback applies —
+        // the same posture as the legacy `HYPRSTREAM_CORS_ORIGINS` parser.
+        for origins in ["", "   ", ",", " ,\t, "] {
+            let cfg = cors_cfg_from_env(origins)?;
+            assert!(cfg.oauth.cors.allowed_origins.is_empty(), "{origins:?}");
+            assert!(cfg.oauth.cors.enabled);
+            assert!(cfg.oauth.cors.allow_credentials);
+            assert_eq!(
+                cfg.oauth.external_url.as_deref(),
+                Some("https://discovery.staging.lab.hyprstream.com")
+            );
+            assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30));
+
+            // The exact four-origin localhost fallback set is allowed and echoes
+            // credentials; a nearby unlisted port bounds the membership.
+            for origin in [
+                "http://localhost:3000",
+                "http://localhost:3001",
+                "http://127.0.0.1:3000",
+                "http://127.0.0.1:3001",
+            ] {
+                let (acao, credentials) = cors_probe(&cfg, origin).await?;
+                assert_eq!(acao, Some(origin.to_owned()), "{origins:?}");
+                assert_eq!(credentials, Some("true".to_owned()), "{origins:?}");
+            }
+            for denied in ["http://localhost:3002", "https://not-allowed.example"] {
+                // Denial is the absent ACAO; tower-http extends the configured
+                // credentials header independently of the origin match.
+                let (acao, _credentials) = cors_probe(&cfg, denied).await?;
+                assert_eq!(acao, None, "{origins:?} {denied}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_env_mixed_valid_and_empty_entries_drops_empties() -> anyhow::Result<()> {
+        // Empty entries interleaved with real origins are dropped after trimming;
+        // the surviving exact list both serves itself and disables the fallback.
+        let cfg = cors_cfg_from_env(
+            " , https://staging-amp.hyprstream.com ,, https://second.example\t,",
+        )?;
+        assert_eq!(
+            cfg.oauth.cors.allowed_origins,
+            vec![
+                "https://staging-amp.hyprstream.com".to_owned(),
+                "https://second.example".to_owned()
+            ]
+        );
+        assert!(cfg.oauth.cors.allow_credentials);
+        for origin in [
+            "https://staging-amp.hyprstream.com",
+            "https://second.example",
+        ] {
+            let (acao, credentials) = cors_probe(&cfg, origin).await?;
+            assert_eq!(acao, Some(origin.to_owned()));
+            assert_eq!(credentials, Some("true".to_owned()));
+        }
+        // Dropped empties match nothing, the nonempty exact list suppresses the
+        // localhost fallback, and unrelated origins stay denied. Denial is the
+        // absent ACAO; the configured credentials header may still be emitted.
+        for origin in ["", "http://localhost:3000", "https://not-allowed.example"] {
+            let (acao, _credentials) = cors_probe(&cfg, origin).await?;
+            assert_eq!(acao, None, "{origin:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oauth_cors_env_padded_wildcard_selects_wildcard_with_credentials_off(
+    ) -> anyhow::Result<()> {
+        // Trimming a whitespace-padded star intentionally selects the explicit
+        // wildcard operator, which always disables ambient credentials.
+        let cfg = cors_cfg_from_env(" * ")?;
+        assert_eq!(cfg.oauth.cors.allowed_origins, vec!["*".to_owned()]);
+        assert!(cfg.oauth.cors.allow_credentials);
+        for origin in ["https://anything.example", "http://localhost:3000"] {
+            let (acao, credentials) = cors_probe(&cfg, origin).await?;
+            assert_eq!(acao, Some("*".to_owned()), "{origin}");
+            assert_eq!(credentials, None, "{origin}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn network_iroh_required_is_serialized_and_rejects_iroh_disabled() -> anyhow::Result<()> {
+        let mut config = QuicConfig::default();
+        config.native_network_profile = NativeNetworkProfile::NetworkIrohRequired;
+        config.iroh = false;
+        assert!(config.validate_native_network_profile().is_err());
+
+        config.iroh = true;
+        config.validate_native_network_profile()?;
+        let serialized = toml::to_string(&config)?;
+        assert!(serialized.contains("native_network_profile = \"network-iroh-required\""));
+        let decoded: QuicConfig = toml::from_str(&serialized)?;
+        assert!(decoded.iroh_required());
+        Ok(())
+    }
+
+    /// #1652: the Event ingress grant is name-keyed. Names outside the factory
+    /// roster are rejected at validation — this is the loud startup failure a
+    /// stale pre-#1652 config (DID-valued list, or a typo'd name) must hit.
+    #[test]
+    fn event_publishers_must_be_factory_service_names() -> anyhow::Result<()> {
+        let mut config = QuicConfig::default();
+        config.validate_admission_policy()?;
+
+        for name in ["event", "streams", "model", "oauth"] {
+            config.event_publishers.insert(name.to_owned());
+        }
+        config.validate_admission_policy()?;
+
+        config.event_publishers.insert("not-a-service".to_owned());
+        let error = match config.validate_admission_policy() {
+            Ok(()) => panic!("unknown service name must fail validation"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("not a registered service name"),
+            "unexpected error: {error}"
+        );
+
+        // A pre-#1652 DID-valued list is exactly this failure: DIDs are not
+        // factory service names.
+        config.event_publishers.clear();
+        config.event_publishers.insert("did:at9p:9f7abc".to_owned());
+        assert!(
+            config.validate_admission_policy().is_err(),
+            "DID-valued event_publishers must fail loudly, not become silent read-only"
+        );
+        Ok(())
+    }
+
+    /// #1652 deploy story: a config file from before the derivation still
+    /// carrying a `[quic.moql_subject_tenants]` table loads (the key is gone
+    /// and ignored — tenants are store-derived now), while its DID-valued
+    /// `event_publishers` is rejected by validation.
+    #[test]
+    fn legacy_did_valued_admission_config_fails_loudly_on_publishers_only() -> anyhow::Result<()> {
+        let legacy = r#"
+            [quic]
+            event_publishers = ["did:at9p:legacy-service-did"]
+
+            [quic.moql_subject_tenants]
+            "did:at9p:legacy-service-did" = "local"
+        "#;
+        let config: HyprConfig = toml::from_str(legacy)?;
+        let error = match config.validate() {
+            Ok(()) => panic!("DID-valued event_publishers must fail validation"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("did:at9p:legacy-service-did"),
+            "validation must name the offending entry: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_state_documentation_configures_root_backend() {
+        let doc = include_str!("../../../../docs/discovery-state.md");
+        let example = doc
+            .split_once("```toml\n")
+            .unwrap_or_else(|| panic!("TOML example"))
+            .1
+            .split_once("```")
+            .unwrap_or_else(|| panic!("closed TOML example"))
+            .0;
+        let config: HyprConfig = toml::from_str(example).unwrap_or_else(|e| panic!("{e}"));
+        let state = config.discovery.state;
+        assert_eq!(
+            state.backend,
+            hyprstream_discovery::DiscoveryStateBackend::Tiered
+        );
+        assert!(state.active_active);
+        assert_eq!(state.memory.announcement_capacity, 16_384);
+        assert_eq!(state.valkey.announcement_capacity, 65_536);
+        assert_eq!(state.valkey.key_prefix, "production");
+        assert_eq!(state.valkey.url, "rediss://discovery-state.example:6379");
+        assert_eq!(state.tiered.l1_max_ttl_ms, 1_000);
+    }
+
     #[test]
     fn credentials_backend_default_matches_build_profile() {
         let config: CredentialsConfig =
@@ -3070,9 +3719,47 @@ mod tests {
 
     #[test]
     fn credential_pds_rejects_plaintext_capable_backends() {
-        assert!(CredentialsBackend::Pglite.ensure_allowed_for_build().is_ok());
-        assert!(CredentialsBackend::Rocksdb.ensure_allowed_for_build().is_err());
-        assert!(CredentialsBackend::Valkey.ensure_allowed_for_build().is_err());
+        assert!(CredentialsBackend::Pglite
+            .ensure_allowed_for_build()
+            .is_ok());
+        assert!(CredentialsBackend::Postgres
+            .ensure_allowed_for_build()
+            .is_ok());
+        assert!(CredentialsBackend::Rocksdb
+            .ensure_allowed_for_build()
+            .is_err());
+        assert!(CredentialsBackend::Valkey
+            .ensure_allowed_for_build()
+            .is_err());
+    }
+
+    #[test]
+    fn credentials_backend_deserializes_postgres() {
+        let config: CredentialsConfig =
+            toml::from_str("backend = \"postgres\"").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(config.backend, CredentialsBackend::Postgres);
+    }
+
+    #[test]
+    fn nested_environment_selects_postgres_accounts_and_rds_cell() -> anyhow::Result<()> {
+        let source = [
+            ("HYPRSTREAM__CREDENTIALS__BACKEND", "postgres"),
+            ("HYPRSTREAM__RDS__CELL_ID", "staging-us-east-1"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let config: HyprConfig = Config::builder()
+            .add_source(Config::try_from(&HyprConfig::default())?)
+            .add_source(HyprConfig::environment_source().source(Some(source)))
+            .build()?
+            .try_deserialize()?;
+
+        assert_eq!(config.credentials.backend, CredentialsBackend::Postgres);
+        assert_eq!(config.rds.cell_id, "staging-us-east-1");
+        let resolved_rds = config.rds.resolve_with(|_| None)?;
+        assert_eq!(resolved_rds.cell_id, "staging-us-east-1");
+        Ok(())
     }
 
     #[test]
@@ -3084,11 +3771,7 @@ mod tests {
             model_oid: "1".repeat(40),
             tenant: "demo.example".to_owned(),
             quic_port: Some(7440),
-            advertise_addr: Some(
-                "192.0.2.10:7440"
-                    .parse()
-                    .unwrap_or_else(|e| panic!("{e}")),
-            ),
+            advertise_addr: Some("192.0.2.10:7440".parse().unwrap_or_else(|e| panic!("{e}"))),
             stage_start: 8,
             stage_end: Some(16),
             ..InferenceServerConfig::default()
@@ -3124,11 +3807,7 @@ mod tests {
             model_oid: "1".repeat(40),
             tenant: "demo.example".to_owned(),
             quic_port: Some(7441),
-            advertise_addr: Some(
-                "192.0.2.10:7440"
-                    .parse()
-                    .unwrap_or_else(|e| panic!("{e}")),
-            ),
+            advertise_addr: Some("192.0.2.10:7440".parse().unwrap_or_else(|e| panic!("{e}"))),
             ..InferenceServerConfig::default()
         };
 
@@ -3142,10 +3821,8 @@ mod tests {
     #[test]
     fn standalone_inference_verifies_materialized_git_oid() {
         let model = tempfile::TempDir::new().unwrap_or_else(|e| panic!("{e}"));
-        let repository =
-            git2::Repository::init(model.path()).unwrap_or_else(|e| panic!("{e}"));
-        std::fs::write(model.path().join("config.json"), b"{}")
-            .unwrap_or_else(|e| panic!("{e}"));
+        let repository = git2::Repository::init(model.path()).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(model.path().join("config.json"), b"{}").unwrap_or_else(|e| panic!("{e}"));
         std::fs::write(model.path().join(".gitignore"), b"ignored.bin\n")
             .unwrap_or_else(|e| panic!("{e}"));
         let mut index = repository.index().unwrap_or_else(|e| panic!("{e}"));
@@ -3160,18 +3837,10 @@ mod tests {
         let tree = repository
             .find_tree(tree_oid)
             .unwrap_or_else(|e| panic!("{e}"));
-        let signature =
-            git2::Signature::now("hyprstream-test", "test@hyprstream.local")
-                .unwrap_or_else(|e| panic!("{e}"));
+        let signature = git2::Signature::now("hyprstream-test", "test@hyprstream.local")
+            .unwrap_or_else(|e| panic!("{e}"));
         let oid = repository
-            .commit(
-                Some("HEAD"),
-                &signature,
-                &signature,
-                "fixture",
-                &tree,
-                &[],
-            )
+            .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
             .unwrap_or_else(|e| panic!("{e}"));
 
         let mut config = InferenceServerConfig {
@@ -3180,11 +3849,7 @@ mod tests {
             model_oid: oid.to_string(),
             tenant: "demo.example".to_owned(),
             quic_port: Some(7440),
-            advertise_addr: Some(
-                "192.0.2.10:7440"
-                    .parse()
-                    .unwrap_or_else(|e| panic!("{e}")),
-            ),
+            advertise_addr: Some("192.0.2.10:7440".parse().unwrap_or_else(|e| panic!("{e}"))),
             ..InferenceServerConfig::default()
         };
         config
@@ -3200,8 +3865,7 @@ mod tests {
             config.verify_materialized_oid().is_err(),
             "dirty tracked model bytes must not inherit the HEAD identity"
         );
-        std::fs::write(model.path().join("config.json"), b"{}")
-            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(model.path().join("config.json"), b"{}").unwrap_or_else(|e| panic!("{e}"));
 
         std::fs::write(model.path().join("ignored.bin"), b"mutable weights")
             .unwrap_or_else(|e| panic!("{e}"));
@@ -3209,8 +3873,7 @@ mod tests {
             config.verify_materialized_oid().is_err(),
             "ignored model bytes must not inherit the HEAD identity"
         );
-        std::fs::remove_file(model.path().join("ignored.bin"))
-            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::remove_file(model.path().join("ignored.bin")).unwrap_or_else(|e| panic!("{e}"));
 
         config.model_oid = "f".repeat(40);
         assert!(config.verify_materialized_oid().is_err());
@@ -3226,23 +3889,30 @@ mod tests {
 
         c.cluster_at9p_did = Some("did:at9p:example".to_owned());
         c.cluster_did_web = None;
-        assert!(c.validate().is_err(), "at9p without did:web must be rejected");
+        assert!(
+            c.validate().is_err(),
+            "at9p without did:web must be rejected"
+        );
 
         c.cluster_at9p_did = None;
         c.cluster_did_web = Some("did:web:example.com".to_owned());
-        assert!(c.validate().is_err(), "did:web without at9p must be rejected");
+        assert!(
+            c.validate().is_err(),
+            "did:web without at9p must be rejected"
+        );
 
         // Both absent: anchors simply not configured — the OS-owned path applies.
         c.cluster_did_web = None;
-        assert!(c.validate().is_ok(), "no anchors configured must remain valid");
+        assert!(
+            c.validate().is_ok(),
+            "no anchors configured must remain valid"
+        );
 
         // Both present: the pairing the resolver expects.
         c.cluster_at9p_did = Some("did:at9p:example".to_owned());
         c.cluster_did_web = Some("did:web:example.com".to_owned());
         assert!(c.validate().is_ok(), "paired anchors must be accepted");
     }
-
-    use super::*;
 
     /// Serialize process-env mutations for secrets-dir resolver tests.
     static SECRETS_DIR_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -3334,8 +4004,7 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
 
         let toml_str = toml::to_string_pretty(&config)
             .expect("a default worker section must serialize to TOML (F3)");
-        let parsed: HyprConfig =
-            toml::from_str(&toml_str).expect("round-trip parse must succeed");
+        let parsed: HyprConfig = toml::from_str(&toml_str).expect("round-trip parse must succeed");
         let admission = parsed
             .worker
             .expect("worker section round-trips")
@@ -3350,11 +4019,17 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         let config = GenerationConfig::default();
 
         // Verify max_tokens is set to 2048 (not 100)
-        assert_eq!(config.max_tokens, 2048, "Default max_tokens should be 2048 for thinking mode support");
+        assert_eq!(
+            config.max_tokens, 2048,
+            "Default max_tokens should be 2048 for thinking mode support"
+        );
 
         // Verify other reasonable defaults
         assert!(config.temperature > 0.0, "Temperature should be non-zero");
-        assert!(config.top_p > 0.0 && config.top_p <= 1.0, "top_p should be in valid range");
+        assert!(
+            config.top_p > 0.0 && config.top_p <= 1.0,
+            "top_p should be in valid range"
+        );
     }
 
     #[test]
@@ -3398,9 +4073,7 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
             ..Default::default()
         };
 
-        let final_config = server_defaults
-            .merge(model_defaults)
-            .merge(user_overrides);
+        let final_config = server_defaults.merge(model_defaults).merge(user_overrides);
 
         assert_eq!(final_config.temperature, Some(0.9));
         assert_eq!(final_config.max_tokens, Some(512));
@@ -3461,7 +4134,10 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
     #[test]
     fn test_oauth_secs_overrides() {
         let mut config = OAuthConfig::default();
-        assert_eq!(config.active_secs(), i64::from(config.jwt_key_active_days) * 86400);
+        assert_eq!(
+            config.active_secs(),
+            i64::from(config.jwt_key_active_days) * 86400
+        );
         config.jwt_key_active_secs = Some(30);
         config.jwt_key_lead_secs = Some(25);
         config.jwt_key_drain_secs = Some(20);
@@ -3469,7 +4145,10 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         assert_eq!(config.active_secs(), 30);
         assert_eq!(config.lead_secs(), 25);
         assert_eq!(config.drain_secs(), 20);
-        assert_eq!(config.rotation_check_interval(), std::time::Duration::from_secs(3));
+        assert_eq!(
+            config.rotation_check_interval(),
+            std::time::Duration::from_secs(3)
+        );
     }
 
     #[test]
@@ -3487,7 +4166,9 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
             .insert("legacy".to_owned(), provider);
 
         let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("disabled user_mapping = \"didweb\""));
+        assert!(err
+            .to_string()
+            .contains("disabled user_mapping = \"didweb\""));
     }
 
     #[test]
@@ -3497,148 +4178,21 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         std::env::set_var("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS", "30");
         let result = config::Config::builder()
             .add_source(config::Config::try_from(&HyprConfig::default()).unwrap())
-            .add_source(config::Environment::with_prefix("HYPRSTREAM").separator("__").try_parsing(true))
+            .add_source(
+                config::Environment::with_prefix("HYPRSTREAM")
+                    .separator("__")
+                    .try_parsing(true),
+            )
             .build()
             .and_then(config::Config::try_deserialize::<HyprConfig>);
         std::env::remove_var("HYPRSTREAM__OAUTH__JWT_KEY_ACTIVE_SECS");
         let cfg = result.expect("config should parse with env var");
-        assert_eq!(cfg.oauth.jwt_key_active_secs, Some(30), "jwt_key_active_secs should be 30 from env");
+        assert_eq!(
+            cfg.oauth.jwt_key_active_secs,
+            Some(30),
+            "jwt_key_active_secs should be 30 from env"
+        );
         assert_eq!(cfg.oauth.active_secs(), 30);
-    }
-
-    // ---- Multi-GPU device resolution (#313) ----
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn parse_device_list_basic() {
-        assert_eq!(RuntimeConfig::parse_device_list("0,1").unwrap(), vec![0, 1]);
-        // Whitespace around entries is tolerated.
-        assert_eq!(RuntimeConfig::parse_device_list(" 0 , 2 ").unwrap(), vec![0, 2]);
-        assert_eq!(RuntimeConfig::parse_device_list("3").unwrap(), vec![3]);
-    }
-
-    #[test]
-    fn parse_device_list_rejects_garbage() {
-        // Non-numeric, empty fields, and negatives are hard errors (no silent default).
-        assert!(RuntimeConfig::parse_device_list("0,foo").is_err());
-        assert!(RuntimeConfig::parse_device_list("0,").is_err());
-        assert!(RuntimeConfig::parse_device_list("0,,1").is_err());
-        assert!(RuntimeConfig::parse_device_list("-1").is_err());
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn validate_index_set_dedup_and_empty() {
-        // Empty → None (auto-detect).
-        assert_eq!(RuntimeConfig::validate_index_set(vec![]).unwrap(), None);
-        // Duplicates → error.
-        assert!(RuntimeConfig::validate_index_set(vec![0, 0]).is_err());
-        // Distinct → Some, order preserved.
-        assert_eq!(
-            RuntimeConfig::validate_index_set(vec![2, 0, 1]).unwrap(),
-            Some(vec![2, 0, 1])
-        );
-    }
-
-    /// Serializes the two tests that mutate the shared `HYPRSTREAM_GPU_DEVICES`
-    /// process env var so they don't race under the parallel test runner.
-    static GPU_DEVICES_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn resolve_uses_devices_field_and_legacy_fallback() {
-        let _serial = GPU_DEVICES_ENV_LOCK.lock();
-        // Guard against the env var leaking from the ambient environment so the
-        // struct-field/legacy precedence is exercised deterministically.
-        let _guard = EnvVarGuard::unset("HYPRSTREAM_GPU_DEVICES");
-
-        // Explicit multi-device field wins.
-        let mut cfg = RuntimeConfig::default();
-        cfg.devices = vec![0, 1];
-        cfg.gpu_device_id = Some(7);
-        assert_eq!(
-            cfg.resolve_explicit_multi_device_indices().unwrap(),
-            Some(vec![0, 1])
-        );
-        assert_eq!(cfg.resolve_device_indices().unwrap(), Some(vec![0, 1]));
-
-        // No explicit multi-device set → explicit resolver is None, but the full
-        // resolver falls back to the legacy single gpu_device_id.
-        let mut legacy = RuntimeConfig::default();
-        legacy.devices = vec![];
-        legacy.gpu_device_id = Some(3);
-        assert_eq!(legacy.resolve_explicit_multi_device_indices().unwrap(), None);
-        assert_eq!(legacy.resolve_device_indices().unwrap(), Some(vec![3]));
-
-        // Nothing requested anywhere → None (auto-detect path preserved).
-        let mut none = RuntimeConfig::default();
-        none.devices = vec![];
-        none.gpu_device_id = None;
-        assert_eq!(none.resolve_device_indices().unwrap(), None);
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn resolve_env_var_overrides_and_is_strict() {
-        let _serial = GPU_DEVICES_ENV_LOCK.lock();
-        let mut cfg = RuntimeConfig::default();
-        cfg.devices = vec![5];
-        cfg.gpu_device_id = Some(9);
-
-        {
-            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "0,1,2");
-            assert_eq!(
-                cfg.resolve_explicit_multi_device_indices().unwrap(),
-                Some(vec![0, 1, 2]),
-                "env var must override the devices field"
-            );
-        }
-        {
-            // Malformed env var is a hard error (not a silent fallback to field).
-            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "0,nope");
-            assert!(cfg.resolve_explicit_multi_device_indices().is_err());
-        }
-        {
-            // Duplicate in env var → error.
-            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "1,1");
-            assert!(cfg.resolve_explicit_multi_device_indices().is_err());
-        }
-        {
-            // Explicitly-empty env var is treated as unset (falls back to field).
-            let _g = EnvVarGuard::set("HYPRSTREAM_GPU_DEVICES", "  ");
-            assert_eq!(
-                cfg.resolve_explicit_multi_device_indices().unwrap(),
-                Some(vec![5])
-            );
-        }
-    }
-
-    /// Serializes tests mutating the shared `HYPRSTREAM_STRICT_DEVICE` env var.
-    static STRICT_DEVICE_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-    /// #315: strict_device defaults to fail-fast, and can be opted out via env.
-    #[test]
-    fn strict_device_defaults_to_true_and_respects_env() {
-        let _serial = STRICT_DEVICE_ENV_LOCK.lock();
-
-        {
-            let _g = EnvVarGuard::unset("HYPRSTREAM_STRICT_DEVICE");
-            assert!(
-                RuntimeConfig::default().strict_device,
-                "strict_device must default to true (safe default for multi-GPU)"
-            );
-        }
-        for falsy in ["0", "false", "no", "off"] {
-            let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", falsy);
-            assert!(
-                !RuntimeConfig::default().strict_device,
-                "HYPRSTREAM_STRICT_DEVICE={falsy} must disable strict_device"
-            );
-        }
-        {
-            let _g = EnvVarGuard::set("HYPRSTREAM_STRICT_DEVICE", "1");
-            assert!(RuntimeConfig::default().strict_device);
-        }
     }
 
     /// RAII guard to set/unset a process env var for the duration of a test and
@@ -3651,12 +4205,18 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
         fn set(key: &str, val: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::set_var(key, val);
-            Self { key: key.to_owned(), prev }
+            Self {
+                key: key.to_owned(),
+                prev,
+            }
         }
         fn unset(key: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key: key.to_owned(), prev }
+            Self {
+                key: key.to_owned(),
+                prev,
+            }
         }
     }
     impl Drop for EnvVarGuard {
@@ -3669,283 +4229,80 @@ cluster_did_web = "did:web:discovery.hyprstream.com"
     }
 }
 
-/// Generation result with metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerationResult {
-    pub text: String,
-    pub tokens_generated: usize,
-    pub finish_reason: FinishReason,
-    pub generation_time_ms: u64,
-    pub tokens_per_second: f32,
-    /// Quality metrics for self-supervised training
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quality_metrics: Option<GenerationQualityMetrics>,
+#[cfg(test)]
+mod pinned_config_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-    // Prefill metrics (processing the prompt)
-    #[serde(default)]
-    pub prefill_tokens: usize,
-    #[serde(default)]
-    pub prefill_time_ms: u64,
-    #[serde(default)]
-    pub prefill_tokens_per_sec: f32,
+    use super::*;
 
-    // Inference metrics (generating new tokens, excluding prefill)
-    #[serde(default)]
-    pub inference_tokens: usize,
-    #[serde(default)]
-    pub inference_time_ms: u64,
-    #[serde(default)]
-    pub inference_tokens_per_sec: f32,
+    const PINNED_CHILD: &str = "HYPRSTREAM_PINNED_CONFIG_CHILD";
 
-    /// Online training (TTT) adaptation metrics
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttt_metrics: Option<TTTMetrics>,
-}
-
-/// TTT adaptation metrics (mirrors training::ttt::TTTResult)
-///
-/// Exposed as "Online Training" metrics in user-facing APIs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TTTMetrics {
-    pub avg_loss: f32,
-    pub loss_improvement: f32,
-    pub steps_performed: usize,
-    pub adaptation_time_ms: u64,
-    pub skipped: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skip_reason: Option<String>,
-
-    // Advanced metrics (expert recommendation)
-    pub avg_grad_norm: f32,
-    pub max_grad_norm: f32,
-    pub gradient_clipped: bool,
-    pub tokens_used: usize,
-    pub tokens_provided: usize,
-    pub was_truncated: bool,
-
-    // Tenant-aware TTT metrics
-    /// Initial perplexity before adaptation
-    #[serde(default)]
-    pub initial_perplexity: f32,
-    /// Final perplexity after adaptation
-    #[serde(default)]
-    pub final_perplexity: f32,
-    /// Server's recommendation: true = commit, false = rollback
-    #[serde(default)]
-    pub recommendation: bool,
-    /// Number of steps determined by perplexity gating
-    #[serde(default)]
-    pub gated_steps: usize,
-    /// Whether adaptation is pending client commit/rollback
-    #[serde(default)]
-    pub pending: bool,
-}
-
-impl From<crate::training::ttt::TTTResult> for TTTMetrics {
-    fn from(r: crate::training::ttt::TTTResult) -> Self {
-        Self {
-            avg_loss: r.avg_loss,
-            loss_improvement: r.loss_improvement,
-            steps_performed: r.steps_performed,
-            adaptation_time_ms: r.adaptation_time_ms,
-            skipped: r.skipped,
-            skip_reason: r.skip_reason,
-            avg_grad_norm: r.avg_grad_norm,
-            max_grad_norm: r.max_grad_norm,
-            gradient_clipped: r.gradient_clipped,
-            tokens_used: r.tokens_used,
-            tokens_provided: r.tokens_provided,
-            was_truncated: r.was_truncated,
-            initial_perplexity: r.initial_perplexity,
-            final_perplexity: r.final_perplexity,
-            recommendation: r.recommendation,
-            gated_steps: r.gated_steps,
-            pending: r.pending,
+    /// The write-once snapshot must be the ONE process configuration: after
+    /// startup pins the validated explicit file, factory-style
+    /// `HyprConfig::load()` calls observe the snapshot even when the XDG
+    /// default changes underneath, and never follow source-file rereads.
+    /// Runs in an isolated child because the slot is process-global.
+    #[test]
+    fn pinned_config_snapshot_observed_by_load() -> anyhow::Result<()> {
+        if std::env::var_os(PINNED_CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "config::pinned_config_tests::pinned_config_snapshot_observed_by_load",
+                    "--nocapture",
+                ])
+                .env(PINNED_CHILD, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "pinned-config regression failed");
+            return Ok(());
         }
+
+        let root = tempfile::tempdir()?;
+        let xdg = root.path().join("xdg-config");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let default_config = xdg.join("hyprstream").join("config.toml");
+        std::fs::create_dir_all(default_config.parent().expect("parent"))?;
+
+        let write_config = |path: &Path, secrets: &Path| -> anyhow::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut configured = HyprConfig::default();
+            configured.secrets.path = Some(secrets.to_path_buf());
+            configured.to_file(path)
+        };
+
+        // XDG default initially points at B; the operator's explicit file at A.
+        let secrets_b = root.path().join("secrets-B");
+        write_config(&default_config, &secrets_b)?;
+        let explicit = root.path().join("custom dir/custom.toml");
+        let secrets_a = root.path().join("secrets-A");
+        write_config(&explicit, &secrets_a)?;
+
+        // Main's path: load the explicit file, validate, pin.
+        let loaded = HyprConfig::from_file(&explicit)?;
+        loaded.validate()?;
+        let _ = install_pinned_config(loaded);
+
+        // Post-pin drift: the XDG default changes to C and the explicit source
+        // file changes to D. Factory-style reloads must stay on the snapshot.
+        let secrets_c = root.path().join("secrets-C");
+        write_config(&default_config, &secrets_c)?;
+        let reloaded = HyprConfig::load().expect("pinned reload");
+        assert_eq!(
+            reloaded.secrets.path,
+            Some(secrets_a.clone()),
+            "factory-style HyprConfig::load() must observe the pinned snapshot, not XDG defaults"
+        );
+        let secrets_d = root.path().join("secrets-D");
+        write_config(&explicit, &secrets_d)?;
+        let again = HyprConfig::load().expect("second pinned reload");
+        assert_eq!(
+            again.secrets.path,
+            Some(secrets_a),
+            "load() must not follow source-file rereads after the pin"
+        );
+        std::env::remove_var("XDG_CONFIG_HOME");
+        Ok(())
     }
-}
-
-/// Why generation stopped
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FinishReason {
-    MaxTokens,
-    StopToken(String),
-    EndOfSequence,
-    Error(String),
-    Stop,
-}
-
-// =============================================================================
-// Training Mode Configuration (Phase D)
-// =============================================================================
-
-/// Model-level training mode configuration (embedded in config.json under "hyprstream_training")
-///
-/// This allows inference to automatically adapt models when enabled.
-/// The training mode is set via `hyprstream training set test_time_training`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HyprstreamTrainingConfig {
-    /// Training mode: disabled, test_time_training, supervised
-    #[serde(default)]
-    pub mode: TrainingMode,
-
-    /// Target adapter to train (e.g., "01_coding")
-    pub target_adapter: Option<String>,
-
-    /// Learning rate for training
-    #[serde(default = "default_training_learning_rate")]
-    pub learning_rate: f64,
-
-    /// Batch size for training (used by supervised mode)
-    #[serde(default = "default_training_batch_size")]
-    pub batch_size: usize,
-
-    /// Training steps per cycle (used by supervised mode)
-    #[serde(default = "default_training_steps_per_cycle")]
-    pub steps_per_cycle: usize,
-
-    /// Minimum quality score to keep examples (0.0-1.0)
-    #[serde(default = "default_training_min_quality")]
-    pub min_quality_threshold: f32,
-
-    /// Enable training on base model weights (vs LoRA only)
-    #[serde(default)]
-    pub train_base_model: bool,
-
-    /// TTT-specific configuration (for TestTimeTraining mode)
-    #[serde(default)]
-    pub ttt: TTTTrainingConfig,
-
-    /// LoRA rank for TTT delta (default: 8)
-    #[serde(default = "default_lora_rank")]
-    pub lora_rank: usize,
-
-    /// LoRA alpha scaling factor (default: None, which means alpha = rank)
-    #[serde(default)]
-    pub lora_alpha: Option<f32>,
-
-    /// Target modules for LoRA adaptation (default: ["q_proj", "v_proj"])
-    #[serde(default = "default_target_modules")]
-    pub target_modules: Vec<String>,
-}
-
-/// TTT-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TTTTrainingConfig {
-    /// Learning rate for TTT adaptation (higher than fine-tuning)
-    #[serde(default = "default_ttt_learning_rate")]
-    pub learning_rate: f64,
-
-    /// Number of gradient steps per input
-    #[serde(default = "default_ttt_gradient_steps")]
-    pub gradient_steps: u32,
-
-    /// Maximum gradient norm for clipping
-    #[serde(default = "default_ttt_max_grad_norm")]
-    pub max_grad_norm: f64,
-
-    /// Minimum input length (tokens) to trigger TTT
-    #[serde(default = "default_ttt_min_input_length")]
-    pub min_input_length: u32,
-
-    /// Maximum input length to process for TTT
-    #[serde(default = "default_ttt_max_context")]
-    pub max_ttt_context: u32,
-
-    /// Rank oracle configuration (optional — omit to disable runtime rank adaptation)
-    #[serde(default)]
-    pub rank_oracle: Option<crate::training::RankOracleConfig>,
-
-    /// Per-layer gradient gating (optional — enabled by default)
-    #[serde(default)]
-    pub gradient_gating: Option<crate::training::GradientGatingConfig>,
-}
-
-fn default_ttt_learning_rate() -> f64 {
-    3e-4
-}
-fn default_ttt_gradient_steps() -> u32 {
-    3
-}
-fn default_ttt_max_grad_norm() -> f64 {
-    1.0
-}
-fn default_ttt_min_input_length() -> u32 {
-    32
-}
-fn default_ttt_max_context() -> u32 {
-    512
-}
-
-impl Default for TTTTrainingConfig {
-    fn default() -> Self {
-        Self {
-            learning_rate: default_ttt_learning_rate(),
-            gradient_steps: default_ttt_gradient_steps(),
-            max_grad_norm: default_ttt_max_grad_norm(),
-            min_input_length: default_ttt_min_input_length(),
-            max_ttt_context: default_ttt_max_context(),
-            rank_oracle: None,
-            gradient_gating: None,
-        }
-    }
-}
-
-impl HyprstreamTrainingConfig {
-    /// Check if training is enabled (mode != Disabled)
-    pub fn is_enabled(&self) -> bool {
-        self.mode != TrainingMode::Disabled
-    }
-}
-
-impl Default for HyprstreamTrainingConfig {
-    fn default() -> Self {
-        Self {
-            mode: TrainingMode::default(),
-            target_adapter: None,
-            learning_rate: default_training_learning_rate(),
-            batch_size: default_training_batch_size(),
-            steps_per_cycle: default_training_steps_per_cycle(),
-            min_quality_threshold: default_training_min_quality(),
-            train_base_model: false,
-            ttt: TTTTrainingConfig::default(),
-            lora_rank: default_lora_rank(),
-            lora_alpha: None,
-            target_modules: default_target_modules(),
-        }
-    }
-}
-
-/// Training mode configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TrainingMode {
-    /// Training disabled (default)
-    #[default]
-    Disabled,
-    /// Test-Time Training: adapts to input context before generation
-    /// Research-valid approach based on TTT-E2E
-    TestTimeTraining,
-    /// Supervised training with explicit training data
-    Supervised,
-}
-
-// Default functions for HyprstreamTrainingConfig
-pub fn default_lora_rank() -> usize {
-    8
-}
-pub fn default_target_modules() -> Vec<String> {
-    vec!["q_proj".to_owned(), "v_proj".to_owned()]
-}
-fn default_training_learning_rate() -> f64 {
-    1e-5
-}
-fn default_training_batch_size() -> usize {
-    4
-}
-fn default_training_steps_per_cycle() -> usize {
-    10
-}
-fn default_training_min_quality() -> f32 {
-    0.3
 }

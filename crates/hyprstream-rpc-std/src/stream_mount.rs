@@ -41,12 +41,12 @@ use std::collections::HashMap;
 use parking_lot::Mutex;
 
 use async_trait::async_trait;
-use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
-use hyprstream_rpc::Subject;
 use hyprstream_rpc::stream_consumer::{StreamHandle, StreamPayload};
 use hyprstream_rpc::stream_info::{
     Completion, Delivery, Ordering, OverflowPolicy, Retention, StreamOpt,
 };
+use hyprstream_rpc::Subject;
+use hyprstream_vfs::{DirEntry, Fid, Mount, MountError, Stat};
 
 // ============================================================================
 // StreamKind — what plane a topic belongs to (#819: events ride the same surface)
@@ -503,9 +503,7 @@ impl Mount for StreamMount {
             .ok_or_else(|| MountError::InvalidArgument("bad fid".into()))?;
 
         match state {
-            StreamFidState::Root => {
-                Err(MountError::IsDirectory("stream root".into()))
-            }
+            StreamFidState::Root => Err(MountError::IsDirectory("stream root".into())),
             StreamFidState::TopicDir { .. } => {
                 Err(MountError::IsDirectory("stream topic dir".into()))
             }
@@ -520,7 +518,11 @@ impl Mount for StreamMount {
                     let entry = streams
                         .get(topic.as_str())
                         .ok_or_else(|| MountError::NotFound(topic.clone()))?;
-                    let done = entry.handle.as_ref().map(|h| h.is_completed()).unwrap_or(true);
+                    let done = entry
+                        .handle
+                        .as_ref()
+                        .map(|h| h.is_completed())
+                        .unwrap_or(true);
                     (done, entry.qos.is_lossy())
                 };
 
@@ -534,7 +536,9 @@ impl Mount for StreamMount {
                     let entry = streams
                         .get_mut(topic.as_str())
                         .ok_or_else(|| MountError::NotFound(topic.clone()))?;
-                    entry.handle.take()
+                    entry
+                        .handle
+                        .take()
                         .ok_or_else(|| MountError::Io("stream read in progress".into()))?
                 };
 
@@ -598,7 +602,11 @@ impl Mount for StreamMount {
                     .get(topic.as_str())
                     .ok_or_else(|| MountError::NotFound(topic.clone()))?;
 
-                let complete = entry.handle.as_ref().map(|h| h.is_completed()).unwrap_or(true);
+                let complete = entry
+                    .handle
+                    .as_ref()
+                    .map(|h| h.is_completed())
+                    .unwrap_or(true);
                 let info = serde_json::json!({
                     "topic": topic,
                     "kind": entry.kind.as_str(),
@@ -666,10 +674,9 @@ impl Mount for StreamMount {
                     }
                     // QoS selection through ctl (#819): `qos latest-wins drop-stale`.
                     "qos" => {
-                        let qos = StreamQos::parse(arg)
-                            .map_err(|tok| MountError::InvalidArgument(format!(
-                                "unknown qos token: {tok}"
-                            )))?;
+                        let qos = StreamQos::parse(arg).map_err(|tok| {
+                            MountError::InvalidArgument(format!("unknown qos token: {tok}"))
+                        })?;
                         if !self.registry.set_qos(topic, qos) {
                             return Err(MountError::NotFound(topic.clone()));
                         }
@@ -705,7 +712,9 @@ impl Mount for StreamMount {
                 }
                 Ok(data.len() as u32)
             }
-            _ => Err(MountError::NotSupported("stream files are read-only".into())),
+            _ => Err(MountError::NotSupported(
+                "stream files are read-only".into(),
+            )),
         }
     }
 
@@ -885,7 +894,10 @@ mod tests {
         let q = StreamQos::reliable();
         assert!(matches!(q.stream_opt().ordering, Ordering::Ordered));
         assert!(matches!(q.stream_opt().completion, Completion::EndOfStream));
-        assert!(matches!(q.stream_opt().overflow_policy, OverflowPolicy::Block));
+        assert!(matches!(
+            q.stream_opt().overflow_policy,
+            OverflowPolicy::Block
+        ));
         assert!(!q.is_lossy());
         assert_eq!(q.to_tokens(), vec!["reliable"]);
     }
@@ -1000,10 +1012,7 @@ mod tests {
         let reg = std::sync::Arc::new(StreamRegistry::new());
         reg.register(
             "s".into(),
-            StreamEntry::stream(
-                Some(boxed(MockHandle::new("s", vec![]))),
-                "owner".into(),
-            ),
+            StreamEntry::stream(Some(boxed(MockHandle::new("s", vec![]))), "owner".into()),
         );
         let mount = StreamMount::new(std::sync::Arc::clone(&reg));
         let caller = Subject::anonymous();
@@ -1081,7 +1090,10 @@ mod tests {
         let reg = std::sync::Arc::new(StreamRegistry::new());
         reg.register(
             "model-lifecycle".into(),
-            StreamEntry::event(Some(boxed(MockHandle::new("model-lifecycle", vec![]))), "svc".into()),
+            StreamEntry::event(
+                Some(boxed(MockHandle::new("model-lifecycle", vec![]))),
+                "svc".into(),
+            ),
         );
         assert_eq!(reg.kind("model-lifecycle"), Some(StreamKind::Event));
 
@@ -1116,7 +1128,9 @@ mod tests {
 
         let info_fid = Fid::new(StreamFidState::Info { topic: "r".into() });
         let info = mount.read(&info_fid, 0, 4096, &caller).await.unwrap();
-        assert!(String::from_utf8(info).unwrap().contains("\"resumeSeq\": 42"));
+        assert!(String::from_utf8(info)
+            .unwrap()
+            .contains("\"resumeSeq\": 42"));
 
         // A non-numeric resume arg is rejected.
         assert!(matches!(
@@ -1136,10 +1150,7 @@ mod tests {
         );
         let mount = StreamMount::new(reg);
         let caller = Subject::anonymous();
-        let dir = mount
-            .walk(&["d"], &caller)
-            .await
-            .unwrap();
+        let dir = mount.walk(&["d"], &caller).await.unwrap();
         let entries = mount.readdir(&dir, &caller).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"data"));

@@ -1,0 +1,9 @@
+{
+  "name": "hyprstream-docs-publish",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Locked tool graph for the docs-publish workflow (rustdoc -> IPFS CAR). Only the committed lockfile graph is installed (npm ci --ignore-scripts).",
+  "devDependencies": {
+    "ipfs-car": "3.1.0"
+  }
+}

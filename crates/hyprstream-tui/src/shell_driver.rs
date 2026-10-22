@@ -128,7 +128,10 @@ impl ShellOwner {
             })
             .expect("spawn tcl-shell-owner thread");
 
-        Self { job_tx, _handle: handle }
+        Self {
+            job_tx,
+            _handle: handle,
+        }
     }
 
     /// Evaluate a Tcl script on the owner thread and block (parked, not spun)
@@ -240,7 +243,10 @@ impl NamespaceDriver {
             })
             .expect("spawn vfs-namespace-driver thread");
 
-        Self { job_tx, _handle: handle }
+        Self {
+            job_tx,
+            _handle: handle,
+        }
     }
 
     /// Read a file's contents as a UTF-8 (lossy) string. Blocks the calling
@@ -257,7 +263,14 @@ impl NamespaceDriver {
 
     fn request(&self, op: NsOp) -> Result<String, String> {
         let (reply_tx, reply_rx) = std_mpsc::channel();
-        if self.job_tx.send(NsJob { op, reply: reply_tx }).is_err() {
+        if self
+            .job_tx
+            .send(NsJob {
+                op,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             return Err("vfs namespace driver thread is gone".to_owned());
         }
         reply_rx

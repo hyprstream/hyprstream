@@ -88,9 +88,12 @@ struct TclFid {
 // devfile callback type aliases
 // ─────────────────────────────────────────────────────────────────────────────
 
-type EvalCtl = ControlFile<Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>>;
+type EvalCtl = ControlFile<
+    Box<dyn Fn(Vec<u8>) -> DevFuture<'static, Result<Vec<u8>, MountError>> + Send + Sync>,
+>;
 type ListFn = Box<dyn Fn() -> DevFuture<'static, Vec<String>> + Send + Sync>;
-type GetFn = Box<dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync>;
+type GetFn =
+    Box<dyn Fn(String) -> DevFuture<'static, Result<Option<Vec<u8>>, MountError>> + Send + Sync>;
 type VarsDir = DynamicDir<ListFn, GetFn>;
 type ProcsDir = DynamicDir<ListFn, GetFn>;
 
@@ -186,13 +189,17 @@ impl TclMount {
         let vars = DynamicDir::new(
             Box::new(move || {
                 let tx = vars_tx.clone();
-                Box::pin(async move { request(&tx, |resp| TclCommand::ListVars { resp }).await.unwrap_or_default() })
-                    as DevFuture<'static, _>
+                Box::pin(async move {
+                    request(&tx, |resp| TclCommand::ListVars { resp })
+                        .await
+                        .unwrap_or_default()
+                }) as DevFuture<'static, _>
             }) as ListFn,
             Box::new(move |name: String| {
                 let tx = vars_get_tx.clone();
                 Box::pin(async move {
-                    let val: Option<String> = request(&tx, |resp| TclCommand::GetVar { name, resp }).await?;
+                    let val: Option<String> =
+                        request(&tx, |resp| TclCommand::GetVar { name, resp }).await?;
                     Ok(val.map(String::into_bytes))
                 }) as DevFuture<'static, _>
             }) as GetFn,
@@ -203,13 +210,17 @@ impl TclMount {
         let procs = DynamicDir::new(
             Box::new(move || {
                 let tx = procs_tx.clone();
-                Box::pin(async move { request(&tx, |resp| TclCommand::ListProcs { resp }).await.unwrap_or_default() })
-                    as DevFuture<'static, _>
+                Box::pin(async move {
+                    request(&tx, |resp| TclCommand::ListProcs { resp })
+                        .await
+                        .unwrap_or_default()
+                }) as DevFuture<'static, _>
             }) as ListFn,
             Box::new(move |name: String| {
                 let tx = procs_get_tx.clone();
                 Box::pin(async move {
-                    let val: Option<String> = request(&tx, |resp| TclCommand::GetProc { name, resp }).await?;
+                    let val: Option<String> =
+                        request(&tx, |resp| TclCommand::GetProc { name, resp }).await?;
                     Ok(val.map(String::into_bytes))
                 }) as DevFuture<'static, _>
             }) as GetFn,

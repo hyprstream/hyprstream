@@ -21,6 +21,7 @@ parking_lot = { workspace = true }
 # `net` pulls `mio`, which has no wasm32-unknown-unknown backend, so it must stay
 # off the wasm target (the browser path uses the DMA/Wanix transport instead).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "macros"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

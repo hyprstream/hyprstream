@@ -23,9 +23,9 @@ pub enum ToastLevel {
 
 pub struct Toast {
     pub message: String,
-    pub level:   ToastLevel,
-    born:        std::time::Instant,
-    ttl:         std::time::Duration,
+    pub level: ToastLevel,
+    born: std::time::Instant,
+    ttl: std::time::Duration,
 }
 
 /// Bit-31 marks client-local IDs (windows/panes not on the server).
@@ -91,22 +91,58 @@ pub struct InputField {
 
 impl InputField {
     pub fn text(label: &'static str) -> Self {
-        Self { label, buf: Vec::new(), cursor: 0, choices: None, choice_idx: 0, is_toggle: false, toggle_val: false }
+        Self {
+            label,
+            buf: Vec::new(),
+            cursor: 0,
+            choices: None,
+            choice_idx: 0,
+            is_toggle: false,
+            toggle_val: false,
+        }
     }
     pub fn text_with_default(label: &'static str, default: &str) -> Self {
         let buf = default.as_bytes().to_vec();
         let cursor = buf.len();
-        Self { label, buf, cursor, choices: None, choice_idx: 0, is_toggle: false, toggle_val: false }
+        Self {
+            label,
+            buf,
+            cursor,
+            choices: None,
+            choice_idx: 0,
+            is_toggle: false,
+            toggle_val: false,
+        }
     }
     pub fn toggle(label: &'static str) -> Self {
-        Self { label, buf: Vec::new(), cursor: 0, choices: None, choice_idx: 0, is_toggle: true, toggle_val: false }
+        Self {
+            label,
+            buf: Vec::new(),
+            cursor: 0,
+            choices: None,
+            choice_idx: 0,
+            is_toggle: true,
+            toggle_val: false,
+        }
     }
     pub fn choices(label: &'static str, options: Vec<String>) -> Self {
-        Self { label, buf: Vec::new(), cursor: 0, choices: Some(options), choice_idx: 0, is_toggle: false, toggle_val: false }
+        Self {
+            label,
+            buf: Vec::new(),
+            cursor: 0,
+            choices: Some(options),
+            choice_idx: 0,
+            is_toggle: false,
+            toggle_val: false,
+        }
     }
     pub fn value(&self) -> String {
         if self.is_toggle {
-            if self.toggle_val { "true".to_owned() } else { "false".to_owned() }
+            if self.toggle_val {
+                "true".to_owned()
+            } else {
+                "false".to_owned()
+            }
         } else if let Some(ref opts) = self.choices {
             opts.get(self.choice_idx).cloned().unwrap_or_default()
         } else {
@@ -283,7 +319,11 @@ pub enum ShellMode {
 pub enum CloneScreen {
     EnterUrl(waxterm::widgets::TextInput),
     EnterName(waxterm::widgets::TextInput, String),
-    Cloning { name: String, progress_msg: String, progress_pct: u8 },
+    Cloning {
+        name: String,
+        progress_msg: String,
+        progress_pct: u8,
+    },
     Done(String),
     Failed(String),
 }
@@ -300,16 +340,36 @@ pub struct PreChatSettingsState {
 pub fn build_settings_form(defaults: &GenerationDefaults) -> waxterm::widgets::SettingsForm {
     use waxterm::widgets::NumericField;
     waxterm::widgets::SettingsForm::new(vec![
-        NumericField::new("Max Tokens").integer().range(64.0, 32768.0).step(64.0)
-            .value(defaults.max_tokens.map(|v| v as f64)).none_label("default"),
-        NumericField::new("Temperature").float(2).range(0.0, 2.0).step(0.05)
-            .value(defaults.temperature.map(|v| v as f64)).none_label("default"),
-        NumericField::new("Top-P").float(2).range(0.05, 1.0).step(0.05)
-            .value(defaults.top_p.map(|v| v as f64)).none_label("default"),
-        NumericField::new("Top-K").integer().range(1.0, 200.0).step(1.0)
-            .value(defaults.top_k.map(|v| v as f64)).none_label("off"),
-        NumericField::new("Context Window").integer().range(512.0, 131072.0).step(512.0)
-            .value(defaults.context_window.map(|v| v as f64)).none_label("model default"),
+        NumericField::new("Max Tokens")
+            .integer()
+            .range(64.0, 32768.0)
+            .step(64.0)
+            .value(defaults.max_tokens.map(|v| v as f64))
+            .none_label("default"),
+        NumericField::new("Temperature")
+            .float(2)
+            .range(0.0, 2.0)
+            .step(0.05)
+            .value(defaults.temperature.map(|v| v as f64))
+            .none_label("default"),
+        NumericField::new("Top-P")
+            .float(2)
+            .range(0.05, 1.0)
+            .step(0.05)
+            .value(defaults.top_p.map(|v| v as f64))
+            .none_label("default"),
+        NumericField::new("Top-K")
+            .integer()
+            .range(1.0, 200.0)
+            .step(1.0)
+            .value(defaults.top_k.map(|v| v as f64))
+            .none_label("off"),
+        NumericField::new("Context Window")
+            .integer()
+            .range(512.0, 131072.0)
+            .step(512.0)
+            .value(defaults.context_window.map(|v| v as f64))
+            .none_label("model default"),
     ])
 }
 
@@ -335,14 +395,14 @@ pub enum PreChatType {
 /// Menu items: (label, chord hint shown in popup).
 #[cfg(feature = "experimental")]
 pub const MENU_ITEMS: &[(&str, &str)] = &[
-    ("New",        "N"),
-    ("Close",      "Q"),
-    ("Cycle",      "Tab"),
-    ("Models",     "M"),
-    ("Log",        "L"),
-    ("Workers",    "W"),
-    ("Services",   "V"),
-    ("Settings",   "S"),
+    ("New", "N"),
+    ("Close", "Q"),
+    ("Cycle", "Tab"),
+    ("Models", "M"),
+    ("Log", "L"),
+    ("Workers", "W"),
+    ("Services", "V"),
+    ("Settings", "S"),
     ("Fullscreen", "F"),
     ("Disconnect", "D"),
 ];
@@ -350,13 +410,13 @@ pub const MENU_ITEMS: &[(&str, &str)] = &[
 /// Menu items: (label, chord hint shown in popup).
 #[cfg(not(feature = "experimental"))]
 pub const MENU_ITEMS: &[(&str, &str)] = &[
-    ("New",        "N"),
-    ("Close",      "Q"),
-    ("Cycle",      "Tab"),
-    ("Models",     "M"),
-    ("Log",        "L"),
-    ("Workers",    "W"),
-    ("Settings",   "S"),
+    ("New", "N"),
+    ("Close", "Q"),
+    ("Cycle", "Tab"),
+    ("Models", "M"),
+    ("Log", "L"),
+    ("Workers", "W"),
+    ("Settings", "S"),
     ("Fullscreen", "F"),
     ("Disconnect", "D"),
 ];
@@ -369,13 +429,32 @@ pub const MENU_ITEMS: &[(&str, &str)] = &[
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcRequest {
-    SendInput   { viewer_id: u32, data: Vec<u8> },
-    CreateWindow { session_id: u32 },
-    CloseWindow  { session_id: u32, window_id: u32 },
-    FocusWindow  { session_id: u32, window_id: u32 },
-    SpawnShell   { session_id: u32, pane_id: u32, cwd: String },
-    LoadModel    { model_ref: String },
-    UnloadModel  { model_ref: String },
+    SendInput {
+        viewer_id: u32,
+        data: Vec<u8>,
+    },
+    CreateWindow {
+        session_id: u32,
+    },
+    CloseWindow {
+        session_id: u32,
+        window_id: u32,
+    },
+    FocusWindow {
+        session_id: u32,
+        window_id: u32,
+    },
+    SpawnShell {
+        session_id: u32,
+        pane_id: u32,
+        cwd: String,
+    },
+    LoadModel {
+        model_ref: String,
+    },
+    UnloadModel {
+        model_ref: String,
+    },
     SpawnServerChat {
         session_id: u32,
         model_ref: String,
@@ -402,26 +481,69 @@ pub enum RpcRequest {
     ListConversations {
         model_ref: String,
     },
-    ServiceStart { name: String },
-    ServiceStop { name: String },
-    ServiceRestart { name: String },
+    ServiceStart {
+        name: String,
+    },
+    ServiceStop {
+        name: String,
+    },
+    ServiceRestart {
+        name: String,
+    },
     ServiceInstall,
     ServiceStopAll,
     ServiceStartAll,
-    WorkerDestroySandbox { sandbox_id: String },
-    WorkerExecSync { sandbox_id: String, container_id: String, cmd: Vec<String> },
+    WorkerDestroySandbox {
+        sandbox_id: String,
+    },
+    WorkerExecSync {
+        sandbox_id: String,
+        container_id: String,
+        cmd: Vec<String>,
+    },
     WorkerImageList,
-    WorkerImagePull { image: String },
-    WorkerImageRemove { image: String },
-    WorkerCreateSandbox { hostname: String, backend: String, gpu: bool },
-    WorkerCreateContainer { sandbox_id: String, image: String, cmd: Vec<String>, tty: bool },
-    WorkerStartContainer { container_id: String },
-    WorkerStopContainer { container_id: String },
-    WorkerRemoveContainer { container_id: String },
-    AttachContainer { sandbox_id: String, container_id: String, cols: u16, rows: u16 },
-    CloneModel { url: String, name: String },
-    PullModel { model_ref: String },
-    PushModel { model_ref: String },
+    WorkerImagePull {
+        image: String,
+    },
+    WorkerImageRemove {
+        image: String,
+    },
+    WorkerCreateSandbox {
+        hostname: String,
+        backend: String,
+        gpu: bool,
+    },
+    WorkerCreateContainer {
+        sandbox_id: String,
+        image: String,
+        cmd: Vec<String>,
+        tty: bool,
+    },
+    WorkerStartContainer {
+        container_id: String,
+    },
+    WorkerStopContainer {
+        container_id: String,
+    },
+    WorkerRemoveContainer {
+        container_id: String,
+    },
+    AttachContainer {
+        sandbox_id: String,
+        container_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    CloneModel {
+        url: String,
+        name: String,
+    },
+    PullModel {
+        model_ref: String,
+    },
+    PushModel {
+        model_ref: String,
+    },
     FetchModelStatus,
     Quit,
 }
@@ -431,7 +553,10 @@ pub enum ChromeOutput {
     Redraw,
     Rpc(RpcRequest),
     /// Key bytes that should be routed to a client-owned ChatApp task.
-    RouteInput { app_id: u32, data: Vec<u8> },
+    RouteInput {
+        app_id: u32,
+        data: Vec<u8>,
+    },
 }
 
 // ============================================================================
@@ -486,8 +611,7 @@ impl ShellChrome {
     ) -> Self {
         let model_list = SelectList::new("Models", models);
         let default_style = BackgroundStyle::Stars;
-        let settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
-            .with_selected(1); // Stars is index 1
+        let settings_list = SelectList::new("Background", ALL_STYLES.to_vec()).with_selected(1); // Stars is index 1
 
         let mut bg = BackgroundState::new(default_style);
         bg.tick(cols, pane_rows);
@@ -555,19 +679,24 @@ impl ShellChrome {
     /// Merges server windows with existing client-local windows (bit-31 set).
     pub fn update_windows(&mut self, server_wins: Vec<WindowSummary>) -> bool {
         // Preserve client-local windows (bit-31 set).
-        let local_wins: Vec<WindowSummary> = self.windows.drain(..)
+        let local_wins: Vec<WindowSummary> = self
+            .windows
+            .drain(..)
             .filter(|w| is_local_id(w.id))
             .collect();
 
         // Sync private_panes: combine server-reported + locally-tracked.
-        let mut new_private: std::collections::HashSet<u32> = server_wins.iter()
+        let mut new_private: std::collections::HashSet<u32> = server_wins
+            .iter()
             .flat_map(|w| w.panes.iter())
             .filter(|p| p.is_private)
             .map(|p| p.id)
             .collect();
         for w in &local_wins {
             for p in &w.panes {
-                if p.is_private { new_private.insert(p.id); }
+                if p.is_private {
+                    new_private.insert(p.id);
+                }
             }
         }
         let private_changed = new_private != self.private_panes;
@@ -578,9 +707,10 @@ impl ShellChrome {
         merged.extend(local_wins);
 
         let changed = merged.len() != self.windows.len()
-            || merged.iter().zip(&self.windows).any(|(a, b)| {
-                a.id != b.id || a.panes.len() != b.panes.len()
-            });
+            || merged
+                .iter()
+                .zip(&self.windows)
+                .any(|(a, b)| a.id != b.id || a.panes.len() != b.panes.len());
         if changed || private_changed {
             self.active_win = self.active_win.min(merged.len().saturating_sub(1));
             self.windows = merged;
@@ -593,8 +723,14 @@ impl ShellChrome {
     /// since the server intentionally keeps the non-private pane as active_pane_id
     /// to avoid publishing private content to viewers.
     pub fn active_pane_id(&self) -> u32 {
-        let Some(win) = self.windows.get(self.active_win) else { return 0 };
-        if let Some(p) = win.panes.iter().find(|p| self.private_panes.contains(&p.id)) {
+        let Some(win) = self.windows.get(self.active_win) else {
+            return 0;
+        };
+        if let Some(p) = win
+            .panes
+            .iter()
+            .find(|p| self.private_panes.contains(&p.id))
+        {
             return p.id;
         }
         win.active_pane_id
@@ -618,10 +754,15 @@ impl ShellChrome {
         self.log_line(message.clone());
         let ttl = match level {
             ToastLevel::Error => std::time::Duration::from_secs(5),
-            ToastLevel::Warn  => std::time::Duration::from_secs(4),
-            ToastLevel::Info  => std::time::Duration::from_secs(2),
+            ToastLevel::Warn => std::time::Duration::from_secs(4),
+            ToastLevel::Info => std::time::Duration::from_secs(2),
         };
-        self.toasts.push_back(Toast { message, level, born: std::time::Instant::now(), ttl });
+        self.toasts.push_back(Toast {
+            message,
+            level,
+            born: std::time::Instant::now(),
+            ttl,
+        });
         if self.toasts.len() > 5 {
             self.toasts.pop_front();
         }
@@ -657,22 +798,35 @@ impl ShellChrome {
 
     pub fn handle_key(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
         match self.mode {
-            ShellMode::Normal                 => self.handle_normal(key),
-            ShellMode::Fullscreen             => self.handle_fullscreen(key),
-            ShellMode::ModelList              => self.handle_model_list(key),
-            ShellMode::Settings               => self.handle_settings(key),
+            ShellMode::Normal => self.handle_normal(key),
+            ShellMode::Fullscreen => self.handle_fullscreen(key),
+            ShellMode::ModelList => self.handle_model_list(key),
+            ShellMode::Settings => self.handle_settings(key),
             ShellMode::StartMenu { selected } => self.handle_start_menu(key, selected),
-            ShellMode::Console                => self.handle_console(key),
+            ShellMode::Console => self.handle_console(key),
             ShellMode::ConversationPicker { .. } => self.handle_conversation_picker(key),
             ShellMode::ServiceManager { selected } => self.handle_service_manager(key, selected),
-            ShellMode::WorkerManager { sandbox_sel, container_sel, show_containers, tab, image_sel, ref mut input_mode }
-                => {
-                    // Input dialog intercepts all keys when active.
-                    if input_mode.is_some() {
-                        return self.handle_input_dialog(key);
-                    }
-                    self.handle_worker_manager(key, sandbox_sel, container_sel, show_containers, tab, image_sel)
+            ShellMode::WorkerManager {
+                sandbox_sel,
+                container_sel,
+                show_containers,
+                tab,
+                image_sel,
+                ref mut input_mode,
+            } => {
+                // Input dialog intercepts all keys when active.
+                if input_mode.is_some() {
+                    return self.handle_input_dialog(key);
                 }
+                self.handle_worker_manager(
+                    key,
+                    sandbox_sel,
+                    container_sel,
+                    show_containers,
+                    tab,
+                    image_sel,
+                )
+            }
             ShellMode::PreChatSettings(_) => self.handle_pre_chat_settings(key),
             ShellMode::CloneFlow(_) => self.handle_clone_flow(key),
             ShellMode::GitOpInProgress { .. } => self.handle_git_op(key),
@@ -704,10 +858,16 @@ impl ShellChrome {
                     let active = self.active_pane_id();
                     if self.private_panes.contains(&active) {
                         // Route to client-owned ChatApp task instead of server
-                        vec![ChromeOutput::RouteInput { app_id: active, data: bytes }]
+                        vec![ChromeOutput::RouteInput {
+                            app_id: active,
+                            data: bytes,
+                        }]
                     } else {
                         let vid = self.viewer_id;
-                        vec![ChromeOutput::Rpc(RpcRequest::SendInput { viewer_id: vid, data: bytes })]
+                        vec![ChromeOutput::Rpc(RpcRequest::SendInput {
+                            viewer_id: vid,
+                            data: bytes,
+                        })]
                     }
                 }
             }
@@ -719,9 +879,9 @@ impl ShellChrome {
     fn handle_model_list(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
         // c — clone
         if matches!(key, KeyPress::Char(b'c')) {
-            self.mode = ShellMode::CloneFlow(
-                CloneScreen::EnterUrl(waxterm::widgets::TextInput::new("Repository URL:")),
-            );
+            self.mode = ShellMode::CloneFlow(CloneScreen::EnterUrl(
+                waxterm::widgets::TextInput::new("Repository URL:"),
+            ));
             return vec![ChromeOutput::Redraw];
         }
         // p — pull
@@ -733,7 +893,9 @@ impl ShellChrome {
                     progress_msg: "Fetching…".to_owned(),
                 };
                 return vec![
-                    ChromeOutput::Rpc(RpcRequest::PullModel { model_ref: model.model_ref }),
+                    ChromeOutput::Rpc(RpcRequest::PullModel {
+                        model_ref: model.model_ref,
+                    }),
                     ChromeOutput::Redraw,
                 ];
             }
@@ -747,7 +909,9 @@ impl ShellChrome {
                     progress_msg: "Pushing…".to_owned(),
                 };
                 return vec![
-                    ChromeOutput::Rpc(RpcRequest::PushModel { model_ref: model.model_ref }),
+                    ChromeOutput::Rpc(RpcRequest::PushModel {
+                        model_ref: model.model_ref,
+                    }),
                     ChromeOutput::Redraw,
                 ];
             }
@@ -792,9 +956,7 @@ impl ShellChrome {
                 self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
-            WidgetResult::Confirmed(model) => {
-                self.enter_chat_for_model(&model)
-            }
+            WidgetResult::Confirmed(model) => self.enter_chat_for_model(&model),
             WidgetResult::Pending => {
                 vec![ChromeOutput::Redraw]
             }
@@ -807,7 +969,9 @@ impl ShellChrome {
         if model.loaded {
             // Model ready — open conversation picker immediately.
             self.mode = ShellMode::Normal;
-            vec![ChromeOutput::Rpc(RpcRequest::ListConversations { model_ref })]
+            vec![ChromeOutput::Rpc(RpcRequest::ListConversations {
+                model_ref,
+            })]
         } else if model.loading {
             // Already loading — stash pending picker, stay in ModelList.
             self.pending_picker_model = Some(model_ref.clone());
@@ -834,7 +998,10 @@ impl ShellChrome {
     fn handle_clone_flow(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
         let screen = match std::mem::replace(&mut self.mode, ShellMode::Normal) {
             ShellMode::CloneFlow(s) => s,
-            other => { self.mode = other; return vec![]; }
+            other => {
+                self.mode = other;
+                return vec![];
+            }
         };
         match screen {
             CloneScreen::EnterUrl(mut input) => {
@@ -854,39 +1021,51 @@ impl ShellChrome {
                 }
                 vec![ChromeOutput::Redraw]
             }
-            CloneScreen::EnterName(mut input, url) => {
-                match input.handle_key(&key) {
-                    WidgetResult::Confirmed(name) => {
-                        let clone_name = if name.is_empty() {
-                            url.rsplit('/').next().unwrap_or("model")
-                                .trim_end_matches(".git").to_owned()
-                        } else {
-                            name
-                        };
-                        let display_name = clone_name.clone();
-                        self.mode = ShellMode::CloneFlow(CloneScreen::Cloning {
-                            name: display_name,
-                            progress_msg: "Starting…".to_owned(),
-                            progress_pct: 0,
-                        });
-                        vec![
-                            ChromeOutput::Rpc(RpcRequest::CloneModel { url, name: clone_name }),
-                            ChromeOutput::Redraw,
-                        ]
-                    }
-                    WidgetResult::Cancelled => {
-                        self.mode = ShellMode::ModelList;
-                        vec![ChromeOutput::Redraw]
-                    }
-                    WidgetResult::Pending => {
-                        self.mode = ShellMode::CloneFlow(CloneScreen::EnterName(input, url));
-                        vec![ChromeOutput::Redraw]
-                    }
+            CloneScreen::EnterName(mut input, url) => match input.handle_key(&key) {
+                WidgetResult::Confirmed(name) => {
+                    let clone_name = if name.is_empty() {
+                        url.rsplit('/')
+                            .next()
+                            .unwrap_or("model")
+                            .trim_end_matches(".git")
+                            .to_owned()
+                    } else {
+                        name
+                    };
+                    let display_name = clone_name.clone();
+                    self.mode = ShellMode::CloneFlow(CloneScreen::Cloning {
+                        name: display_name,
+                        progress_msg: "Starting…".to_owned(),
+                        progress_pct: 0,
+                    });
+                    vec![
+                        ChromeOutput::Rpc(RpcRequest::CloneModel {
+                            url,
+                            name: clone_name,
+                        }),
+                        ChromeOutput::Redraw,
+                    ]
                 }
-            }
-            CloneScreen::Cloning { name, progress_msg, progress_pct } => {
+                WidgetResult::Cancelled => {
+                    self.mode = ShellMode::ModelList;
+                    vec![ChromeOutput::Redraw]
+                }
+                WidgetResult::Pending => {
+                    self.mode = ShellMode::CloneFlow(CloneScreen::EnterName(input, url));
+                    vec![ChromeOutput::Redraw]
+                }
+            },
+            CloneScreen::Cloning {
+                name,
+                progress_msg,
+                progress_pct,
+            } => {
                 // No key handling during clone — just put the screen back
-                self.mode = ShellMode::CloneFlow(CloneScreen::Cloning { name, progress_msg, progress_pct });
+                self.mode = ShellMode::CloneFlow(CloneScreen::Cloning {
+                    name,
+                    progress_msg,
+                    progress_pct,
+                });
                 vec![]
             }
             CloneScreen::Done(_) | CloneScreen::Failed(_) => {
@@ -908,8 +1087,9 @@ impl ShellChrome {
 
     fn handle_git_op(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
         let is_terminal = match &self.mode {
-            ShellMode::GitOpInProgress { progress_msg, .. } =>
-                progress_msg.starts_with("Done:") || progress_msg.starts_with("Error:"),
+            ShellMode::GitOpInProgress { progress_msg, .. } => {
+                progress_msg.starts_with("Done:") || progress_msg.starts_with("Error:")
+            }
             _ => false,
         };
         if is_terminal && matches!(key, KeyPress::Enter | KeyPress::Escape) {
@@ -928,7 +1108,12 @@ impl ShellChrome {
 
     /// Update clone progress from the service layer.
     pub fn update_clone_progress(&mut self, stage: &str, pct: u8) {
-        if let ShellMode::CloneFlow(CloneScreen::Cloning { progress_msg, progress_pct, .. }) = &mut self.mode {
+        if let ShellMode::CloneFlow(CloneScreen::Cloning {
+            progress_msg,
+            progress_pct,
+            ..
+        }) = &mut self.mode
+        {
             *progress_msg = stage.to_owned();
             *progress_pct = pct;
         }
@@ -950,25 +1135,43 @@ impl ShellChrome {
     fn handle_start_menu(&mut self, key: KeyPress, selected: usize) -> Vec<ChromeOutput> {
         let n = MENU_ITEMS.len();
         let chord: Option<usize> = match key {
-            KeyPress::Char(b'n' | b'N') => Some(0),  // New
-            KeyPress::Char(b'q' | b'Q') => Some(1),  // Close
-            KeyPress::Tab               => Some(2),   // Cycle
-            KeyPress::Char(b'm' | b'M') => Some(3),  // Models
-            KeyPress::Char(b'l' | b'L') => Some(4),  // Log
-            KeyPress::Char(b'w' | b'W') => Some(5),  // Workers
+            KeyPress::Char(b'n' | b'N') => Some(0), // New
+            KeyPress::Char(b'q' | b'Q') => Some(1), // Close
+            KeyPress::Tab => Some(2),               // Cycle
+            KeyPress::Char(b'm' | b'M') => Some(3), // Models
+            KeyPress::Char(b'l' | b'L') => Some(4), // Log
+            KeyPress::Char(b'w' | b'W') => Some(5), // Workers
             #[cfg(feature = "experimental")]
-            KeyPress::Char(b'v' | b'V') => Some(6),  // Services
+            KeyPress::Char(b'v' | b'V') => Some(6), // Services
             KeyPress::Char(b's' | b'S') => {
-                #[cfg(feature = "experimental")]     { Some(7) }
-                #[cfg(not(feature = "experimental"))] { Some(6) }
+                #[cfg(feature = "experimental")]
+                {
+                    Some(7)
+                }
+                #[cfg(not(feature = "experimental"))]
+                {
+                    Some(6)
+                }
             }
             KeyPress::Char(b'f' | b'F') => {
-                #[cfg(feature = "experimental")]     { Some(8) }
-                #[cfg(not(feature = "experimental"))] { Some(7) }
+                #[cfg(feature = "experimental")]
+                {
+                    Some(8)
+                }
+                #[cfg(not(feature = "experimental"))]
+                {
+                    Some(7)
+                }
             }
             KeyPress::Char(b'd' | b'D') => {
-                #[cfg(feature = "experimental")]     { Some(9) }
-                #[cfg(not(feature = "experimental"))] { Some(8) }
+                #[cfg(feature = "experimental")]
+                {
+                    Some(9)
+                }
+                #[cfg(not(feature = "experimental"))]
+                {
+                    Some(8)
+                }
             }
             _ => None,
         };
@@ -986,7 +1189,9 @@ impl ShellChrome {
                 };
             }
             KeyPress::ArrowDown => {
-                self.mode = ShellMode::StartMenu { selected: (selected + 1) % n };
+                self.mode = ShellMode::StartMenu {
+                    selected: (selected + 1) % n,
+                };
             }
             KeyPress::Enter => {
                 self.mode = ShellMode::Normal;
@@ -1017,12 +1222,15 @@ impl ShellChrome {
         const DISCONNECT_IDX: usize = 8;
 
         match idx {
-            0 => vec![ChromeOutput::Rpc(RpcRequest::CreateWindow { session_id: sid })],
+            0 => vec![ChromeOutput::Rpc(RpcRequest::CreateWindow {
+                session_id: sid,
+            })],
             1 => {
                 if let Some(win) = self.windows.get(self.active_win) {
                     let wid = win.id;
                     vec![ChromeOutput::Rpc(RpcRequest::CloseWindow {
-                        session_id: sid, window_id: wid,
+                        session_id: sid,
+                        window_id: wid,
                     })]
                 } else {
                     vec![]
@@ -1036,7 +1244,8 @@ impl ShellChrome {
                     if let Some(w) = self.windows.get(next) {
                         let wid = w.id;
                         return vec![ChromeOutput::Rpc(RpcRequest::FocusWindow {
-                            session_id: sid, window_id: wid,
+                            session_id: sid,
+                            window_id: wid,
                         })];
                     }
                 }
@@ -1055,8 +1264,12 @@ impl ShellChrome {
             5 => {
                 // Workers
                 self.mode = ShellMode::WorkerManager {
-                    sandbox_sel: 0, container_sel: 0, show_containers: false,
-                    tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None,
+                    sandbox_sel: 0,
+                    container_sel: 0,
+                    show_containers: false,
+                    tab: WorkerTab::Sandboxes,
+                    image_sel: 0,
+                    input_mode: None,
                 };
                 vec![ChromeOutput::Redraw]
             }
@@ -1067,9 +1280,12 @@ impl ShellChrome {
             }
             SETTINGS_IDX => {
                 self.saved_style = self.bg.style;
-                let i = ALL_STYLES.iter().position(|s| *s == self.bg.style).unwrap_or(0);
-                self.settings_list = SelectList::new("Background", ALL_STYLES.to_vec())
-                    .with_selected(i);
+                let i = ALL_STYLES
+                    .iter()
+                    .position(|s| *s == self.bg.style)
+                    .unwrap_or(0);
+                self.settings_list =
+                    SelectList::new("Background", ALL_STYLES.to_vec()).with_selected(i);
                 self.preview_bg.style = self.bg.style;
                 self.mode = ShellMode::Settings;
                 vec![ChromeOutput::Redraw]
@@ -1122,10 +1338,16 @@ impl ShellChrome {
                 } else {
                     let active = self.active_pane_id();
                     if self.private_panes.contains(&active) {
-                        vec![ChromeOutput::RouteInput { app_id: active, data: bytes }]
+                        vec![ChromeOutput::RouteInput {
+                            app_id: active,
+                            data: bytes,
+                        }]
                     } else {
                         let vid = self.viewer_id;
-                        vec![ChromeOutput::Rpc(RpcRequest::SendInput { viewer_id: vid, data: bytes })]
+                        vec![ChromeOutput::Rpc(RpcRequest::SendInput {
+                            viewer_id: vid,
+                            data: bytes,
+                        })]
                     }
                 }
             }
@@ -1169,7 +1391,7 @@ impl ShellChrome {
             if let Some(entry) = list.selected_item() {
                 let chat_type = match entry.kind {
                     ConversationKind::NewPrivate => Some(PreChatType::Private),
-                    ConversationKind::NewServer  => Some(PreChatType::Server),
+                    ConversationKind::NewServer => Some(PreChatType::Server),
                     ConversationKind::Resume { .. } => None,
                 };
                 if let Some(chat_type) = chat_type {
@@ -1196,7 +1418,10 @@ impl ShellChrome {
                     list.clamp_selected();
                     self.push_toast("Deleted conversation", ToastLevel::Info);
                     return vec![
-                        ChromeOutput::Rpc(RpcRequest::DeleteConversation { uuid, model_ref: mr }),
+                        ChromeOutput::Rpc(RpcRequest::DeleteConversation {
+                            uuid,
+                            model_ref: mr,
+                        }),
                         ChromeOutput::Redraw,
                     ];
                 }
@@ -1217,20 +1442,29 @@ impl ShellChrome {
                         let gen_defs = self.gen_defaults_for(&model_ref);
                         vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
                             session_id: self.session_id,
-                            model_ref, cols, rows, pane_id: 0,
+                            model_ref,
+                            cols,
+                            rows,
+                            pane_id: 0,
                             gen_defaults: Some(gen_defs),
                         })]
                     }
                     ConversationKind::NewPrivate => {
                         let gen_defs = self.gen_defaults_for(&model_ref);
                         vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
-                            model_ref, cols, rows, resume_uuid: None,
+                            model_ref,
+                            cols,
+                            rows,
+                            resume_uuid: None,
                             gen_defaults: Some(gen_defs),
                         })]
                     }
                     ConversationKind::Resume { uuid } => {
                         vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
-                            model_ref, cols, rows, resume_uuid: Some(uuid),
+                            model_ref,
+                            cols,
+                            rows,
+                            resume_uuid: Some(uuid),
                             gen_defaults: None,
                         })]
                     }
@@ -1247,7 +1481,9 @@ impl ShellChrome {
 
     /// Look up generation defaults for a model from the model list.
     fn gen_defaults_for(&self, model_ref: &str) -> GenerationDefaults {
-        self.model_list.items().iter()
+        self.model_list
+            .items()
+            .iter()
             .find(|e| e.model_ref == model_ref)
             .map(|e| e.gen_defaults.clone())
             .unwrap_or_default()
@@ -1276,13 +1512,18 @@ impl ShellChrome {
                     PreChatType::Server => {
                         vec![ChromeOutput::Rpc(RpcRequest::SpawnServerChat {
                             session_id: self.session_id,
-                            model_ref: mr, cols, rows, pane_id: 0,
+                            model_ref: mr,
+                            cols,
+                            rows,
+                            pane_id: 0,
                             gen_defaults: Some(gen_defs),
                         })]
                     }
                     PreChatType::Private => {
                         vec![ChromeOutput::Rpc(RpcRequest::LocalPrivateChat {
-                            model_ref: mr, cols, rows,
+                            model_ref: mr,
+                            cols,
+                            rows,
                             resume_uuid: None,
                             gen_defaults: Some(gen_defs),
                         })]
@@ -1292,7 +1533,9 @@ impl ShellChrome {
             waxterm::widgets::WidgetResult::Cancelled => {
                 let mr = state.model_ref.clone();
                 self.mode = ShellMode::Normal;
-                vec![ChromeOutput::Rpc(RpcRequest::ListConversations { model_ref: mr })]
+                vec![ChromeOutput::Rpc(RpcRequest::ListConversations {
+                    model_ref: mr,
+                })]
             }
             waxterm::widgets::WidgetResult::Pending => {
                 vec![ChromeOutput::Redraw]
@@ -1312,7 +1555,9 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             KeyPress::ArrowDown | KeyPress::Char(b'j') if n > 0 => {
-                self.mode = ShellMode::ServiceManager { selected: (selected + 1) % n };
+                self.mode = ShellMode::ServiceManager {
+                    selected: (selected + 1) % n,
+                };
                 vec![ChromeOutput::Redraw]
             }
             KeyPress::Char(b's') => {
@@ -1356,28 +1601,44 @@ impl ShellChrome {
     // ── WorkerManager mode ──────────────────────────────────────────────────
 
     fn handle_worker_manager(
-        &mut self, key: KeyPress,
-        sandbox_sel: usize, container_sel: usize, show_containers: bool,
-        tab: WorkerTab, image_sel: usize,
+        &mut self,
+        key: KeyPress,
+        sandbox_sel: usize,
+        container_sel: usize,
+        show_containers: bool,
+        tab: WorkerTab,
+        image_sel: usize,
     ) -> Vec<ChromeOutput> {
         // Helper macro for constructing mode with current tab state.
         macro_rules! wm {
             ($ss:expr, $cs:expr, $sc:expr) => {
                 ShellMode::WorkerManager {
-                    sandbox_sel: $ss, container_sel: $cs, show_containers: $sc,
-                    tab, image_sel, input_mode: None,
+                    sandbox_sel: $ss,
+                    container_sel: $cs,
+                    show_containers: $sc,
+                    tab,
+                    image_sel,
+                    input_mode: None,
                 }
             };
             ($ss:expr, $cs:expr, $sc:expr, tab: $t:expr) => {
                 ShellMode::WorkerManager {
-                    sandbox_sel: $ss, container_sel: $cs, show_containers: $sc,
-                    tab: $t, image_sel, input_mode: None,
+                    sandbox_sel: $ss,
+                    container_sel: $cs,
+                    show_containers: $sc,
+                    tab: $t,
+                    image_sel,
+                    input_mode: None,
                 }
             };
             ($ss:expr, $cs:expr, $sc:expr, tab: $t:expr, img: $is:expr) => {
                 ShellMode::WorkerManager {
-                    sandbox_sel: $ss, container_sel: $cs, show_containers: $sc,
-                    tab: $t, image_sel: $is, input_mode: None,
+                    sandbox_sel: $ss,
+                    container_sel: $cs,
+                    show_containers: $sc,
+                    tab: $t,
+                    image_sel: $is,
+                    input_mode: None,
                 }
             };
         }
@@ -1391,7 +1652,10 @@ impl ShellChrome {
             self.mode = wm!(sandbox_sel, container_sel, false, tab: new_tab);
             // When switching to Images tab, request image list refresh
             if new_tab == WorkerTab::Images {
-                return vec![ChromeOutput::Redraw, ChromeOutput::Rpc(RpcRequest::WorkerImageList)];
+                return vec![
+                    ChromeOutput::Redraw,
+                    ChromeOutput::Rpc(RpcRequest::WorkerImageList),
+                ];
             }
             return vec![ChromeOutput::Redraw];
         }
@@ -1413,8 +1677,11 @@ impl ShellChrome {
                 // Pull image
                 KeyPress::Char(b'p') => {
                     self.mode = ShellMode::WorkerManager {
-                        sandbox_sel, container_sel, show_containers: false,
-                        tab: WorkerTab::Images, image_sel,
+                        sandbox_sel,
+                        container_sel,
+                        show_containers: false,
+                        tab: WorkerTab::Images,
+                        image_sel,
                         input_mode: Some(InputDialog {
                             title: "Pull Image",
                             fields: vec![InputField::text("Image")],
@@ -1445,8 +1712,13 @@ impl ShellChrome {
             // Sandbox navigation (when not showing containers)
             KeyPress::ArrowUp | KeyPress::Char(b'k') if n > 0 && !show_containers => {
                 self.mode = wm!(
-                    if sandbox_sel == 0 { n - 1 } else { sandbox_sel - 1 },
-                    0, false
+                    if sandbox_sel == 0 {
+                        n - 1
+                    } else {
+                        sandbox_sel - 1
+                    },
+                    0,
+                    false
                 );
                 vec![ChromeOutput::Redraw]
             }
@@ -1472,7 +1744,13 @@ impl ShellChrome {
             KeyPress::ArrowUp | KeyPress::Char(b'k') if show_containers => {
                 if let Some(sb) = self.worker_list.get(sandbox_sel) {
                     let cn = sb.containers.len();
-                    let new_sel = if cn > 0 && container_sel > 0 { container_sel - 1 } else if cn > 0 { cn - 1 } else { 0 };
+                    let new_sel = if cn > 0 && container_sel > 0 {
+                        container_sel - 1
+                    } else if cn > 0 {
+                        cn - 1
+                    } else {
+                        0
+                    };
                     self.mode = wm!(sandbox_sel, new_sel, true);
                 }
                 vec![ChromeOutput::Redraw]
@@ -1488,13 +1766,19 @@ impl ShellChrome {
             // Create sandbox
             KeyPress::Char(b'n') if !show_containers => {
                 self.mode = ShellMode::WorkerManager {
-                    sandbox_sel, container_sel, show_containers: false,
-                    tab, image_sel,
+                    sandbox_sel,
+                    container_sel,
+                    show_containers: false,
+                    tab,
+                    image_sel,
                     input_mode: Some(InputDialog {
                         title: "Create Sandbox",
                         fields: vec![
                             InputField::text_with_default("Hostname", "sandbox"),
-                            InputField::choices("Backend", vec!["kata".to_owned(), "runc".to_owned(), "gvisor".to_owned()]),
+                            InputField::choices(
+                                "Backend",
+                                vec!["kata".to_owned(), "runc".to_owned(), "gvisor".to_owned()],
+                            ),
                             InputField::toggle("GPU"),
                         ],
                         focused: 0,
@@ -1506,7 +1790,9 @@ impl ShellChrome {
             KeyPress::Char(b'x') if !show_containers => {
                 if let Some(sb) = self.worker_list.get(sandbox_sel) {
                     let sid = sb.full_id.clone();
-                    return vec![ChromeOutput::Rpc(RpcRequest::WorkerDestroySandbox { sandbox_id: sid })];
+                    return vec![ChromeOutput::Rpc(RpcRequest::WorkerDestroySandbox {
+                        sandbox_id: sid,
+                    })];
                 }
                 vec![]
             }
@@ -1514,8 +1800,11 @@ impl ShellChrome {
             KeyPress::Char(b'n') if show_containers => {
                 if self.worker_list.get(sandbox_sel).is_some() {
                     self.mode = ShellMode::WorkerManager {
-                        sandbox_sel, container_sel, show_containers: true,
-                        tab, image_sel,
+                        sandbox_sel,
+                        container_sel,
+                        show_containers: true,
+                        tab,
+                        image_sel,
                         input_mode: Some(InputDialog {
                             title: "Create Container",
                             fields: vec![
@@ -1604,8 +1893,20 @@ impl ShellChrome {
     fn handle_input_dialog(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
         // Extract current state to determine context.
         let (tab, sandbox_sel, container_sel, show_containers, image_sel) = match &self.mode {
-            ShellMode::WorkerManager { tab, sandbox_sel, container_sel, show_containers, image_sel, .. } =>
-                (*tab, *sandbox_sel, *container_sel, *show_containers, *image_sel),
+            ShellMode::WorkerManager {
+                tab,
+                sandbox_sel,
+                container_sel,
+                show_containers,
+                image_sel,
+                ..
+            } => (
+                *tab,
+                *sandbox_sel,
+                *container_sel,
+                *show_containers,
+                *image_sel,
+            ),
             _ => return vec![],
         };
 
@@ -1613,44 +1914,72 @@ impl ShellChrome {
             KeyPress::Escape => {
                 // Cancel dialog
                 self.mode = ShellMode::WorkerManager {
-                    sandbox_sel, container_sel, show_containers,
-                    tab, image_sel, input_mode: None,
+                    sandbox_sel,
+                    container_sel,
+                    show_containers,
+                    tab,
+                    image_sel,
+                    input_mode: None,
                 };
                 vec![ChromeOutput::Redraw]
             }
             KeyPress::Enter => {
                 // Submit dialog
                 let dialog = match &mut self.mode {
-                    ShellMode::WorkerManager { ref mut input_mode, .. } => input_mode.take(),
+                    ShellMode::WorkerManager {
+                        ref mut input_mode, ..
+                    } => input_mode.take(),
                     _ => None,
                 };
-                let Some(dialog) = dialog else { return vec![]; };
+                let Some(dialog) = dialog else {
+                    return vec![];
+                };
                 let rpc = match dialog.title {
                     "Pull Image" => {
                         let image = dialog.fields[0].value();
-                        if image.is_empty() { None } else { Some(RpcRequest::WorkerImagePull { image }) }
+                        if image.is_empty() {
+                            None
+                        } else {
+                            Some(RpcRequest::WorkerImagePull { image })
+                        }
                     }
                     "Create Sandbox" => {
                         let hostname = dialog.fields[0].value();
                         let backend = dialog.fields[1].value();
                         let gpu = dialog.fields[2].toggle_val;
-                        Some(RpcRequest::WorkerCreateSandbox { hostname, backend, gpu })
+                        Some(RpcRequest::WorkerCreateSandbox {
+                            hostname,
+                            backend,
+                            gpu,
+                        })
                     }
                     "Create Container" => {
-                        let sandbox_id = self.worker_list.get(sandbox_sel)
+                        let sandbox_id = self
+                            .worker_list
+                            .get(sandbox_sel)
                             .map(|sb| sb.full_id.clone())
                             .unwrap_or_default();
                         let image = dialog.fields[0].value();
                         let cmd_str = dialog.fields[1].value();
-                        let cmd: Vec<String> = cmd_str.split_whitespace().map(String::from).collect();
+                        let cmd: Vec<String> =
+                            cmd_str.split_whitespace().map(String::from).collect();
                         let tty = dialog.fields[2].toggle_val;
-                        Some(RpcRequest::WorkerCreateContainer { sandbox_id, image, cmd, tty })
+                        Some(RpcRequest::WorkerCreateContainer {
+                            sandbox_id,
+                            image,
+                            cmd,
+                            tty,
+                        })
                     }
                     _ => None,
                 };
                 self.mode = ShellMode::WorkerManager {
-                    sandbox_sel, container_sel, show_containers,
-                    tab, image_sel, input_mode: None,
+                    sandbox_sel,
+                    container_sel,
+                    show_containers,
+                    tab,
+                    image_sel,
+                    input_mode: None,
                 };
                 if let Some(req) = rpc {
                     vec![ChromeOutput::Redraw, ChromeOutput::Rpc(req)]
@@ -1659,7 +1988,11 @@ impl ShellChrome {
                 }
             }
             KeyPress::ArrowDown => {
-                if let ShellMode::WorkerManager { input_mode: Some(ref mut d), .. } = self.mode {
+                if let ShellMode::WorkerManager {
+                    input_mode: Some(ref mut d),
+                    ..
+                } = self.mode
+                {
                     if d.focused + 1 < d.fields.len() {
                         d.focused += 1;
                     }
@@ -1667,7 +2000,11 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             KeyPress::ArrowUp => {
-                if let ShellMode::WorkerManager { input_mode: Some(ref mut d), .. } = self.mode {
+                if let ShellMode::WorkerManager {
+                    input_mode: Some(ref mut d),
+                    ..
+                } = self.mode
+                {
                     if d.focused > 0 {
                         d.focused -= 1;
                     }
@@ -1675,7 +2012,11 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             KeyPress::Char(b' ') => {
-                if let ShellMode::WorkerManager { input_mode: Some(ref mut d), .. } = self.mode {
+                if let ShellMode::WorkerManager {
+                    input_mode: Some(ref mut d),
+                    ..
+                } = self.mode
+                {
                     if let Some(f) = d.fields.get_mut(d.focused) {
                         if f.is_toggle {
                             f.toggle_val = !f.toggle_val;
@@ -1692,7 +2033,11 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             KeyPress::Backspace => {
-                if let ShellMode::WorkerManager { input_mode: Some(ref mut d), .. } = self.mode {
+                if let ShellMode::WorkerManager {
+                    input_mode: Some(ref mut d),
+                    ..
+                } = self.mode
+                {
                     if let Some(f) = d.fields.get_mut(d.focused) {
                         if !f.is_toggle && f.choices.is_none() && f.cursor > 0 {
                             f.cursor -= 1;
@@ -1703,7 +2048,11 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             KeyPress::ArrowLeft => {
-                if let ShellMode::WorkerManager { input_mode: Some(ref mut d), .. } = self.mode {
+                if let ShellMode::WorkerManager {
+                    input_mode: Some(ref mut d),
+                    ..
+                } = self.mode
+                {
                     if let Some(f) = d.fields.get_mut(d.focused) {
                         if !f.is_toggle && f.choices.is_none() && f.cursor > 0 {
                             f.cursor -= 1;
@@ -1713,7 +2062,11 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             KeyPress::ArrowRight => {
-                if let ShellMode::WorkerManager { input_mode: Some(ref mut d), .. } = self.mode {
+                if let ShellMode::WorkerManager {
+                    input_mode: Some(ref mut d),
+                    ..
+                } = self.mode
+                {
                     if let Some(f) = d.fields.get_mut(d.focused) {
                         if !f.is_toggle && f.choices.is_none() && f.cursor < f.buf.len() {
                             f.cursor += 1;
@@ -1723,7 +2076,11 @@ impl ShellChrome {
                 vec![ChromeOutput::Redraw]
             }
             KeyPress::Char(c) => {
-                if let ShellMode::WorkerManager { input_mode: Some(ref mut d), .. } = self.mode {
+                if let ShellMode::WorkerManager {
+                    input_mode: Some(ref mut d),
+                    ..
+                } = self.mode
+                {
                     if let Some(f) = d.fields.get_mut(d.focused) {
                         if f.is_toggle {
                             f.toggle_val = !f.toggle_val;
@@ -1748,20 +2105,20 @@ impl ShellChrome {
     fn handle_settings(&mut self, key: KeyPress) -> Vec<ChromeOutput> {
         match self.settings_list.handle_key(&key) {
             WidgetResult::Cancelled => {
-                self.bg.style         = self.saved_style;
+                self.bg.style = self.saved_style;
                 self.preview_bg.style = self.saved_style;
-                self.mode             = ShellMode::Normal;
+                self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
             WidgetResult::Confirmed(style) => {
-                self.bg.style         = style;
+                self.bg.style = style;
                 self.preview_bg.style = style;
-                self.mode             = ShellMode::Normal;
+                self.mode = ShellMode::Normal;
                 vec![ChromeOutput::Redraw]
             }
             WidgetResult::Pending => {
                 if let Some(&style) = self.settings_list.selected_item() {
-                    self.bg.style         = style;
+                    self.bg.style = style;
                     self.preview_bg.style = style;
                 }
                 vec![ChromeOutput::Redraw]
@@ -1776,29 +2133,28 @@ impl ShellChrome {
 
 pub fn keypress_to_bytes(key: KeyPress) -> Vec<u8> {
     match key {
-        KeyPress::Char(b)    => vec![b],
-        KeyPress::Enter      => vec![b'\r'],
-        KeyPress::Backspace  => vec![0x7f],
-        KeyPress::Tab        => vec![b'\t'],
-        KeyPress::Escape     => vec![0x1b],
-        KeyPress::ArrowUp    => b"\x1b[A".to_vec(),
-        KeyPress::ArrowDown  => b"\x1b[B".to_vec(),
+        KeyPress::Char(b) => vec![b],
+        KeyPress::Enter => vec![b'\r'],
+        KeyPress::Backspace => vec![0x7f],
+        KeyPress::Tab => vec![b'\t'],
+        KeyPress::Escape => vec![0x1b],
+        KeyPress::ArrowUp => b"\x1b[A".to_vec(),
+        KeyPress::ArrowDown => b"\x1b[B".to_vec(),
         KeyPress::ArrowRight => b"\x1b[C".to_vec(),
-        KeyPress::ArrowLeft  => b"\x1b[D".to_vec(),
-        KeyPress::F(1)  => b"\x1bOP".to_vec(),
-        KeyPress::F(2)  => b"\x1bOQ".to_vec(),
-        KeyPress::F(3)  => b"\x1bOR".to_vec(),
-        KeyPress::F(4)  => b"\x1bOS".to_vec(),
-        KeyPress::F(5)  => b"\x1b[15~".to_vec(),
-        KeyPress::F(6)  => b"\x1b[17~".to_vec(),
-        KeyPress::F(7)  => b"\x1b[18~".to_vec(),
-        KeyPress::F(8)  => b"\x1b[19~".to_vec(),
-        KeyPress::F(9)  => b"\x1b[20~".to_vec(),
+        KeyPress::ArrowLeft => b"\x1b[D".to_vec(),
+        KeyPress::F(1) => b"\x1bOP".to_vec(),
+        KeyPress::F(2) => b"\x1bOQ".to_vec(),
+        KeyPress::F(3) => b"\x1bOR".to_vec(),
+        KeyPress::F(4) => b"\x1bOS".to_vec(),
+        KeyPress::F(5) => b"\x1b[15~".to_vec(),
+        KeyPress::F(6) => b"\x1b[17~".to_vec(),
+        KeyPress::F(7) => b"\x1b[18~".to_vec(),
+        KeyPress::F(8) => b"\x1b[19~".to_vec(),
+        KeyPress::F(9) => b"\x1b[20~".to_vec(),
         KeyPress::F(10) => b"\x1b[21~".to_vec(),
         KeyPress::F(11) => b"\x1b[23~".to_vec(),
         KeyPress::F(12) => b"\x1b[24~".to_vec(),
-        KeyPress::F(_) | KeyPress::CtrlSpace
-        | KeyPress::ScrollUp | KeyPress::ScrollDown => vec![],
+        KeyPress::F(_) | KeyPress::CtrlSpace | KeyPress::ScrollUp | KeyPress::ScrollDown => vec![],
     }
 }
 
@@ -1818,35 +2174,62 @@ mod tests {
     #[cfg(feature = "experimental")]
     fn sample_services() -> Vec<ServiceEntry> {
         vec![
-            ServiceEntry { name: "oai".into(), active: true, mode: ServiceMode::Systemd, pid: Some(1234) },
-            ServiceEntry { name: "registry".into(), active: false, mode: ServiceMode::Stopped, pid: None },
-            ServiceEntry { name: "model".into(), active: true, mode: ServiceMode::Daemon, pid: Some(5678) },
+            ServiceEntry {
+                name: "oai".into(),
+                active: true,
+                mode: ServiceMode::Systemd,
+                pid: Some(1234),
+            },
+            ServiceEntry {
+                name: "registry".into(),
+                active: false,
+                mode: ServiceMode::Stopped,
+                pid: None,
+            },
+            ServiceEntry {
+                name: "model".into(),
+                active: true,
+                mode: ServiceMode::Daemon,
+                pid: Some(5678),
+            },
         ]
     }
 
     fn sample_workers() -> Vec<WorkerEntry> {
         vec![
             WorkerEntry {
-                id: "abc123".into(), full_id: "abc12345-6789".into(),
-                state: "Ready".into(), backend: "kata".into(),
-                cpu_pct: Some(25), mem_mb: Some(512),
+                id: "abc123".into(),
+                full_id: "abc12345-6789".into(),
+                state: "Ready".into(),
+                backend: "kata".into(),
+                cpu_pct: Some(25),
+                mem_mb: Some(512),
                 containers: vec![
                     ContainerEntry {
-                        id: "ctr1".into(), full_id: "ctr1-full".into(),
-                        image: "hyprstream:latest".into(), state: "Running".into(),
-                        cpu_pct: Some(10), mem_mb: Some(256),
+                        id: "ctr1".into(),
+                        full_id: "ctr1-full".into(),
+                        image: "hyprstream:latest".into(),
+                        state: "Running".into(),
+                        cpu_pct: Some(10),
+                        mem_mb: Some(256),
                     },
                     ContainerEntry {
-                        id: "ctr2".into(), full_id: "ctr2-full".into(),
-                        image: "worker:v2".into(), state: "Stopped".into(),
-                        cpu_pct: None, mem_mb: None,
+                        id: "ctr2".into(),
+                        full_id: "ctr2-full".into(),
+                        image: "worker:v2".into(),
+                        state: "Stopped".into(),
+                        cpu_pct: None,
+                        mem_mb: None,
                     },
                 ],
             },
             WorkerEntry {
-                id: "def456".into(), full_id: "def45678-abcd".into(),
-                state: "Starting".into(), backend: "nspawn".into(),
-                cpu_pct: None, mem_mb: None,
+                id: "def456".into(),
+                full_id: "def45678-abcd".into(),
+                state: "Starting".into(),
+                backend: "nspawn".into(),
+                cpu_pct: None,
+                mem_mb: None,
                 containers: vec![],
             },
         ]
@@ -1860,7 +2243,10 @@ mod tests {
         let mut chrome = make_chrome();
         chrome.mode = ShellMode::StartMenu { selected: 0 };
         let out = chrome.handle_key(KeyPress::Char(b'v'));
-        assert!(matches!(chrome.mode, ShellMode::ServiceManager { selected: 0 }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::ServiceManager { selected: 0 }
+        ));
         assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
     }
 
@@ -1882,14 +2268,23 @@ mod tests {
         chrome.mode = ShellMode::ServiceManager { selected: 0 };
 
         chrome.handle_key(KeyPress::ArrowDown);
-        assert!(matches!(chrome.mode, ShellMode::ServiceManager { selected: 1 }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::ServiceManager { selected: 1 }
+        ));
 
         chrome.handle_key(KeyPress::ArrowDown);
-        assert!(matches!(chrome.mode, ShellMode::ServiceManager { selected: 2 }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::ServiceManager { selected: 2 }
+        ));
 
         // Wraps around
         chrome.handle_key(KeyPress::ArrowDown);
-        assert!(matches!(chrome.mode, ShellMode::ServiceManager { selected: 0 }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::ServiceManager { selected: 0 }
+        ));
     }
 
     #[cfg(feature = "experimental")]
@@ -1901,10 +2296,16 @@ mod tests {
 
         // Wraps to last
         chrome.handle_key(KeyPress::ArrowUp);
-        assert!(matches!(chrome.mode, ShellMode::ServiceManager { selected: 2 }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::ServiceManager { selected: 2 }
+        ));
 
         chrome.handle_key(KeyPress::ArrowUp);
-        assert!(matches!(chrome.mode, ShellMode::ServiceManager { selected: 1 }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::ServiceManager { selected: 1 }
+        ));
     }
 
     #[cfg(feature = "experimental")]
@@ -1915,10 +2316,16 @@ mod tests {
         chrome.mode = ShellMode::ServiceManager { selected: 0 };
 
         chrome.handle_key(KeyPress::Char(b'j'));
-        assert!(matches!(chrome.mode, ShellMode::ServiceManager { selected: 1 }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::ServiceManager { selected: 1 }
+        ));
 
         chrome.handle_key(KeyPress::Char(b'k'));
-        assert!(matches!(chrome.mode, ShellMode::ServiceManager { selected: 0 }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::ServiceManager { selected: 0 }
+        ));
     }
 
     #[cfg(feature = "experimental")]
@@ -1961,7 +2368,9 @@ mod tests {
         chrome.mode = ShellMode::ServiceManager { selected: 0 };
 
         let out = chrome.handle_key(KeyPress::Char(b'a'));
-        assert!(out.iter().any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::ServiceStartAll))));
+        assert!(out
+            .iter()
+            .any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::ServiceStartAll))));
     }
 
     #[cfg(feature = "experimental")]
@@ -1971,7 +2380,9 @@ mod tests {
         chrome.mode = ShellMode::ServiceManager { selected: 0 };
 
         let out = chrome.handle_key(KeyPress::Char(b'S'));
-        assert!(out.iter().any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::ServiceStopAll))));
+        assert!(out
+            .iter()
+            .any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::ServiceStopAll))));
     }
 
     #[cfg(feature = "experimental")]
@@ -1981,7 +2392,9 @@ mod tests {
         chrome.mode = ShellMode::ServiceManager { selected: 0 };
 
         let out = chrome.handle_key(KeyPress::Char(b'i'));
-        assert!(out.iter().any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::ServiceInstall))));
+        assert!(out
+            .iter()
+            .any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::ServiceInstall))));
     }
 
     #[cfg(feature = "experimental")]
@@ -2014,9 +2427,12 @@ mod tests {
         chrome.mode = ShellMode::ServiceManager { selected: 2 };
 
         // Shrink the list — selection should be clamped
-        let short_list = vec![
-            ServiceEntry { name: "oai".into(), active: true, mode: ServiceMode::Systemd, pid: None },
-        ];
+        let short_list = vec![ServiceEntry {
+            name: "oai".into(),
+            active: true,
+            mode: ServiceMode::Systemd,
+            pid: None,
+        }];
         chrome.update_service_list(short_list);
         // Selection clamping happens in Compositor::handle(ServiceList), not in chrome directly.
         // But verify the list was updated.
@@ -2030,14 +2446,31 @@ mod tests {
         let mut chrome = make_chrome();
         chrome.mode = ShellMode::StartMenu { selected: 0 };
         let out = chrome.handle_key(KeyPress::Char(b'w'));
-        assert!(matches!(chrome.mode, ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::WorkerManager {
+                sandbox_sel: 0,
+                container_sel: 0,
+                show_containers: false,
+                tab: WorkerTab::Sandboxes,
+                image_sel: 0,
+                input_mode: None
+            }
+        ));
         assert!(out.iter().any(|o| matches!(o, ChromeOutput::Redraw)));
     }
 
     #[test]
     fn worker_manager_escape_returns_to_normal() {
         let mut chrome = make_chrome();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
+        chrome.mode = ShellMode::WorkerManager {
+            sandbox_sel: 0,
+            container_sel: 0,
+            show_containers: false,
+            tab: WorkerTab::Sandboxes,
+            image_sel: 0,
+            input_mode: None,
+        };
         chrome.handle_key(KeyPress::Escape);
         assert!(matches!(chrome.mode, ShellMode::Normal));
     }
@@ -2046,69 +2479,160 @@ mod tests {
     fn worker_manager_navigate_sandboxes() {
         let mut chrome = make_chrome();
         chrome.worker_list = sample_workers();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
+        chrome.mode = ShellMode::WorkerManager {
+            sandbox_sel: 0,
+            container_sel: 0,
+            show_containers: false,
+            tab: WorkerTab::Sandboxes,
+            image_sel: 0,
+            input_mode: None,
+        };
 
         chrome.handle_key(KeyPress::ArrowDown);
-        assert!(matches!(chrome.mode, ShellMode::WorkerManager { sandbox_sel: 1, .. }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::WorkerManager { sandbox_sel: 1, .. }
+        ));
 
         chrome.handle_key(KeyPress::ArrowDown);
-        assert!(matches!(chrome.mode, ShellMode::WorkerManager { sandbox_sel: 0, .. }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::WorkerManager { sandbox_sel: 0, .. }
+        ));
 
         chrome.handle_key(KeyPress::ArrowUp);
-        assert!(matches!(chrome.mode, ShellMode::WorkerManager { sandbox_sel: 1, .. }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::WorkerManager { sandbox_sel: 1, .. }
+        ));
     }
 
     #[test]
     fn worker_manager_enter_container_view() {
         let mut chrome = make_chrome();
         chrome.worker_list = sample_workers();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
+        chrome.mode = ShellMode::WorkerManager {
+            sandbox_sel: 0,
+            container_sel: 0,
+            show_containers: false,
+            tab: WorkerTab::Sandboxes,
+            image_sel: 0,
+            input_mode: None,
+        };
 
         // First sandbox has containers
         chrome.handle_key(KeyPress::Enter);
-        assert!(matches!(chrome.mode, ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: true, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::WorkerManager {
+                sandbox_sel: 0,
+                container_sel: 0,
+                show_containers: true,
+                tab: WorkerTab::Sandboxes,
+                image_sel: 0,
+                input_mode: None
+            }
+        ));
     }
 
     #[test]
     fn worker_manager_enter_no_containers() {
         let mut chrome = make_chrome();
         chrome.worker_list = sample_workers();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 1, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
+        chrome.mode = ShellMode::WorkerManager {
+            sandbox_sel: 1,
+            container_sel: 0,
+            show_containers: false,
+            tab: WorkerTab::Sandboxes,
+            image_sel: 0,
+            input_mode: None,
+        };
 
         // Second sandbox has no containers — should stay in sandbox view
         chrome.handle_key(KeyPress::Enter);
-        assert!(matches!(chrome.mode, ShellMode::WorkerManager { show_containers: false, .. }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::WorkerManager {
+                show_containers: false,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn worker_manager_navigate_containers() {
         let mut chrome = make_chrome();
         chrome.worker_list = sample_workers();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: true, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
+        chrome.mode = ShellMode::WorkerManager {
+            sandbox_sel: 0,
+            container_sel: 0,
+            show_containers: true,
+            tab: WorkerTab::Sandboxes,
+            image_sel: 0,
+            input_mode: None,
+        };
 
         chrome.handle_key(KeyPress::ArrowDown);
-        assert!(matches!(chrome.mode, ShellMode::WorkerManager { container_sel: 1, show_containers: true, .. }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::WorkerManager {
+                container_sel: 1,
+                show_containers: true,
+                ..
+            }
+        ));
 
         // Wrap around
         chrome.handle_key(KeyPress::ArrowDown);
-        assert!(matches!(chrome.mode, ShellMode::WorkerManager { container_sel: 0, show_containers: true, .. }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::WorkerManager {
+                container_sel: 0,
+                show_containers: true,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn worker_manager_back_from_containers() {
         let mut chrome = make_chrome();
         chrome.worker_list = sample_workers();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 1, show_containers: true, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
+        chrome.mode = ShellMode::WorkerManager {
+            sandbox_sel: 0,
+            container_sel: 1,
+            show_containers: true,
+            tab: WorkerTab::Sandboxes,
+            image_sel: 0,
+            input_mode: None,
+        };
 
         chrome.handle_key(KeyPress::ArrowLeft);
-        assert!(matches!(chrome.mode, ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None }));
+        assert!(matches!(
+            chrome.mode,
+            ShellMode::WorkerManager {
+                sandbox_sel: 0,
+                container_sel: 0,
+                show_containers: false,
+                tab: WorkerTab::Sandboxes,
+                image_sel: 0,
+                input_mode: None
+            }
+        ));
     }
 
     #[test]
     fn worker_manager_destroy_sandbox() {
         let mut chrome = make_chrome();
         chrome.worker_list = sample_workers();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
+        chrome.mode = ShellMode::WorkerManager {
+            sandbox_sel: 0,
+            container_sel: 0,
+            show_containers: false,
+            tab: WorkerTab::Sandboxes,
+            image_sel: 0,
+            input_mode: None,
+        };
 
         let out = chrome.handle_key(KeyPress::Char(b'x'));
         assert!(out.iter().any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::WorkerDestroySandbox { ref sandbox_id }) if sandbox_id == "abc12345-6789")));
@@ -2118,7 +2642,14 @@ mod tests {
     fn worker_manager_exec_in_container() {
         let mut chrome = make_chrome();
         chrome.worker_list = sample_workers();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 1, show_containers: true, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
+        chrome.mode = ShellMode::WorkerManager {
+            sandbox_sel: 0,
+            container_sel: 1,
+            show_containers: true,
+            tab: WorkerTab::Sandboxes,
+            image_sel: 0,
+            input_mode: None,
+        };
 
         let out = chrome.handle_key(KeyPress::Char(b'e'));
         assert!(out.iter().any(|o| matches!(o,
@@ -2130,7 +2661,14 @@ mod tests {
     #[test]
     fn worker_manager_empty_list_no_crash() {
         let mut chrome = make_chrome();
-        chrome.mode = ShellMode::WorkerManager { sandbox_sel: 0, container_sel: 0, show_containers: false, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
+        chrome.mode = ShellMode::WorkerManager {
+            sandbox_sel: 0,
+            container_sel: 0,
+            show_containers: false,
+            tab: WorkerTab::Sandboxes,
+            image_sel: 0,
+            input_mode: None,
+        };
         // Empty list — no panic
         chrome.handle_key(KeyPress::ArrowDown);
         chrome.handle_key(KeyPress::ArrowUp);
@@ -2148,7 +2686,9 @@ mod tests {
         comp.chrome.mode = ShellMode::ServiceManager { selected: 5 };
 
         let out = comp.handle(crate::CompositorInput::ServiceList(sample_services()));
-        assert!(out.iter().any(|o| matches!(o, crate::CompositorOutput::Redraw)));
+        assert!(out
+            .iter()
+            .any(|o| matches!(o, crate::CompositorOutput::Redraw)));
         if let ShellMode::ServiceManager { selected } = comp.chrome.mode {
             assert!(selected <= 2, "selection should be clamped to list len - 1");
         } else {
@@ -2159,13 +2699,22 @@ mod tests {
     #[test]
     fn compositor_worker_list_clamps_selection() {
         let mut comp = crate::Compositor::new(120, 40, 1, 1, vec![], vec![]);
-        comp.chrome.mode = ShellMode::WorkerManager { sandbox_sel: 10, container_sel: 5, show_containers: true, tab: WorkerTab::Sandboxes, image_sel: 0, input_mode: None };
+        comp.chrome.mode = ShellMode::WorkerManager {
+            sandbox_sel: 10,
+            container_sel: 5,
+            show_containers: true,
+            tab: WorkerTab::Sandboxes,
+            image_sel: 0,
+            input_mode: None,
+        };
 
         let out = comp.handle(crate::CompositorInput::WorkerList {
             sandboxes: sample_workers(),
             pool_summary: "2 sandboxes".into(),
         });
-        assert!(out.iter().any(|o| matches!(o, crate::CompositorOutput::Redraw)));
+        assert!(out
+            .iter()
+            .any(|o| matches!(o, crate::CompositorOutput::Redraw)));
         if let ShellMode::WorkerManager { sandbox_sel, .. } = comp.chrome.mode {
             assert!(sandbox_sel <= 1, "sandbox_sel should be clamped");
         } else {
@@ -2211,9 +2760,27 @@ mod tests {
 
     fn make_chrome_with_models() -> ShellChrome {
         let models = vec![
-            ModelEntry { model_ref: "loaded:main".into(), path: "/tmp".into(), loaded: true, loading: false, gen_defaults: GenerationDefaults::default() },
-            ModelEntry { model_ref: "unloaded:main".into(), path: "/tmp".into(), loaded: false, loading: false, gen_defaults: GenerationDefaults::default() },
-            ModelEntry { model_ref: "loading:main".into(), path: "/tmp".into(), loaded: false, loading: true, gen_defaults: GenerationDefaults::default() },
+            ModelEntry {
+                model_ref: "loaded:main".into(),
+                path: "/tmp".into(),
+                loaded: true,
+                loading: false,
+                gen_defaults: GenerationDefaults::default(),
+            },
+            ModelEntry {
+                model_ref: "unloaded:main".into(),
+                path: "/tmp".into(),
+                loaded: false,
+                loading: false,
+                gen_defaults: GenerationDefaults::default(),
+            },
+            ModelEntry {
+                model_ref: "loading:main".into(),
+                path: "/tmp".into(),
+                loaded: false,
+                loading: true,
+                gen_defaults: GenerationDefaults::default(),
+            },
         ];
         ShellChrome::new(120, 40, 1, 1, vec![], models)
     }
@@ -2244,7 +2811,10 @@ mod tests {
             ChromeOutput::Rpc(RpcRequest::LoadModel { ref model_ref })
                 if model_ref == "unloaded:main"
         )));
-        assert_eq!(chrome.pending_picker_model.as_deref(), Some("unloaded:main"));
+        assert_eq!(
+            chrome.pending_picker_model.as_deref(),
+            Some("unloaded:main")
+        );
     }
 
     #[test]
@@ -2265,7 +2835,9 @@ mod tests {
         let mut chrome = make_chrome_with_models();
         chrome.pending_picker_model = Some("unloaded:main".into());
         let follow_up = chrome.update_model_status("unloaded:main", true);
-        assert!(matches!(follow_up, Some(RpcRequest::ListConversations { ref model_ref }) if model_ref == "unloaded:main"));
+        assert!(
+            matches!(follow_up, Some(RpcRequest::ListConversations { ref model_ref }) if model_ref == "unloaded:main")
+        );
         assert!(chrome.pending_picker_model.is_none());
     }
 
@@ -2322,6 +2894,8 @@ mod tests {
         // Try to delete first entry (sentinel).
         let out = chrome.handle_key(KeyPress::Char(b'd'));
         // Should NOT emit DeleteConversation.
-        assert!(!out.iter().any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::DeleteConversation { .. }))));
+        assert!(!out
+            .iter()
+            .any(|o| matches!(o, ChromeOutput::Rpc(RpcRequest::DeleteConversation { .. }))));
     }
 }

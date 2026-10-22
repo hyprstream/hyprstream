@@ -186,7 +186,12 @@ pub fn validate_node(method_snake: &str, scope: &str, kind: NodeKind) -> Result<
 /// the latter case `.` would silently collide across every listing, so each
 /// gets a name-derived path instead: strip a leading `list_` from the method's
 /// snake-case name if present, else use the name as-is.
-fn infer_path(kind: NodeKind, method_snake: &str, arg: &CapnpType, dir_is_sole_listing: bool) -> String {
+fn infer_path(
+    kind: NodeKind,
+    method_snake: &str,
+    arg: &CapnpType,
+    dir_is_sole_listing: bool,
+) -> String {
     match kind {
         // The lone directory listing in this scope is the mount root by
         // convention. When there's more than one, each needs its own name so
@@ -250,7 +255,12 @@ fn build_node_entries(
             return Err(compile_error(&msg));
         }
 
-        resolved_variants.push(Resolved { variant: v, method_snake, arg, kind });
+        resolved_variants.push(Resolved {
+            variant: v,
+            method_snake,
+            arg,
+            kind,
+        });
     }
 
     // How many un-annotated methods in this scope infer to `Dir` — decides
@@ -465,25 +475,46 @@ mod tests {
     fn infers_parameterized_file_for_text_query() {
         let k = infer_kind("query", &CapnpType::Text, "getByName", false);
         assert_eq!(k, NodeKind::File);
-        assert_eq!(infer_path(k, "get_by_name", &CapnpType::Text, true), "{arg}");
+        assert_eq!(
+            infer_path(k, "get_by_name", &CapnpType::Text, true),
+            "{arg}"
+        );
     }
 
     #[test]
     fn infers_query_for_struct_query() {
-        let k = infer_kind("query", &CapnpType::Struct("SearchRequest".into()), "search", false);
+        let k = infer_kind(
+            "query",
+            &CapnpType::Struct("SearchRequest".into()),
+            "search",
+            false,
+        );
         assert_eq!(k, NodeKind::Query);
     }
 
     #[test]
     fn infers_ctl_for_write() {
-        let k = infer_kind("write", &CapnpType::Struct("CloneRequest".into()), "clone", false);
+        let k = infer_kind(
+            "write",
+            &CapnpType::Struct("CloneRequest".into()),
+            "clone",
+            false,
+        );
         assert_eq!(k, NodeKind::Ctl);
-        assert_eq!(infer_path(k, "clone", &CapnpType::Struct("CloneRequest".into()), true), "ctl");
+        assert_eq!(
+            infer_path(k, "clone", &CapnpType::Struct("CloneRequest".into()), true),
+            "ctl"
+        );
     }
 
     #[test]
     fn infers_stream_for_streaming() {
-        let k = infer_kind("write", &CapnpType::Struct("CloneRequest".into()), "cloneStream", true);
+        let k = infer_kind(
+            "write",
+            &CapnpType::Struct("CloneRequest".into()),
+            "cloneStream",
+            true,
+        );
         assert_eq!(k, NodeKind::Stream);
     }
 
@@ -492,7 +523,10 @@ mod tests {
         // A write method forced to a read-only `file` must be rejected.
         let err = validate_node("clone", "write", NodeKind::File).unwrap_err();
         assert!(err.contains("clone"), "error names the method: {err}");
-        assert!(err.contains("side-effect-free"), "error explains why: {err}");
+        assert!(
+            err.contains("side-effect-free"),
+            "error explains why: {err}"
+        );
     }
 
     #[test]
@@ -531,6 +565,12 @@ mod tests {
             vfs_bulk: false,
             vfs_hidden: false,
             vfs_mac: String::new(),
+            dispatch_mac: String::new(),
+            dispatch_public: String::new(),
+            mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         };
         let err = resolve_kind(&v, &CapnpType::Struct("CloneRequest".into()), false).unwrap_err();
         assert!(err.contains("bogus"));
@@ -553,6 +593,12 @@ mod tests {
             vfs_bulk: false,
             vfs_hidden: false,
             vfs_mac: String::new(),
+            dispatch_mac: String::new(),
+            dispatch_public: String::new(),
+            mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         };
         let k = resolve_kind(&v, &CapnpType::Text, false).expect("valid kind");
         assert_eq!(k, NodeKind::Query);
@@ -576,6 +622,12 @@ mod tests {
             vfs_bulk: false,
             vfs_hidden: false,
             vfs_mac: String::new(),
+            dispatch_mac: String::new(),
+            dispatch_public: String::new(),
+            mutation_semantics: String::new(),
+            dispatch_mac_present: false,
+            dispatch_public_present: false,
+            mutation_semantics_present: false,
         }
     }
 
@@ -687,15 +739,15 @@ mod tests {
     fn vfs_hidden_excludes_a_method() {
         let mut hidden = variant("internalPing", "Void", "query");
         hidden.vfs_hidden = true;
-        let schema = schema_with(
-            vec![variant("list", "Void", "query"), hidden],
-            vec![],
-        );
+        let schema = schema_with(vec![variant("list", "Void", "query"), hidden], vec![]);
         let resolved = ResolvedSchema::from(&schema);
         let out = generate_mount("registry", &resolved).to_string();
 
         assert!(out.contains("\"list\"") || out.contains("VfsNodeKind :: Dir"));
-        assert!(!out.contains("internal_ping"), "hidden method excluded: {out}");
+        assert!(
+            !out.contains("internal_ping"),
+            "hidden method excluded: {out}"
+        );
     }
 
     #[test]
@@ -724,13 +776,22 @@ mod tests {
         let resolved = ResolvedSchema::from(&schema);
         let out = generate_mount("repo", &resolved).to_string();
 
-        assert!(!out.contains("compile_error"), "no collision guard error: {out}");
+        assert!(
+            !out.contains("compile_error"),
+            "no collision guard error: {out}"
+        );
         assert!(out.contains("\"branches\""), "list_ prefix stripped: {out}");
         assert!(out.contains("\"tags\""), "list_ prefix stripped: {out}");
         assert!(out.contains("\"remotes\""), "list_ prefix stripped: {out}");
-        assert!(out.contains("\"worktrees\""), "list_ prefix stripped: {out}");
+        assert!(
+            out.contains("\"worktrees\""),
+            "list_ prefix stripped: {out}"
+        );
         // None of the four should still be the bare "." (the pre-fix collision).
-        assert!(!out.contains("path : \".\""), "no method landed on the bare root: {out}");
+        assert!(
+            !out.contains("path : \".\""),
+            "no method landed on the bare root: {out}"
+        );
     }
 
     #[test]
@@ -741,7 +802,10 @@ mod tests {
         let out = generate_mount("registry", &resolved).to_string();
 
         assert!(!out.contains("compile_error"), "no guard error: {out}");
-        assert!(out.contains("path : \".\""), "sole listing is still the scope root: {out}");
+        assert!(
+            out.contains("path : \".\""),
+            "sole listing is still the scope root: {out}"
+        );
     }
 
     #[test]
@@ -763,9 +827,18 @@ mod tests {
         let out = generate_mount("repo", &resolved).to_string();
 
         assert!(!out.contains("compile_error"), "no guard error: {out}");
-        assert!(out.contains("\"custom-branches\""), "explicit path wins: {out}");
-        assert!(out.contains("\"custom-remotes\""), "explicit path wins: {out}");
-        assert!(out.contains("path : \".\""), "the sole un-annotated listing still gets the root: {out}");
+        assert!(
+            out.contains("\"custom-branches\""),
+            "explicit path wins: {out}"
+        );
+        assert!(
+            out.contains("\"custom-remotes\""),
+            "explicit path wins: {out}"
+        );
+        assert!(
+            out.contains("path : \".\""),
+            "the sole un-annotated listing still gets the root: {out}"
+        );
     }
 
     #[test]
@@ -779,8 +852,14 @@ mod tests {
         let resolved = ResolvedSchema::from(&schema);
         let out = generate_mount("registry", &resolved).to_string();
 
-        assert!(out.contains("compile_error"), "collision is a build error: {out}");
-        assert!(out.contains("get_by_name") && out.contains("get_by_id"), "names both methods: {out}");
+        assert!(
+            out.contains("compile_error"),
+            "collision is a build error: {out}"
+        );
+        assert!(
+            out.contains("get_by_name") && out.contains("get_by_id"),
+            "names both methods: {out}"
+        );
         assert!(out.contains("dup"), "names the colliding path: {out}");
     }
 }

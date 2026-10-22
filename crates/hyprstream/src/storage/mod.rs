@@ -13,6 +13,7 @@ pub mod cas;
 pub mod errors;
 pub mod model_ref;
 pub mod paths;
+pub mod pinned_model;
 pub mod release_store;
 
 // Re-export types for backward compatibility
@@ -103,4 +104,3 @@ pub struct CheckoutResult {
     pub files_changed: usize,
     pub has_submodule: bool,
 }
-

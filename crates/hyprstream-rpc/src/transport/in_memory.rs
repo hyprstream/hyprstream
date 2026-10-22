@@ -140,7 +140,10 @@ mod tests {
         }));
         let t = InMemoryTransport::new(slow);
         let err = t.send(b"x".to_vec(), Some(20)).await;
-        assert!(err.is_err(), "a handler exceeding the deadline must time out");
+        assert!(
+            err.is_err(),
+            "a handler exceeding the deadline must time out"
+        );
     }
 
     #[tokio::test]

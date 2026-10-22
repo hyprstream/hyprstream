@@ -109,7 +109,9 @@ mod tests {
         // Should be able to mkdir and stat
         fs.mkdir_all("test/subdir")
             .unwrap_or_else(|e| panic!("mkdir_all: {e}"));
-        let stat = fs.stat("test/subdir").unwrap_or_else(|e| panic!("stat: {e}"));
+        let stat = fs
+            .stat("test/subdir")
+            .unwrap_or_else(|e| panic!("stat: {e}"));
         assert_eq!(stat.qtype, QTDIR);
     }
 
@@ -146,12 +148,13 @@ mod tests {
         let temp = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let fs = open(temp.path()).unwrap_or_else(|e| panic!("open: {e}"));
 
-        fs.mkdir("testdir")
-            .unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs.mkdir("testdir").unwrap_or_else(|e| panic!("mkdir: {e}"));
         let handle = fs.walk("testdir").unwrap_or_else(|e| panic!("walk: {e}"));
         assert_eq!(handle.rel_path(), "testdir");
 
-        let meta = handle.metadata().unwrap_or_else(|e| panic!("metadata: {e}"));
+        let meta = handle
+            .metadata()
+            .unwrap_or_else(|e| panic!("metadata: {e}"));
         assert!(meta.is_dir());
     }
 
@@ -192,7 +195,8 @@ mod tests {
             let mut f = fs
                 .create("old.txt", OpenMode::OWRITE)
                 .unwrap_or_else(|e| panic!("create: {e}"));
-            f.write_all(b"data").unwrap_or_else(|e| panic!("write: {e}"));
+            f.write_all(b"data")
+                .unwrap_or_else(|e| panic!("write: {e}"));
         }
 
         fs.rename("old.txt", "new.txt")
@@ -212,7 +216,8 @@ mod tests {
             let mut f = fs
                 .create("to_remove.txt", OpenMode::OWRITE)
                 .unwrap_or_else(|e| panic!("create: {e}"));
-            f.write_all(b"data").unwrap_or_else(|e| panic!("write: {e}"));
+            f.write_all(b"data")
+                .unwrap_or_else(|e| panic!("write: {e}"));
         }
 
         fs.remove("to_remove.txt")
@@ -230,7 +235,8 @@ mod tests {
             let mut f = fs
                 .create("src.txt", OpenMode::OWRITE)
                 .unwrap_or_else(|e| panic!("create: {e}"));
-            f.write_all(b"copy me").unwrap_or_else(|e| panic!("write: {e}"));
+            f.write_all(b"copy me")
+                .unwrap_or_else(|e| panic!("write: {e}"));
         }
 
         fs.copy("src.txt", "dst.txt")
@@ -253,8 +259,7 @@ mod tests {
         let temp = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let fs = open(temp.path()).unwrap_or_else(|e| panic!("open: {e}"));
 
-        fs.mkdir("parent")
-            .unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs.mkdir("parent").unwrap_or_else(|e| panic!("mkdir: {e}"));
         let handle = fs.walk("parent").unwrap_or_else(|e| panic!("walk: {e}"));
         assert_eq!(handle.child_rel_path("child"), "parent/child");
 

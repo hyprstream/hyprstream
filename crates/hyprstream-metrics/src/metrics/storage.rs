@@ -1,5 +1,5 @@
 use crate::aggregation::{AggregateFunction, AggregateResult, GroupBy, TimeWindow};
-use crate::metrics::{MetricRecord, create_record_batch, encode_record_batch};
+use crate::metrics::{create_record_batch, encode_record_batch, MetricRecord};
 use crate::storage::StorageBackend;
 use duckdb::arrow::array::{Float64Array, Int64Array, StringArray};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
@@ -117,10 +117,9 @@ pub trait MetricsStorage: Send + Sync + 'static {
     /// Get the underlying storage backend
     fn backend(&self) -> &dyn StorageBackend;
 
-    /// Initialize metrics storage (create tables etc.)
+    /// Initialize metrics storage (create schema-v2 tables, migrate pre-v2 `metrics`).
     async fn init(&self) -> Result<(), Status> {
-        let schema = Self::get_metrics_schema();
-        self.backend().create_table("metrics", &schema).await
+        crate::metrics::create_schema_v2_tables(self.backend()).await
     }
 
     /// Insert metrics into storage
@@ -145,12 +144,13 @@ pub trait MetricsStorage: Send + Sync + 'static {
         from_timestamp: i64,
         to_timestamp: Option<i64>,
     ) -> Result<Vec<AggregateResult>, Status> {
-        let sql = Self::generate_metric_aggregation_sql(function, group_by, from_timestamp, to_timestamp);
+        let sql =
+            Self::generate_metric_aggregation_sql(function, group_by, from_timestamp, to_timestamp);
         let handle = self.backend().prepare_sql(&sql).await?;
         let batch = self.backend().query_sql(&handle).await?;
 
         let mut results = Vec::with_capacity(batch.num_rows());
-        
+
         // Extract column arrays
         let value_col = batch
             .column_by_name("value")
@@ -177,7 +177,9 @@ pub trait MetricsStorage: Send + Sync + 'static {
                 } else if let Some(float_col) = col.as_any().downcast_ref::<Float64Array>() {
                     float_col.value(row).to_string()
                 } else {
-                    return Err(Status::internal(format!("Unsupported group by column type: {col_name}")));
+                    return Err(Status::internal(format!(
+                        "Unsupported group by column type: {col_name}"
+                    )));
                 };
                 group_values.insert(col_name.clone(), value);
             }
@@ -185,7 +187,9 @@ pub trait MetricsStorage: Send + Sync + 'static {
             // Extract timestamp if it's part of the group by
             let timestamp = if let Some(time_col) = &group_by.time_column {
                 if let Some(col) = batch.column_by_name(time_col) {
-                    col.as_any().downcast_ref::<Int64Array>().map(|int_col| int_col.value(row))
+                    col.as_any()
+                        .downcast_ref::<Int64Array>()
+                        .map(|int_col| int_col.value(row))
                 } else {
                     None
                 }
@@ -205,25 +209,17 @@ pub trait MetricsStorage: Send + Sync + 'static {
 
     /// Get the standard schema for metric records
     fn get_metrics_schema() -> Schema {
-        Schema::new(vec![
-            Field::new("metric_id", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Int64, false),
-            Field::new("value_running_window_sum", DataType::Float64, false),
-            Field::new("value_running_window_avg", DataType::Float64, false),
-            Field::new("value_running_window_count", DataType::Int64, false),
-        ])
+        crate::metrics::get_metrics_schema()
     }
 
     /// Generate SQL for inserting metric records
     fn generate_metric_insert_sql() -> String {
-        "INSERT INTO metrics (metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count) VALUES (?, ?, ?, ?, ?)".to_owned()
+        "INSERT INTO metrics (metric_id, timestamp, value_running_window_sum, value_running_window_avg, value_running_window_count, labels, tenant_id) VALUES (?, ?, ?, ?, ?, ?, ?)".to_owned()
     }
 
     /// Generate SQL for querying metrics
     fn generate_metric_query_sql(from_timestamp: i64) -> String {
-        format!(
-            "SELECT * FROM metrics WHERE timestamp >= {from_timestamp} ORDER BY timestamp ASC"
-        )
+        format!("SELECT * FROM metrics WHERE timestamp >= {from_timestamp} ORDER BY timestamp ASC")
     }
 
     /// Generate SQL for aggregating metrics
@@ -234,7 +230,7 @@ pub trait MetricsStorage: Send + Sync + 'static {
         to_timestamp: Option<i64>,
     ) -> String {
         let mut sql = format!(
-            "SELECT {}, {}({}) as value",
+            "SELECT {}, CAST({}({}) AS DOUBLE) as value",
             group_by.columns.join(", "),
             function,
             "value_running_window_avg" // Use avg for now

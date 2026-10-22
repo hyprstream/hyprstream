@@ -15,7 +15,11 @@ use crate::util::*;
 
 /// Generate portable scoped client structs using `Arc<dyn RpcClient>`.
 /// No ZMQ deps, no jwt_token field — compiles on all targets.
-pub fn generate_portable_scoped_clients(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+pub fn generate_portable_scoped_clients(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
     let mut tokens = TokenStream::new();
     let pascal = to_pascal_case(service_name);
     let rust_service_name = service_name.replace('-', "_");
@@ -27,8 +31,14 @@ pub fn generate_portable_scoped_clients(service_name: &str, resolved: &ResolvedS
 
     for sc in &resolved.raw.scoped_clients {
         walk_portable_scoped(
-            &mut tokens, service_name, &pascal, &capnp_mod, sc, &[],
-            resolved, types_crate,
+            &mut tokens,
+            service_name,
+            &pascal,
+            &capnp_mod,
+            sc,
+            &[],
+            resolved,
+            types_crate,
         );
     }
 
@@ -37,7 +47,11 @@ pub fn generate_portable_scoped_clients(service_name: &str, resolved: &ResolvedS
 
 /// Generate only the response enums and parse functions for scoped clients.
 /// No client structs, no transport deps — compiles on all targets including wasm32.
-pub fn generate_scoped_response_types(service_name: &str, resolved: &ResolvedSchema, types_crate: Option<&syn::Path>) -> TokenStream {
+pub fn generate_scoped_response_types(
+    service_name: &str,
+    resolved: &ResolvedSchema,
+    types_crate: Option<&syn::Path>,
+) -> TokenStream {
     let mut tokens = TokenStream::new();
     let pascal = to_pascal_case(service_name);
     let capnp_mod_ident = format_ident!("{}_capnp", service_name);
@@ -47,7 +61,15 @@ pub fn generate_scoped_response_types(service_name: &str, resolved: &ResolvedSch
     };
 
     for sc in &resolved.raw.scoped_clients {
-        walk_scoped_response_types(&mut tokens, &pascal, &capnp_mod, sc, &[], resolved, types_crate);
+        walk_scoped_response_types(
+            &mut tokens,
+            &pascal,
+            &capnp_mod,
+            sc,
+            &[],
+            resolved,
+            types_crate,
+        );
     }
 
     tokens
@@ -62,11 +84,26 @@ fn walk_scoped_response_types(
     resolved: &ResolvedSchema,
     types_crate: Option<&syn::Path>,
 ) {
-    tokens.extend(generate_scoped_response_only(pascal, capnp_mod, sc, ancestors, resolved, types_crate));
+    tokens.extend(generate_scoped_response_only(
+        pascal,
+        capnp_mod,
+        sc,
+        ancestors,
+        resolved,
+        types_crate,
+    ));
     let mut next_ancestors: Vec<&ScopedClient> = ancestors.to_vec();
     next_ancestors.push(sc);
     for nested in &sc.nested_clients {
-        walk_scoped_response_types(tokens, pascal, capnp_mod, nested, &next_ancestors, resolved, types_crate);
+        walk_scoped_response_types(
+            tokens,
+            pascal,
+            capnp_mod,
+            nested,
+            &next_ancestors,
+            resolved,
+            types_crate,
+        );
     }
 }
 
@@ -91,7 +128,11 @@ fn generate_scoped_response_only(
 
     // Build parse_scoped_response
     let outer_resp_type = format_ident!("{}", to_snake_case(&format!("{pascal}Response")));
-    let full_chain: Vec<&ScopedClient> = ancestors.iter().copied().chain(std::iter::once(sc)).collect();
+    let full_chain: Vec<&ScopedClient> = ancestors
+        .iter()
+        .copied()
+        .chain(std::iter::once(sc))
+        .collect();
 
     let mut levels = Vec::new();
     for (i, level_sc) in full_chain.iter().enumerate() {
@@ -100,15 +141,33 @@ fn generate_scoped_response_only(
         } else {
             format_ident!("{}", full_chain[i - 1].capnp_inner_response)
         };
-        let variant = format_ident!("{}", to_pascal_case(&format!("{}Result", level_sc.factory_name)));
+        let variant = format_ident!(
+            "{}",
+            to_pascal_case(&format!("{}Result", level_sc.factory_name))
+        );
         let which_alias = format_ident!("__W{}", i);
-        levels.push(UnwrapLevel { resp_module, variant, which_alias });
+        levels.push(UnwrapLevel {
+            resp_module,
+            variant,
+            which_alias,
+        });
     }
 
     let inner_which = format_ident!("__WInner");
-    let inner_match_arms: Vec<TokenStream> = sc.inner_response_variants.iter().map(|v| {
-        generate_parse_match_arm(&response_type, capnp_mod, v, resolved, &inner_which, types_crate)
-    }).collect();
+    let inner_match_arms: Vec<TokenStream> = sc
+        .inner_response_variants
+        .iter()
+        .map(|v| {
+            generate_parse_match_arm(
+                &response_type,
+                capnp_mod,
+                v,
+                resolved,
+                &inner_which,
+                types_crate,
+            )
+        })
+        .collect();
 
     let inner_resp_mod = format_ident!("{}", sc.capnp_inner_response);
     let mut body = quote! {
@@ -221,7 +280,13 @@ fn walk_portable_scoped(
     types_crate: Option<&syn::Path>,
 ) {
     tokens.extend(generate_portable_scoped_client_recursive(
-        service_name, pascal, capnp_mod, sc, ancestors, resolved, types_crate,
+        service_name,
+        pascal,
+        capnp_mod,
+        sc,
+        ancestors,
+        resolved,
+        types_crate,
     ));
     let mut next_ancestors: Vec<&ScopedClient> = ancestors.to_vec();
     next_ancestors.push(sc);
@@ -252,22 +317,31 @@ fn generate_portable_scoped_client_recursive(
     let client_name = format_ident!("{}", sc.client_name);
     let response_type = format_ident!("{}ResponseVariant", sc.client_name);
     let outer_req_type = format_ident!("{}", to_snake_case(&format!("{pascal}Request")));
-    let doc = format!("Scoped client for {} operations (transport-agnostic).", sc.factory_name);
+    let doc = format!(
+        "Scoped client for {} operations (transport-agnostic).",
+        sc.factory_name
+    );
 
     // Struct fields: all ancestor scope fields + own scope fields
-    let all_scope_field_defs: Vec<TokenStream> = ancestors.iter()
+    let all_scope_field_defs: Vec<TokenStream> = ancestors
+        .iter()
         .flat_map(|a| &a.scope_fields)
         .chain(&sc.scope_fields)
         .map(|f| {
             let name = format_ident!("{}", to_snake_case(&f.name));
-            let ty = rust_type_tokens(&CapnpType::classify_primitive(&f.type_name).rust_owned_type());
+            let ty =
+                rust_type_tokens(&CapnpType::classify_primitive(&f.type_name).rust_owned_type());
             quote! { #name: #ty }
         })
         .collect();
 
     // Build parse_scoped_response body (same as native — pure capnp parsing)
     let outer_resp_type = format_ident!("{}", to_snake_case(&format!("{pascal}Response")));
-    let full_chain: Vec<&ScopedClient> = ancestors.iter().copied().chain(std::iter::once(sc)).collect();
+    let full_chain: Vec<&ScopedClient> = ancestors
+        .iter()
+        .copied()
+        .chain(std::iter::once(sc))
+        .collect();
 
     let mut levels = Vec::new();
     for (i, level_sc) in full_chain.iter().enumerate() {
@@ -276,15 +350,33 @@ fn generate_portable_scoped_client_recursive(
         } else {
             format_ident!("{}", full_chain[i - 1].capnp_inner_response)
         };
-        let variant = format_ident!("{}", to_pascal_case(&format!("{}Result", level_sc.factory_name)));
+        let variant = format_ident!(
+            "{}",
+            to_pascal_case(&format!("{}Result", level_sc.factory_name))
+        );
         let which_alias = format_ident!("__W{}", i);
-        levels.push(UnwrapLevel { resp_module, variant, which_alias });
+        levels.push(UnwrapLevel {
+            resp_module,
+            variant,
+            which_alias,
+        });
     }
 
     let inner_which = format_ident!("__WInner");
-    let inner_match_arms: Vec<TokenStream> = sc.inner_response_variants.iter().map(|v| {
-        generate_parse_match_arm(&response_type, capnp_mod, v, resolved, &inner_which, types_crate)
-    }).collect();
+    let inner_match_arms: Vec<TokenStream> = sc
+        .inner_response_variants
+        .iter()
+        .map(|v| {
+            generate_parse_match_arm(
+                &response_type,
+                capnp_mod,
+                v,
+                resolved,
+                &inner_which,
+                types_crate,
+            )
+        })
+        .collect();
 
     let inner_resp_mod = format_ident!("{}", sc.capnp_inner_response);
     let mut body = quote! {
@@ -319,24 +411,30 @@ fn generate_portable_scoped_client_recursive(
 
     // Request methods (portable mode)
     let scope_ctx = build_scope_context(sc, ancestors, resolved);
-    let request_methods: Vec<TokenStream> = sc.inner_request_variants.iter().map(|v| {
-        generate_portable_request_method(
-            capnp_mod,
-            &outer_req_type,
-            &response_type,
-            v,
-            resolved,
-            Some(&scope_ctx),
-            Some(&sc.inner_response_variants),
-            true,
-            types_crate,
-        )
-    }).collect();
+    let request_methods: Vec<TokenStream> = sc
+        .inner_request_variants
+        .iter()
+        .map(|v| {
+            generate_portable_request_method(
+                capnp_mod,
+                &outer_req_type,
+                &response_type,
+                v,
+                resolved,
+                Some(&scope_ctx),
+                Some(&sc.inner_response_variants),
+                true,
+                types_crate,
+            )
+        })
+        .collect();
 
     // Nested factory methods (portable — no jwt_token)
-    let nested_factory_methods: Vec<TokenStream> = sc.nested_clients.iter().map(|nested| {
-        generate_portable_nested_factory_method(nested, ancestors, sc)
-    }).collect();
+    let nested_factory_methods: Vec<TokenStream> = sc
+        .nested_clients
+        .iter()
+        .map(|nested| generate_portable_nested_factory_method(nested, ancestors, sc))
+        .collect();
 
     quote! {
         #[doc = #doc]
@@ -426,13 +524,19 @@ fn generate_portable_nested_factory_method(
     let client_name_ident = format_ident!("{}", nested.client_name);
     let doc = format!("Create a scoped {} client.", nested.factory_name);
 
-    let params: Vec<TokenStream> = nested.scope_fields.iter().map(|f| {
-        let name = format_ident!("{}", to_snake_case(&f.name));
-        let ty = rust_type_tokens(&CapnpType::classify_primitive(&f.type_name).rust_param_type());
-        quote! { #name: #ty }
-    }).collect();
+    let params: Vec<TokenStream> = nested
+        .scope_fields
+        .iter()
+        .map(|f| {
+            let name = format_ident!("{}", to_snake_case(&f.name));
+            let ty =
+                rust_type_tokens(&CapnpType::classify_primitive(&f.type_name).rust_param_type());
+            quote! { #name: #ty }
+        })
+        .collect();
 
-    let all_parent_field_inits: Vec<TokenStream> = ancestors.iter()
+    let all_parent_field_inits: Vec<TokenStream> = ancestors
+        .iter()
         .flat_map(|a| &a.scope_fields)
         .chain(&parent.scope_fields)
         .map(|f| {
@@ -441,13 +545,17 @@ fn generate_portable_nested_factory_method(
         })
         .collect();
 
-    let own_field_inits: Vec<TokenStream> = nested.scope_fields.iter().map(|f| {
-        let name = format_ident!("{}", to_snake_case(&f.name));
-        match f.type_name.as_str() {
-            "Text" => quote! { #name: #name.to_owned() },
-            _ => quote! { #name },
-        }
-    }).collect();
+    let own_field_inits: Vec<TokenStream> = nested
+        .scope_fields
+        .iter()
+        .map(|f| {
+            let name = format_ident!("{}", to_snake_case(&f.name));
+            match f.type_name.as_str() {
+                "Text" => quote! { #name: #name.to_owned() },
+                _ => quote! { #name },
+            }
+        })
+        .collect();
 
     quote! {
         #[doc = #doc]
@@ -486,8 +594,8 @@ mod canonical_service_authority_tests {
             response_struct: None,
         };
         let resolved = ResolvedSchema::from(&schema);
-        let generated = generate_portable_scoped_clients("text-generation", &resolved, None)
-            .to_string();
+        let generated =
+            generate_portable_scoped_clients("text-generation", &resolved, None).to_string();
 
         assert!(generated.contains("text-generation"));
         assert!(!generated.contains("text_generation\""));

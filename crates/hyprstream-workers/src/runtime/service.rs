@@ -1,4 +1,4 @@
-//! WorkerService — CRI RuntimeClient + ImageClient control plane.
+//! WorkerService — AGPL implementation of the canonical worker control plane.
 //!
 //! Implements the `RequestService` trait for handling CRI-aligned requests.
 //!
@@ -6,7 +6,7 @@
 //!
 //! This is the worker **control plane**. It is transport-agnostic: the service
 //! only implements `RequestService` (Cap'n Proto wire format via
-//! `generate_rpc_service!("worker")`) and carries a `TransportConfig`. The
+//! `generate_rpc_server!("worker")`) and carries a `TransportConfig`. The
 //! legacy ZMQ ROUTER/DEALER stack was removed workspace-wide (#138/#167 —
 //! ZMQ/ZeroMQ is gone); the blanket `Spawnable` impl bridges this service and
 //! serves it over its *registered* transport (`serve_bridged`: Inproc / IPC-UDS
@@ -15,7 +15,7 @@
 //!
 //! The **asynchronous** surfaces of the worker already ride the moq-lite
 //! streaming plane, mirroring the event-bus migration (#167): lifecycle events
-//! publish via [`EventPublisher`] (moq-backed — see `crate::events`) and
+//! publish via [`EventPublisher`] (moq-backed — see `hyprstream_rpc::events`) and
 //! terminal attach/detach FD data streams via `StreamChannel` /
 //! `AnyStreamPublisher` (moq). moq is a pub/sub fan-out plane, not a
 //! request/response RPC transport, so the synchronous CRI req/rep control plane
@@ -34,6 +34,7 @@ use tracing::{debug, info, warn};
 // RPC service infrastructure from hyprstream-rpc: the pluggable Cap'n Proto
 // bridged transport (inproc/UDS/QUIC/iroh) + the moq streaming plane. ZMQ is
 // gone (#138/#167) — this is not a ZMQ socket API.
+use hyprstream_rpc::events::EventPublisher;
 use hyprstream_rpc::moq_stream::AnyStreamPublisher;
 use hyprstream_rpc::prelude::SigningKey;
 use hyprstream_rpc::service::{AuthorizeFn, EnvelopeContext, RequestService};
@@ -43,11 +44,15 @@ use hyprstream_rpc::transport::TransportConfig;
 use crate::config::PoolConfig;
 use crate::error::{Result, WorkerError};
 use crate::events::{
-    EventPublisher,
+    serialize_container_started,
+    serialize_container_stopped,
+    serialize_sandbox_started,
+    serialize_sandbox_stopped,
     // Event types and serialization helpers
-    ContainerStarted, ContainerStopped, SandboxStarted, SandboxStopped,
-    serialize_container_started, serialize_container_stopped,
-    serialize_sandbox_started, serialize_sandbox_stopped,
+    ContainerStarted,
+    ContainerStopped,
+    SandboxStarted,
+    SandboxStopped,
 };
 // ImageStore trait seam — always compiled (feature-invariant). Concrete
 // backends (RafsStore under `oci-image`) register via inventory; the service
@@ -55,36 +60,61 @@ use crate::events::{
 // it, with no cfg mirror (#646).
 use crate::image::ImageStore;
 // Import generated wire types (canonical OCI-aligned names)
+use super::status::StatusResponse;
 use crate::generated::worker_client::{
-    // Filter + request types for handler signatures
-    PodSandboxFilter, PodSandboxStatsFilter,
-    ContainerFilter, ContainerStatsFilter,
-    StatusRequest, PodSandboxStatusRequest, StopContainerRequest,
-    ContainerStatusRequest, AttachRequest, ImageFilter, ImageStatusRequest,
+    dispatch_worker, ContainerHandler, ImageHandler, RuntimeHandler, SandboxHandler, WorkerHandler,
 };
-use super::client::{
-    StatusResponse, KeyValue,
-    VersionInfo, RuntimeStatus, RuntimeCondition,
+use hyprstream_rpc_std::worker_client::{
+    AttachRequest,
+    AuthConfig,
+    ContainerAttributes,
+    ContainerConfig,
+    ContainerFilter,
+    ContainerInfo,
+    ContainerState,
+    ContainerStats,
+    ContainerStatsFilter,
+    ContainerStatus,
+    ContainerStatusRequest,
+    ContainerStatusResponse,
     ExecSyncResult,
-    PodSandboxStats, PodSandboxAttributes, LinuxPodSandboxStats,
-    ContainerStats, ContainerAttributes,
-    PodSandboxInfo, ContainerInfo,
-    ContainerState, Timestamp, ImageSpec,
-    PodSandboxConfig, PodSandboxStatus,
-    ContainerConfig, ContainerStatus,
+    FilesystemUsage,
+    ImageFilter,
+    ImageInfo,
+    ImageSpec,
+    ImageStatusRequest,
+    ImageStatusResult,
+    KeyValue,
+    LinuxPodSandboxStats,
+    PodSandboxAttributes,
+    PodSandboxConfig,
+    // Filter + request types for handler signatures
+    PodSandboxFilter,
+    PodSandboxInfo,
+    PodSandboxStats,
+    PodSandboxStatsFilter,
+    PodSandboxStatus,
+    PodSandboxStatusRequest,
+    PodSandboxStatusResponse,
+    RuntimeCondition,
+    RuntimeStatus,
+    StatusRequest,
+    StopContainerRequest,
     StreamInfo,
+    Timestamp,
+    VersionInfo,
 };
 // Domain entities (business logic)
 use super::container::Container;
 use super::pool::SandboxPool;
-use super::ExecMount;
 use super::sandbox::PodSandbox;
+use super::ExecMount;
 use super::{RUNTIME_NAME, RUNTIME_VERSION};
 
 /// Service name for endpoint registry
 const SERVICE_NAME: &str = "worker";
 
-/// WorkerService handles CRI RuntimeClient and ImageClient requests
+/// WorkerService handles requests from the canonical worker contract.
 ///
 /// Implements the RequestService trait for integration with hyprstream's
 /// Cap'n Proto bridged RPC transport (inproc/UDS/systemd-fd + QUIC/Iroh); ZMQ is gone.
@@ -242,7 +272,10 @@ impl WorkerService {
         if verbose {
             let stats = self.sandbox_pool.stats().await;
             info.insert("warm_pool_size".to_owned(), stats.warm_count.to_string());
-            info.insert("active_sandboxes".to_owned(), stats.active_count.to_string());
+            info.insert(
+                "active_sandboxes".to_owned(),
+                stats.active_count.to_string(),
+            );
             info.insert("max_sandboxes".to_owned(), stats.max_sandboxes.to_string());
         }
 
@@ -263,7 +296,11 @@ impl WorkerService {
     /// dispatch boundary (see `handle_run`), never accept a caller-asserted
     /// subject as a plain parameter (see the MAC interface policy: "derive,
     /// don't extend").
-    pub async fn run_pod_sandbox(&self, subject: &hyprstream_vfs::Subject, config: &PodSandboxConfig) -> Result<String> {
+    pub async fn run_pod_sandbox(
+        &self,
+        subject: &hyprstream_vfs::Subject,
+        config: &PodSandboxConfig,
+    ) -> Result<String> {
         let sandbox_id = self.sandbox_pool.acquire(subject, config).await?;
         tracing::info!(sandbox_id = %sandbox_id, "Created pod sandbox");
 
@@ -326,7 +363,8 @@ impl WorkerService {
             exit_code: 0,
         };
         let payload = serialize_sandbox_stopped(&event).unwrap_or_default();
-        self.publish_event(pod_sandbox_id, "stopped", &payload).await;
+        self.publish_event(pod_sandbox_id, "stopped", &payload)
+            .await;
 
         Ok(())
     }
@@ -377,10 +415,19 @@ impl WorkerService {
         if verbose {
             // Get PIDs from backend (host-level sandbox management)
             let pids = self.sandbox_pool.backend().get_pids(&sandbox).await.ok();
-            let pid_str = pids.map_or_else(|| "none".to_owned(), |p| {
-                p.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(",")
+            let pid_str = pids.map_or_else(
+                || "none".to_owned(),
+                |p| {
+                    p.iter()
+                        .map(std::string::ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                },
+            );
+            info.push(KeyValue {
+                key: "vm_pids".to_owned(),
+                value: pid_str,
             });
-            info.push(KeyValue { key: "vm_pids".to_owned(), value: pid_str });
         }
 
         Ok((PodSandboxStatus::from(&sandbox), info))
@@ -390,17 +437,18 @@ impl WorkerService {
     ///
     /// Empty string fields mean "no filter". State filtering is not supported
     /// over the wire (Cap'n Proto enum defaults make it ambiguous).
-    pub async fn list_pod_sandbox(
-        &self,
-        filter: &PodSandboxFilter,
-    ) -> Result<Vec<PodSandboxInfo>> {
+    pub async fn list_pod_sandbox(&self, filter: &PodSandboxFilter) -> Result<Vec<PodSandboxInfo>> {
         let mut sandboxes = self.sandbox_pool.list_active().await;
 
         if !filter.id.is_empty() {
             sandboxes.retain(|s| s.id == filter.id);
         }
         for kv in &filter.label_selector {
-            sandboxes.retain(|s| s.labels.iter().any(|l| l.key == kv.key && l.value == kv.value));
+            sandboxes.retain(|s| {
+                s.labels
+                    .iter()
+                    .any(|l| l.key == kv.key && l.value == kv.value)
+            });
         }
 
         Ok(sandboxes.iter().map(PodSandboxInfo::from).collect())
@@ -662,7 +710,9 @@ impl WorkerService {
         if verbose {
             info.push(KeyValue {
                 key: "pid".to_owned(),
-                value: container.pid.map_or_else(|| "none".to_owned(), |p| p.to_string()),
+                value: container
+                    .pid
+                    .map_or_else(|| "none".to_owned(), |p| p.to_string()),
             });
         }
 
@@ -673,10 +723,7 @@ impl WorkerService {
     ///
     /// Empty string fields mean "no filter". State filtering is not supported
     /// over the wire (Cap'n Proto enum defaults make it ambiguous).
-    pub async fn list_containers(
-        &self,
-        filter: &ContainerFilter,
-    ) -> Result<Vec<ContainerInfo>> {
+    pub async fn list_containers(&self, filter: &ContainerFilter) -> Result<Vec<ContainerInfo>> {
         let containers = self.containers.read().await;
         let mut result: Vec<Container> = containers.values().cloned().collect();
 
@@ -687,7 +734,11 @@ impl WorkerService {
             result.retain(|c| c.pod_sandbox_id == filter.pod_sandbox_id);
         }
         for kv in &filter.label_selector {
-            result.retain(|c| c.labels.iter().any(|l| l.key == kv.key && l.value == kv.value));
+            result.retain(|c| {
+                c.labels
+                    .iter()
+                    .any(|l| l.key == kv.key && l.value == kv.value)
+            });
         }
 
         Ok(result.iter().map(ContainerInfo::from).collect())
@@ -776,7 +827,11 @@ impl WorkerService {
             }
             let mut matches_labels = true;
             for kv in &filter.label_selector {
-                if !sandbox.labels.iter().any(|l| l.key == kv.key && l.value == kv.value) {
+                if !sandbox
+                    .labels
+                    .iter()
+                    .any(|l| l.key == kv.key && l.value == kv.value)
+                {
                     matches_labels = false;
                     break;
                 }
@@ -800,7 +855,10 @@ impl WorkerService {
             let container = containers
                 .get(container_id)
                 .ok_or_else(|| WorkerError::ContainerNotFound(container_id.to_owned()))?;
-            (ContainerStats::from(container), container.pod_sandbox_id.clone())
+            (
+                ContainerStats::from(container),
+                container.pod_sandbox_id.clone(),
+            )
         };
 
         self.enrich_container_stats(container_id, &pod_sandbox_id, &mut stats)
@@ -903,7 +961,11 @@ impl WorkerService {
     /// 3. REP is sent with StreamInfo (stream_id, endpoint, server_pubkey)
     /// 4. Continuation spawns the FD streaming task AFTER client receives REP
     /// 5. Client derives topic/mac_key from DH shared secret and subscribes
-    pub async fn prepare_attach(&self, ctx: &EnvelopeContext, container_id: &str) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
+    pub async fn prepare_attach(
+        &self,
+        ctx: &EnvelopeContext,
+        container_id: &str,
+    ) -> Result<(StreamInfo, hyprstream_rpc::service::Continuation)> {
         // Verify container exists
         let containers = self.containers.read().await;
         if !containers.contains_key(container_id) {
@@ -912,15 +974,18 @@ impl WorkerService {
         drop(containers);
 
         // Extract ephemeral pubkey from envelope (required for E2E auth)
-        let client_pubkey = ctx.ephemeral_pubkey()
-            .ok_or_else(|| anyhow::anyhow!("Attach requires client ephemeral pubkey for E2E authentication"))?;
+        let client_pubkey = ctx.ephemeral_pubkey().ok_or_else(|| {
+            anyhow::anyhow!("Attach requires client ephemeral pubkey for E2E authentication")
+        })?;
 
         // Forward user claims for StreamService subscription-time validation
         let claims = ctx.claims().cloned();
 
         // DH + pre-authorization via StreamChannel — atomic, no pending state
-        let stream_ctx = self.stream_channel
-            .prepare_third_party_interop_stream_with_claims(&client_pubkey, 600, claims).await
+        let stream_ctx = self
+            .stream_channel
+            .prepare_third_party_interop_stream_with_claims(&client_pubkey, 600, claims)
+            .await
             .map_err(|e| anyhow::anyhow!("Stream preparation failed: {}", e))?
             .with_qos_preset::<hyprstream_rpc::stream_info::Pipe>();
 
@@ -933,11 +998,18 @@ impl WorkerService {
         let cancel_token = stream_ctx.cancel_token().child_token();
         self.active_fd_streams.write().await.insert(
             stream_id.clone(),
-            ActiveFdStream { container_id: container_id.to_owned(), cancel_token: cancel_token.clone() },
+            ActiveFdStream {
+                container_id: container_id.to_owned(),
+                cancel_token: cancel_token.clone(),
+            },
         );
 
-        let sandbox_id = self.container_sandbox_map.read().await
-            .get(container_id).cloned();
+        let sandbox_id = self
+            .container_sandbox_map
+            .read()
+            .await
+            .get(container_id)
+            .cloned();
         let sandbox_pool = self.sandbox_pool.clone();
         let container_id_owned = container_id.to_owned();
         let active_streams = self.active_fd_streams.clone();
@@ -950,6 +1022,7 @@ impl WorkerService {
             qos: stream_ctx.qos().clone(),
             broadcast_path,
             announced_at: stream_ctx.reach(), // #384: per-stream reach via ctx
+            moql_server_identity: stream_ctx.moql_server_identity(),
             kem_ciphertexts: Vec::new(), // #554: classical FD stream (dh_public path), no hybrid KEM
         };
 
@@ -957,12 +1030,19 @@ impl WorkerService {
         let continuation: hyprstream_rpc::service::Continuation = Box::pin(async move {
             tokio::spawn(async move {
                 let container_id_for_log = container_id_owned.clone();
-                let result = sc.run_stream(&stream_ctx, |mut publisher| async move {
-                    let result = run_fd_streaming_task(
-                        &mut publisher, container_id_owned, cancel_token, sandbox_pool, sandbox_id,
-                    ).await;
-                    (publisher, result)
-                }).await;
+                let result = sc
+                    .run_stream(&stream_ctx, |mut publisher| async move {
+                        let result = run_fd_streaming_task(
+                            &mut publisher,
+                            container_id_owned,
+                            cancel_token,
+                            sandbox_pool,
+                            sandbox_id,
+                        )
+                        .await;
+                        (publisher, result)
+                    })
+                    .await;
 
                 // Always clean up active_fd_streams entry on task exit
                 active_streams.write().await.remove(&stream_id_for_cleanup);
@@ -1040,7 +1120,9 @@ async fn run_fd_streaming_task(
         None
     };
 
-    let console_path = sandbox.as_ref().and_then(|s| s.console_socket().map(std::path::Path::to_path_buf));
+    let console_path = sandbox
+        .as_ref()
+        .and_then(|s| s.console_socket().map(std::path::Path::to_path_buf));
 
     if let Some(ref path) = console_path {
         match tokio::net::UnixStream::connect(path).await {
@@ -1161,8 +1243,14 @@ impl From<&Container> for ContainerStatus {
                 seconds: c.created_at.timestamp(),
                 nanos: c.created_at.timestamp_subsec_nanos() as i32,
             },
-            started_at: Timestamp { seconds: 0, nanos: 0 },
-            finished_at: Timestamp { seconds: 0, nanos: 0 },
+            started_at: Timestamp {
+                seconds: 0,
+                nanos: 0,
+            },
+            finished_at: Timestamp {
+                seconds: 0,
+                nanos: 0,
+            },
             exit_code: c.exit_code.unwrap_or(0),
             image: c.image.clone(),
             image_ref: String::new(),
@@ -1215,33 +1303,32 @@ impl From<&Container> for ContainerStats {
 // Generated scope handler traits (typed inner dispatch)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use crate::generated::worker_client::{
-    WorkerHandler, dispatch_worker,
-    RuntimeHandler, SandboxHandler, ContainerHandler, ImageHandler,
-};
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Typed Scope Handler Implementations
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use super::client::{
-    PodSandboxStatusResponse, ContainerStatusResponse,
-    ImageInfo, ImageStatusResult,
-    FilesystemUsage,
-};
-use crate::generated::worker_client::{
-    CreateContainerRequest,
-    ExecSyncRequest, PullImageRequest,
+use hyprstream_rpc_std::worker_client::{
+    CreateContainerRequest, ExecSyncRequest, PullImageRequest,
 };
 
 #[async_trait::async_trait(?Send)]
 impl RuntimeHandler for WorkerService {
-    async fn handle_version(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> AnyhowResult<VersionInfo> {
+    async fn handle_version(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> AnyhowResult<VersionInfo> {
         let resp = self.version(value).await?;
         Ok(resp)
     }
 
-    async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64, request: &StatusRequest) -> AnyhowResult<RuntimeStatus> {
+    async fn handle_status(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        request: &StatusRequest,
+    ) -> AnyhowResult<RuntimeStatus> {
         let resp = self.status(request.verbose).await?;
         Ok(resp.status)
     }
@@ -1249,7 +1336,12 @@ impl RuntimeHandler for WorkerService {
 
 #[async_trait::async_trait(?Send)]
 impl SandboxHandler for WorkerService {
-    async fn handle_run(&self, ctx: &EnvelopeContext, _request_id: u64, data: &PodSandboxConfig) -> AnyhowResult<String> {
+    async fn handle_run(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &PodSandboxConfig,
+    ) -> AnyhowResult<String> {
         // #525 P2: thread the verified caller identity through to admission
         // control. `ctx.subject()` is derived from the verified envelope
         // (signer key / JWT), never caller-asserted data.
@@ -1257,32 +1349,64 @@ impl SandboxHandler for WorkerService {
         Ok(sandbox_id)
     }
 
-    async fn handle_stop(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> AnyhowResult<()> {
+    async fn handle_stop(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> AnyhowResult<()> {
         self.stop_pod_sandbox(value).await?;
         Ok(())
     }
 
-    async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> AnyhowResult<()> {
+    async fn handle_remove(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> AnyhowResult<()> {
         self.remove_pod_sandbox(value).await?;
         Ok(())
     }
 
-    async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64, request: &PodSandboxStatusRequest) -> AnyhowResult<PodSandboxStatusResponse> {
-        let (status, info) = self.pod_sandbox_status(&request.pod_sandbox_id, request.verbose).await?;
+    async fn handle_status(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        request: &PodSandboxStatusRequest,
+    ) -> AnyhowResult<PodSandboxStatusResponse> {
+        let (status, info) = self
+            .pod_sandbox_status(&request.pod_sandbox_id, request.verbose)
+            .await?;
         Ok(PodSandboxStatusResponse { status, info })
     }
 
-    async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PodSandboxFilter) -> AnyhowResult<Vec<PodSandboxInfo>> {
+    async fn handle_list(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &PodSandboxFilter,
+    ) -> AnyhowResult<Vec<PodSandboxInfo>> {
         let sandboxes = self.list_pod_sandbox(data).await?;
         Ok(sandboxes)
     }
 
-    async fn handle_stats(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> AnyhowResult<PodSandboxStats> {
+    async fn handle_stats(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> AnyhowResult<PodSandboxStats> {
         let stats = self.pod_sandbox_stats(value).await?;
         Ok(stats)
     }
 
-    async fn handle_list_stats(&self, _ctx: &EnvelopeContext, _request_id: u64, filter: &PodSandboxStatsFilter) -> AnyhowResult<Vec<PodSandboxStats>> {
+    async fn handle_list_stats(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        filter: &PodSandboxStatsFilter,
+    ) -> AnyhowResult<Vec<PodSandboxStats>> {
         let stats = self.list_pod_sandbox_stats(filter).await?;
         Ok(stats)
     }
@@ -1290,62 +1414,123 @@ impl SandboxHandler for WorkerService {
 
 #[async_trait::async_trait(?Send)]
 impl ContainerHandler for WorkerService {
-    async fn handle_create(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &CreateContainerRequest) -> AnyhowResult<String> {
-        let container_id = self.create_container(&data.pod_sandbox_id, &data.config, &data.sandbox_config).await?;
+    async fn handle_create(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &CreateContainerRequest,
+    ) -> AnyhowResult<String> {
+        let container_id = self
+            .create_container(&data.pod_sandbox_id, &data.config, &data.sandbox_config)
+            .await?;
         Ok(container_id)
     }
 
-    async fn handle_start(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> AnyhowResult<()> {
+    async fn handle_start(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> AnyhowResult<()> {
         self.start_container(value).await?;
         Ok(())
     }
 
-    async fn handle_stop(&self, _ctx: &EnvelopeContext, _request_id: u64, request: &StopContainerRequest) -> AnyhowResult<()> {
-        self.stop_container(&request.container_id, request.timeout).await?;
+    async fn handle_stop(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        request: &StopContainerRequest,
+    ) -> AnyhowResult<()> {
+        self.stop_container(&request.container_id, request.timeout)
+            .await?;
         Ok(())
     }
 
-    async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> AnyhowResult<()> {
+    async fn handle_remove(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> AnyhowResult<()> {
         self.remove_container(value).await?;
         Ok(())
     }
 
-    async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64, request: &ContainerStatusRequest) -> AnyhowResult<ContainerStatusResponse> {
-        let (status, info) = self.container_status(&request.container_id, request.verbose).await?;
+    async fn handle_status(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        request: &ContainerStatusRequest,
+    ) -> AnyhowResult<ContainerStatusResponse> {
+        let (status, info) = self
+            .container_status(&request.container_id, request.verbose)
+            .await?;
         Ok(ContainerStatusResponse { status, info })
     }
 
-    async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ContainerFilter) -> AnyhowResult<Vec<ContainerInfo>> {
+    async fn handle_list(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ContainerFilter,
+    ) -> AnyhowResult<Vec<ContainerInfo>> {
         let containers = self.list_containers(data).await?;
         Ok(containers)
     }
 
-    async fn handle_stats(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> AnyhowResult<ContainerStats> {
+    async fn handle_stats(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> AnyhowResult<ContainerStats> {
         let stats = self.container_stats(value).await?;
         Ok(stats)
     }
 
-    async fn handle_list_stats(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ContainerStatsFilter) -> AnyhowResult<Vec<ContainerStats>> {
+    async fn handle_list_stats(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ContainerStatsFilter,
+    ) -> AnyhowResult<Vec<ContainerStats>> {
         let stats = self.list_container_stats(data).await?;
         Ok(stats)
     }
 
-    async fn handle_exec(&self, ctx: &EnvelopeContext, _request_id: u64, data: &ExecSyncRequest) -> AnyhowResult<ExecSyncResult> {
-        let resp = self.exec_sync(&ctx.subject(), &data.container_id, &data.cmd, data.timeout).await?;
+    async fn handle_exec(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ExecSyncRequest,
+    ) -> AnyhowResult<ExecSyncResult> {
+        let resp = self
+            .exec_sync(&ctx.subject(), &data.container_id, &data.cmd, data.timeout)
+            .await?;
         Ok(resp)
     }
 
-    async fn handle_attach(&self, ctx: &EnvelopeContext, _request_id: u64, request: &AttachRequest) -> AnyhowResult<(StreamInfo, hyprstream_rpc::service::Continuation)> {
+    async fn handle_attach(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        request: &AttachRequest,
+    ) -> AnyhowResult<(StreamInfo, hyprstream_rpc::service::Continuation)> {
         let _ = &request.fds; // fds used for future fd selection
         let (stream_info, continuation) = self.prepare_attach(ctx, &request.container_id).await?;
         Ok((stream_info, continuation))
     }
 
-    async fn handle_detach(&self, _ctx: &EnvelopeContext, _request_id: u64, value: &str) -> AnyhowResult<()> {
+    async fn handle_detach(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        value: &str,
+    ) -> AnyhowResult<()> {
         self.detach(value).await?;
         Ok(())
     }
-
 }
 
 // CRI image operations dispatch through the `ImageStore` trait object — ONE
@@ -1362,21 +1547,38 @@ fn image_store_missing() -> anyhow::Error {
 
 #[async_trait::async_trait(?Send)]
 impl ImageHandler for WorkerService {
-    async fn handle_list(&self, _ctx: &EnvelopeContext, _request_id: u64, filter: &ImageFilter) -> AnyhowResult<Vec<ImageInfo>> {
+    async fn handle_list(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        filter: &ImageFilter,
+    ) -> AnyhowResult<Vec<ImageInfo>> {
         let _ = filter; // filter not yet used
         let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
         Ok(store.list_images().await?)
     }
 
-    async fn handle_status(&self, _ctx: &EnvelopeContext, _request_id: u64, request: &ImageStatusRequest) -> AnyhowResult<ImageStatusResult> {
+    async fn handle_status(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        request: &ImageStatusRequest,
+    ) -> AnyhowResult<ImageStatusResult> {
         let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
-        Ok(store.image_status(&request.image.image, request.verbose).await?)
+        Ok(store
+            .image_status(&request.image.image, request.verbose)
+            .await?)
     }
 
-    async fn handle_pull(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &PullImageRequest) -> AnyhowResult<String> {
+    async fn handle_pull(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &PullImageRequest,
+    ) -> AnyhowResult<String> {
         let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
         let auth = if !data.auth.username.is_empty() {
-            Some(crate::image::AuthConfig {
+            Some(AuthConfig {
                 username: data.auth.username.clone(),
                 password: data.auth.password.clone(),
                 auth: String::new(),
@@ -1387,16 +1589,27 @@ impl ImageHandler for WorkerService {
         } else {
             None
         };
-        Ok(store.pull_with_auth(&data.image.image, auth.as_ref()).await?)
+        Ok(store
+            .pull_with_auth(&data.image.image, auth.as_ref())
+            .await?)
     }
 
-    async fn handle_remove(&self, _ctx: &EnvelopeContext, _request_id: u64, data: &ImageSpec) -> AnyhowResult<()> {
+    async fn handle_remove(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+        data: &ImageSpec,
+    ) -> AnyhowResult<()> {
         let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
         store.remove_image(&data.image).await?;
         Ok(())
     }
 
-    async fn handle_fs_info(&self, _ctx: &EnvelopeContext, _request_id: u64) -> AnyhowResult<Vec<FilesystemUsage>> {
+    async fn handle_fs_info(
+        &self,
+        _ctx: &EnvelopeContext,
+        _request_id: u64,
+    ) -> AnyhowResult<Vec<FilesystemUsage>> {
         let store = self.image_store.as_ref().ok_or_else(image_store_missing)?;
         Ok(store.fs_info().await?)
     }
@@ -1405,26 +1618,32 @@ impl ImageHandler for WorkerService {
 /// Super-trait with authorization — all scope traits are implemented above.
 #[async_trait::async_trait(?Send)]
 impl WorkerHandler for WorkerService {
-    async fn authorize(&self, ctx: &EnvelopeContext, resource: &str, operation: &str) -> AnyhowResult<()> {
+    async fn authorize(
+        &self,
+        ctx: &EnvelopeContext,
+        resource: &str,
+        operation: &str,
+    ) -> AnyhowResult<()> {
         if let Some(ref auth_fn) = self.authorize_fn {
             let subject = ctx.subject().to_string();
-            let domain = ctx.domain()?;
-            let allowed = auth_fn(
-                subject.clone(),
-                domain,
-                resource.to_owned(),
-                operation.to_owned(),
-                ctx.jwt_token().map(str::to_owned),
-            )
-            .await
-            .unwrap_or_else(|e| {
-                warn!("Policy check failed for {} on {}: {} - denying access", subject, resource, e);
-                false
-            });
+            let allowed = auth_fn(ctx.clone(), resource.to_owned(), operation.to_owned())
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        "Policy check failed for {} on {}: {} - denying access",
+                        subject, resource, e
+                    );
+                    false
+                });
             if allowed {
                 Ok(())
             } else {
-                anyhow::bail!("Unauthorized: {} cannot {} on {}", subject, operation, resource)
+                anyhow::bail!(
+                    "Unauthorized: {} cannot {} on {}",
+                    subject,
+                    operation,
+                    resource
+                )
             }
         } else {
             // No authorization configured — fail-closed
@@ -1439,7 +1658,19 @@ impl WorkerHandler for WorkerService {
 
 #[async_trait(?Send)]
 impl RequestService for WorkerService {
-    fn producer_reach_config_handle(&self) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
+    fn decode_request_body(
+        &self,
+        signed_body: &[u8],
+    ) -> anyhow::Result<hyprstream_rpc::service::DecodedRequestBody> {
+        // The ONE bounded decode (v16 §5.2): the generated decoder derives
+        // the full method leaf and returns the decoded message that policy,
+        // MAC, and dispatch below all consume.
+        crate::generated::worker_client::decode_worker_request_body(signed_body)
+    }
+
+    fn producer_reach_config_handle(
+        &self,
+    ) -> Option<hyprstream_rpc::moq_stream::ProducerReachConfigHandle> {
         Some(self.stream_channel.reach_config_handle())
     }
 
@@ -1447,13 +1678,17 @@ impl RequestService for WorkerService {
         Some(self.stream_channel.moq_origin_handle())
     }
 
-    async fn handle_request(&self, ctx: &EnvelopeContext, payload: &[u8]) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
+    async fn handle_request(
+        &self,
+        ctx: &EnvelopeContext,
+        body: &hyprstream_rpc::service::DecodedRequestBody,
+    ) -> AnyhowResult<(Vec<u8>, Option<hyprstream_rpc::service::Continuation>)> {
         debug!(
             "Worker request from {} (request_id={})",
             ctx.subject(),
             ctx.request_id
         );
-        dispatch_worker(self, ctx, payload).await
+        dispatch_worker(self, ctx, body).await
     }
 
     fn name(&self) -> &str {
@@ -1485,10 +1720,10 @@ mod tests {
     use super::*;
     use crate::config::ImageConfig;
     use crate::image::RafsStore;
-    use crate::runtime::{PodSandboxConfig, PodSandboxState, ContainerConfig};
     use hyprstream_rpc::auth::mac::{ObjectRef, SecurityContext};
     use hyprstream_rpc::crypto::generate_signing_keypair;
     use hyprstream_rpc::transport::TransportConfig;
+    use hyprstream_rpc_std::worker_client::{ContainerConfig, PodSandboxConfig, PodSandboxState};
     use tempfile::TempDir;
 
     struct FixtureAccessDecider;
@@ -1515,7 +1750,8 @@ mod tests {
     }
 
     /// Create a test WorkerService with temporary directories
-    async fn create_test_service() -> std::result::Result<(WorkerService, TempDir), Box<dyn std::error::Error>> {
+    async fn create_test_service(
+    ) -> std::result::Result<(WorkerService, TempDir), Box<dyn std::error::Error>> {
         // The moq event-bus migration (#133/#167) made WorkerService publish
         // lifecycle events on the process-global moq event origin; without it,
         // EventPublisher::new fails with "moq event bus not initialized".
@@ -1554,15 +1790,20 @@ mod tests {
         let transport = TransportConfig::inproc("test-worker-service");
         let (signing_key, _verifying_key) = generate_signing_keypair();
 
-        let backend: Arc<dyn crate::runtime::backend::SandboxBackend> = Arc::new(
-            crate::runtime::kata_backend::KataBackend::new(
+        let backend: Arc<dyn crate::runtime::backend::SandboxBackend> =
+            Arc::new(crate::runtime::kata_backend::KataBackend::new(
                 image_config,
                 Arc::clone(&rafs_store),
                 Arc::new(FixtureAccessDecider),
                 None,
-            ),
-        );
-        let service = WorkerService::new(pool_config, backend, Some(rafs_store), transport, signing_key)?;
+            ));
+        let service = WorkerService::new(
+            pool_config,
+            backend,
+            Some(rafs_store),
+            transport,
+            signing_key,
+        )?;
         Ok((service, temp_dir))
     }
 
@@ -1596,7 +1837,9 @@ mod tests {
         assert_eq!(status.state, PodSandboxState::SandboxReady);
 
         // List sandboxes
-        let sandboxes = service.list_pod_sandbox(&PodSandboxFilter::default()).await?;
+        let sandboxes = service
+            .list_pod_sandbox(&PodSandboxFilter::default())
+            .await?;
         assert_eq!(sandboxes.len(), 1);
 
         // Stop and remove
@@ -1604,7 +1847,9 @@ mod tests {
         service.remove_pod_sandbox(&sandbox_id).await?;
 
         // Should be empty
-        let sandboxes = service.list_pod_sandbox(&PodSandboxFilter::default()).await?;
+        let sandboxes = service
+            .list_pod_sandbox(&PodSandboxFilter::default())
+            .await?;
         assert_eq!(sandboxes.len(), 0);
         Ok(())
     }
