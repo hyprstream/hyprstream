@@ -84,8 +84,12 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains("certificate") || error.to_string().contains("TLS"),
-            "expected TLS validation error, got: {error:#}"
+            error.chain().any(|cause| {
+                let message = cause.to_string();
+                message.contains("certificate verify failed")
+                    && message.contains("self-signed certificate in certificate chain")
+            }),
+            "expected untrusted certificate-chain error, got: {error:#}"
         );
 
         let declared_ca = reqwest::Certificate::from_pem(&tls.root_pem)?;
