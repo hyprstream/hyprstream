@@ -2327,7 +2327,20 @@ impl ModelService {
         work: hyprstream_rpc::auth::internal_work::InternalWorkScope,
     ) -> Result<InferenceClient> {
         let instance = Self::inference_instance(ctx, model_ref_str)?;
-        let _endpoint = self.load_model(&instance, None, None).await?;
+        // The ingress deadline bounds only this caller's waiter; the shared
+        // service-owned load continues for other waiters.
+        let load = self.load_model(&instance, None, None);
+        let _endpoint = match deadline {
+            Some(deadline) => tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                load,
+            )
+            .await
+            .map_err(|_| Self::typed_decision_error(anyhow!(
+                "clef-decision-cancelled: decision deadline elapsed while waiting for model load"
+            )))??,
+            None => load.await?,
+        };
         let mut cache = self.loaded_models.write().await;
         let model = cache
             .get_mut(&instance)
@@ -7294,7 +7307,7 @@ mod tests {
             &caller_key,
             "restart-acceptance-tenant",
         );
-        let pinned_ref = "clef-flash-fp8:main";
+        let pinned_ref = "clef-flash-fp8:7b43c2d799e7b5e9fef96b6137840088d75af0d6";
         let pinned_instance = InferenceInstanceId::new("restart-acceptance-tenant", pinned_ref, 0)?;
         let mut request = wire_decide_request(&format!(
             r#"{{"model":"{}","state":null,"questions":{{"q":{{"type":"noul"}}}}}}"#,
