@@ -426,7 +426,52 @@ impl StagingModelPin {
     }
 
     fn admits(&self, model_ref: &str) -> bool {
-        self.model_ref == model_ref
+        if self.model_ref == model_ref {
+            return true;
+        }
+        // The ingress decision gate requires the immutable OID selector form;
+        // it names the same commit this pin admits through its mutable ref.
+        let Ok(parsed) = ModelRef::parse(model_ref) else {
+            return false;
+        };
+        let Ok(configured) = ModelRef::parse(&self.model_ref) else {
+            return false;
+        };
+        if parsed.name() != configured.name() {
+            return false;
+        }
+        let crate::storage::GitRef::Commit(oid) = parsed.git_ref else {
+            return false;
+        };
+        oid == self.commit
+    }
+
+    /// The local branch whose worktree must hold `self.commit` for `model_ref`
+    /// to be admitted: the configured branch ref itself, or an immutable
+    /// commit selector naming exactly the pinned commit. Mutable refs other
+    /// than the configured one, tags, revspecs, and bare names stay rejected.
+    fn staging_worktree_branch(&self, model_ref: &ModelRef) -> Result<String> {
+        let configured = ModelRef::parse(&self.model_ref)?;
+        let crate::storage::GitRef::Branch(branch) = configured.git_ref else {
+            anyhow::bail!("staging pin modelRef must be a canonical local branch ref");
+        };
+        match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(requested) => {
+                anyhow::ensure!(
+                    requested == &branch,
+                    "staging modelRef must select its configured local branch"
+                );
+                Ok(branch)
+            }
+            crate::storage::GitRef::Commit(oid) => {
+                anyhow::ensure!(
+                    oid == &self.commit,
+                    "staging commit selector does not match the configured pin"
+                );
+                Ok(branch)
+            }
+            _ => anyhow::bail!("staging modelRef must select its configured local branch"),
+        }
     }
 }
 
@@ -1092,10 +1137,7 @@ impl ModelService {
             })?;
         let repo_client = self.registry.repo(&tracked.id);
         let worktrees = repo_client.list_worktrees().await?;
-        let branch = match &model_ref.git_ref {
-            crate::storage::GitRef::Branch(branch) => branch,
-            _ => anyhow::bail!("staging modelRef must select its configured local branch"),
-        };
+        let branch = pin.staging_worktree_branch(&model_ref)?;
         anyhow::ensure!(
             worktrees.iter().any(|worktree| {
                 worktree.unavailable_reason.is_empty()
@@ -1106,7 +1148,7 @@ impl ModelService {
             model_ref.name(),
             branch
         );
-        let path = crate::storage::StoragePaths::new()?.worktree_path(model_ref.name(), branch)?;
+        let path = crate::storage::StoragePaths::new()?.worktree_path(model_ref.name(), &branch)?;
         crate::storage::pinned_model::verify_selected_checkout(&path, pin.commit)
             .with_context(|| format!("admit staging worktree for {}", pin.model_ref))
     }
@@ -1633,7 +1675,7 @@ impl ModelService {
 
         let pinned_artifact = if let Some(pin) = &self.config.staging_model_pin {
             anyhow::ensure!(
-                model_ref_str == pin.model_ref,
+                pin.admits(model_ref_str),
                 "staging modelRef changed after admission"
             );
             let policy = pin.capture_policy()?;
@@ -3971,6 +4013,50 @@ mod tests {
         let mut clef = super::StagingModelPin::reviewed_clef_flash(Default::default())?;
         clef.model_ref = a0.model_ref;
         assert!(clef.capture_policy().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn staging_pin_admits_only_exact_commit_selector_of_same_model() -> Result<()> {
+        let commit = git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        let pin = StagingModelPin::new("fixture-model:main", commit)?;
+        // The configured mutable branch ref stays admitted (direct worker path).
+        assert!(pin.admits("fixture-model:main"));
+        // The immutable full-OID selector of the pinned commit is admitted.
+        assert!(pin.admits("fixture-model:7b43c2d799e7b5e9fef96b6137840088d75af0d6"));
+        // Mutable refs other than the configured one stay rejected.
+        assert!(!pin.admits("fixture-model:dev"));
+        assert!(!pin.admits("fixture-model:HEAD"));
+        // A foreign model name is rejected even with the pinned OID.
+        assert!(!pin.admits("other-model:7b43c2d799e7b5e9fef96b6137840088d75af0d6"));
+        // A different commit OID is rejected for the same model.
+        assert!(!pin.admits("fixture-model:18c562db6830c2ef6636b8eaf42fb479272052f7"));
+        // Short SHAs remain revspecs, not immutable selectors.
+        assert!(!pin.admits("fixture-model:7b43c2d"));
+        // A bare name (default branch) is not an immutable selector.
+        assert!(!pin.admits("fixture-model"));
+        Ok(())
+    }
+
+    #[test]
+    fn staging_pin_resolves_commit_selector_to_pinned_worktree_branch() -> Result<()> {
+        let commit = git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        let pin = StagingModelPin::new("fixture-model:main", commit)?;
+        // The immutable OID selector of the pinned commit resolves to the
+        // configured branch's worktree, where capture verifies pin.commit.
+        let parsed = ModelRef::parse("fixture-model:7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        assert_eq!(pin.staging_worktree_branch(&parsed)?, "main");
+        // The configured branch ref itself resolves to the same worktree.
+        let parsed = ModelRef::parse("fixture-model:main")?;
+        assert_eq!(pin.staging_worktree_branch(&parsed)?, "main");
+        // A commit selector naming a different commit is rejected.
+        let parsed = ModelRef::parse("fixture-model:18c562db6830c2ef6636b8eaf42fb479272052f7")?;
+        assert!(pin.staging_worktree_branch(&parsed).is_err());
+        // Mutable refs other than the configured one and bare names stay rejected.
+        let parsed = ModelRef::parse("fixture-model:dev")?;
+        assert!(pin.staging_worktree_branch(&parsed).is_err());
+        let parsed = ModelRef::parse("fixture-model")?;
+        assert!(pin.staging_worktree_branch(&parsed).is_err());
         Ok(())
     }
 
