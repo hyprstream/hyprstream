@@ -1820,7 +1820,9 @@ mod tests {
 
         let stop = tokio::spawn(async move { spawned.stop().await });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while hyprstream_rpc::dial::lookup_inproc(endpoint).is_some() {
+            while hyprstream_rpc::dial::lookup_inproc(endpoint).is_some()
+                || !lifecycle_observed.load(std::sync::atomic::Ordering::Acquire)
+            {
                 tokio::task::yield_now().await;
             }
         })
