@@ -18,6 +18,7 @@ CLASS_LICENSES = {
     "mit_packages": "MIT",
     "agpl_packages": "AGPL-3.0-only",
     "apache_packages": "Apache-2.0",
+    "mit_or_apache_packages": "MIT OR Apache-2.0",
 }
 
 
@@ -364,7 +365,7 @@ def resolved_paths_for_permissive_packages(
 def classifications(config: dict, package_names: set[str]) -> dict[str, set[str]]:
     classes: dict[str, set[str]] = {}
     for class_name in CLASS_LICENSES:
-        values = config.get(class_name)
+        values = config.get(class_name, [] if class_name == "mit_or_apache_packages" else None)
         if not isinstance(values, list):
             fail(f"missing classification {class_name!r}")
         if not all(isinstance(value, str) for value in values):
@@ -423,7 +424,11 @@ def main(root: Path = ROOT) -> None:
                     f"{actual_license!r}"
                 )
 
-    permissive = classes["mit_packages"] | classes["apache_packages"]
+    permissive = (
+        classes["mit_packages"]
+        | classes["apache_packages"]
+        | classes["mit_or_apache_packages"]
+    )
     agpl = classes["agpl_packages"]
     permissive_roots = named_package_set(
         config, "permissive_roots", set(manifests)

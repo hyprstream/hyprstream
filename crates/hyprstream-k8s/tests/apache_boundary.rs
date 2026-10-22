@@ -128,9 +128,45 @@ fn policy_permissive_roots(workspace_root: &Path) -> Result<BTreeSet<String>, St
     policy_packages(workspace_root, "permissive_roots")
 }
 
+fn policy_packages_optional(workspace_root: &Path, key: &str) -> Result<BTreeSet<String>, String> {
+    let path = workspace_root.join(".github/license-boundary.toml");
+    if !path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let policy = load_toml(&path)?;
+    let Some(values) = policy
+        .as_table()
+        .and_then(|table| table.get("license_gate"))
+        .and_then(|gate| gate.as_table())
+        .and_then(|gate| gate.get(key))
+    else {
+        return Ok(BTreeSet::new());
+    };
+    values
+        .as_array()
+        .ok_or_else(|| {
+            format!(
+                "{} must define license_gate.{key} as an array",
+                path.display()
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{} has a non-string package in {key}", path.display()))
+        })
+        .collect()
+}
+
 fn policy_permissive_packages(workspace_root: &Path) -> Result<BTreeSet<String>, String> {
     let mut permissive = policy_packages(workspace_root, "mit_packages")?;
     permissive.extend(policy_packages(workspace_root, "apache_packages")?);
+    permissive.extend(policy_packages_optional(
+        workspace_root,
+        "mit_or_apache_packages",
+    )?);
     Ok(permissive)
 }
 
@@ -696,7 +732,7 @@ fn production_every_permissive_package_is_a_strict_root() {
             .as_deref()
             .expect("package license metadata");
         assert!(
-            matches!(license, "MIT" | "Apache-2.0"),
+            matches!(license, "MIT" | "Apache-2.0" | "MIT OR Apache-2.0"),
             "permissive package {package_name} has unauthorized license {license}"
         );
 
