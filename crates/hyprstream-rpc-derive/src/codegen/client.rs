@@ -1040,6 +1040,14 @@ pub fn generate_client(
                 self
             }
 
+            /// Set this client's per-call request deadline (milliseconds)
+            /// without touching any auth options already on the client.
+            #[must_use]
+            pub fn with_timeout_ms(mut self, timeout_ms: i32) -> Self {
+                self.call_options.timeout_ms = Some(timeout_ms);
+                self
+            }
+
             /// Set this client's DIRECT bearer for every call.
             ///
             /// Unlike [`Self::with_delegated_bearer`], the token travels as the

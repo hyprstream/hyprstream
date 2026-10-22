@@ -2367,6 +2367,7 @@ impl ModelService {
         model_ref_str: &str,
         ctx: &EnvelopeContext,
         work: hyprstream_rpc::auth::internal_work::InternalWorkScope,
+        deadline: Option<Instant>,
     ) -> Result<InferenceClient> {
         let instance = Self::inference_instance(ctx, model_ref_str)?;
         // The ingress deadline bounds only this caller's waiter; the shared
@@ -2489,6 +2490,7 @@ impl ModelService {
                     format!("inference:{path}"),
                     "write",
                 ),
+            None,
             )
             .await?;
         client.load_lora(path).await
@@ -2501,6 +2503,7 @@ impl ModelService {
                 model_ref_str,
                 ctx,
                 Self::inference_scope("unloadLora", "write"),
+            None,
             )
             .await?;
         client.unload_lora().await
@@ -2513,6 +2516,7 @@ impl ModelService {
                 model_ref_str,
                 ctx,
                 Self::inference_scope("hasLora", "query"),
+            None,
             )
             .await?;
         client.has_lora().await
@@ -2525,6 +2529,7 @@ impl ModelService {
                 model_ref_str,
                 ctx,
                 Self::inference_scope("tttWriteback", "train"),
+            None,
             )
             .await?;
         client.ttt_writeback().await
@@ -2536,6 +2541,7 @@ impl ModelService {
                 model_ref_str,
                 ctx,
                 Self::inference_scope("tttEvict", "train"),
+            None,
             )
             .await?;
         client.ttt_evict().await
@@ -2547,6 +2553,7 @@ impl ModelService {
                 model_ref_str,
                 ctx,
                 Self::inference_scope("tttZero", "manage"),
+            None,
             )
             .await?;
         client.ttt_zero().await
@@ -2562,6 +2569,7 @@ impl ModelService {
                 model_ref_str,
                 ctx,
                 Self::inference_scope("getDeltaStatus", "query"),
+            None,
             )
             .await?;
         client.get_delta_status().await
@@ -2577,6 +2585,7 @@ impl ModelService {
                 model_ref_str,
                 ctx,
                 Self::inference_scope("snapshotDelta", "write"),
+            None,
             )
             .await?;
         client.snapshot_delta().await
@@ -2593,6 +2602,7 @@ impl ModelService {
                 model_ref_str,
                 ctx,
                 Self::inference_scope("exportPeftAdapter", "write"),
+            None,
             )
             .await?;
         client.export_peft_adapter(data).await
@@ -2652,7 +2662,7 @@ impl TttHandler for ModelService {
         data: &LoraConfig,
     ) -> Result<()> {
         let client = self
-            .get_inference_client(model_ref, ctx, Self::inference_scope("createLora", "write"))
+            .get_inference_client(model_ref, ctx, Self::inference_scope("createLora", "write"), None)
             .await?;
         client.create_lora(data).await
     }
@@ -2665,7 +2675,7 @@ impl TttHandler for ModelService {
         data: &TrainStepRequest,
     ) -> Result<TrainStepResult> {
         let client = self
-            .get_inference_client(model_ref, ctx, Self::inference_scope("trainStep", "train"))
+            .get_inference_client(model_ref, ctx, Self::inference_scope("trainStep", "train"), None)
             .await?;
         client.train_step(data).await
     }
@@ -2685,6 +2695,7 @@ impl TttHandler for ModelService {
                 model_ref,
                 ctx,
                 Self::inference_scope("trainStepStream", "train"),
+            None,
             )
             .await?;
         let ephemeral_pubkey = ctx.ephemeral_pubkey().ok_or_else(|| {
@@ -2742,6 +2753,7 @@ impl TttHandler for ModelService {
                 model_ref,
                 ctx,
                 Self::inference_scope("saveAdaptation", "write"),
+            None,
             )
             .await?;
         client.save_adaptation(data).await
@@ -3006,7 +3018,7 @@ impl AdapterHandler for ModelService {
         data: &MergeLoraRequest,
     ) -> Result<()> {
         let client = self
-            .get_inference_client(model_ref, ctx, Self::inference_scope("mergeLora", "write"))
+            .get_inference_client(model_ref, ctx, Self::inference_scope("mergeLora", "write"), None)
             .await?;
         client.merge_lora(data).await
     }
@@ -3029,6 +3041,7 @@ impl InferHandler for ModelService {
                 model_ref,
                 ctx,
                 Self::inference_scope("generateStream", "infer"),
+            None,
             )
             .await?;
         let ephemeral_pubkey = ctx.ephemeral_pubkey().ok_or_else(|| {
@@ -3050,6 +3063,7 @@ impl InferHandler for ModelService {
                 model_ref,
                 ctx,
                 Self::inference_scope("applyChatTemplate", "query"),
+            None,
             )
             .await?;
         client.apply_chat_template(data).await
@@ -3063,7 +3077,7 @@ impl InferHandler for ModelService {
         data: &EmbedImagesRequest,
     ) -> Result<EmbedImagesResponse> {
         let client = self
-            .get_inference_client(model_ref, ctx, Self::inference_scope("embed", "infer"))
+            .get_inference_client(model_ref, ctx, Self::inference_scope("embed", "infer"), None)
             .await?;
         client.embed(data).await
     }
@@ -3108,7 +3122,7 @@ impl InferHandler for ModelService {
         crate::services::decision::remaining_timeout_ms(deadline, Instant::now())
             .map_err(Self::typed_decision_error)?;
         let client = self
-            .get_inference_client(model_ref, ctx, Self::inference_scope("decide", "decide"))
+            .get_inference_client(model_ref, ctx, Self::inference_scope("decide", "decide"), Some(deadline))
             .await?;
         // Model load and routing happen between ingress and this worker call.
         // Forward only the remaining relative budget, then bound the whole RPC
@@ -3122,9 +3136,10 @@ impl InferHandler for ModelService {
         };
         // Honor the forwarded budget at the transport layer too: the engine
         // RPC must not be cut by the client's default ceiling while the
-        // ingress deadline still has budget left.
-        let client = client
-            .with_call_options(hyprstream_rpc::CallOptions::new().timeout_ms(i32::try_from(timeout_ms).unwrap_or(i32::MAX)));
+        // ingress deadline still has budget left. Only the deadline is set —
+        // the client's work-order bearer must survive (dispatch denies a
+        // request whose worker order was stripped).
+        let client = client.with_timeout_ms(i32::try_from(timeout_ms).unwrap_or(i32::MAX));
         let decision = async {
             tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
@@ -3151,7 +3166,6 @@ impl InferHandler for ModelService {
         } else {
             decision.await
         }
-    }
     }
 
     async fn handle_status(
@@ -6573,7 +6587,7 @@ mod tests {
         let ctx = boundary_caller_ctx(chrono::Utc::now().timestamp() + 3600);
         let scope = InternalWorkScope::new("inference:GenerateStream", "infer");
         let error = match service
-            .get_inference_client(instance.model_ref(), &ctx, scope)
+            .get_inference_client(instance.model_ref(), &ctx, scope, None)
             .await
         {
             Ok(_) => panic!("a dead worker cache entry must not mint work orders"),
@@ -7524,7 +7538,7 @@ mod tests {
         };
         let a_client = fixture
             .model
-            .get_inference_client(&fixture.model_ref, &caller_a, scope.clone())
+            .get_inference_client(&fixture.model_ref, &caller_a, scope.clone(), None)
             .await?;
         let mut old_order = fixture
             .model
@@ -7606,7 +7620,7 @@ mod tests {
         // Fresh A work succeeds at B and carries the same original holder.
         let b_client_for_a = fixture
             .model
-            .get_inference_client(&fixture.model_ref, &caller_a, scope.clone())
+            .get_inference_client(&fixture.model_ref, &caller_a, scope.clone(), None)
             .await?;
         let fresh_a_order = fixture
             .model
@@ -7628,7 +7642,7 @@ mod tests {
         // subject, caller snapshot, or pairwise owner DID.
         let b_client_for_b = fixture
             .model
-            .get_inference_client(&fixture.model_ref, &caller_b, scope)
+            .get_inference_client(&fixture.model_ref, &caller_b, scope, None)
             .await?;
         let fresh_b_order = fixture
             .model

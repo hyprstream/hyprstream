@@ -772,7 +772,6 @@ mod tests {
             rx,
             Arc::new(crate::envelope::InMemoryNonceCache::new()),
             CancellationToken::new(),
-            CancellationToken::new(),
         ));
         local.run_until(dispatch).await??;
 
