@@ -76,6 +76,10 @@ struct PendingDecision {
     /// The verified client class selector this challenge was prepared under.
     /// The commit must name the same class or the one-use handle is denied.
     client: String,
+    /// The session-establishment flow OAuth verified this source under
+    /// (W1b). The commit must repeat it, and device-flow consumption uses
+    /// the nonce-free replay identity only (D2).
+    device_flow: bool,
     source: Source,
     requested: Vec<String>,
     decision: Decision,
@@ -131,6 +135,9 @@ impl CredentialReplayAdmission for GlobalCredentialReplay {
 struct PossessionEvidence {
     /// The verified client class this redemption belongs to (W1.2).
     client: String,
+    /// The verified session-establishment flow (W1b); selects the
+    /// nonce-free replay identity for device sources (D2).
+    device_flow: bool,
     source: Source,
     ed_public: [u8; 32],
     pq_public: Vec<u8>,
@@ -808,6 +815,7 @@ impl AdmissionService {
         ctx: &EnvelopeContext,
         client_id: &str,
         source: Source,
+        device_flow: bool,
         requested: Vec<String>,
         challenge_id: [u8; 32],
         created_at: i64,
@@ -868,6 +876,7 @@ impl AdmissionService {
             handle,
             PendingDecision {
                 client: client_id.to_owned(),
+                device_flow,
                 source,
                 requested,
                 decision,
@@ -889,6 +898,7 @@ impl AdmissionService {
         handle: [u8; 32],
         client_id: &str,
         source: Source,
+        device_flow: bool,
         challenge_id: [u8; 32],
         created_at: i64,
         expires_at: i64,
@@ -910,6 +920,7 @@ impl AdmissionService {
         ensure!(
             now < pending.expires_at
                 && client_id == pending.client
+                && device_flow == pending.device_flow
                 && source == pending.source
                 && challenge_id == pending.challenge_id
                 && created_at == pending.created_at
@@ -933,6 +944,7 @@ impl AdmissionService {
                     &mut client,
                     PossessionEvidence {
                         client: client_id.to_owned(),
+                        device_flow: pending.device_flow,
                         source,
                         ed_public,
                         pq_public,
@@ -955,7 +967,7 @@ impl AdmissionService {
         ensure!(current == pending.decision, "challenge decision changed");
         let session_expires_at = pending.source.expires_at.min(now + 300);
         ensure!(session_expires_at > now, "source credential expired");
-        self.consume_source_credential(&source, &profile.client)?;
+        self.consume_source_credential(&source, &profile.client, pending.device_flow)?;
         Ok(Session {
             host: profile.host.clone(),
             sid: uuid::Uuid::new_v4().to_string(),
@@ -984,7 +996,12 @@ impl AdmissionService {
         Ok(authority)
     }
 
-    fn consume_source_credential(&self, source: &Source, client_id: &str) -> Result<()> {
+    fn consume_source_credential(
+        &self,
+        source: &Source,
+        client_id: &str,
+        device_flow: bool,
+    ) -> Result<()> {
         let expires_at = u64::try_from(source.expires_at)?;
         let now = u64::try_from(chrono::Utc::now().timestamp())?;
         ensure!(expires_at > now, "source credential expired");
@@ -992,18 +1009,37 @@ impl AdmissionService {
             .source_replay
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("source credential replay admission disabled"))?;
-        // D2 transition: consume under BOTH the legacy (nonce-bearing) and
-        // the current (nonce-free) identity. On this code-flow path the
-        // nonce is the verified signed claim, so the legacy key is equally
-        // token-stable, and a mixed-version fleet cannot consume one token
-        // twice in either direction. Legacy first: it serializes
-        // mixed-version consumers. The device-flow variant (W1b) does not
-        // pin the nonce and must drop the legacy write when it lands; the
-        // legacy read can be dropped once every pre-D2 token has expired
-        // (source tokens live at most 300s past issue).
-        let legacy = legacy_source_credential_replay_key(source, client_id);
+        // D2 replay identity: exactly one consumption of a signed source
+        // token, independent of client-supplied commitment inputs.
         let key = source_credential_replay_key(source, client_id);
-        for candidate in [&legacy, &key] {
+        // Code flow (D2 transition): consume under BOTH the legacy
+        // (nonce-bearing) and the current (nonce-free) identity. Its nonce
+        // is an issuer-signed claim, so the legacy key is token-stable and
+        // a mixed-version fleet cannot consume one token twice in either
+        // direction. Legacy first: it serializes mixed-version consumers.
+        // A failure between the two writes only ever leaves the token
+        // recorded under the legacy key of the SAME nonce, which any retry
+        // of the same token hits (Replayed).
+        //
+        // Device flow (W1b): consume under the CURRENT identity ONLY. The
+        // device commitment nonce is client-controlled (login_random,
+        // device_code, keys), never issuer-signed, so a legacy write would
+        // let a partially-failed consumption (legacy recorded, current
+        // write failed) be retried under a DIFFERENT device commitment —
+        // a fresh legacy key and an absent current key — and commit twice.
+        // Single-key consumption removes the window entirely: the write
+        // either lands (every retry is Replayed) or fails (nothing
+        // recorded; the retry re-attempts the same key). No pre-W1b
+        // instance can hold a device-flow record (the flow did not exist),
+        // so no legacy transition applies. The code-flow legacy read can
+        // be dropped once every pre-D2 token has expired (source tokens
+        // live at most 300s past issue).
+        let legacy = (!device_flow).then(|| legacy_source_credential_replay_key(source, client_id));
+        let candidates: Vec<&CredentialReplayKey> = match &legacy {
+            Some(legacy) => vec![legacy, &key],
+            None => vec![&key],
+        };
+        for candidate in candidates {
             match replay.admit_source_credential(candidate, expires_at) {
                 ProofAdmissionResult::Admitted => {}
                 ProofAdmissionResult::Replayed => {
@@ -1057,7 +1093,11 @@ impl AdmissionService {
                 .decision(&evidence.client, &evidence.source, &evidence.requested)
                 .await?;
             ensure!(current == evidence.challenge, "challenge decision changed");
-            self.consume_source_credential(&evidence.source, &profile.client)?;
+            self.consume_source_credential(
+                &evidence.source,
+                &profile.client,
+                evidence.device_flow,
+            )?;
             let session = PendingSession {
                 host: profile.host.clone(),
                 sid: evidence.sid,

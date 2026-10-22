@@ -1306,6 +1306,7 @@ impl PolicyHandler for PolicyService {
                         ctx,
                         &data.client,
                         federate_verified_source(&data.source)?,
+                        data.source.device_flow,
                         data.requested.clone(),
                         data.challenge_id.as_slice().try_into()?,
                         data.challenge_created_at,
@@ -1357,6 +1358,7 @@ impl PolicyHandler for PolicyService {
                         data.policy_handle.as_slice().try_into()?,
                         &data.client,
                         federate_verified_source(&data.source)?,
+                        data.source.device_flow,
                         data.challenge_id.as_slice().try_into()?,
                         data.challenge_created_at,
                         data.challenge_expires_at,
@@ -4837,6 +4839,7 @@ mod tests {
             token_hash: vec![1; 32],
             issued_at: 1,
             expires_at: 2,
+            device_flow: false,
         };
         let prepare = hyprstream_rpc_std::policy_client::PrepareFederateSession {
             source: source.clone(),

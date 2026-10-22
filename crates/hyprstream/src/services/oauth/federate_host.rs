@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 
 #[cfg(feature = "postgres")]
 use super::{
-    federate_exchange::{ChallengeRequest, ExchangeRequest},
+    federate_exchange::{AnyChallengeRequest, ExchangeRequest},
     federate_source::{AuthorityBinding, Challenge, Source, VerifiedPossession, Verifier},
 };
 use super::{federate_source, state::OAuthState};
@@ -76,8 +76,11 @@ pub(crate) trait FederateSigner: Send + Sync {
 }
 
 #[cfg(feature = "postgres")]
+/// The pending challenge leg of either flow (W1b): the code-flow envelope or
+/// the device envelope, pinned with its challenge and Policy handle until
+/// the exchange leg repeats the exact flow profile.
 struct Pending {
-    request: ChallengeRequest,
+    request: AnyChallengeRequest,
     challenge: Challenge,
     policy_handle: Vec<u8>,
 }
@@ -125,7 +128,7 @@ impl FederateIssuer {
         body: &[u8],
         now: u64,
     ) -> Result<ChallengeResponse, federate_source::Error> {
-        let request = ChallengeRequest::parse_for_host(
+        let request = AnyChallengeRequest::parse_for_host(
             body,
             self.verifier.host()?,
             self.verifier.tui_client(),
@@ -154,12 +157,17 @@ impl FederateIssuer {
         let response = ChallengeResponse {
             challenge_id: B64.encode(challenge.challenge_id()),
             // The class's own profile string: a TUI-class challenge must
-            // answer federate-tui-v1, not the www v1 pin.
-            profile: super::federate_exchange::resolve_wire_class(
-                request.client_id(),
-                self.verifier.tui_client(),
-            )?
-            .profile(),
+            // answer federate-tui-v1, not the www v1 pin. The W1b device
+            // variant answers its own device profile; the exchange leg must
+            // repeat exactly this string, pinning both legs to one flow.
+            profile: match &request {
+                AnyChallengeRequest::Code(_) => super::federate_exchange::resolve_wire_class(
+                    request.client_id(),
+                    self.verifier.tui_client(),
+                )?
+                .profile(),
+                AnyChallengeRequest::Device(_) => federate_source::TUI_DEVICE_PROFILE,
+            },
             expires_in: challenge.expires_at() - now,
             granted_scope: challenge.granted_scope().to_owned(),
             transcript_b64u: B64.encode(challenge.transcript()),
@@ -214,6 +222,14 @@ impl FederateIssuer {
             || pending.request.requested_scope() != request.requested_scope()
             || pending.request.subject_token() != request.subject_token()
         {
+            return Err(federate_source::Error::Invalid);
+        }
+        // The exchange must stay in the exact flow the challenge was
+        // prepared under (W1b): a device-profile challenge is redeemed only
+        // by a device-profile exchange and a code-flow challenge only by
+        // the class profile, so neither leg can reinterpret the other's
+        // commitment binding or claim set.
+        if pending.request.profile() != request.hs_profile() {
             return Err(federate_source::Error::Invalid);
         }
         let (expected, ed_key, pq_key) = pending.challenge.expected_session();
@@ -809,6 +825,271 @@ mod tests {
                 result.as_ref().err()
             );
             assert!(matches!(result, Err(federate_source::Error::Unavailable)));
+        }
+
+        // ── W1b: the device flow through the real issuer ──────────────────
+
+        const DEVICE_CODE: &str = "TEST-DEVICE-CODE-NOT-LIVE";
+
+        fn device_token(ed_public: &str) -> String {
+            token(&json!({
+                "iss": federate_source::ISSUER,
+                "aud": TUI_AUD,
+                "azp": TUI_CLIENT,
+                "sub": "opaque-sub",
+                "jti": "source-id",
+                "iat": NOW,
+                "exp": NOW + 300,
+                "binding_key": ed_public,
+                "federated_claims": {"connector_id":"atproto","user_id":"did:plc:abcdefghijklmnopqrstuvwx"},
+            }))
+        }
+
+        fn device_body(
+            subject_token: &str,
+            login_random: &str,
+            ed_public: &str,
+            pq_public: &str,
+        ) -> Vec<u8> {
+            serde_json::to_vec(&json!({
+                "profile": federate_source::TUI_DEVICE_PROFILE,
+                "client_id": TUI_CLIENT,
+                "subject_token": subject_token,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                "device_code": DEVICE_CODE,
+                "resource": federate_source::HOST,
+                "scope": SCOPE,
+                "login_random": login_random,
+                "ed25519_public": ed_public,
+                "ml_dsa65_public": pq_public,
+            }))
+            .unwrap()
+        }
+
+        async fn prepare_device_challenge() -> Prepared {
+            let host = federate_source::FederateHost::new(federate_source::HOST).unwrap();
+            let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let admission = Arc::new(StubAdmission {
+                commits: Arc::clone(&commits),
+            });
+            let mut issuer = FederateIssuer::new(
+                admission,
+                Arc::new(StubSigner),
+                host.clone(),
+                Some(federate_source::ClientClass::new(TUI_CLIENT, TUI_AUD, None).unwrap()),
+            )
+            .unwrap();
+            issuer.verifier.set_test_responses(
+                (0..4)
+                    .map(|_| Ok(serde_json::to_vec(&jwks()).unwrap()))
+                    .collect(),
+            );
+            let login_random = B64.encode([21; 32]);
+            let ed = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let pq = ml_dsa_sk_from_seed(&[8; 32]);
+            let ed_public = B64.encode(ed.verifying_key().as_bytes());
+            let pq_public = B64.encode(ml_dsa_sk_to_vk_bytes(&pq));
+            let subject_token = device_token(&ed_public);
+            let body = device_body(&subject_token, &login_random, &ed_public, &pq_public);
+            // Native client: no Origin header at all.
+            let response = issuer
+                .challenge(&HeaderMap::new(), &body, NOW)
+                .await
+                .unwrap();
+            // The challenge answers the device profile, pinning the flow for
+            // the exchange leg.
+            assert_eq!(response.profile, federate_source::TUI_DEVICE_PROFILE);
+            Prepared {
+                issuer,
+                commits,
+                challenge_id: response.challenge_id,
+                transcript: B64.decode(response.transcript_b64u).unwrap(),
+                subject_token,
+            }
+        }
+
+        fn device_exchange_form(
+            prepared: &Prepared,
+            hs_profile: &str,
+            transcript: &[u8],
+        ) -> String {
+            let ed = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let pq = ml_dsa_sk_from_seed(&[8; 32]);
+            let ed_sig = ed.sign(transcript);
+            let pq_sig = ml_dsa_sign(&pq, transcript);
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair(
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                )
+                .append_pair("hs_profile", hs_profile)
+                .append_pair("client_id", TUI_CLIENT)
+                .append_pair(
+                    "subject_token_type",
+                    "urn:ietf:params:oauth:token-type:id_token",
+                )
+                .append_pair("subject_token", &prepared.subject_token)
+                .append_pair(
+                    "requested_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                )
+                .append_pair("resource", federate_source::HOST)
+                .append_pair("scope", SCOPE)
+                .append_pair("challenge_id", &prepared.challenge_id)
+                .append_pair("ed25519_signature", &B64.encode(ed_sig.to_bytes()))
+                .append_pair("ml_dsa65_signature", &B64.encode(pq_sig))
+                .finish()
+        }
+
+        #[tokio::test]
+        async fn device_challenge_and_exchange_reach_policy_commit() {
+            let prepared = prepare_device_challenge().await;
+            let form = device_exchange_form(
+                &prepared,
+                federate_source::TUI_DEVICE_PROFILE,
+                &prepared.transcript,
+            );
+            let result = prepared
+                .issuer
+                .exchange(&HeaderMap::new(), form.as_bytes(), NOW)
+                .await;
+            assert_eq!(
+                prepared.commits.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "device-flow exchange must reach Policy commit: {:?}",
+                result.as_ref().err()
+            );
+            assert!(matches!(result, Err(federate_source::Error::Unavailable)));
+        }
+
+        #[tokio::test]
+        async fn device_and_code_flows_cannot_substitute_for_each_other() {
+            // Device challenge redeemed with the class profile: denied
+            // before Policy commit by the flow pin.
+            let prepared = prepare_device_challenge().await;
+            let form = device_exchange_form(
+                &prepared,
+                federate_source::TUI_PROFILE,
+                &prepared.transcript,
+            );
+            let result = prepared
+                .issuer
+                .exchange(&HeaderMap::new(), form.as_bytes(), NOW)
+                .await;
+            assert!(matches!(result, Err(federate_source::Error::Invalid)));
+            assert_eq!(
+                prepared.commits.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+
+            // Code-flow TUI challenge redeemed with the device profile: the
+            // exchange parses (the TUI class accepts both profile strings)
+            // but the pending challenge pins the code flow, so this denies
+            // before Policy commit.
+            let prepared = prepare_challenge(true).await;
+            let form = device_exchange_form(
+                &prepared,
+                federate_source::TUI_DEVICE_PROFILE,
+                &prepared.transcript,
+            );
+            let result = prepared
+                .issuer
+                .exchange(&HeaderMap::new(), form.as_bytes(), NOW)
+                .await;
+            assert!(matches!(result, Err(federate_source::Error::Invalid)));
+            assert_eq!(
+                prepared.commits.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+        }
+
+        #[tokio::test]
+        async fn device_challenge_requires_the_signed_binding_key_claim() {
+            let host = federate_source::FederateHost::new(federate_source::HOST).unwrap();
+            let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut issuer = FederateIssuer::new(
+                Arc::new(StubAdmission {
+                    commits: Arc::clone(&commits),
+                }),
+                Arc::new(StubSigner),
+                host.clone(),
+                Some(federate_source::ClientClass::new(TUI_CLIENT, TUI_AUD, None).unwrap()),
+            )
+            .unwrap();
+            issuer.verifier.set_test_responses(
+                (0..4)
+                    .map(|_| Ok(serde_json::to_vec(&jwks()).unwrap()))
+                    .collect(),
+            );
+            let ed = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let pq = ml_dsa_sk_from_seed(&[8; 32]);
+            let ed_public = B64.encode(ed.verifying_key().as_bytes());
+            let pq_public = B64.encode(ml_dsa_sk_to_vk_bytes(&pq));
+            let login_random = B64.encode([21; 32]);
+
+            // A code-flow token (nonce/c_hash, no binding_key) under the
+            // device envelope: the challenge denies before Policy prepare.
+            let code_flow_token = token(&json!({
+                "iss": federate_source::ISSUER,
+                "aud": TUI_AUD,
+                "azp": TUI_CLIENT,
+                "sub": "opaque-sub",
+                "jti": "source-id",
+                "iat": NOW,
+                "exp": NOW + 300,
+                "nonce": "hsn1.unrelated",
+                "c_hash": B64.encode(&sha2::Sha256::digest(CODE.as_bytes())[..16]),
+                "federated_claims": {"connector_id":"atproto","user_id":"did:plc:abcdefghijklmnopqrstuvwx"},
+            }));
+            let body = device_body(&code_flow_token, &login_random, &ed_public, &pq_public);
+            assert!(matches!(
+                issuer.challenge(&HeaderMap::new(), &body, NOW).await,
+                Err(federate_source::Error::Invalid)
+            ));
+
+            // A binding_key naming a different holder key denies the same way.
+            let foreign = device_token(
+                &B64.encode(
+                    ed25519_dalek::SigningKey::from_bytes(&[77; 32])
+                        .verifying_key()
+                        .as_bytes(),
+                ),
+            );
+            let body = device_body(&foreign, &login_random, &ed_public, &pq_public);
+            assert!(matches!(
+                issuer.challenge(&HeaderMap::new(), &body, NOW).await,
+                Err(federate_source::Error::Invalid)
+            ));
+
+            // The staging class never accepts the device profile.
+            let staging = serde_json::json!({
+                "profile": federate_source::TUI_DEVICE_PROFILE,
+                "client_id": federate_source::CLIENT,
+                "subject_token": device_token(&ed_public),
+                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                "device_code": DEVICE_CODE,
+                "resource": federate_source::HOST,
+                "scope": SCOPE,
+                "login_random": login_random,
+                "ed25519_public": ed_public,
+                "ml_dsa65_public": pq_public,
+            });
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::ORIGIN,
+                axum::http::HeaderValue::from_static(federate_source::WEBSITE),
+            );
+            assert!(matches!(
+                issuer
+                    .challenge(
+                        &headers,
+                        serde_json::to_vec(&staging).unwrap().as_slice(),
+                        NOW
+                    )
+                    .await,
+                Err(federate_source::Error::Invalid)
+            ));
+            assert_eq!(commits.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }
 }

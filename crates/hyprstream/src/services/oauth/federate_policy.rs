@@ -31,7 +31,7 @@ impl PolicyFederateAdmission {
     }
 }
 
-fn source_wire(source: StoreSource) -> FederateVerifiedSource {
+fn source_wire(source: StoreSource, device_flow: bool) -> FederateVerifiedSource {
     FederateVerifiedSource {
         issuer: source.issuer,
         subject: source.subject,
@@ -41,6 +41,9 @@ fn source_wire(source: StoreSource) -> FederateVerifiedSource {
         issued_at: source.issued_at,
         expires_at: source.expires_at,
         atproto_did: source.atproto_did,
+        // Derived from the VERIFIED commitment (never request input): the
+        // device flow consumes under the nonce-free replay identity only.
+        device_flow,
     }
 }
 
@@ -129,6 +132,7 @@ impl FederateAdmission for PolicyFederateAdmission {
         federate_source::scopes(requested)?;
         let (ed, pq) = source.proof_public_keys();
         ensure!(pq.len() == 1952, "invalid committed signer suite");
+        let device_flow = source.is_device_flow();
         let store_source = source.store_source();
         let verified_did = store_source.atproto_did.clone();
         // The client selector is the VERIFIED class's client_id (the wire
@@ -137,7 +141,7 @@ impl FederateAdmission for PolicyFederateAdmission {
         // entry with it (W1.2).
         let verified_client = source.client_id().to_owned();
         let data = PrepareFederateSession {
-            source: source_wire(store_source),
+            source: source_wire(store_source, device_flow),
             requested: requested.split(' ').map(str::to_owned).collect(),
             challenge_id: challenge_id.to_vec(),
             challenge_created_at: i64::try_from(created_at)?,
@@ -159,14 +163,14 @@ impl FederateAdmission for PolicyFederateAdmission {
     ) -> Result<Session> {
         ensure!(policy_handle.len() == 32, "invalid Policy handle");
         let verified_client = evidence.client_id().to_owned();
-        let (source, ed, pq, binding, challenge_id, created_at, expires_at) =
+        let (source, ed, pq, binding, challenge_id, created_at, expires_at, device_flow) =
             evidence.into_admission_parts();
         ensure!(
             binding.subject == source.atproto_did,
             "Policy challenge subject does not match verified ATProto DID"
         );
         let data = CommitFederateSession {
-            source: source_wire(source),
+            source: source_wire(source, device_flow),
             policy_handle,
             challenge_id: challenge_id.to_vec(),
             challenge_created_at: i64::try_from(created_at)?,

@@ -177,6 +177,208 @@ impl ChallengeRequest {
     }
 }
 
+/// The exact W1b device challenge envelope. Mirrors [`ChallengeRequest`]
+/// but binds the RFC 8628 `device_code` instead of the authorization-code
+/// `state`/`pkce_challenge` pair; the source token is pinned through the
+/// issuer-signed `binding_key` claim (W5f/D1), not `nonce`/`c_hash`.
+/// `deny_unknown_fields` keeps browser-chosen authority from being silently
+/// ignored, exactly as in the code-flow envelope.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeviceChallengeRequest {
+    profile: String,
+    client_id: String,
+    subject_token: String,
+    subject_token_type: String,
+    device_code: String,
+    resource: String,
+    scope: String,
+    login_random: String,
+    ed25519_public: String,
+    ml_dsa65_public: String,
+}
+
+impl DeviceChallengeRequest {
+    #[cfg(test)]
+    pub(crate) fn parse(body: &[u8]) -> Result<Self, federate_source::Error> {
+        Self::parse_for_host(
+            body,
+            &federate_source::FederateHost::new(federate_source::HOST)
+                .map_err(|_| federate_source::Error::Invalid)?,
+            None,
+        )
+    }
+    pub(crate) fn parse_for_host(
+        body: &[u8],
+        host: &federate_source::FederateHost,
+        tui_client: Option<&ClientClass>,
+    ) -> Result<Self, federate_source::Error> {
+        if body.is_empty() || body.len() > MAX_BODY {
+            return Err(federate_source::Error::Invalid);
+        }
+        let request: Self =
+            serde_json::from_slice(body).map_err(|_| federate_source::Error::Invalid)?;
+        // The wire client_id selects the accepted class and the profile
+        // string must be exactly the device profile. The device variant is
+        // the native second-class flow: the hardcoded www staging class
+        // keeps the authorization-code challenge only, so a device-profile
+        // request naming the staging client fails closed here.
+        let class = resolve_wire_class(&request.client_id, tui_client)?;
+        if class == ClientClass::staging()
+            || request.profile != federate_source::TUI_DEVICE_PROFILE
+            || request.subject_token_type != ID_TOKEN_TYPE
+            || request.resource != host.as_str()
+            || request.subject_token.is_empty()
+            || request.subject_token.len() > MAX_SOURCE_TOKEN
+            || request.device_code.is_empty()
+            || request.device_code.len() > MAX_CODE
+            || !request.device_code.is_ascii()
+        {
+            return Err(federate_source::Error::Invalid);
+        }
+        validate_requested_scope(&request.scope)?;
+        Ok(request)
+    }
+
+    /// Still only upstream identity evidence. The resulting Source must be
+    /// mapped through Policy and paired with a challenge and both signatures.
+    pub(crate) async fn verify_source(
+        &self,
+        verifier: &Verifier,
+        now: u64,
+    ) -> Result<Source, federate_source::Error> {
+        if self.resource != verifier.host()?.as_str() {
+            return Err(federate_source::Error::Invalid);
+        }
+        // Build the class from the verifier's own canonical resolution —
+        // never from raw request fields. `Verifier::source` re-resolves the
+        // class from the commitment and rejects anything the verifier did
+        // not configure (W1.1 acceptance check).
+        let class = verifier.resolve_client_class(&self.client_id)?;
+        let commitment = Commitment::for_class_device(
+            verifier.host()?.clone(),
+            &class,
+            &self.login_random,
+            &self.device_code,
+            &self.ed25519_public,
+            &self.ml_dsa65_public,
+        )?;
+        verifier
+            .source(
+                &self.subject_token,
+                &self.device_code,
+                commitment,
+                now,
+                None,
+            )
+            .await
+    }
+
+    pub(crate) fn requested_scope(&self) -> &str {
+        &self.scope
+    }
+
+    pub(crate) fn subject_token(&self) -> &str {
+        &self.subject_token
+    }
+
+    /// The class-resolved wire client id (validated against the accepted
+    /// classes at parse time).
+    pub(crate) fn client_id(&self) -> &str {
+        &self.client_id
+    }
+}
+
+/// Either challenge envelope, dispatched on the exact wire profile string
+/// so a device-profile request can never be interpreted as a code-flow one
+/// (and vice versa: the code-flow parser rejects the device profile).
+pub(crate) enum AnyChallengeRequest {
+    Code(ChallengeRequest),
+    Device(DeviceChallengeRequest),
+}
+
+impl AnyChallengeRequest {
+    pub(crate) fn parse_for_host(
+        body: &[u8],
+        host: &federate_source::FederateHost,
+        tui_client: Option<&ClientClass>,
+    ) -> Result<Self, federate_source::Error> {
+        if body.is_empty() || body.len() > MAX_BODY {
+            return Err(federate_source::Error::Invalid);
+        }
+        #[derive(Deserialize)]
+        struct Probe {
+            profile: String,
+        }
+        let probe: Probe =
+            serde_json::from_slice(body).map_err(|_| federate_source::Error::Invalid)?;
+        if probe.profile == federate_source::TUI_DEVICE_PROFILE {
+            DeviceChallengeRequest::parse_for_host(body, host, tui_client).map(Self::Device)
+        } else {
+            ChallengeRequest::parse_for_host(body, host, tui_client).map(Self::Code)
+        }
+    }
+
+    pub(crate) async fn verify_source(
+        &self,
+        verifier: &Verifier,
+        now: u64,
+    ) -> Result<Source, federate_source::Error> {
+        match self {
+            Self::Code(request) => request.verify_source(verifier, now).await,
+            Self::Device(request) => request.verify_source(verifier, now).await,
+        }
+    }
+
+    /// The exact profile string the challenge leg was validated under; the
+    /// exchange leg must repeat it, pinning both legs to one flow.
+    pub(crate) fn profile(&self) -> &str {
+        match self {
+            Self::Code(request) => &request.profile,
+            Self::Device(request) => &request.profile,
+        }
+    }
+
+    pub(crate) fn requested_scope(&self) -> &str {
+        match self {
+            Self::Code(request) => request.requested_scope(),
+            Self::Device(request) => request.requested_scope(),
+        }
+    }
+
+    pub(crate) fn subject_token(&self) -> &str {
+        match self {
+            Self::Code(request) => request.subject_token(),
+            Self::Device(request) => request.subject_token(),
+        }
+    }
+
+    pub(crate) fn client_id(&self) -> &str {
+        match self {
+            Self::Code(request) => request.client_id(),
+            Self::Device(request) => request.client_id(),
+        }
+    }
+}
+
+/// The shared scope grammar/limit check of both challenge envelopes.
+fn validate_requested_scope(scope: &str) -> Result<(), federate_source::Error> {
+    federate_source::scopes(scope)?;
+    let requested: Vec<_> = scope.split(' ').collect();
+    if requested.len() > 64
+        || requested.iter().any(|text| {
+            text.len() > 256
+                || Scope::parse(text).is_err()
+                || text
+                    .split(':')
+                    .any(|part| part.is_empty() || part.contains('*'))
+        })
+    {
+        return Err(federate_source::Error::Invalid);
+    }
+    Ok(())
+}
+
 const EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 
@@ -229,9 +431,15 @@ impl ExchangeRequest {
             serde_urlencoded::from_bytes(body).map_err(|_| federate_source::Error::Invalid)?;
         // Per-class profile pin: the wire client_id selects the accepted
         // class and hs_profile must be exactly that class's profile string.
+        // A non-staging class additionally accepts the W1b device challenge
+        // profile; the exact flow is pinned against the pending challenge
+        // in the exchange handler, so accepting both here cannot mix flows.
         let class = resolve_wire_class(&request.client_id, tui_client)?;
+        let profile_ok = request.hs_profile == class.profile()
+            || (class != ClientClass::staging()
+                && request.hs_profile == federate_source::TUI_DEVICE_PROFILE);
         if request.grant_type != EXCHANGE_GRANT
-            || request.hs_profile != class.profile()
+            || !profile_ok
             || request.subject_token_type != ID_TOKEN_TYPE
             || request.requested_token_type != ACCESS_TOKEN_TYPE
             || request.resource != host.as_str()
@@ -294,6 +502,13 @@ impl ExchangeRequest {
 
     pub(crate) fn requested_scope(&self) -> &str {
         &self.scope
+    }
+
+    /// The submitted profile string (validated at parse time against the
+    /// accepted class; the exchange handler additionally pins it to the
+    /// pending challenge's exact flow profile).
+    pub(crate) fn hs_profile(&self) -> &str {
+        &self.hs_profile
     }
 
     /// The class-resolved wire client id (validated against the accepted
@@ -936,6 +1151,143 @@ mod tests {
             ChallengeRequest::parse_for_host(&serde_json::to_vec(&body)?, &host, None).is_err()
         );
         assert!(ExchangeRequest::parse_for_host(form.as_bytes(), &host, None).is_err());
+        Ok(())
+    }
+
+    // ── W1b: the device challenge envelope beside the code flow ───────────
+
+    fn device_request() -> Value {
+        json!({
+            "profile": federate_source::TUI_DEVICE_PROFILE,
+            "client_id": TUI_CLIENT_ID,
+            "subject_token": "header.claims.signature",
+            "subject_token_type": ID_TOKEN_TYPE,
+            "device_code": "test-device-code",
+            "resource": federate_source::HOST,
+            "scope": "connect:tui:session",
+            "login_random": "a",
+            "ed25519_public": "d",
+            "ml_dsa65_public": "e"
+        })
+    }
+
+    fn class_form(profile: &str, client_id: &str, resource: &str) -> String {
+        url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(
+                url::form_urlencoded::parse(exchange_form().as_bytes()).map(|(k, v)| {
+                    let v = match k.as_ref() {
+                        "hs_profile" => profile.to_owned(),
+                        "client_id" => client_id.to_owned(),
+                        "resource" => resource.to_owned(),
+                        _ => v.into_owned(),
+                    };
+                    (k.into_owned(), v)
+                }),
+            )
+            .finish()
+    }
+
+    #[test]
+    fn w1b_device_wire_is_tui_class_only_and_flow_pinned() -> anyhow::Result<()> {
+        let host = federate_source::FederateHost::new(federate_source::HOST)?;
+        let body = device_request();
+        // Configured TUI class + exact device profile: accepted, and the
+        // envelope profile dispatches to the device variant.
+        let parsed = AnyChallengeRequest::parse_for_host(
+            &serde_json::to_vec(&body)?,
+            &host,
+            Some(&tui_class()),
+        )?;
+        assert!(matches!(parsed, AnyChallengeRequest::Device(_)));
+        assert_eq!(parsed.profile(), federate_source::TUI_DEVICE_PROFILE);
+        // A code-flow envelope dispatches to the code variant unchanged.
+        let mut code = request();
+        code["client_id"] = TUI_CLIENT_ID.into();
+        code["profile"] = TUI_PROFILE_STR.into();
+        code["resource"] = federate_source::HOST.into();
+        let parsed = AnyChallengeRequest::parse_for_host(
+            &serde_json::to_vec(&code)?,
+            &host,
+            Some(&tui_class()),
+        )?;
+        assert!(matches!(parsed, AnyChallengeRequest::Code(_)));
+        // The staging class never accepts the device profile: the www flow
+        // stays authorization-code only, fail-closed at parse.
+        let mut staging = device_request();
+        staging["client_id"] = federate_source::CLIENT.into();
+        assert!(DeviceChallengeRequest::parse_for_host(
+            &serde_json::to_vec(&staging)?,
+            &host,
+            Some(&tui_class())
+        )
+        .is_err());
+        // Default-deny: an unconfigured second class resolves nothing.
+        assert!(
+            AnyChallengeRequest::parse_for_host(&serde_json::to_vec(&body)?, &host, None).is_err()
+        );
+        // Envelope integrity: missing/empty/non-ascii/oversized device_code,
+        // unknown browser fields, and the code profile on the device
+        // envelope are all denied.
+        for (field, value) in [
+            ("device_code", "".into()),
+            ("device_code", "nonascii-é".into()),
+        ] {
+            let mut changed = device_request();
+            changed[field] = value;
+            assert!(AnyChallengeRequest::parse_for_host(
+                &serde_json::to_vec(&changed)?,
+                &host,
+                Some(&tui_class())
+            )
+            .is_err());
+        }
+        let mut oversized = device_request();
+        oversized["device_code"] = "x".repeat(MAX_CODE + 1).into();
+        assert!(AnyChallengeRequest::parse_for_host(
+            &serde_json::to_vec(&oversized)?,
+            &host,
+            Some(&tui_class())
+        )
+        .is_err());
+        let mut browser_field = device_request();
+        browser_field["state"] = "b".into();
+        assert!(AnyChallengeRequest::parse_for_host(
+            &serde_json::to_vec(&browser_field)?,
+            &host,
+            Some(&tui_class())
+        )
+        .is_err());
+        let mut wrong_profile = device_request();
+        wrong_profile["profile"] = TUI_PROFILE_STR.into();
+        assert!(AnyChallengeRequest::parse_for_host(
+            &serde_json::to_vec(&wrong_profile)?,
+            &host,
+            Some(&tui_class())
+        )
+        .is_err());
+        // The exchange form of a configured TUI class accepts both its own
+        // profile and the device profile (the handler pins the exact flow
+        // against the pending challenge); the staging class rejects the
+        // device profile outright.
+        for profile in [TUI_PROFILE_STR, federate_source::TUI_DEVICE_PROFILE] {
+            assert!(ExchangeRequest::parse_for_host(
+                class_form(profile, TUI_CLIENT_ID, federate_source::HOST).as_bytes(),
+                &host,
+                Some(&tui_class())
+            )
+            .is_ok());
+        }
+        assert!(ExchangeRequest::parse_for_host(
+            class_form(
+                federate_source::TUI_DEVICE_PROFILE,
+                federate_source::CLIENT,
+                federate_source::HOST
+            )
+            .as_bytes(),
+            &federate_source::FederateHost::new(federate_source::HOST)?,
+            None
+        )
+        .is_err());
         Ok(())
     }
 
