@@ -2439,7 +2439,12 @@ async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary(
     }
     let source_record = source();
     let decision = service
-        .prepare(&ctx, TUI_CLIENT_ID, &source_record, std::slice::from_ref(&scope))
+        .prepare(
+            &ctx,
+            TUI_CLIENT_ID,
+            &source_record,
+            std::slice::from_ref(&scope),
+        )
         .await
         .unwrap();
     assert_eq!(decision.subject, ATPROTO_DID);

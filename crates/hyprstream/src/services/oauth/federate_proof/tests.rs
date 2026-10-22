@@ -851,7 +851,6 @@ async fn h3b_two_handles_for_one_subject_do_not_share_positive_authority() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
 }
 
-
 // ── W1.4: re-signed malformed-fixture negatives for the TUI profile ──────
 
 const TUI_CLIENT_ID: &str = "hyprstream-tui-staging";

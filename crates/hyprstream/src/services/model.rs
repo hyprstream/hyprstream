@@ -2639,14 +2639,15 @@ impl ModelService {
         // service-owned load continues for other waiters.
         let load = self.load_model(&instance, None, None);
         let _endpoint = match deadline {
-            Some(deadline) => tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                load,
-            )
-            .await
-            .map_err(|_| Self::typed_decision_error(anyhow!(
+            Some(deadline) => {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), load)
+                    .await
+                    .map_err(|_| {
+                        Self::typed_decision_error(anyhow!(
                 "clef-decision-cancelled: decision deadline elapsed while waiting for model load"
-            )))??,
+            ))
+                    })??
+            }
             None => load.await?,
         };
         let mut cache = self.loaded_models.write().await;
