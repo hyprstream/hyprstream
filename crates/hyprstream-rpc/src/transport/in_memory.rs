@@ -158,6 +158,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_deadline_value_is_what_the_transport_honors() {
+        let start = std::time::Instant::now();
+        let slow = Arc::new(from_fn(|req: Bytes| async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok(req)
+        }));
+        let t = InMemoryTransport::new(slow);
+        // A 1ms deadline must cut the 150ms handler at ~1ms, not at the 30s
+        // default: proves the caller's value (not the default) is used.
+        let err = t.send(b"x".to_vec(), Some(1)).await;
+        assert!(err.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the caller-supplied deadline must apply immediately: {:?}",
+            start.elapsed()
+        );
+        // A deadline above the default admits the same handler.
+        let resp = t.send(b"x".to_vec(), Some(35_000)).await.unwrap();
+        assert_eq!(resp, b"x");
+    }
+
+    #[tokio::test]
     async fn processor_error_propagates() {
         let failing = Arc::new(from_fn(|_req: Bytes| async move {
             Err(anyhow!("handler boom"))

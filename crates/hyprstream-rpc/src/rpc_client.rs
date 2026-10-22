@@ -132,6 +132,10 @@ pub struct CallOptions {
     pub jwt: Option<String>,
     /// Bearer token relayed on behalf of a user (delegation).
     pub delegated_bearer: Option<String>,
+    /// Caller-supplied request deadline for this call, in milliseconds. When
+    /// present it replaces the client's default transport ceiling: a deadline
+    /// is a property of the request, not something the transport may shorten.
+    pub timeout_ms: Option<i32>,
 }
 
 impl CallOptions {
@@ -150,6 +154,19 @@ impl CallOptions {
     pub fn delegated_bearer(mut self, token: impl Into<String>) -> Self {
         self.delegated_bearer = Some(token.into());
         self
+    }
+
+    /// Set the caller's request deadline for this call (milliseconds).
+    pub fn timeout_ms(mut self, timeout_ms: i32) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// The effective transport timeout: the request deadline when present,
+    /// else the client's default ceiling. A present deadline is honored as-is,
+    /// never clamped to the default.
+    pub fn effective_timeout_ms(&self, default: Option<i32>) -> Option<i32> {
+        self.timeout_ms.or(default)
     }
 }
 
@@ -228,6 +245,7 @@ impl<'a> RequestBuilder<'a> {
         let options = CallOptions {
             jwt: self.jwt,
             delegated_bearer: self.delegated_bearer,
+            timeout_ms: None,
         };
         match self.service_domain {
             Some(service_domain) => {
@@ -596,6 +614,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         );
         // Delegation is an explicit principal-selection mode. Do not let a
         // pooled client's default JWT silently take precedence over it.
+        let timeout = options.effective_timeout_ms(self.calculate_timeout());
         let jwt = if options.delegated_bearer.is_some() {
             None
         } else {
@@ -613,7 +632,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 method_discriminator,
             )
             .await?;
-        let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
         let (_req_id, inner) = self.unwrap_response(&response_bytes, request_id, pending)?;
         Ok(inner)
@@ -674,6 +692,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         );
         // Delegation is an explicit principal-selection mode. Do not let a
         // pooled client's default JWT silently take precedence over it.
+        let timeout = options.effective_timeout_ms(self.calculate_timeout());
         let jwt = if options.delegated_bearer.is_some() {
             None
         } else {
@@ -691,7 +710,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 method_discriminator,
             )
             .await?;
-        let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
         let (_req_id, inner) = self.unwrap_response(&response_bytes, request_id, pending)?;
         Ok(inner)
@@ -2509,6 +2527,27 @@ mod request_kem_tests {
         assert_ne!(
             recipients[1], recipients[2],
             "caller retry must generate a fresh response recipient"
+        );
+    }
+}
+
+#[cfg(test)]
+mod call_options_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn request_deadline_overrides_default_and_absence_keeps_it() {
+        let options = CallOptions::new().timeout_ms(35_000);
+        assert_eq!(
+            options.effective_timeout_ms(Some(30_000)),
+            Some(35_000),
+            "a caller deadline above the default must never be clamped to it"
+        );
+        let quiet = CallOptions::new();
+        assert_eq!(
+            quiet.effective_timeout_ms(Some(30_000)),
+            Some(30_000),
+            "without a request deadline the default ceiling applies"
         );
     }
 }

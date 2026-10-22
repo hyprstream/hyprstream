@@ -1033,6 +1033,13 @@ pub fn generate_client(
                 self
             }
 
+            /// Override this client's per-call options for every call.
+            #[must_use]
+            pub fn with_call_options(mut self, options: hyprstream_rpc::CallOptions) -> Self {
+                self.call_options = options;
+                self
+            }
+
             /// Set this client's DIRECT bearer for every call.
             ///
             /// Unlike [`Self::with_delegated_bearer`], the token travels as the

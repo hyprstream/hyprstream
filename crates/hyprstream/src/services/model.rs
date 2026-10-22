@@ -3120,33 +3120,38 @@ impl InferHandler for ModelService {
             max_state_tokens: data.max_state_tokens,
             timeout_ms: Some(timeout_ms),
         };
-        let decision = if let Some(disconnected) = ctx.request_cancellation() {
-            tokio::select! {
-                biased;
-                _ = disconnected.cancelled() => {
-                    Err(anyhow!("clef-decision-cancelled: caller disconnected"))
-                }
-                result = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    client.decide(&forwarded),
-                ) => match result {
-                    Ok(outcome) => outcome,
-                    Err(_) => Err(anyhow!(
-                        "clef-decision-cancelled: decision deadline elapsed at Model ingress"
-                    )),
-                },
-            }
-        } else {
+        // Honor the forwarded budget at the transport layer too: the engine
+        // RPC must not be cut by the client's default ceiling while the
+        // ingress deadline still has budget left.
+        let client = client
+            .with_call_options(hyprstream_rpc::CallOptions::new().timeout_ms(i32::try_from(timeout_ms).unwrap_or(i32::MAX)));
+        let decision = async {
             tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
                 client.decide(&forwarded),
             )
             .await
             .map_err(|_| {
-                anyhow!("clef-decision-cancelled: decision deadline elapsed at Model ingress")
+                Self::typed_decision_error(anyhow!(
+                    "clef-decision-cancelled: decision deadline elapsed at Model ingress"
+                ))
             })?
+            .map_err(Self::typed_decision_error)
         };
-        decision.map_err(Self::typed_decision_error)
+        if let Some(disconnected) = ctx.request_cancellation() {
+            tokio::select! {
+                biased;
+                _ = disconnected.cancelled() => {
+                    Err(Self::typed_decision_error(anyhow!(
+                        "clef-decision-cancelled: caller disconnected"
+                    )))
+                }
+                result = decision => result,
+            }
+        } else {
+            decision.await
+        }
+    }
     }
 
     async fn handle_status(
