@@ -196,13 +196,15 @@ async fn attack_connect(endpoint: &quinn::Endpoint, addr: SocketAddr, frame: &[u
 }
 
 /// CONNECT frame carrying more unique tiny fields than the entry-count cap.
-/// Built with the production encoder so the wire bytes are exactly what a real
+/// Names stay short so the encoded section stays under the 64 KiB wire frame
+/// cap and the entry-count cap is the guard that rejects the decode. Built
+/// with the production encoder so the wire bytes are exactly what a real
 /// (hostile) client would send.
 fn unique_header_flood_frame(count: usize) -> Result<Vec<u8>> {
     let mut headers = http::HeaderMap::new();
     for i in 0..count {
         headers.insert(
-            http::HeaderName::from_bytes(format!("x-flood-{:06}", i).as_bytes())?,
+            http::HeaderName::from_bytes(format!("x-f-{:05}", i).as_bytes())?,
             http::HeaderValue::from_static(""),
         );
     }
