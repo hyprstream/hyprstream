@@ -7449,7 +7449,9 @@ mod tests {
             .map_err(|_| anyhow!("cold-load gate receiver disappeared"))?;
         fixture.model.set_test_cold_load_gate(None);
         let mut second_request = request.clone();
-        second_request.timeout_ms = Some(30_000);
+        // A cold 12 GiB pinned capture plus the first engine load runs ~45s on
+        // current hardware; the asserted properties are budget-independent.
+        second_request.timeout_ms = Some(120_000);
         let second = tokio::time::timeout(
             std::time::Duration::from_secs(180),
             fixture
