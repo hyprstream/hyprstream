@@ -144,7 +144,12 @@ fn policy_packages_optional(workspace_root: &Path, key: &str) -> Result<BTreeSet
     };
     values
         .as_array()
-        .ok_or_else(|| format!("{} must define license_gate.{key} as an array", path.display()))?
+        .ok_or_else(|| {
+            format!(
+                "{} must define license_gate.{key} as an array",
+                path.display()
+            )
+        })?
         .iter()
         .map(|value| {
             value
