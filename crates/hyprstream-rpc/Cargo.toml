@@ -122,9 +122,10 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 quinn = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true, features = ["ring", "aws_lc_rs"] }
-h3 = { workspace = true }
-h3-quinn = { workspace = true }
-h3-webtransport = { workspace = true }
+# h3/h3-quinn/h3-webtransport removed 2026-10-21: unused since #274 moved the
+# RPC plane to web_transport_quinn (zero source references; verified by grep
+# and cargo tree before removal). h3 0.0.8's unlimited default header budget
+# is the CVE class this branch hardens — dead deps stay out of the lockfile.
 http = { workspace = true }
 
 # Iroh + MoQ (Epic #131 — Phase 1 substrate). See transport::iroh_substrate.

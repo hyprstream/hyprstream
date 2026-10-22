@@ -406,6 +406,10 @@ WORKDIR /build
 COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY crates ./crates
+# Vendored QPACK parser: [patch.crates-io] redirects web-transport-proto
+# here, so cargo cannot load the manifest graph (even with --locked) unless
+# the patched source is present in the build context.
+COPY third_party/web-transport-proto ./third_party/web-transport-proto
 # workspace-hack sits at the workspace root and is referenced by member
 # manifests (cas-serve, ...), so the manifest graph cannot load without it
 # even for -p hyprstream. The .config/hakari.toml config is not needed here:
