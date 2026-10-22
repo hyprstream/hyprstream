@@ -7,6 +7,9 @@ mit_packages = [
   "git-xet-filter",
 ]
 
+# Preserve the upstream dual-license expression for vendored permissive code.
+mit_or_apache_packages = ["web-transport-proto"]
+
 agpl_packages = [
   "hyprstream-flight",
   "hyprstream-metrics",
@@ -51,6 +54,7 @@ apache_packages = [
 # intentionally excluded from the root workspace and are therefore the only
 # additional standalone manifests included in the owner package universe.
 standalone_manifests = [
+  "third_party/web-transport-proto/Cargo.toml",
   "crates/bitsandbytes-sys/Cargo.toml",
   "crates/hyprstream-workers-python-guest/Cargo.toml",
   "crates/hyprstream-workers-wasmtime-fsguest/Cargo.toml",
@@ -59,6 +63,7 @@ standalone_manifests = [
 # Reusable permissive-only roots retain a strict complete resolved-graph
 # guarantee: none may reach a local AGPL package through any dependency source.
 permissive_roots = [
+  "web-transport-proto",
   "bitsandbytes-sys",
   "cas-serve",
   "chat-core",

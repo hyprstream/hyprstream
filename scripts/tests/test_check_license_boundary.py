@@ -33,6 +33,7 @@ class LicenseBoundaryFixtures(unittest.TestCase):
         workspace_extra: str = "",
         extra_workspace_members: tuple[str, ...] = (),
         mit_packages: tuple[str, ...] = (),
+        mit_or_apache_packages: tuple[str, ...] = (),
         agpl_packages: tuple[str, ...] = ("service",),
         apache_packages: tuple[str, ...] = ("apache", "middle"),
         permissive_roots: tuple[str, ...] = ("apache", "middle"),
@@ -122,6 +123,7 @@ class LicenseBoundaryFixtures(unittest.TestCase):
                 policy_text = (
                     "[license_gate]\n"
                     f"mit_packages = {list(mit_packages)!r}\n"
+                    f"mit_or_apache_packages = {list(mit_or_apache_packages)!r}\n"
                     f"agpl_packages = {list(agpl_packages)!r}\n"
                     f"apache_packages = {list(apache_packages)!r}\n"
                     "standalone_manifests = "
@@ -142,6 +144,27 @@ class LicenseBoundaryFixtures(unittest.TestCase):
     def assert_boundary_failure(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("permissive-root-to-AGPL dependency", result.stderr)
+
+    def test_dual_license_root_passes(self) -> None:
+        result = self.run_fixture(
+            license_declarations=('license = "MIT OR Apache-2.0"',
+                                  'license = "Apache-2.0"',
+                                  'license = "AGPL-3.0-only"'),
+            apache_packages=("middle",),
+            mit_or_apache_packages=("apache",),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_dual_license_root_cannot_reach_agpl(self) -> None:
+        result = self.run_fixture(
+            license_declarations=('license = "MIT OR Apache-2.0"',
+                                  'license = "Apache-2.0"',
+                                  'license = "AGPL-3.0-only"'),
+            apache_packages=("middle",),
+            mit_or_apache_packages=("apache",),
+            apache_manifest='[dependencies]\nservice = { path = "../service" }\n',
+        )
+        self.assert_boundary_failure(result)
 
     def test_clean_graph_passes(self) -> None:
         result = self.run_fixture(
