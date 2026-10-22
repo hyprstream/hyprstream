@@ -40,7 +40,7 @@ jobs:
       - name: Download the exact packed tarball from the build run
         uses: actions/download-artifact@v4
         with:
-          name: hyprstream-rpc-std-wasm-${{ github.event.workflow_run.head_sha }}
+          name: hyprstream-rpc-std-wasm
           path: dist/hyprstream-rpc-std-wasm
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
