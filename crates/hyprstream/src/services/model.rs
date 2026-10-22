@@ -981,6 +981,25 @@ fn select_unique_worktree_for_head(
     Ok(matches[0].branch_name.clone())
 }
 
+/// Branch that backs a cold load of a commit selector. With a staging pin
+/// configured, admission has already matched the selector to the pin, so the
+/// load reuses the pin's configured staging branch — the worktree that
+/// checkout validation verified — instead of repeating generic commit
+/// resolution, which would reject valid repositories where another branch
+/// points at the same pinned commit. Without a pin the selector has no
+/// branch identity, so the unique-worktree rule still applies.
+fn commit_selector_load_branch(
+    pin: Option<&StagingModelPin>,
+    model_ref: &ModelRef,
+    commit: &git2::Oid,
+    worktrees: &[hyprstream_rpc_std::registry_client::WorktreeInfo],
+) -> Result<String> {
+    match pin {
+        Some(pin) => pin.staging_worktree_branch(model_ref),
+        None => select_unique_worktree_for_head(worktrees, &commit.to_string()),
+    }
+}
+
 impl ModelService {
     /// Create a new model service with infrastructure
     pub async fn new(
@@ -1872,7 +1891,12 @@ impl ModelService {
                 name.clone()
             }
             crate::storage::GitRef::Commit(commit) => {
-                select_unique_worktree_for_head(&worktrees, &commit.to_string())?
+                commit_selector_load_branch(
+                    self.config.staging_model_pin.as_ref(),
+                    &model_ref,
+                    commit,
+                    &worktrees,
+                )?
             }
             crate::storage::GitRef::Tag(_) | crate::storage::GitRef::Revspec(_) => {
                 anyhow::bail!("tag and revspec model loads are unsupported; use a full commit OID")
@@ -4367,6 +4391,60 @@ mod tests {
         assert!(pin.staging_worktree_branch(&parsed).is_err());
         let parsed = ModelRef::parse("fixture-model")?;
         assert!(pin.staging_worktree_branch(&parsed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn staging_commit_selector_load_reuses_pinned_branch_despite_ambiguous_heads() -> Result<()> {
+        let commit = git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        let pinned = commit.to_string();
+        let pin = StagingModelPin::new("fixture-model:main", commit)?;
+        let parsed = ModelRef::parse(&format!("fixture-model:{pinned}"))?;
+        // Another available branch also points at the pinned commit: the load
+        // must reuse the staging branch preflight verified, not fail on
+        // multiple matching heads.
+        let worktrees = vec![worktree("main", &pinned), worktree("mirror", &pinned)];
+        assert_eq!(
+            super::commit_selector_load_branch(Some(&pin), &parsed, &commit, &worktrees)?,
+            "main"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unpinned_commit_selector_load_keeps_unique_worktree_rule() -> Result<()> {
+        let commit = git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        let pinned = commit.to_string();
+        let parsed = ModelRef::parse(&format!("fixture-model:{pinned}"))?;
+        // Without a staging pin, ambiguous heads stay rejected...
+        let ambiguous = vec![worktree("main", &pinned), worktree("mirror", &pinned)];
+        let result = super::commit_selector_load_branch(None, &parsed, &commit, &ambiguous);
+        assert!(result
+            .err()
+            .is_some_and(|error| error.to_string().contains("exactly one")));
+        // ...and a unique head still resolves to its branch.
+        let unique = vec![worktree("main", &pinned)];
+        assert_eq!(
+            super::commit_selector_load_branch(None, &parsed, &commit, &unique)?,
+            "main"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_commit_selector_load_rejects_commit_outside_the_pin() -> Result<()> {
+        let pinned = git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        let pin = StagingModelPin::new("fixture-model:main", pinned)?;
+        let foreign = git2::Oid::from_str("18c562db6830c2ef6636b8eaf42fb479272052f7")?;
+        let parsed = ModelRef::parse(&format!("fixture-model:{foreign}"))?;
+        // Defense in depth: a selector naming a different commit never routes
+        // to the staging branch, even when a worktree happens to hold it.
+        let worktrees = vec![
+            worktree("main", &pinned.to_string()),
+            worktree("foreign", &foreign.to_string()),
+        ];
+        let result = super::commit_selector_load_branch(Some(&pin), &parsed, &foreign, &worktrees);
+        assert!(result.is_err());
         Ok(())
     }
 
