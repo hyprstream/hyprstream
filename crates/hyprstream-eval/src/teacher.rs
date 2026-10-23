@@ -152,23 +152,22 @@ impl TeacherEnsemble {
         // Check every teacher before querying the first one: a stricter
         // later transport must not reject input after earlier billed calls.
         for teacher in &self.teachers {
-            teacher.subject.preflight_row(set, state, row)?;
+            teacher.subject.preflight(set, state, row)?;
         }
         let mut teacher_answers = Vec::with_capacity(self.teachers.len());
         for teacher in &self.teachers {
-            // Bind provenance to THIS response: reading resolved_model_id
-            // after decide races with a concurrent ensemble/run sharing the
-            // subject (its response can overwrite the resolved slot in
-            // between), persisting raw targets under the wrong model id.
-            let (answer_row, resolved) = teacher
-                .subject
-                .decide_with_version(set, state, row)
-                .await
-                .map_err(|error| EvalError::Subject {
-                    model: teacher.subject.model_id().to_owned(),
-                    item_id: item_id.to_owned(),
-                    message: error.to_string(),
-                })?;
+            // Answers and model provenance come from the same response,
+            // including when concurrent runs share this subject.
+            let (answer_row, resolved) =
+                teacher
+                    .subject
+                    .decide(set, state, row)
+                    .await
+                    .map_err(|error| EvalError::Subject {
+                        model: teacher.subject.model_id().to_owned(),
+                        item_id: item_id.to_owned(),
+                        message: error.to_string(),
+                    })?;
             if resolved.is_empty() {
                 return Err(EvalError::InvalidInput(format!(
                     "teacher `{}` returned an empty resolved model id",
@@ -306,7 +305,7 @@ questions:
             set: &QuestionSet,
             state: &Entry,
             row: usize,
-        ) -> Result<AnswerRow, EvalError> {
+        ) -> Result<(AnswerRow, String), EvalError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             TruthSubject::new("count-calls")
                 .decide(set, state, row)
@@ -412,7 +411,7 @@ questions:
             set: &QuestionSet,
             _state: &Entry,
             _row: usize,
-        ) -> Result<AnswerRow, EvalError> {
+        ) -> Result<(AnswerRow, String), EvalError> {
             let mut answers = std::collections::BTreeMap::new();
             for question in &set.questions {
                 answers.insert(
@@ -420,7 +419,7 @@ questions:
                     hyprstream_decision::answer::QuestionAnswer::abstained(),
                 );
             }
-            Ok(AnswerRow { answers })
+            Ok((AnswerRow { answers }, self.model_id().to_owned()))
         }
     }
 
@@ -484,7 +483,7 @@ questions:
             set: &QuestionSet,
             _state: &Entry,
             _row: usize,
-        ) -> Result<AnswerRow, EvalError> {
+        ) -> Result<(AnswerRow, String), EvalError> {
             let mut answers = std::collections::BTreeMap::new();
             for question in &set.questions {
                 answers.insert(
@@ -497,7 +496,7 @@ questions:
                     ),
                 );
             }
-            Ok(AnswerRow { answers })
+            Ok((AnswerRow { answers }, self.model_id().to_owned()))
         }
     }
 

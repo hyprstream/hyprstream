@@ -154,64 +154,106 @@ impl Observation {
 
 /// What a run produced: the observation stream, version triple, and — for
 /// [`EvalSet`] runs — the eval-v2 Arrow batch bound to its observation provenance.
+///
+/// Results expose only shared references, so scoring and persistence see the
+/// same validated provenance throughout their lifetime.
+///
+/// ```compile_fail
+/// fn replace_producer(output: &mut hyprstream_eval::RunOutput) {
+///     output.version().model = "different-model".to_owned();
+/// }
+/// ```
 #[derive(Debug)]
 pub struct RunOutput {
-    /// The subject's resolved model id.
-    pub model_id: String,
-    /// The batch version triple used for persistence.
-    pub version: VersionTriple,
-    /// One observation per (row, question), in run order.
-    pub observations: Vec<Observation>,
-    /// The emitted batch (`None` for loose item runs).
-    pub batch: Option<RecordBatch>,
-    /// The physical eval-v2 fingerprint of a set batch, when present. Loose item
-    /// runs have no shared batch contract and leave it absent.
-    pub schema_fingerprint: Option<String>,
-    // Keep the origin shape independent of the mutable public batch fields so
-    // a set run cannot be downgraded into loose-item scoring by clearing them.
+    version: VersionTriple,
+    observations: Vec<Observation>,
     shape: RunShape,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum RunShape {
-    Set,
+    Set {
+        batch: RecordBatch,
+        schema_fingerprint: String,
+    },
     Items,
 }
 
 impl RunOutput {
-    /// Construct a loose-item run for callers that assemble observations
-    /// without using [`Harness::run_items`]. Item runs have no shared Arrow
-    /// contract and remain scoreable through [`crate::score::score_run`].
+    /// Construct and validate a loose-item run. Set runs are produced by the
+    /// harness, which binds the observations and Arrow batch together.
     pub fn from_items(
-        model_id: String,
         version: VersionTriple,
         observations: Vec<Observation>,
-    ) -> Self {
-        Self {
-            model_id,
-            version,
-            observations,
-            batch: None,
-            schema_fingerprint: None,
-            shape: RunShape::Items,
-        }
-    }
-
-    pub(crate) fn is_set_run(&self) -> bool {
-        self.shape == RunShape::Set
-    }
-
-    /// Both public model coordinates name the same resolved producer. Check
-    /// them again at consuming boundaries because callers may mutate a run.
-    pub(crate) fn validate_model_provenance(&self) -> Result<(), EvalError> {
-        if self.model_id.is_empty() || self.model_id != self.version.model {
+    ) -> Result<Self, EvalError> {
+        if version.model.is_empty() {
             return Err(EvalError::InvalidInput(
-                "run requires one nonempty resolved model id matching its version triple"
-                    .to_owned(),
+                "run requires a nonempty resolved model id".to_owned(),
             ));
         }
-        Ok(())
+        let output = Self {
+            version,
+            observations,
+            shape: RunShape::Items,
+        };
+        validate_observations(&output)?;
+        Ok(output)
     }
+
+    /// Response-bound resolved producer identity.
+    pub fn model_id(&self) -> &str {
+        &self.version.model
+    }
+
+    /// Version triple captured for this run.
+    pub fn version(&self) -> &VersionTriple {
+        &self.version
+    }
+
+    /// Validated observations in run order.
+    pub fn observations(&self) -> &[Observation] {
+        &self.observations
+    }
+
+    /// Set runs always carry a batch and its fingerprint together.
+    pub fn batch(&self) -> Option<&RecordBatch> {
+        match &self.shape {
+            RunShape::Set { batch, .. } => Some(batch),
+            RunShape::Items => None,
+        }
+    }
+
+    /// Physical eval-v2 fingerprint, present only for set runs.
+    pub fn schema_fingerprint(&self) -> Option<&str> {
+        match &self.shape {
+            RunShape::Set {
+                schema_fingerprint, ..
+            } => Some(schema_fingerprint),
+            RunShape::Items => None,
+        }
+    }
+}
+
+/// Validate every input before fit/eval splitting or any metric aggregation.
+fn validate_observations(output: &RunOutput) -> Result<(), EvalError> {
+    use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
+    let invalid = |message: &str| EvalError::InvalidInput(message.to_owned());
+    for obs in output.observations() {
+        crate::run::question_from_labels(&obs.question_id, obs.kind, &obs.labels)?;
+        if obs.truth.is_some_and(|truth| truth >= obs.labels.len()) {
+            return Err(invalid("observation truth is outside its declared labels"));
+        }
+        if let Some(probabilities) = &obs.probabilities {
+            if probabilities.len() != obs.labels.len() {
+                return Err(invalid(
+                    "observation probability width differs from its labels",
+                ));
+            }
+            check_distribution(probabilities, PRODUCER_SUM_TOLERANCE)
+                .map_err(|_| invalid("observation has an invalid probability distribution"))?;
+        }
+    }
+    Ok(())
 }
 
 /// The harness. Stateless; every method is a pure function of its inputs plus
@@ -295,7 +337,7 @@ impl Harness {
         // Subject-specific checks must also complete for ALL requests before
         // any decide call (e.g. the legacy HTTP endpoint rejects null state).
         for (row_index, row) in set.rows.iter().enumerate() {
-            subject.preflight_row(&question_set, &row.state, row_index)?;
+            subject.preflight(&question_set, &row.state, row_index)?;
         }
         let mut rows = Vec::with_capacity(set.rows.len());
         let mut observations = Vec::new();
@@ -303,12 +345,12 @@ impl Harness {
         // re-resolves its alias per response, and a rolling deploy mid-run
         // would otherwise stamp every row with the LAST resolved version,
         // mislabeling the earlier rows. The version is read from the same
-        // exchange as the answers (`decide_with_version`) so a concurrent
+        // exchange as the answers (`decide`) so a concurrent
         // run sharing the subject cannot overwrite it in between.
         let mut pinned_model: Option<String> = None;
         for (row_index, row) in set.rows.iter().enumerate() {
             let (answers, resolved) = subject
-                .decide_with_version(&question_set, &row.state, row_index)
+                .decide(&question_set, &row.state, row_index)
                 .await
                 .map_err(|error| EvalError::Subject {
                     model: subject.model_id().to_owned(),
@@ -381,12 +423,12 @@ impl Harness {
         let schema = EvalBatchSchema::new(schema)?;
         let batch = schema.build_batch(&version, &rows)?;
         Ok(RunOutput {
-            model_id: version.model.clone(),
-            schema_fingerprint: Some(schema.fingerprint()),
-            batch: Some(batch),
             version,
             observations,
-            shape: RunShape::Set,
+            shape: RunShape::Set {
+                batch,
+                schema_fingerprint: schema.fingerprint(),
+            },
         })
     }
 
@@ -436,7 +478,7 @@ impl Harness {
                 state: Some(item.state.clone()),
                 questions: vec![item.question.clone()],
             };
-            subject.preflight_row(&set, &item.state, row_index)?;
+            subject.preflight(&set, &item.state, row_index)?;
         }
         let mut observations = Vec::with_capacity(items.len());
         let mut pinned_model: Option<String> = None;
@@ -445,14 +487,15 @@ impl Harness {
                 state: Some(item.state.clone()),
                 questions: vec![item.question.clone()],
             };
-            let (answers, resolved) = subject
-                .decide_with_version(&set, &item.state, row_index)
-                .await
-                .map_err(|error| EvalError::Subject {
-                    model: subject.model_id().to_owned(),
-                    item_id: item.id.clone(),
-                    message: error.to_string(),
-                })?;
+            let (answers, resolved) =
+                subject
+                    .decide(&set, &item.state, row_index)
+                    .await
+                    .map_err(|error| EvalError::Subject {
+                        model: subject.model_id().to_owned(),
+                        item_id: item.id.clone(),
+                        message: error.to_string(),
+                    })?;
             if resolved.is_empty() {
                 return Err(EvalError::InvalidInput(format!(
                     "subject `{}` resolved an empty model id on item `{}` — a run requires model provenance",
@@ -497,17 +540,13 @@ impl Harness {
             model: final_model_id(pinned_model, subject)?,
             calib: None,
         };
-        Ok(RunOutput::from_items(
-            version.model.clone(),
-            version,
-            observations,
-        ))
+        RunOutput::from_items(version, observations)
     }
 }
 
 /// Empty runs have no response capture, but still require usable provenance.
 fn final_model_id(pinned: Option<String>, subject: &dyn Subject) -> Result<String, EvalError> {
-    let model = pinned.unwrap_or_else(|| subject.resolved_model_id());
+    let model = pinned.unwrap_or_else(|| subject.model_id().to_owned());
     if model.is_empty() {
         return Err(EvalError::InvalidInput(format!(
             "subject `{}` resolved an empty model id — a run requires model provenance",

@@ -108,7 +108,6 @@ async fn provision_policy_templates(
     let manager = PolicyManager::new(&staged_policies_dir)
         .await
         .context("open staged policy store")?;
-    migrate_legacy_clef_inference_grants(&manager, &templates).await?;
     for template in &templates {
         manager
             .apply_template(template)
@@ -119,7 +118,6 @@ async fn provision_policy_templates(
     let requested: BTreeSet<&str> = templates.iter().map(|template| template.name).collect();
     let public_staging: BTreeSet<&str> = ["public-inference", "public-read"].into_iter().collect();
     verify_requested_templates(&manager, &templates).await?;
-    verify_legacy_clef_inference_grants_removed(&manager, &templates).await?;
     if requested == public_staging {
         verify_public_staging_policy(&manager).await?;
     }
@@ -172,7 +170,6 @@ async fn provision_policy_templates(
         .await
         .context("reopen published policy store")?;
     verify_requested_templates(&published, &templates).await?;
-    verify_legacy_clef_inference_grants_removed(&published, &templates).await?;
     if requested == public_staging {
         verify_public_staging_policy(&published).await?;
     }
@@ -182,66 +179,6 @@ async fn provision_policy_templates(
         templates.len(),
         template_names.join(",")
     );
-    Ok(())
-}
-
-/// Exact grants written by the older Clef staging templates before their
-/// model action was narrowed from `infer` to `decide`. These are deliberately
-/// enumerated rather than derived from arbitrary policy rows: provisioning a
-/// closed Clef template may migrate only the corresponding known owner grant.
-const LEGACY_CLEF_STAGING_INFER_GRANTS: [(&str, &str, &str); 2] = [
-    (
-        "cyberdione-staging-clef-e2e",
-        "did:plc:3f7ldey5bivhfjapwqi2sljy",
-        "model:clef-flash-fp8:main",
-    ),
-    (
-        "cyberdione-staging-clef-operator",
-        "did:plc:rjqczurevrpoz4mcnax2kgw4",
-        "model:clef-flash-fp8:main",
-    ),
-];
-
-async fn migrate_legacy_clef_inference_grants(
-    manager: &crate::auth::PolicyManager,
-    templates: &[&crate::auth::PolicyTemplate],
-) -> Result<()> {
-    let requested: std::collections::BTreeSet<&str> =
-        templates.iter().map(|template| template.name).collect();
-    for (template, subject, resource) in LEGACY_CLEF_STAGING_INFER_GRANTS {
-        if requested.contains(template) {
-            manager
-                .remove_policy_with_domain(subject, "local", resource, "infer", "allow")
-                .await
-                .with_context(|| format!("remove legacy infer grant for template '{template}'"))?;
-        }
-    }
-    Ok(())
-}
-
-async fn verify_legacy_clef_inference_grants_removed(
-    manager: &crate::auth::PolicyManager,
-    templates: &[&crate::auth::PolicyTemplate],
-) -> Result<()> {
-    use anyhow::ensure;
-    use std::collections::BTreeSet;
-
-    let requested: BTreeSet<&str> = templates.iter().map(|template| template.name).collect();
-    let policies = manager.get_policy().await;
-    for (template, subject, resource) in LEGACY_CLEF_STAGING_INFER_GRANTS {
-        if requested.contains(template) {
-            ensure!(
-                !policies.contains(&vec![
-                    subject.to_owned(),
-                    "local".to_owned(),
-                    resource.to_owned(),
-                    "infer".to_owned(),
-                    "allow".to_owned(),
-                ]),
-                "legacy Clef inference grant remains after provisioning template '{template}'"
-            );
-        }
-    }
     Ok(())
 }
 
@@ -2294,169 +2231,6 @@ mod offline_policy_provision_tests {
                 .check_with_domain(did, "local", "model:qwen2.5-0.5b-instruct:other", "infer")
                 .await
         );
-    }
-
-    #[tokio::test]
-    async fn clef_template_upgrade_removes_only_its_legacy_infer_grant() {
-        let legacy_owners = [
-            (
-                "cyberdione-staging-clef-e2e",
-                "did:plc:3f7ldey5bivhfjapwqi2sljy",
-            ),
-            (
-                "cyberdione-staging-clef-operator",
-                "did:plc:rjqczurevrpoz4mcnax2kgw4",
-            ),
-        ];
-        for (name, did) in legacy_owners {
-            let other_owner = legacy_owners
-                .iter()
-                .find_map(|(_, owner)| (*owner != did).then_some(*owner))
-                .expect("the two legacy Clef owners are distinct");
-            let root = tempfile::tempdir().expect("temporary retained policy root");
-            let policies_dir = root.path().join(".registry/policies");
-            let legacy = PolicyManager::new(&policies_dir)
-                .await
-                .expect("create legacy policy store");
-            for (_, legacy_did) in legacy_owners {
-                for (resource, action) in [
-                    ("registry:clef-flash-fp8", "query"),
-                    ("model:Load", "write"),
-                    ("model:Status", "query"),
-                    ("model:clef-flash-fp8:main", "infer"),
-                ] {
-                    legacy
-                        .add_policy_with_domain(legacy_did, "local", resource, action, "allow")
-                        .await
-                        .expect("seed prior four-row Clef template");
-                }
-            }
-            let unrelated = vec![
-                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-                "local".to_owned(),
-                "model:unrelated:main".to_owned(),
-                "infer".to_owned(),
-                "allow".to_owned(),
-            ];
-            legacy
-                .add_policy_with_domain(
-                    &unrelated[0],
-                    &unrelated[1],
-                    &unrelated[2],
-                    &unrelated[3],
-                    &unrelated[4],
-                )
-                .await
-                .expect("seed unrelated administrator policy");
-            legacy.save().await.expect("persist legacy policy store");
-            let original_policy = std::fs::read(policies_dir.join("policy.csv"))
-                .expect("read retained policy before migration");
-            assert!(
-                legacy
-                    .check_with_domain(did, "local", "model:clef-flash-fp8:main", "infer")
-                    .await,
-                "fixture must reproduce the pre-upgrade authority"
-            );
-            assert!(
-                legacy
-                    .check_with_domain(other_owner, "local", "model:clef-flash-fp8:main", "infer")
-                    .await,
-                "fixture must seed the other legacy Clef owner's grant"
-            );
-            drop(legacy);
-
-            let names = vec![name.to_owned()];
-            let mut fault_reached = false;
-            assert!(
-                provision_policy_templates(
-                    root.path(),
-                    &names,
-                    |_| {
-                        fault_reached = true;
-                        anyhow::bail!("injected failure after staged Clef migration")
-                    },
-                    |_| Ok(()),
-                    |_| Ok(()),
-                )
-                .await
-                .is_err(),
-                "injected prepublication failure must abort the staged migration"
-            );
-            assert!(fault_reached, "prepublication failure seam must be reached");
-            assert_eq!(
-                std::fs::read(policies_dir.join("policy.csv"))
-                    .expect("read retained policy after failed migration"),
-                original_policy,
-                "failed staged migration must leave the published policy byte-identical"
-            );
-            let retained = PolicyManager::new(&policies_dir)
-                .await
-                .expect("reopen retained policy after failed migration");
-            assert!(
-                retained
-                    .check_with_domain(did, "local", "model:clef-flash-fp8:main", "infer")
-                    .await,
-                "failed staged migration must leave the prior grant in force"
-            );
-            drop(retained);
-
-            handle_service_provision_policy_templates(root.path(), &names)
-                .await
-                .expect("upgrade retained Clef policy store");
-            let upgraded = PolicyManager::new(&policies_dir)
-                .await
-                .expect("reopen upgraded policy store");
-            assert!(
-                upgraded
-                    .check_with_domain(did, "local", "model:clef-flash-fp8:main", "decide")
-                    .await,
-                "the canonical decision grant remains available"
-            );
-            for action in ["infer", "infer.generate", "infer.embed"] {
-                assert!(
-                    !upgraded
-                        .check_with_domain(did, "local", "model:clef-flash-fp8:main", action)
-                        .await,
-                    "legacy model inference must be denied for action {action}"
-                );
-            }
-            assert!(
-                upgraded.get_policy().await.contains(&unrelated),
-                "unrelated administrator policy must be preserved"
-            );
-            let owner_rows: Vec<Vec<String>> = upgraded
-                .get_policy()
-                .await
-                .into_iter()
-                .filter(|rule| rule.first().map(String::as_str) == Some(did))
-                .collect();
-            assert_eq!(
-                owner_rows.len(),
-                4,
-                "upgrade leaves exactly four owner rows"
-            );
-            drop(upgraded);
-
-            handle_service_provision_policy_templates(root.path(), &names)
-                .await
-                .expect("repeat upgraded Clef provisioning");
-            let reopened = PolicyManager::new(&policies_dir)
-                .await
-                .expect("reopen repeated upgraded policy store");
-            assert!(
-                !reopened
-                    .check_with_domain(did, "local", "model:clef-flash-fp8:main", "infer")
-                    .await,
-                "repeat upgrade must not restore the legacy inference grant"
-            );
-            assert!(reopened.get_policy().await.contains(&unrelated));
-            assert!(
-                reopened
-                    .check_with_domain(other_owner, "local", "model:clef-flash-fp8:main", "infer")
-                    .await,
-                "a template not requested must retain the other owner's legacy row"
-            );
-        }
     }
 
     #[tokio::test]

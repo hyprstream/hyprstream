@@ -36,7 +36,7 @@ impl Subject for UniformSubject {
         set: &QuestionSet,
         _state: &Entry,
         _row: usize,
-    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
         let mut answers = std::collections::BTreeMap::new();
         for question in &set.questions {
             let n = question.cardinality();
@@ -49,7 +49,7 @@ impl Subject for UniformSubject {
             };
             answers.insert(question.id.clone(), QuestionAnswer::answered(value));
         }
-        Ok(AnswerRow { answers })
+        Ok((AnswerRow { answers }, self.model_id().to_owned()))
     }
 }
 
@@ -164,7 +164,7 @@ async fn argmax_ties_break_earliest_everywhere() {
     };
     let items = vec![item];
     let output = Harness.run_items(&items, &UniformSubject).await.unwrap();
-    let obs = &output.observations[0];
+    let obs = &output.observations()[0];
     assert_eq!(obs.probabilities.as_deref(), Some([0.5, 0.5].as_slice()));
     assert_eq!(
         obs.argmax_label_index(),
@@ -196,10 +196,13 @@ impl Subject for SilentSubject {
         _set: &QuestionSet,
         _state: &Entry,
         _row: usize,
-    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
-        Ok(AnswerRow {
-            answers: std::collections::BTreeMap::new(),
-        })
+    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
+        Ok((
+            AnswerRow {
+                answers: std::collections::BTreeMap::new(),
+            },
+            self.model_id().to_owned(),
+        ))
     }
 }
 
@@ -218,7 +221,7 @@ impl Subject for WrongKindSubject {
         set: &QuestionSet,
         _state: &Entry,
         _row: usize,
-    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
         let mut answers = std::collections::BTreeMap::new();
         for question in &set.questions {
             let n = question.cardinality();
@@ -229,7 +232,7 @@ impl Subject for WrongKindSubject {
                 }),
             );
         }
-        Ok(AnswerRow { answers })
+        Ok((AnswerRow { answers }, self.model_id().to_owned()))
     }
 }
 
@@ -421,7 +424,7 @@ impl Subject for CountingSubject {
         set: &QuestionSet,
         _state: &Entry,
         _row: usize,
-    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut answers = std::collections::BTreeMap::new();
         for question in &set.questions {
@@ -430,7 +433,7 @@ impl Subject for CountingSubject {
                 QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
             );
         }
-        Ok(AnswerRow { answers })
+        Ok((AnswerRow { answers }, self.model_id().to_owned()))
     }
 }
 
@@ -613,12 +616,12 @@ impl Subject for AbstainSubject {
         set: &QuestionSet,
         _state: &Entry,
         _row: usize,
-    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
         let mut answers = std::collections::BTreeMap::new();
         for question in &set.questions {
             answers.insert(question.id.clone(), QuestionAnswer::abstained());
         }
-        Ok(AnswerRow { answers })
+        Ok((AnswerRow { answers }, self.model_id().to_owned()))
     }
 }
 
@@ -707,21 +710,13 @@ impl Subject for VersionFlipSubject {
         "version-flip"
     }
 
-    fn resolved_model_id(&self) -> String {
-        if self.0.load(std::sync::atomic::Ordering::SeqCst) <= 1 {
-            "v1".to_owned()
-        } else {
-            "v2".to_owned()
-        }
-    }
-
     async fn decide(
         &self,
         set: &QuestionSet,
         _state: &Entry,
         _row: usize,
-    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
+        let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut answers = std::collections::BTreeMap::new();
         for question in &set.questions {
             answers.insert(
@@ -729,7 +724,10 @@ impl Subject for VersionFlipSubject {
                 QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
             );
         }
-        Ok(AnswerRow { answers })
+        Ok((
+            AnswerRow { answers },
+            if call == 0 { "v1" } else { "v2" }.to_owned(),
+        ))
     }
 }
 
@@ -851,7 +849,7 @@ impl Subject for MalformedOnSecondRowSubject {
         set: &QuestionSet,
         _state: &Entry,
         _row: usize,
-    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
         let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut answers = std::collections::BTreeMap::new();
         if call == 0 {
@@ -862,7 +860,7 @@ impl Subject for MalformedOnSecondRowSubject {
                 );
             }
         }
-        Ok(AnswerRow { answers })
+        Ok((AnswerRow { answers }, self.model_id().to_owned()))
     }
 }
 
@@ -899,9 +897,7 @@ async fn run_set_validates_each_row_before_requesting_the_next() {
     );
 }
 
-/// Reports a stale global version but binds a fresh one to each response —
-/// the shape an HTTP subject presents when a concurrent run overwrites the
-/// shared resolved slot between a decide and a later resolved_model_id read.
+/// Resolves the configured alias to a version bound to each response.
 struct FreshPerResponseSubject;
 
 #[async_trait::async_trait]
@@ -910,16 +906,12 @@ impl Subject for FreshPerResponseSubject {
         "alias"
     }
 
-    fn resolved_model_id(&self) -> String {
-        "stale-global".to_owned()
-    }
-
     async fn decide(
         &self,
         set: &QuestionSet,
         _state: &Entry,
         _row: usize,
-    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
         let mut answers = std::collections::BTreeMap::new();
         for question in &set.questions {
             answers.insert(
@@ -927,16 +919,7 @@ impl Subject for FreshPerResponseSubject {
                 QuestionAnswer::answered(AnswerValue::Noul { p_true: 0.5 }),
             );
         }
-        Ok(AnswerRow { answers })
-    }
-
-    async fn decide_with_version(
-        &self,
-        set: &QuestionSet,
-        state: &Entry,
-        row: usize,
-    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
-        Ok((self.decide(set, state, row).await?, "fresh-v42".to_owned()))
+        Ok((AnswerRow { answers }, "fresh-v42".to_owned()))
     }
 }
 
@@ -1128,8 +1111,8 @@ async fn truth_preflight_uses_the_effective_row_override_for_reused_question_ids
         .with_row_truth(1, "shared", 2);
 
     let output = Harness.run_items(&items, &subject).await.unwrap();
-    assert_eq!(output.observations[0].argmax_label_index(), Some(1));
-    assert_eq!(output.observations[1].argmax_label_index(), Some(2));
+    assert_eq!(output.observations()[0].argmax_label_index(), Some(1));
+    assert_eq!(output.observations()[1].argmax_label_index(), Some(2));
 }
 
 #[test]
@@ -1233,11 +1216,11 @@ async fn empty_runs_validate_fallback_provenance_without_queries() {
     };
     let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
     assert_eq!(
-        Harness.run_set(&set, &subject).await.unwrap().model_id,
+        Harness.run_set(&set, &subject).await.unwrap().model_id(),
         "counting"
     );
     assert_eq!(
-        Harness.run_items(&[], &subject).await.unwrap().model_id,
+        Harness.run_items(&[], &subject).await.unwrap().model_id(),
         "counting"
     );
     assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -1434,7 +1417,7 @@ async fn nonfinite_request_entries_fail_before_any_subject_or_teacher_call() {
             set: &QuestionSet,
             state: &Entry,
             row: usize,
-        ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+        ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             UniformSubject.decide(set, state, row).await
         }
@@ -1488,7 +1471,7 @@ async fn nonfinite_request_entries_fail_before_any_subject_or_teacher_call() {
             let items = vec![noul_item(), item.clone()];
             let result = Harness.run_items(&items, &subject).await;
             if value.is_finite() {
-                assert_eq!(result.unwrap().observations.len(), 2);
+                assert_eq!(result.unwrap().observations().len(), 2);
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
             } else {
                 assert!(matches!(
@@ -1521,7 +1504,7 @@ async fn nonfinite_request_entries_fail_before_any_subject_or_teacher_call() {
             };
             let result = Harness.run_set(&set, &subject).await;
             if value.is_finite() {
-                assert_eq!(result.unwrap().observations.len(), 2);
+                assert_eq!(result.unwrap().observations().len(), 2);
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
             } else {
                 assert!(matches!(
@@ -1584,7 +1567,7 @@ async fn empty_schema_versions_fail_preflight_even_for_empty_runs() {
         assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         set.schema_version = "schema@revision".into();
         let output = Harness.run_set(&set, &subject).await.unwrap();
-        assert_eq!(output.version.schema, "schema@revision");
+        assert_eq!(output.version().schema, "schema@revision");
         assert_eq!(
             subject.0.load(std::sync::atomic::Ordering::SeqCst),
             set.rows.len()
@@ -1614,11 +1597,14 @@ async fn empty_runs_have_no_measured_abstention_rate() {
     assert_eq!(report.accuracy, None);
     assert!(report.gate.is_none());
     // A real unanswered observation is measured, even with no ground truth.
-    let mut output = Harness
+    let output = Harness
         .run_items(std::slice::from_ref(&item), &subject)
         .await
         .unwrap();
-    output.observations[0].probabilities = None;
+    let mut observations = output.observations().to_vec();
+    observations[0].probabilities = None;
+    let output =
+        hyprstream_eval::RunOutput::from_items(output.version().clone(), observations).unwrap();
     let report = score_bench_run(&output, &[item], &ScoreConfig::default()).unwrap();
     assert_eq!(report.abstention_rate, Some(1.0));
     assert_eq!(report.by_family[0].abstention_rate, 1.0);
@@ -1693,56 +1679,47 @@ async fn bench_scoring_requires_the_exact_item_observation_identity_set() {
         matches!(score_bench_run(&partial, &items, &ScoreConfig::default()),
         Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("no matching observation"))
     );
-    let mut duplicate = Harness.run_items(&items, &UniformSubject).await.unwrap();
-    duplicate
-        .observations
-        .push(duplicate.observations[0].clone());
+    let mut observations = output.observations().to_vec();
+    observations.push(observations[0].clone());
+    let duplicate =
+        hyprstream_eval::RunOutput::from_items(output.version().clone(), observations).unwrap();
     assert!(
         matches!(score_bench_run(&duplicate, &items, &ScoreConfig::default()),
         Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("duplicate observation identity"))
     );
-    let mut substituted = Harness.run_items(&items, &UniformSubject).await.unwrap();
-    substituted.observations[1].id = "outside".into();
+    let mut observations = output.observations().to_vec();
+    observations[1].id = "outside".into();
+    let substituted =
+        hyprstream_eval::RunOutput::from_items(output.version().clone(), observations).unwrap();
     assert!(
         matches!(score_bench_run(&substituted, &items, &ScoreConfig::default()),
         Err(hyprstream_eval::EvalError::InvalidInput(ref message)) if message.contains("no matching eval item"))
     );
 }
 
+#[test]
+fn imported_item_run_requires_model_provenance() {
+    let version = hyprstream_decision::answer::VersionTriple {
+        schema: "items".into(),
+        model: String::new(),
+        calib: None,
+    };
+    assert!(hyprstream_eval::RunOutput::from_items(version, Vec::new()).is_err());
+}
+
 #[tokio::test]
-async fn item_scoring_preserves_resolved_alias_identity_and_rejects_mutated_provenance() {
+async fn item_scoring_preserves_resolved_alias_identity() {
     let items = vec![noul_item()];
-    let mut output = Harness
+    let output = Harness
         .run_items(&items, &FreshPerResponseSubject)
         .await
         .unwrap();
-    assert_eq!(output.model_id, "fresh-v42");
-    assert_eq!(output.version.model, "fresh-v42");
-    assert_ne!(output.model_id, FreshPerResponseSubject.model_id());
-    assert!(output.batch.is_none());
+    assert_eq!(output.model_id(), "fresh-v42");
+    assert_eq!(output.version().model, "fresh-v42");
+    assert_ne!(output.model_id(), FreshPerResponseSubject.model_id());
+    assert!(output.batch().is_none());
     score_run(&output, &ScoreConfig::default()).unwrap();
     score_bench_run(&output, &items, &ScoreConfig::default()).unwrap();
-    output.model_id = "alias".into();
-    assert!(matches!(
-        score_run(&output, &ScoreConfig::default()),
-        Err(hyprstream_eval::EvalError::InvalidInput(_))
-    ));
-    assert!(matches!(
-        score_bench_run(&output, &items, &ScoreConfig::default()),
-        Err(hyprstream_eval::EvalError::InvalidInput(_))
-    ));
-    output.model_id = "fresh-v42".into();
-    output.version.model = "another-resolved-version".into();
-    assert!(matches!(
-        score_run(&output, &ScoreConfig::default()),
-        Err(hyprstream_eval::EvalError::InvalidInput(_))
-    ));
-    output.model_id.clear();
-    output.version.model.clear();
-    assert!(matches!(
-        score_bench_run(&output, &items, &ScoreConfig::default()),
-        Err(hyprstream_eval::EvalError::InvalidInput(_))
-    ));
 }
 
 struct PartialSetSubject;
@@ -1758,7 +1735,7 @@ impl Subject for PartialSetSubject {
         set: &QuestionSet,
         _state: &Entry,
         row: usize,
-    ) -> Result<AnswerRow, hyprstream_eval::EvalError> {
+    ) -> Result<(AnswerRow, String), hyprstream_eval::EvalError> {
         let mut answers = std::collections::BTreeMap::new();
         for question in &set.questions {
             let answer = if row == 0 && question.id == "q1" {
@@ -1774,7 +1751,7 @@ impl Subject for PartialSetSubject {
             };
             answers.insert(question.id.clone(), answer);
         }
-        Ok(AnswerRow { answers })
+        Ok((AnswerRow { answers }, self.model_id().to_owned()))
     }
 }
 
@@ -1834,8 +1811,8 @@ async fn scoring_validates_every_observation_before_fit_or_breakdown_aggregation
         let valid = Harness.run_items(&items, &UniformSubject).await.unwrap();
         score_run(&valid, &config).unwrap();
         for mutation in ["nan", "sum", "range", "width", "truth", "abstained-truth"] {
-            let mut output = Harness.run_items(&items, &UniformSubject).await.unwrap();
-            let obs = &mut output.observations[0];
+            let mut observations = valid.observations().to_vec();
+            let obs = &mut observations[0];
             match mutation {
                 "nan" => obs.probabilities = Some(vec![f32::NAN, 0.5]),
                 "sum" => obs.probabilities = Some(vec![0.2, 0.2]),
@@ -1850,67 +1827,13 @@ async fn scoring_validates_every_observation_before_fit_or_breakdown_aggregation
             }
             assert!(
                 matches!(
-                    score_run(&output, &config),
+                    hyprstream_eval::RunOutput::from_items(valid.version().clone(), observations),
                     Err(hyprstream_eval::EvalError::InvalidInput(_))
                 ),
                 "fit={fit} {mutation}"
             );
         }
     }
-}
-
-#[tokio::test]
-async fn set_scoring_rejects_observation_batch_divergence() {
-    let set = hyprstream_eval::EvalSet {
-        name: "batch-consistency".into(),
-        schema_version: "v1".into(),
-        questions: vec![noul_item().question],
-        rows: (0..2)
-            .map(|i| hyprstream_eval::EvalRow {
-                id: format!("row{i}"),
-                family: None,
-                stratum: None,
-                group: None,
-                state: Entry::Null,
-                truth: std::collections::BTreeMap::from([("val_q".into(), 1)]),
-            })
-            .collect(),
-    };
-    let control = Harness.run_set(&set, &UniformSubject).await.unwrap();
-    score_run(&control, &ScoreConfig::default()).unwrap();
-    for mutation in [
-        "valid-different-probabilities",
-        "abstained-observation",
-        "missing",
-        "profile-order",
-    ] {
-        let mut output = Harness.run_set(&set, &UniformSubject).await.unwrap();
-        match mutation {
-            "valid-different-probabilities" => {
-                output.observations[0].probabilities = Some(vec![0.2, 0.8]);
-            }
-            "abstained-observation" => output.observations[0].probabilities = None,
-            "missing" => {
-                output.observations.pop();
-            }
-            "profile-order" => output.observations[0].question_id = "other".into(),
-            _ => unreachable!(),
-        }
-        assert!(
-            matches!(
-                score_run(&output, &ScoreConfig::default()),
-                Err(hyprstream_eval::EvalError::InvalidInput(_))
-            ),
-            "{mutation}"
-        );
-    }
-    let mut abstained = Harness.run_set(&set, &AbstainSubject).await.unwrap();
-    score_run(&abstained, &ScoreConfig::default()).unwrap();
-    abstained.observations[0].probabilities = Some(vec![0.5, 0.5]);
-    assert!(matches!(
-        score_run(&abstained, &ScoreConfig::default()),
-        Err(hyprstream_eval::EvalError::InvalidInput(_))
-    ));
 }
 
 #[tokio::test]
@@ -2001,7 +1924,7 @@ async fn wide_set_truth_index_preserves_all_input_preflight() {
     };
     let subject = CountingSubject(std::sync::atomic::AtomicUsize::new(0));
     let output = Harness.run_set(&set, &subject).await.unwrap();
-    assert_eq!(output.observations.len(), 192);
+    assert_eq!(output.observations().len(), 192);
     assert_eq!(subject.0.load(std::sync::atomic::Ordering::SeqCst), 3);
     for (key, truth) in [("outside", 0), ("q63", 2)] {
         let mut invalid = set.clone();
@@ -2019,53 +1942,4 @@ async fn wide_set_truth_index_preserves_all_input_preflight() {
         .unwrap()
         .items
         .is_empty());
-}
-
-#[tokio::test]
-async fn scoring_rejects_inconsistent_batch_and_schema_fingerprint_presence() {
-    let config = ScoreConfig::default();
-    let mut item = Harness
-        .run_items(&[noul_item()], &UniformSubject)
-        .await
-        .unwrap();
-    assert!(item.batch.is_none());
-    assert!(item.schema_fingerprint.is_none());
-    score_run(&item, &config).unwrap();
-    item.schema_fingerprint = Some("detached-set-fingerprint".into());
-    assert!(matches!(
-        score_run(&item, &config),
-        Err(hyprstream_eval::EvalError::InvalidInput(ref message))
-            if message.contains("must either both be present or both be absent")
-    ));
-
-    let set = hyprstream_eval::EvalSet {
-        name: "run-shape-presence".into(),
-        schema_version: "v1".into(),
-        questions: vec![noul_item().question],
-        rows: vec![hyprstream_eval::EvalRow {
-            id: "row".into(),
-            family: None,
-            stratum: None,
-            group: None,
-            state: Entry::Null,
-            truth: std::collections::BTreeMap::new(),
-        }],
-    };
-    let mut output = Harness.run_set(&set, &UniformSubject).await.unwrap();
-    assert!(output.batch.is_some());
-    assert!(output.schema_fingerprint.is_some());
-    score_run(&output, &config).unwrap();
-    let batch = output.batch.take();
-    assert!(matches!(
-        score_run(&output, &config),
-        Err(hyprstream_eval::EvalError::InvalidInput(ref message))
-            if message.contains("must either both be present or both be absent")
-    ));
-    output.batch = batch;
-    output.schema_fingerprint = None;
-    assert!(matches!(
-        score_run(&output, &config),
-        Err(hyprstream_eval::EvalError::InvalidInput(ref message))
-            if message.contains("must either both be present or both be absent")
-    ));
 }

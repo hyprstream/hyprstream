@@ -475,7 +475,6 @@ impl InferenceServiceInner {
             crate::runtime::clef_decision::ClefDecisionRuntime::load(
                 &self.model_path,
                 Some(engine_hidden),
-                None,
                 self.precision_mode.as_deref(),
                 cancel,
             )?,

@@ -160,7 +160,9 @@ class ExplicitReleasePackageTests(unittest.TestCase):
         ]:
             with self.subTest(changes=changes):
                 commands = self.run_affected(changes)
-                for package in PR_AFFECTED.EXPLICIT_FULL_SET_PACKAGES:
+                for package in ["hyprstream-decision", "hyprstream-calibration",
+                                "hyprstream-decision-head", "hyprstream-decision-stub",
+                                "hyprstream-eval"]:
                     self.assertIn(
                         ["cargo", "nextest", "run", "--cargo-profile", "release",
                          "--profile", "ci", "--no-fail-fast", "-p", package],

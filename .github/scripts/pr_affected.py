@@ -52,8 +52,10 @@ GUEST_ARTIFACT_PACKAGES = ("hyprstream-workers-python", "hyprstream-workers-wasm
 # trigger must still execute their own tests: compiling them as dependencies
 # does not exercise their encoder, head, Arrow or measurement regressions.
 EXPLICIT_FULL_SET_PACKAGES = (
+    "hyprstream-calibration",
     "hyprstream-decision",
     "hyprstream-decision-head",
+    "hyprstream-decision-stub",
     "hyprstream-eval",
 )
 GUEST_BUILDS = (

@@ -310,10 +310,10 @@ impl DecisionCancel {
 pub struct ClefBundleIdentity {
     pub head_config_sha256: String,
     pub head_weights_sha256: String,
-    /// tokenizer.json digest; `None` when the bundle ships none.
-    pub tokenizer_sha256: Option<String>,
-    /// backbone config.json digest; `None` when absent.
-    pub backbone_config_sha256: Option<String>,
+    /// Required tokenizer.json digest.
+    pub tokenizer_sha256: String,
+    /// Required backbone config.json digest.
+    pub backbone_config_sha256: String,
     /// quantization format actually declared by config.json, if any.
     pub quantization: Option<String>,
     pub head_tensor_count: u32,
@@ -415,7 +415,7 @@ fn sha256_bytes_staged(bytes: &[u8], cancel: &DecisionCancel) -> Result<String> 
 /// Digest a file in 1 MiB reads with a cooperative cancellation check between
 /// reads (stage 300+chunk). Same cooperative bound as
 /// [`sha256_bytes_staged`].
-fn sha256_file_staged(path: &Path, cancel: &DecisionCancel) -> Result<Option<String>> {
+fn sha256_file_staged(path: &Path, cancel: &DecisionCancel) -> Result<String> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut h = Sha256::new();
@@ -430,7 +430,7 @@ fn sha256_file_staged(path: &Path, cancel: &DecisionCancel) -> Result<Option<Str
         h.update(&buf[..n]);
         chunk += 1;
     }
-    Ok(Some(hex::encode(h.finalize())))
+    Ok(hex::encode(h.finalize()))
 }
 
 /// The tensor dtype kind used for compute-profile reporting (re-exported so
@@ -701,9 +701,8 @@ impl ClefDecisionRuntime {
     /// (immutable, service-pinned) model directory.
     ///
     /// `engine_hidden` validates the head geometry against the admitted
-    /// engine before the weights are even mapped. `kind_hint` overrides the
-    /// file-derived head dtype (tests with tiny FP32 backbones); production
-    /// passes `None`.
+    /// engine before the weights are even mapped. `precision_mode` selects
+    /// the head dtype through the shared engine precision policy.
     ///
     /// COOPERATIVE cancellation/deadline awareness (the lazy first-load runs
     /// inside a request's budget): `cancel` is checked at every meaningful
@@ -724,7 +723,6 @@ impl ClefDecisionRuntime {
     pub fn load(
         model_path: &Path,
         engine_hidden: Option<u32>,
-        kind_hint: Option<Kind>,
         precision_mode: Option<&str>,
         cancel: &DecisionCancel,
     ) -> Result<Self> {
@@ -786,7 +784,7 @@ impl ClefDecisionRuntime {
             std::fs::read(&config_path).with_context(|| "reading backbone config.json")?;
         let backbone_config: Value = serde_json::from_slice(&backbone_bytes)
             .map_err(|e| ClefDecisionError::Bundle(format!("invalid backbone config.json: {e}")))?;
-        let kind = kind_hint.unwrap_or(default_head_kind(model_path, precision_mode)?);
+        let kind = default_head_kind(model_path, precision_mode)?;
         cancel.check_load(4)?;
 
         // Metadata admission BEFORE any tensor materialization. The
@@ -853,12 +851,8 @@ impl ClefDecisionRuntime {
         let head_weights_sha256 = sha256_bytes_staged(&mmap, cancel)?;
         // The bundle tokenizer is REQUIRED for decision serving: fail closed
         // rather than attesting incomplete provenance.
-        let tokenizer_sha256 = Some(
-            sha256_file_staged(&model_path.join("tokenizer.json"), cancel)?.ok_or_else(|| {
-                ClefDecisionError::Bundle("decision bundle is missing tokenizer.json".into())
-            })?,
-        );
-        let backbone_config_sha256 = Some(sha256_hex(&backbone_bytes));
+        let tokenizer_sha256 = sha256_file_staged(&model_path.join("tokenizer.json"), cancel)?;
+        let backbone_config_sha256 = sha256_hex(&backbone_bytes);
         let quantization =
             quant_profile(&backbone_config).map(|p| p.trim_start_matches("cpu-").to_owned());
         cancel.check_load(7)?;
@@ -1639,25 +1633,17 @@ mod tests {
         let weights = tiny_head_tensors(&config);
         write_bundle(dir.path(), &config, &weights, Some(SIMPLE_BACKBONE_CONFIG));
 
-        let runtime = ClefDecisionRuntime::load(
-            dir.path(),
-            Some(8),
-            Some(Kind::Float),
-            None,
-            &DecisionCancel::none(),
-        )
-        .unwrap();
+        let runtime =
+            ClefDecisionRuntime::load(dir.path(), Some(8), Some("fp32"), &DecisionCancel::none())
+                .unwrap();
         assert_eq!(runtime.identity.head_tensor_count, weights.len() as u32);
         assert_eq!(runtime.compute_profile, "cpu-float32");
         assert_eq!(runtime.encoding_version, CLEF_ENCODING_VERSION);
         assert_eq!(runtime.identity.head_weights_sha256.len(), 64);
         // Required identity material: the bundle tokenizer digest is present.
-        let tokenizer_digest = runtime
-            .identity
-            .tokenizer_sha256
-            .expect("tokenizer digest required");
+        let tokenizer_digest = runtime.identity.tokenizer_sha256;
         assert_eq!(tokenizer_digest.len(), 64);
-        assert!(runtime.identity.backbone_config_sha256.is_some());
+        assert_eq!(runtime.identity.backbone_config_sha256.len(), 64);
 
         // Absent tokenizer fails closed (no incomplete provenance).
         let no_tok = tempfile::tempdir().unwrap();
@@ -1671,8 +1657,7 @@ mod tests {
         let err = match ClefDecisionRuntime::load(
             no_tok.path(),
             None,
-            Some(Kind::Float),
-            None,
+            Some("fp32"),
             &DecisionCancel::none(),
         ) {
             Err(e) => e.to_string(),
@@ -1685,8 +1670,7 @@ mod tests {
         let err = match ClefDecisionRuntime::load(
             dir.path(),
             Some(4096),
-            Some(Kind::Float),
-            None,
+            Some("fp32"),
             &DecisionCancel::none(),
         ) {
             Err(e) => e.to_string(),
@@ -1703,8 +1687,7 @@ mod tests {
         let err = match ClefDecisionRuntime::load(
             dir2.path(),
             None,
-            Some(Kind::Float),
-            None,
+            Some("fp32"),
             &DecisionCancel::none(),
         ) {
             Err(e) => e.to_string(),
@@ -1792,8 +1775,7 @@ mod tests {
         let load_err = |cancel: &DecisionCancel| match ClefDecisionRuntime::load(
             dir.path(),
             Some(8),
-            Some(Kind::Float),
-            None,
+            Some("fp32"),
             cancel,
         ) {
             Err(e) => e.to_string(),
@@ -1849,7 +1831,7 @@ mod tests {
         // namespace, not a timeline.
         let tensor_count = weights.len();
         let (cancel, last, max) = trip_at(usize::MAX); // never equal: never trips
-        ClefDecisionRuntime::load(dir.path(), Some(8), Some(Kind::Float), None, &cancel)
+        ClefDecisionRuntime::load(dir.path(), Some(8), Some("fp32"), &cancel)
             .expect("healthy retry loads the same bundle");
         assert_eq!(
             last.load(Ordering::SeqCst),
@@ -2096,7 +2078,6 @@ mod tests {
         let runtime = ClefDecisionRuntime::load(
             dir.path(),
             Some(T5_HIDDEN as u32),
-            Some(Kind::Float),
             Some("fp32"),
             &DecisionCancel::none(),
         )
@@ -2184,8 +2165,7 @@ mod tests {
         let bf16_head = ClefDecisionRuntime::load(
             dir.path(),
             Some(T5_HIDDEN as u32),
-            Some(Kind::BFloat16),
-            None,
+            Some("bf16"),
             &DecisionCancel::none(),
         )
         .expect("bf16 head loads");
@@ -2320,7 +2300,6 @@ mod tests {
         let runtime = ClefDecisionRuntime::load(
             dir.path(),
             Some(T5_HIDDEN as u32),
-            Some(Kind::Float),
             Some("fp32"),
             &DecisionCancel::none(),
         )
@@ -2528,7 +2507,6 @@ mod tests {
         let runtime = ClefDecisionRuntime::load(
             dir.path(),
             Some(T5_HIDDEN as u32),
-            Some(Kind::Float),
             Some("fp32"),
             &DecisionCancel::none(),
         )
@@ -2586,7 +2564,6 @@ mod tests {
         let runtime = ClefDecisionRuntime::load(
             dir.path(),
             Some(T5_HIDDEN as u32),
-            Some(Kind::Float),
             Some("fp32"),
             &DecisionCancel::none(),
         )
@@ -2680,22 +2657,15 @@ mod tests {
         let config = tiny_head_config(8);
         let weights = tiny_head_tensors(&config);
         write_bundle(dir.path(), &config, &weights, Some(SIMPLE_BACKBONE_CONFIG));
-        let runtime =
-            ClefDecisionRuntime::load(dir.path(), None, None, None, &DecisionCancel::none())
-                .expect("auto loads BF16 head");
+        let runtime = ClefDecisionRuntime::load(dir.path(), None, None, &DecisionCancel::none())
+            .expect("auto loads BF16 head");
         assert_eq!(runtime.compute_kind, Kind::BFloat16);
-        let runtime = ClefDecisionRuntime::load(
-            dir.path(),
-            None,
-            None,
-            Some("fp32"),
-            &DecisionCancel::none(),
-        )
-        .expect("explicit fp32 head");
+        let runtime =
+            ClefDecisionRuntime::load(dir.path(), None, Some("fp32"), &DecisionCancel::none())
+                .expect("explicit fp32 head");
         assert_eq!(runtime.compute_kind, Kind::Float);
         let err = match ClefDecisionRuntime::load(
             dir.path(),
-            None,
             None,
             Some("fp8e4m3"),
             &DecisionCancel::none(),

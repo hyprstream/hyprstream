@@ -252,9 +252,8 @@ impl StagingModelPin {
     fn capture_policy(&self) -> Result<git2db::pinned_disk::ProjectionPolicy> {
         if self.projection_policy != Default::default() {
             anyhow::ensure!(
-                self.model_ref == "clef-flash-fp8:main"
-                    && self.commit
-                        == git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?,
+                self.model_ref == clef_profile::MODEL_REF
+                    && self.commit == git2::Oid::from_str(clef_profile::COMMIT)?,
                 "Clef projection policy pin identity changed"
             );
         }

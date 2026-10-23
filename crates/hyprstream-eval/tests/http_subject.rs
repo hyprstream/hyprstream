@@ -48,7 +48,7 @@ async fn http_subject_round_trips_against_stub_facade() {
     );
     let set = fixture();
     let state = Entry::Str("The box was crushed.".into());
-    let row = subject.decide(&set, &state, 0).await.unwrap();
+    let (row, _) = subject.decide(&set, &state, 0).await.unwrap();
 
     for question in &set.questions {
         let answer = row
@@ -62,7 +62,7 @@ async fn http_subject_round_trips_against_stub_facade() {
     }
 
     // Determinism: the same request twice yields identical distributions.
-    let again = subject.decide(&set, &state, 0).await.unwrap();
+    let (again, _) = subject.decide(&set, &state, 0).await.unwrap();
     assert_eq!(row, again);
     server.abort();
 }
@@ -80,9 +80,9 @@ async fn http_subject_drives_a_full_bench_slice() {
     .map(EvalItem::from)
     .collect();
     let output = Harness.run_items(&items, &subject).await.unwrap();
-    assert_eq!(output.observations.len(), items.len());
+    assert_eq!(output.observations().len(), items.len());
     assert!(output
-        .observations
+        .observations()
         .iter()
         .all(|obs| obs.probabilities.is_some()));
     server.abort();
@@ -145,25 +145,21 @@ async fn http_subject_records_the_resolved_model_id() {
         "jev-stub-latest",
         "eval-harness",
     );
-    // Before the first call the requested string is the best known id.
+    // The configured alias stays separate from response provenance.
     assert_eq!(subject.requested_model(), "jev-stub-latest");
-    assert_eq!(subject.resolved_model_id(), "jev-stub-latest");
-    subject
+    let (_, resolved) = subject
         .decide(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
         .await
         .unwrap();
     // The alias resolved to the stub's versioned id, and that is what runs
     // must record.
     assert_eq!(subject.requested_model(), "jev-stub-latest");
-    assert_eq!(
-        subject.resolved_model_id(),
-        hyprstream_decision_stub::mock::STUB_MODEL_VERSION
-    );
+    assert_eq!(resolved, hyprstream_decision_stub::mock::STUB_MODEL_VERSION);
     server.abort();
 }
 
 #[tokio::test]
-async fn decide_with_version_binds_the_version_to_its_own_response() {
+async fn decide_binds_the_version_to_its_own_response() {
     // Runs stamp one version on every row; the version must come from the
     // same exchange as the answers, not from a shared mutable slot a
     // concurrent run could overwrite in between.
@@ -174,7 +170,7 @@ async fn decide_with_version_binds_the_version_to_its_own_response() {
         "eval-harness",
     );
     let (answers, resolved) = subject
-        .decide_with_version(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
+        .decide(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
         .await
         .unwrap();
     assert_eq!(resolved, hyprstream_decision_stub::mock::STUB_MODEL_VERSION);
@@ -193,7 +189,7 @@ async fn wire_preserves_declared_option_order_end_to_end() {
     let subject = HttpSubject::new(format!("http://{address}"), "jev-stub-latest", "t");
     let set = fixture();
     let state = Entry::Str("The box was crushed.".into());
-    let row = subject.decide(&set, &state, 0).await.unwrap();
+    let (row, _) = subject.decide(&set, &state, 0).await.unwrap();
     let reference = hyprstream_decision_stub::mock::MockDecisionModel.answer_row(
         &set,
         "The box was crushed.",
@@ -306,7 +302,7 @@ async fn http_subject_rejects_a_response_without_the_resolved_model() {
     });
     let subject = HttpSubject::new(format!("http://{address}"), "some-model", "t");
     let error = subject
-        .decide_with_version(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
+        .decide(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
         .await
         .err()
         .unwrap();
@@ -346,7 +342,7 @@ async fn http_subject_rejects_an_empty_resolved_model() {
     });
     let subject = HttpSubject::new(format!("http://{address}"), "some-model", "t");
     let error = subject
-        .decide_with_version(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
+        .decide(&fixture(), &Entry::Str("The box was crushed.".into()), 0)
         .await
         .err()
         .unwrap();
@@ -358,7 +354,7 @@ async fn http_subject_rejects_an_empty_resolved_model() {
 }
 
 #[tokio::test]
-async fn rejected_http_answers_never_change_the_resolved_model_cache() {
+async fn rejected_http_answers_do_not_affect_response_bound_versions() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -402,25 +398,24 @@ async fn rejected_http_answers_never_change_the_resolved_model_cache() {
     let subject = HttpSubject::new(format!("http://{address}"), "requested", "t");
     let set =
         hyprstream_decision::author::parse_yaml("questions:\n  q:\n    type: noul\n").unwrap();
-    subject
-        .decide_with_version(&set, &Entry::Str("valid state".into()), 0)
+    let (_, first_version) = subject
+        .decide(&set, &Entry::Str("valid state".into()), 0)
         .await
         .unwrap();
-    assert_eq!(subject.resolved_model_id(), "accepted-1");
+    assert_eq!(first_version, "accepted-1");
     assert!(subject
-        .decide_with_version(&set, &Entry::Str("valid state".into()), 1)
+        .decide(&set, &Entry::Str("valid state".into()), 1)
         .await
         .is_err());
     assert_eq!(
-        subject.resolved_model_id(),
-        "accepted-1",
-        "rejected exchange cannot poison provenance"
+        first_version, "accepted-1",
+        "rejected exchange cannot alter prior response provenance"
     );
-    subject
-        .decide_with_version(&set, &Entry::Str("valid state".into()), 2)
+    let (_, last_version) = subject
+        .decide(&set, &Entry::Str("valid state".into()), 2)
         .await
         .unwrap();
-    assert_eq!(subject.resolved_model_id(), "accepted-2");
+    assert_eq!(last_version, "accepted-2");
     server.await.unwrap();
 }
 
@@ -446,7 +441,7 @@ async fn legacy_http_null_states_fail_before_any_request_or_teacher_query() {
             set: &hyprstream_decision::QuestionSet,
             state: &Entry,
             row: usize,
-        ) -> Result<hyprstream_decision::arrow::AnswerRow, EvalError> {
+        ) -> Result<(hyprstream_decision::arrow::AnswerRow, String), EvalError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             TruthSubject::new(self.model_id())
                 .decide(set, state, row)
@@ -547,7 +542,7 @@ async fn legacy_http_null_states_fail_before_any_request_or_teacher_query() {
     // The default hook preserves explicit null for native/in-process subjects.
     let native = CountNative(calls.clone());
     let output = Harness.run_items(&[null_item], &native).await.unwrap();
-    assert_eq!(output.observations.len(), 1);
+    assert_eq!(output.observations().len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let local_set = EvalSet {
         rows: vec![EvalRow {
@@ -565,7 +560,7 @@ async fn legacy_http_null_states_fail_before_any_request_or_teacher_query() {
             .run_set(&local_set, &native)
             .await
             .unwrap()
-            .observations
+            .observations()
             .len(),
         1
     );
@@ -592,7 +587,7 @@ async fn invalid_http_configuration_preflights_all_teachers_before_any_query() {
             set: &hyprstream_decision::QuestionSet,
             state: &Entry,
             row: usize,
-        ) -> Result<hyprstream_decision::arrow::AnswerRow, EvalError> {
+        ) -> Result<(hyprstream_decision::arrow::AnswerRow, String), EvalError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             TruthSubject::new(self.model_id())
                 .decide(set, state, row)
@@ -606,7 +601,7 @@ async fn invalid_http_configuration_preflights_all_teachers_before_any_query() {
     let state = Entry::Str("valid non-null state".into());
     for base_url in [endpoint.as_str(), "https://example.invalid"] {
         assert!(HttpSubject::new(base_url, "alias", "valid-token")
-            .preflight(&set, &state)
+            .preflight(&set, &state, 0)
             .is_ok());
     }
     let unsupported = endpoint.replacen("http://", "ftp://", 1);
@@ -697,7 +692,7 @@ async fn invalid_http_configuration_preflights_all_teachers_before_any_query() {
     ] {
         let http = HttpSubject::new_with_budget(&endpoint, "alias", "secret-token", budget);
         assert!(matches!(
-            http.preflight(&set, &state),
+            http.preflight(&set, &state, 0),
             Err(EvalError::InvalidInput(_))
         ));
         let direct = tokio::time::timeout(Duration::from_secs(1), http.decide(&set, &state, 0))
@@ -853,7 +848,6 @@ async fn http_budget_bounds_stalled_headers_and_incomplete_body() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(subject.resolved_model_id(), "alias");
         server.abort();
     }
 }
@@ -886,7 +880,6 @@ async fn http_budget_counts_chunked_bodies_without_trusting_content_length() {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(subject.resolved_model_id(), "alias");
             server.await.unwrap();
         }
     }
@@ -931,7 +924,7 @@ async fn http_budget_accepts_valid_response_and_redacts_provider_error_body() {
     let (address, server) = serve_stub().await;
     let subject =
         HttpSubject::new_with_budget(format!("http://{address}"), "alias", "secret-token", budget);
-    let answers = tokio::time::timeout(
+    let (answers, resolved) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         subject.decide(&fixture(), &Entry::Str("valid state".into()), 0),
     )
@@ -939,10 +932,7 @@ async fn http_budget_accepts_valid_response_and_redacts_provider_error_body() {
     .unwrap()
     .unwrap();
     assert_eq!(answers.answers.len(), fixture().questions.len());
-    assert_eq!(
-        subject.resolved_model_id(),
-        hyprstream_decision_stub::mock::STUB_MODEL_VERSION
-    );
+    assert_eq!(resolved, hyprstream_decision_stub::mock::STUB_MODEL_VERSION);
     server.abort();
     let (address, server, witnessed) = serve_budget_reply(
         b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 6\r\nconnection: close\r\n\r\nsecret"
@@ -1017,7 +1007,7 @@ async fn http_subject_validates_choice_identity_before_accepting_response_keys()
             ));
             server.abort();
         } else {
-            let row = result.unwrap();
+            let (row, _) = result.unwrap();
             assert_eq!(
                 row.answers["pick"].value.as_ref().unwrap().probabilities(),
                 vec![0.0, 0.0, 1.0]
@@ -1093,11 +1083,11 @@ async fn direct_http_rejects_duplicate_question_ids_before_connecting() {
                 accepted.try_recv(),
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty)
             ));
-            assert_eq!(subject.resolved_model_id(), "alias");
             server.abort();
         } else {
-            assert_eq!(result.unwrap().answers.len(), 2);
-            assert_eq!(subject.resolved_model_id(), "resolved-v1");
+            let (answers, resolved) = result.unwrap();
+            assert_eq!(answers.answers.len(), 2);
+            assert_eq!(resolved, "resolved-v1");
             accepted.await.unwrap();
             server.await.unwrap();
         }
@@ -1194,11 +1184,11 @@ async fn direct_http_empty_question_set_is_rejected_without_connecting() {
                 accepted.try_recv(),
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty)
             ));
-            assert_eq!(subject.resolved_model_id(), "alias");
             server.abort();
         } else {
-            assert_eq!(result.unwrap().answers.len(), 1);
-            assert_eq!(subject.resolved_model_id(), "resolved-v1");
+            let (answers, resolved) = result.unwrap();
+            assert_eq!(answers.answers.len(), 1);
+            assert_eq!(resolved, "resolved-v1");
             accepted.await.unwrap();
             server.await.unwrap();
         }

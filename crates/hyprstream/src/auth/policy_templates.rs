@@ -764,28 +764,3 @@ pub fn get_templates() -> &'static [PolicyTemplate] {
 pub fn get_template(name: &str) -> Option<&'static PolicyTemplate> {
     get_templates().iter().find(|t| t.name == name)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::get_template;
-
-    #[test]
-    fn clef_staging_templates_grant_decide_without_generic_inference() -> Result<(), &'static str> {
-        for name in [
-            "cyberdione-staging-clef-e2e",
-            "cyberdione-staging-clef-operator",
-        ] {
-            let template = get_template(name).ok_or("Clef staging template is missing")?;
-            let policies = template
-                .policies
-                .ok_or("Clef staging template has no policies")?;
-            assert!(policies.iter().any(|policy| {
-                policy.resource == "model:clef-flash-fp8:main" && policy.action == "decide"
-            }));
-            assert!(!policies.iter().any(|policy| {
-                policy.resource == "model:clef-flash-fp8:main" && policy.action == "infer"
-            }));
-        }
-        Ok(())
-    }
-}

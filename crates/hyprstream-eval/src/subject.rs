@@ -26,74 +26,24 @@ use crate::error::EvalError;
 /// One jev-1-shaped answer producer.
 #[async_trait]
 pub trait Subject: Send + Sync {
-    /// The resolved model id recorded on runs and persisted batches. Alias
-    /// resolution is the serving side's job; the id returned here is treated
-    /// as already resolved.
+    /// The configured model id, possibly an alias. Empty runs use this id.
     fn model_id(&self) -> &str;
 
-    /// Check subject-wide input constraints without I/O, model queries,
-    /// mutable state, or other side effects. The default accepts inputs,
-    /// including explicit null states supported by native/in-process
-    /// subjects. Transport adapters may be stricter. Harness execution uses
-    /// [`Subject::preflight_row`] so row-dependent subjects can check the
-    /// exact request before any row is decided.
-    fn preflight(&self, _set: &QuestionSet, _state: &Entry) -> Result<(), EvalError> {
+    /// Check the exact request row without I/O or side effects.
+    /// Native subjects accept null states; transport adapters may be stricter.
+    fn preflight(&self, _set: &QuestionSet, _state: &Entry, _row: usize) -> Result<(), EvalError> {
         Ok(())
     }
 
-    /// Check subject-specific constraints for one concrete request row.
-    /// Subjects with row-dependent behavior can validate the same selection
-    /// that `decide` will use. The default preserves compatibility for
-    /// subjects whose preflight does not depend on the row index.
-    fn preflight_row(
-        &self,
-        set: &QuestionSet,
-        state: &Entry,
-        _row: usize,
-    ) -> Result<(), EvalError> {
-        self.preflight(set, state)
-    }
-
-    /// Answer every question in `set` for one state row. `row` is the batch
-    /// row index, passed through so deterministic subjects can vary by row
-    /// exactly the way the P0.7 mock does. Every declared question must be
-    /// answered — abstain explicitly rather than omitting the key.
+    /// Answer every declared question (abstaining explicitly when needed),
+    /// returning the resolved model version bound to this response.
+    /// `row` lets deterministic subjects vary their answers by batch row.
     async fn decide(
         &self,
         set: &QuestionSet,
         state: &Entry,
         row: usize,
-    ) -> Result<AnswerRow, EvalError>;
-
-    /// The **resolved** model id. Alias resolution is part of the serving
-    /// contract: a server may answer an alias request with a different
-    /// versioned id (`response.model`), and that resolved id — not the
-    /// requested alias — is what runs and persisted batches must record.
-    /// In-process subjects resolve to themselves (the default); HTTP subjects
-    /// return the last resolved id once a response has been seen, falling
-    /// back to the requested string before the first call.
-    fn resolved_model_id(&self) -> String {
-        self.model_id().to_owned()
-    }
-
-    /// Decide one row and return the model version bound to THAT response.
-    /// Runs stamp one version on every row, so the version must come from
-    /// the same exchange as the answers: reading `resolved_model_id` after
-    /// `decide` races with another concurrent run sharing this subject (its
-    /// response can overwrite the resolved slot in between). The default
-    /// implementation composes the two and is correct for subjects whose
-    /// resolved id never changes; `HttpSubject` overrides it to return the
-    /// version from its own response.
-    async fn decide_with_version(
-        &self,
-        set: &QuestionSet,
-        state: &Entry,
-        row: usize,
-    ) -> Result<(AnswerRow, String), EvalError> {
-        let answers = self.decide(set, state, row).await?;
-        let resolved = self.resolved_model_id();
-        Ok((answers, resolved))
-    }
+    ) -> Result<(AnswerRow, String), EvalError>;
 }
 
 /// Ordered JSON for the request wire. serde_json's own `Map` is a BTreeMap in
@@ -656,9 +606,6 @@ pub struct HttpSubject {
     token: String,
     client: Result<reqwest::Client, &'static str>,
     budget: HttpBudget,
-    /// The latest fully accepted response's resolved id. `Arc` so clones
-    /// share the cache; version-bound results never depend on this slot.
-    resolved: std::sync::Arc<parking_lot::RwLock<Option<String>>>,
 }
 
 impl std::fmt::Debug for HttpSubject {
@@ -671,7 +618,6 @@ impl std::fmt::Debug for HttpSubject {
             .field("token", &"<redacted>")
             .field("client_ready", &self.client.is_ok())
             .field("budget", &self.budget)
-            .field("resolved", &self.resolved)
             .finish()
     }
 }
@@ -710,7 +656,6 @@ impl HttpSubject {
             token: token.into(),
             client,
             budget,
-            resolved: std::sync::Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -738,8 +683,7 @@ impl HttpSubject {
     }
     /// POST one decide request, returning the parsed answers and the model
     /// version THIS response resolved to. The version travels with the
-    /// answers so a concurrent run sharing this subject cannot overwrite
-    /// the resolved slot in between. The serving contract requires
+    /// answers so concurrent runs cannot mix their model versions. The serving contract requires
     /// `response.model` to identify the resolved version — a response
     /// without it is rejected, never attributed to the requested alias or
     /// a version cached from an unrelated earlier response.
@@ -748,7 +692,7 @@ impl HttpSubject {
         set: &QuestionSet,
         state: &Entry,
     ) -> Result<(AnswerRow, String), EvalError> {
-        self.preflight(set, state)?;
+        self.preflight(set, state, 0)?;
         // Encode before opening a connection: serde_json otherwise turns a
         // directly-constructed non-finite IR number into JSON null.
         let body = serde_json::to_vec(&request_body(set, state, &self.model))
@@ -789,14 +733,13 @@ impl HttpSubject {
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| EvalError::Http("HTTP response is not UTF-8".to_owned()))?;
         let (answers, resolved) = decode_response(set, text)?;
-        *self.resolved.write() = Some(resolved.clone());
         Ok((answers, resolved))
     }
 }
 
 #[async_trait]
 impl Subject for HttpSubject {
-    fn preflight(&self, set: &QuestionSet, state: &Entry) -> Result<(), EvalError> {
+    fn preflight(&self, set: &QuestionSet, state: &Entry, _row: usize) -> Result<(), EvalError> {
         // Direct callers also require unique question IDs and declared labels
         // before any network call; do not rely on Harness/teacher validation.
         crate::run::question_ids(set).map_err(EvalError::InvalidInput)?;
@@ -843,23 +786,7 @@ impl Subject for HttpSubject {
         &self.model
     }
 
-    fn resolved_model_id(&self) -> String {
-        self.resolved
-            .read()
-            .clone()
-            .unwrap_or_else(|| self.model.clone())
-    }
-
     async fn decide(
-        &self,
-        set: &QuestionSet,
-        state: &Entry,
-        _row: usize,
-    ) -> Result<AnswerRow, EvalError> {
-        Ok(self.post(set, state).await?.0)
-    }
-
-    async fn decide_with_version(
         &self,
         set: &QuestionSet,
         state: &Entry,
@@ -922,7 +849,7 @@ impl Subject for HashSubject {
         set: &QuestionSet,
         state: &Entry,
         row: usize,
-    ) -> Result<AnswerRow, EvalError> {
+    ) -> Result<(AnswerRow, String), EvalError> {
         let state_text = state.canonical_text();
         let mut answers = std::collections::BTreeMap::new();
         for question in &set.questions {
@@ -944,7 +871,7 @@ impl Subject for HashSubject {
             };
             answers.insert(question.id.clone(), QuestionAnswer::answered(value));
         }
-        Ok(AnswerRow { answers })
+        Ok((AnswerRow { answers }, self.model_id.clone()))
     }
 }
 
@@ -1009,23 +936,7 @@ impl Subject for TruthSubject {
         &self.model_id
     }
 
-    fn preflight(&self, set: &QuestionSet, _state: &Entry) -> Result<(), EvalError> {
-        self.validate_model_id()?;
-        for question in &set.questions {
-            let cardinality = question.cardinality();
-            if let Some(&index) = self.truth.get(&question.id) {
-                validate_truth_index(&question.id, index, cardinality)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn preflight_row(
-        &self,
-        set: &QuestionSet,
-        _state: &Entry,
-        row: usize,
-    ) -> Result<(), EvalError> {
+    fn preflight(&self, set: &QuestionSet, _state: &Entry, row: usize) -> Result<(), EvalError> {
         self.validate_model_id()?;
         for question in &set.questions {
             let cardinality = question.cardinality();
@@ -1045,7 +956,7 @@ impl Subject for TruthSubject {
         set: &QuestionSet,
         _state: &Entry,
         row: usize,
-    ) -> Result<AnswerRow, EvalError> {
+    ) -> Result<(AnswerRow, String), EvalError> {
         let mut answers = std::collections::BTreeMap::new();
         for question in &set.questions {
             let cardinality = question.cardinality();
@@ -1081,7 +992,7 @@ impl Subject for TruthSubject {
             };
             answers.insert(question.id.clone(), QuestionAnswer::answered(value));
         }
-        Ok(AnswerRow { answers })
+        Ok((AnswerRow { answers }, self.model_id.clone()))
     }
 }
 
@@ -1179,9 +1090,11 @@ questions:
         let set = fixture();
         let subject = HashSubject::new("hash-1");
         let state = Entry::Str("s".into());
-        let a = subject.decide(&set, &state, 0).await.unwrap();
-        let b = subject.decide(&set, &state, 0).await.unwrap();
+        let (a, version) = subject.decide(&set, &state, 0).await.unwrap();
+        let (b, again_version) = subject.decide(&set, &state, 0).await.unwrap();
         assert_eq!(a, b);
+        assert_eq!(version, "hash-1");
+        assert_eq!(version, again_version);
         for (id, answer) in &a.answers {
             let value = answer.value.as_ref().unwrap();
             let question = set.question(id).unwrap();
@@ -1201,7 +1114,7 @@ questions:
             .with_truth("is_refund", 1)
             .with_truth("tone", 0)
             .with_truth("severity", 2);
-        let row = subject.decide(&set, &Entry::Null, 0).await.unwrap();
+        let (row, _) = subject.decide(&set, &Entry::Null, 0).await.unwrap();
         let p = row.answers["severity"]
             .value
             .as_ref()
@@ -1377,7 +1290,7 @@ questions:
             questions: vec![question],
         };
         let subject = TruthSubject::new("truth"); // no truth configured
-        let row = subject.decide(&set, &Entry::Null, 0).await.unwrap();
+        let (row, _) = subject.decide(&set, &Entry::Null, 0).await.unwrap();
         let probabilities = row.answers["wide"].value.as_ref().unwrap().probabilities();
         confidence::check_distribution(&probabilities, confidence::PRODUCER_SUM_TOLERANCE).unwrap();
         // No f32 vector of 78 exactly-equal components can meet the producer

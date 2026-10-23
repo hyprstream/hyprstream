@@ -8,12 +8,11 @@ use std::sync::Arc;
 
 use hyprstream_decision::answer::VersionTriple;
 use hyprstream_decision::arrow::{AnswerRow, DecisionSchema};
-use hyprstream_decision::spec::QuestionKind;
-use hyprstream_metrics_api::arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
+use hyprstream_metrics_api::arrow::array::{ArrayRef, RecordBatch, StringArray};
 use hyprstream_metrics_api::arrow::datatypes::{DataType, Field, Schema};
 
 use crate::error::EvalError;
-use crate::run::{EvalBatchRow, RunOutput};
+use crate::run::EvalBatchRow;
 
 pub(crate) const CONTRACT_KEY: &str = "hyprstream.batch_contract";
 pub(crate) const CONTRACT_V2: &str = "eval-v2";
@@ -72,10 +71,6 @@ impl EvalBatchSchema {
             decision,
             schema: Arc::new(Schema::new(fields).with_metadata(metadata)),
         })
-    }
-
-    pub(crate) fn decision(&self) -> &DecisionSchema {
-        &self.decision
     }
 
     /// Physical eval-v2 fingerprint. The domain, schema metadata, every field's
@@ -179,147 +174,6 @@ impl EvalBatchSchema {
         RecordBatch::try_new(self.schema.clone(), columns)
             .map_err(|error| invalid(&format!("eval-v2 Arrow batch assembly failed: {error}")))
     }
-
-    /// Reconstruct only an explicit v2 schema from its IPC-decoded Arrow schema.
-    /// Legacy v1 batches remain readable by the decision store, but cannot enter
-    /// eval scoring or persistence qualification.
-    pub(crate) fn from_arrow_schema(schema: &Schema) -> Result<Self, EvalError> {
-        let invalid_contract = || invalid("set run requires the eval-v2 Arrow contract");
-        if schema.metadata().get(CONTRACT_KEY).map(String::as_str) != Some(CONTRACT_V2) {
-            return Err(invalid_contract());
-        }
-        let mut questions = Vec::new();
-        for field in schema.fields() {
-            let Some(id) = field.name().strip_suffix(".probabilities") else {
-                continue;
-            };
-            let kind = match field.metadata().get("jev.kind").map(String::as_str) {
-                Some("noul") => QuestionKind::Noul,
-                Some("choice") => QuestionKind::Choice,
-                Some("score") => QuestionKind::Score,
-                _ => return Err(invalid("eval-v2 question has invalid kind metadata")),
-            };
-            let labels: Vec<String> = serde_json::from_str(
-                field
-                    .metadata()
-                    .get("jev.labels")
-                    .ok_or_else(invalid_contract)?,
-            )
-            .map_err(|_| invalid_contract())?;
-            questions.push(crate::run::question_from_labels(id, kind, &labels)?);
-        }
-        let mut decision = DecisionSchema::new(questions)?;
-        if !schema
-            .fields()
-            .iter()
-            .any(|field| field.name().ends_with(".conformal_set"))
-        {
-            decision = decision.without_conformal_set();
-        }
-        let result = Self::new(decision)?;
-        if result.schema.as_ref() != schema
-            || schema.metadata().get(DECISION_FINGERPRINT_KEY)
-                != Some(&result.decision.fingerprint())
-        {
-            return Err(invalid(
-                "eval-v2 schema, field order, or decision fingerprint is invalid",
-            ));
-        }
-        Ok(result)
-    }
-
-    pub(crate) fn validate_observations(
-        &self,
-        output: &RunOutput,
-        batch: &RecordBatch,
-    ) -> Result<(), EvalError> {
-        let invalid = |message| invalid(message);
-        let question_count = self.decision.questions().len();
-        let expected = batch
-            .num_rows()
-            .checked_mul(question_count)
-            .ok_or_else(|| invalid("set observation count overflow"))?;
-        if output.observations.len() != expected {
-            return Err(invalid(
-                "set observation count differs from its Arrow batch",
-            ));
-        }
-        let row_ids = string_column(batch, "row_id")?;
-        let families = string_column(batch, "family")?;
-        let strata = string_column(batch, "stratum")?;
-        let groups = string_column(batch, "group")?;
-        let mut seen = HashSet::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
-            if row_ids.is_null(row)
-                || row_ids.value(row).is_empty()
-                || !seen.insert(row_ids.value(row))
-            {
-                return Err(invalid("eval-v2 row IDs must be nonempty and unique"));
-            }
-        }
-        for (question_index, question) in self.decision.questions().iter().enumerate() {
-            let labels = question.labels();
-            let labels_by_name: HashMap<&str, usize> = labels
-                .iter()
-                .enumerate()
-                .map(|(index, label)| (label.as_str(), index))
-                .collect();
-            let truth = string_column(batch, &format!("{}.truth", question.id))?;
-            let probabilities = batch
-                .column_by_name(&format!("{}.probabilities", question.id))
-                .and_then(|column| {
-                    column
-                        .as_any()
-                        .downcast_ref::<hyprstream_metrics_api::arrow::array::FixedSizeListArray>()
-                })
-                .ok_or_else(|| invalid("eval-v2 has an invalid probability column"))?;
-            for row in 0..batch.num_rows() {
-                let obs = &output.observations[row * question_count + question_index];
-                let truth_index = if truth.is_null(row) {
-                    None
-                } else {
-                    Some(*labels_by_name.get(truth.value(row)).ok_or_else(|| {
-                        invalid("eval-v2 truth label is outside the question's canonical labels")
-                    })?)
-                };
-                let optional = |array: &StringArray, row| {
-                    (!array.is_null(row)).then(|| array.value(row).to_owned())
-                };
-                if obs.id != row_ids.value(row)
-                    || obs.question_id != question.id
-                    || obs.kind != question.kind
-                    || obs.labels != labels
-                    || obs.family != optional(families, row)
-                    || obs.stratum != optional(strata, row)
-                    || obs.group != optional(groups, row)
-                    || obs.truth != truth_index
-                {
-                    return Err(invalid(
-                        "set observation provenance differs from eval-v2 batch",
-                    ));
-                }
-                if probabilities.is_null(row) {
-                    if obs.probabilities.is_some() {
-                        return Err(invalid(
-                            "set observation abstention differs from eval-v2 batch",
-                        ));
-                    }
-                } else {
-                    let values = probabilities.value(row);
-                    let values = values
-                        .as_any()
-                        .downcast_ref::<hyprstream_metrics_api::arrow::array::Float32Array>()
-                        .ok_or_else(|| invalid("eval-v2 probability values have invalid type"))?;
-                    if obs.probabilities.as_deref() != Some(values.values().as_ref()) {
-                        return Err(invalid(
-                            "set observation probabilities differ from eval-v2 batch",
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 pub(crate) fn physical_fingerprint(schema: &Schema) -> String {
@@ -357,13 +211,6 @@ fn hash_part(hasher: &mut blake3::Hasher, value: &str) {
     hasher.update(value.as_bytes());
 }
 
-fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray, EvalError> {
-    batch
-        .column_by_name(name)
-        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| invalid("eval-v2 has a missing or invalid string column"))
-}
-
 fn invalid(message: &str) -> EvalError {
     EvalError::InvalidInput(message.to_owned())
 }
@@ -374,7 +221,7 @@ mod tests {
 
     use super::*;
     use hyprstream_decision::answer::{AnswerValue, QuestionAnswer};
-    use hyprstream_decision::spec::QuestionSpec;
+    use hyprstream_decision::spec::{QuestionKind, QuestionSpec};
 
     fn noul_question(id: String) -> QuestionSpec {
         crate::run::question_from_labels(
@@ -477,12 +324,6 @@ mod tests {
                 &answer_rows(&questions, 1),
             )
             .unwrap();
-        let reconstructed = EvalBatchSchema::from_arrow_schema(batch.schema().as_ref()).unwrap();
-        assert_eq!(reconstructed.fingerprint(), schema.fingerprint());
-        assert_eq!(
-            reconstructed.schema.as_ref(),
-            schema.schema.as_ref(),
-            "optional-conformal v2 schema must roundtrip unchanged"
-        );
+        assert_eq!(batch.schema().as_ref(), schema.schema.as_ref());
     }
 }

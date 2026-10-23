@@ -246,61 +246,17 @@ fn field_metrics(
     ))
 }
 
-/// Validate every input before fit/eval splitting or any metric aggregation.
-fn validate_observations(output: &RunOutput) -> Result<(), EvalError> {
-    use hyprstream_decision::confidence::{check_distribution, PRODUCER_SUM_TOLERANCE};
-    let invalid = |message: &str| EvalError::InvalidInput(message.to_owned());
-    if output.batch.is_some() != output.schema_fingerprint.is_some() {
-        return Err(invalid(
-            "run batch and schema fingerprint must either both be present or both be absent",
-        ));
-    }
-    for obs in &output.observations {
-        crate::run::question_from_labels(&obs.question_id, obs.kind, &obs.labels)?;
-        if obs.truth.is_some_and(|truth| truth >= obs.labels.len()) {
-            return Err(invalid("observation truth is outside its declared labels"));
-        }
-        if let Some(probabilities) = &obs.probabilities {
-            if probabilities.len() != obs.labels.len() {
-                return Err(invalid(
-                    "observation probability width differs from its labels",
-                ));
-            }
-            check_distribution(probabilities, PRODUCER_SUM_TOLERANCE)
-                .map_err(|_| invalid("observation has an invalid probability distribution"))?;
-        }
-    }
-    if output.is_set_run() {
-        let batch = output
-            .batch
-            .as_ref()
-            .ok_or_else(|| invalid("set run is missing its eval-v2 Arrow batch"))?;
-        let fingerprint = output
-            .schema_fingerprint
-            .as_deref()
-            .ok_or_else(|| invalid("set run has no schema fingerprint"))?;
-        crate::persist::validate_provenance(output, batch, fingerprint)?;
-    } else if output.batch.is_some() || output.schema_fingerprint.is_some() {
-        return Err(invalid(
-            "item run cannot carry a shared Arrow batch contract",
-        ));
-    }
-    Ok(())
-}
-
 /// Score a run's observations under the pinned protocol.
 pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport, EvalError> {
-    output.validate_model_provenance()?;
-    validate_observations(output)?;
-    let by_question = output.batch.is_some();
-    let multi_family = family_count(&output.observations) > 1;
+    let by_question = output.batch().is_some();
+    let multi_family = family_count(output.observations()) > 1;
     // Group labeled, answered observations into fields.
     let mut fields: BTreeMap<FieldKey, (QuestionKind, Vec<Vec<f64>>, Vec<usize>)> = BTreeMap::new();
-    let mut items = Vec::with_capacity(output.observations.len());
+    let mut items = Vec::with_capacity(output.observations().len());
     let mut abstained = 0usize;
     let mut correct = 0usize;
     let mut labeled_answered = 0usize;
-    for obs in &output.observations {
+    for obs in output.observations() {
         let (is_abstained, is_correct) = match (&obs.probabilities, obs.truth) {
             (Some(probs), Some(truth)) => {
                 let probs64: Vec<f64> = probs.iter().map(|p| f64::from(*p)).collect();
@@ -351,7 +307,7 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
     // Match fit tags against actual Some(rawtag), then encode identities
     // consistently for both sides of the reported split.
     let eval_families: Vec<String> = output
-        .observations
+        .observations()
         .iter()
         .map(|obs| obs.family.as_deref())
         .filter(|family| !is_fit_family(*family, config))
@@ -368,7 +324,7 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
         None
     } else {
         Some(GateReport::assemble(
-            output.model_id.clone(),
+            output.model_id().to_owned(),
             config.split_name,
             ShiftSplit::new(fit_families, eval_families)?,
             field_rows,
@@ -377,25 +333,27 @@ pub fn score_run(output: &RunOutput, config: &ScoreConfig) -> Result<ScoreReport
     };
 
     #[allow(clippy::cast_precision_loss)]
-    let total = output.observations.len();
+    let total = output.observations().len();
     let abstention_rate = (total > 0).then(|| abstained as f64 / total as f64);
     #[allow(clippy::cast_precision_loss)]
     let accuracy = (labeled_answered > 0).then(|| correct as f64 / labeled_answered as f64);
 
     Ok(ScoreReport {
         gate,
-        by_family: breakdown(&output.observations, by_question, |obs| {
+        by_family: breakdown(output.observations(), by_question, |obs| {
             Some(family_identity(obs.family.as_deref()))
         })?,
-        by_stratum: breakdown(&output.observations, by_question, |obs| obs.stratum.clone())?,
+        by_stratum: breakdown(output.observations(), by_question, |obs| {
+            obs.stratum.clone()
+        })?,
         flip_rate: {
             // Observation labels are captured with each prediction, so the
             // score path can measure semantic option flips without an
             // external bench manifest. Set runs repeat question ids across
             // rows; item runs may rotate question ids and labels.
             let flip = flip_rate_with_observation_labels(
-                &output.observations,
-                output.batch.is_none(),
+                output.observations(),
+                output.batch().is_none(),
                 |obs| Some(obs.labels.clone()),
             );
             (flip.groups > 0).then_some(flip)
@@ -616,7 +574,7 @@ pub fn score_bench_run(
         }
     }
     let mut observed = std::collections::BTreeSet::new();
-    for obs in &output.observations {
+    for obs in output.observations() {
         let identity = (obs.id.as_str(), obs.question_id.as_str());
         if !observed.insert(identity) {
             return Err(EvalError::InvalidInput(format!(
@@ -651,8 +609,8 @@ pub fn score_bench_run(
         )));
     }
     let mut report = score_run(output, config)?;
-    let bench_shaped = !output.is_set_run();
-    let flip = flip_rate_with_observation_labels(&output.observations, bench_shaped, |obs| {
+    let bench_shaped = output.batch().is_none();
+    let flip = flip_rate_with_observation_labels(output.observations(), bench_shaped, |obs| {
         by_identity
             .get(&(obs.id.as_str(), obs.question_id.as_str()))
             .map(|item| item.question.labels())
