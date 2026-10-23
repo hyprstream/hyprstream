@@ -119,13 +119,7 @@ async fn run_attach_loop(
         .context("mac_key must be 32 bytes")?;
     let topic = stream_info.topic.clone();
 
-    // Enter raw terminal mode
-    let orig_termios = enter_raw_mode()?;
-    println!("\r\nAttached to session (ctrl-b d to detach)\r");
-
-    let mut stdout = std::io::stdout();
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
     // #356: dial the producer's networked reach (the TUI service's QUIC `/moq`
     // endpoint) via the shared `MoqStreamHandle::networked` consumer, which prefers
@@ -173,20 +167,56 @@ async fn run_attach_loop(
         }
     });
 
+    let result = run_attach_io(rx, |input| async move {
+        client.send_input(&SendInputRequest { viewer_id, data: input }).await
+    }).await;
+    recv_handle.abort();
+    result
+}
+
+/// Terminal half of attach; transport ownership stays with the caller.
+async fn run_attach_io<F, Fut>(
+    mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut send_input: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let (cancel_reader, cancel_writer) = std::os::unix::net::UnixStream::pair()?;
+
+    // Enter raw terminal mode
+    let orig_termios = enter_raw_mode()?;
+    println!("\r\nAttached to session (ctrl-b d to detach)\r");
+
+    let mut stdout = std::io::stdout();
+
     // Read stdin in a separate task
     let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    let _stdin_handle = tokio::task::spawn_blocking(move || {
-        use std::io::Read;
+    // Closing the socket wakes the reader even when no more stdin arrives.
+    // A blocking-pool task would prevent Tokio runtime shutdown after detach.
+    let stdin_handle = std::thread::spawn(move || {
+        use std::os::fd::AsRawFd;
         let mut buf = [0u8; 256];
-        let stdin = std::io::stdin();
         loop {
-            match stdin.lock().read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
+            let mut fds = [
+                libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: cancel_reader.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            ];
+            let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if result <= 0 || fds[1].revents != 0 {
+                break;
+            }
+            if fds[0].revents & libc::POLLIN != 0 {
+                let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 || stdin_tx.blocking_send(buf[..n as usize].to_vec()).is_err() {
+                    break;
                 }
+            } else if fds[0].revents != 0 {
+                break;
             }
         }
     });
@@ -212,17 +242,11 @@ async fn run_attach_loop(
                     saw_ctrl_b = byte == 0x02; // ctrl-b
                 }
                 if detach {
-                    restore_terminal(&orig_termios);
-                    recv_handle.abort();
-                    println!("\r\nDetached from session.");
-                    return Ok(());
+                    break;
                 }
 
                 // Forward input to TUI service via sendInput RPC
-                if let Err(e) = client.send_input(&SendInputRequest {
-                    viewer_id,
-                    data: input.clone(),
-                }).await {
+                if let Err(e) = send_input(input).await {
                     tracing::debug!("sendInput failed: {}", e);
                 }
             }
@@ -230,7 +254,14 @@ async fn run_attach_loop(
         }
     }
 
+    // Attach is the sole stdin consumer. Keep raw mode until the reader has
+    // stopped: restoring it first could flush input between poll and read.
+    drop(stdin_rx);
+    drop(cancel_writer);
+    let reader_result = stdin_handle.join();
     restore_terminal(&orig_termios);
+    reader_result.map_err(|_| anyhow::anyhow!("attach stdin reader panicked"))?;
+    println!("\r\nDetached from session.");
     Ok(())
 }
 
@@ -707,5 +738,24 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         s.to_owned()
     } else {
         format!("{}…", &s[..max_len - 1])
+    }
+}
+
+#[cfg(test)]
+mod attach_lifecycle_tests {
+    #[test]
+    #[ignore = "child seam; run tests/tui_attach_pty.py against this test binary"]
+    fn attach_pty_child() {
+        if std::env::var_os("HYPRSTREAM_ATTACH_PTY_CHILD").is_none() {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("create attach test runtime");
+        rt.block_on(async {
+            let (_tx, rx) = tokio::sync::mpsc::channel(64);
+            super::run_attach_io(rx, |_| async { Ok(()) }).await.expect("attach terminal loop");
+        });
+        eprintln!("ATTACH_LOOP_RETURNED");
+        drop(rt);
+        eprintln!("ATTACH_RUNTIME_DROPPED");
     }
 }
