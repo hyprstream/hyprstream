@@ -72,6 +72,10 @@ pub enum RpcError {
     #[error("envelope error: {0}")]
     Envelope(#[from] EnvelopeError),
 
+    /// The in-process transport deadline elapsed, not an error returned by its worker.
+    #[error("in-process RPC timeout after {timeout:?}")]
+    InMemoryRequestTimeout { timeout: std::time::Duration },
+
     /// Process spawn failed.
     #[error("spawn failed: {0}")]
     SpawnFailed(String),

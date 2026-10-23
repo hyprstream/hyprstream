@@ -33,7 +33,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -106,7 +106,7 @@ impl Transport for InMemoryTransport {
         };
         let resp = tokio::time::timeout(timeout, fut)
             .await
-            .map_err(|_| anyhow!("in-process RPC timeout after {timeout:?}"))??;
+            .map_err(|_| crate::error::RpcError::InMemoryRequestTimeout { timeout })??;
         Ok(resp.to_vec())
     }
 
@@ -124,6 +124,7 @@ impl Transport for InMemoryTransport {
 mod tests {
     use super::*;
     use crate::transport::rpc_session::from_fn;
+    use anyhow::anyhow;
 
     fn echo_processor() -> Arc<dyn IrohRequestProcessor> {
         Arc::new(from_fn(|req: Bytes| async move { Ok(req) }))
@@ -151,10 +152,11 @@ mod tests {
         }));
         let t = InMemoryTransport::new(slow);
         let err = t.send(b"x".to_vec(), Some(20)).await;
-        assert!(
-            err.is_err(),
-            "a handler exceeding the deadline must time out"
-        );
+        let error = err.expect_err("a handler exceeding the deadline must time out");
+        assert!(matches!(
+            error.downcast_ref::<crate::error::RpcError>(),
+            Some(crate::error::RpcError::InMemoryRequestTimeout { .. })
+        ));
     }
 
     #[tokio::test]
@@ -177,6 +179,22 @@ mod tests {
         // A deadline above the default admits the same handler.
         let resp = t.send(b"x".to_vec(), Some(35_000)).await.unwrap();
         assert_eq!(resp, b"x");
+    }
+
+    #[tokio::test]
+    async fn worker_elapsed_is_not_transport_timeout() {
+        let failing = Arc::new(from_fn(|_req: Bytes| async move {
+            let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+                .await
+                .unwrap_err();
+            Err(anyhow::Error::new(elapsed))
+        }));
+        let transport = InMemoryTransport::new(failing);
+        let error = transport.send(Vec::new(), Some(30_000)).await.unwrap_err();
+        assert!(error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some());
+        assert!(error.downcast_ref::<crate::error::RpcError>().is_none());
     }
 
     #[tokio::test]

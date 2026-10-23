@@ -2626,6 +2626,36 @@ impl ModelService {
         }
     }
 
+    async fn await_forwarded_decision<F>(
+        deadline: Instant,
+        forwarded: F,
+    ) -> Result<hyprstream_rpc_std::inference_client::DecisionResponse>
+    where
+        F: std::future::Future<
+            Output = Result<hyprstream_rpc_std::inference_client::DecisionResponse>,
+        >,
+    {
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), forwarded)
+            .await
+            .map_err(|_| {
+                Self::typed_decision_error(anyhow!(
+                    "clef-decision-cancelled: decision deadline elapsed at Model ingress"
+                ))
+            })?
+            .map_err(|error| {
+                if matches!(
+                    error.downcast_ref::<hyprstream_rpc::error::RpcError>(),
+                    Some(hyprstream_rpc::error::RpcError::InMemoryRequestTimeout { .. })
+                ) {
+                    Self::typed_decision_error(anyhow!(
+                        "clef-decision-cancelled: in-process worker request deadline elapsed"
+                    ))
+                } else {
+                    Self::typed_decision_error(error)
+                }
+            })
+    }
+
     /// Mint-side scope for one forwarded struct/Void Inference operation:
     /// the exact dispatch coordinate for `variant` plus its scope operation.
     fn inference_scope(
@@ -3477,19 +3507,7 @@ impl InferHandler for ModelService {
         // the client's work-order bearer must survive (dispatch denies a
         // request whose worker order was stripped).
         let client = client.with_timeout_ms(i32::try_from(timeout_ms).unwrap_or(i32::MAX));
-        let decision = async {
-            tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                client.decide(&forwarded),
-            )
-            .await
-            .map_err(|_| {
-                Self::typed_decision_error(anyhow!(
-                    "clef-decision-cancelled: decision deadline elapsed at Model ingress"
-                ))
-            })?
-            .map_err(Self::typed_decision_error)
-        };
+        let decision = Self::await_forwarded_decision(deadline, client.decide(&forwarded));
         if let Some(disconnected) = ctx.request_cancellation() {
             tokio::select! {
                 biased;
@@ -4767,6 +4785,162 @@ mod tests {
             .to_string();
         assert!(err.contains("clef-decision-cancelled"), "{err}");
         assert!(!err.to_lowercase().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn decision_error_mapping_diagnostic_branches() -> Result<()> {
+        use hyprstream_rpc::transport::in_memory::InMemoryTransport;
+        use hyprstream_rpc::transport::rpc_session::from_fn;
+        use hyprstream_rpc::transport_traits::Transport;
+        use hyprstream_rpc::TypedRpcError;
+
+        // Synthetic errors only. Never print arbitrary transport/worker messages.
+        let classify = |e: &anyhow::Error| {
+            e.downcast_ref::<TypedRpcError>()
+                .map(|typed| typed.code.as_str())
+                .unwrap_or("UNTYPED")
+                .to_owned()
+        };
+        let cancel = ModelService::typed_decision_error(anyhow::anyhow!(
+            "clef-decision-cancelled: synthetic deadline"
+        ));
+        assert_eq!(
+            classify(&cancel),
+            "DECISION_CANCELLED",
+            "case=direct_cancel"
+        );
+
+        let internal = ModelService::typed_decision_error(anyhow::Error::new(TypedRpcError {
+            code: "INTERNAL".to_owned(),
+            message: "synthetic worker failure".to_owned(),
+        }));
+        assert_eq!(classify(&internal), "INTERNAL", "case=worker_internal");
+
+        let wrapped = anyhow::Error::new(TypedRpcError {
+            code: "DECISION_CANCELLED".to_owned(),
+            message: "clef-decision-cancelled: synthetic deadline".to_owned(),
+        })
+        .context("synthetic outer context");
+        let wrapped = ModelService::typed_decision_error(wrapped);
+        assert_eq!(
+            classify(&wrapped),
+            "DECISION_CANCELLED",
+            "case=wrapped_typed_cancel"
+        );
+
+        let wrapped_prefix = anyhow::anyhow!("clef-decision-cancelled: synthetic deadline")
+            .context("synthetic outer context");
+        let wrapped_prefix = ModelService::typed_decision_error(wrapped_prefix);
+        assert_eq!(
+            classify(&wrapped_prefix),
+            "UNTYPED",
+            "case=wrapped_prefix_current_behavior"
+        );
+
+        let slow = Arc::new(from_fn(|_request| async {
+            std::future::pending::<Result<bytes::Bytes>>().await
+        }));
+        let transport = InMemoryTransport::new(slow);
+        let timeout = transport
+            .send(Vec::new(), Some(1))
+            .await
+            .err()
+            .context("synthetic pending processor unexpectedly returned")?;
+        // Exercise the actual transport timer and actual Model mapper, not a copy.
+        let timeout = ModelService::typed_decision_error(timeout);
+        assert_eq!(
+            classify(&timeout),
+            "UNTYPED",
+            "case=transport_timeout_current_behavior"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_decision_deadline_diagnostic_branches() -> Result<()> {
+        use hyprstream_rpc::transport::in_memory::InMemoryTransport;
+        use hyprstream_rpc::transport::rpc_session::from_fn;
+        use hyprstream_rpc::transport_traits::Transport;
+        use hyprstream_rpc::TypedRpcError;
+        use hyprstream_rpc_std::inference_client::DecisionResponse;
+
+        let code = |error: &anyhow::Error| {
+            error
+                .downcast_ref::<TypedRpcError>()
+                .map(|typed| typed.code.clone())
+                .unwrap_or_else(|| "UNTYPED".to_owned())
+        };
+        let pending = Arc::new(from_fn(|_request| async {
+            std::future::pending::<Result<bytes::Bytes>>().await
+        }));
+        let transport = InMemoryTransport::new(pending);
+        let forwarded = async {
+            transport.send(Vec::new(), Some(1)).await?;
+            anyhow::bail!("synthetic pending processor unexpectedly completed")
+        };
+        let inner = ModelService::await_forwarded_decision(
+            Instant::now() + std::time::Duration::from_secs(30),
+            forwarded,
+        )
+        .await
+        .err()
+        .context("inner timeout must fail")?;
+        assert_eq!(
+            code(&inner),
+            "DECISION_CANCELLED",
+            "case=earlier_inner_transport_deadline"
+        );
+
+        let outer = ModelService::await_forwarded_decision(
+            Instant::now(),
+            std::future::pending::<Result<DecisionResponse>>(),
+        )
+        .await
+        .err()
+        .context("outer timeout must fail")?;
+        assert_eq!(code(&outer), "DECISION_CANCELLED", "case=outer_deadline");
+
+        let worker_elapsed =
+            tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+                .await
+                .err()
+                .context("synthetic worker timer must expire")?;
+        let worker_elapsed = ModelService::await_forwarded_decision(
+            Instant::now() + std::time::Duration::from_secs(30),
+            std::future::ready(Err::<DecisionResponse, _>(anyhow::Error::new(
+                worker_elapsed,
+            ))),
+        )
+        .await
+        .err()
+        .context("worker elapsed must propagate")?;
+        assert!(
+            worker_elapsed
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some(),
+            "case=worker_elapsed_preserved"
+        );
+        assert_eq!(
+            code(&worker_elapsed),
+            "UNTYPED",
+            "case=worker_elapsed_not_transport"
+        );
+
+        for expected in ["INTERNAL", "DECISION_CANCELLED"] {
+            let error = anyhow::Error::new(TypedRpcError {
+                code: expected.to_owned(),
+                message: "synthetic worker result".to_owned(),
+            });
+            let result = ModelService::await_forwarded_decision(
+                Instant::now() + std::time::Duration::from_secs(30),
+                std::future::ready(Err::<DecisionResponse, _>(error)),
+            )
+            .await
+            .err()
+            .context("worker error must propagate")?;
+            assert_eq!(code(&result), expected, "case=worker_typed_error");
+        }
+        Ok(())
     }
 
     #[tokio::test]
