@@ -168,8 +168,14 @@ async fn run_attach_loop(
     });
 
     let result = run_attach_io(rx, |input| async move {
-        client.send_input(&SendInputRequest { viewer_id, data: input }).await
-    }).await;
+        client
+            .send_input(&SendInputRequest {
+                viewer_id,
+                data: input,
+            })
+            .await
+    })
+    .await;
     recv_handle.abort();
     result
 }
@@ -200,18 +206,29 @@ where
         let mut buf = [0u8; 256];
         loop {
             let mut fds = [
-                libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: cancel_reader.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: cancel_reader.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-            if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            if result < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
                 continue;
             }
             if result <= 0 || fds[1].revents != 0 {
                 break;
             }
             if fds[0].revents & libc::POLLIN != 0 {
-                let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+                let n =
+                    unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
                 if n <= 0 || stdin_tx.blocking_send(buf[..n as usize].to_vec()).is_err() {
                     break;
                 }
@@ -749,10 +766,15 @@ mod attach_lifecycle_tests {
         if std::env::var_os("HYPRSTREAM_ATTACH_PTY_CHILD").is_none() {
             return;
         }
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("create attach test runtime");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create attach test runtime");
         rt.block_on(async {
             let (_tx, rx) = tokio::sync::mpsc::channel(64);
-            super::run_attach_io(rx, |_| async { Ok(()) }).await.expect("attach terminal loop");
+            super::run_attach_io(rx, |_| async { Ok(()) })
+                .await
+                .expect("attach terminal loop");
         });
         eprintln!("ATTACH_LOOP_RETURNED");
         drop(rt);
