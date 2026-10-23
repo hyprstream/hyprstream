@@ -101,6 +101,19 @@ pub async fn cancel_reader_on_expiry(
     result
 }
 
+/// Cancel the unlocked readable side after a write failure, observing the
+/// reset for at most one cleanup grace, never beyond request deadline + grace.
+#[doc(hidden)]
+pub async fn cancel_after_write_failure(
+    readable: &web_sys::ReadableStream,
+    base: anyhow::Error,
+    deadline: web_time::Instant,
+) -> anyhow::Error {
+    let cleanup_deadline = web_time::Instant::now().min(deadline)
+        + web_time::Duration::from_millis(CLEANUP_GRACE_MS as u64);
+    reset_with_grace(readable.cancel(), base, cleanup_deadline).await
+}
+
 /// Observe a stream-reset promise under a short cleanup deadline and fold
 /// any failure into the surfaced error — a reset that did not settle is
 /// never silently swallowed. The cleanup budget can extend the OBSERVED
@@ -268,10 +281,12 @@ impl WtConnection {
                 // readable side is not locked in this phase (only the writer
                 // holds the writable lock), so stream cancel reaches the
                 // underlying source and aborts both directions.
-                return Err(reset_with_grace(readable.cancel(), error, deadline).await);
+                return Err(cancel_after_write_failure(&readable, error, deadline).await);
             }
             Err(_) => {
-                return Err(reset_with_grace(readable.cancel(), deadline_error(), deadline).await);
+                return Err(
+                    cancel_after_write_failure(&readable, deadline_error(), deadline).await,
+                );
             }
         }
 

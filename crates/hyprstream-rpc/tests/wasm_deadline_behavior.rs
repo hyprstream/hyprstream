@@ -29,7 +29,9 @@
 
 use std::time::Duration;
 
-use hyprstream_rpc::web_transport::{bounded, cancel_reader_on_expiry, CLEANUP_GRACE_MS};
+use hyprstream_rpc::web_transport::{
+    bounded, cancel_after_write_failure, cancel_reader_on_expiry, CLEANUP_GRACE_MS,
+};
 use hyprstream_rpc::CallOptions;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -70,6 +72,21 @@ async fn fast_completion_completes_under_a_generous_deadline() {
 }
 
 #[wasm_bindgen(inline_js = r#"
+    export function makeDelayedCancelStream() {
+        let initiated = false;
+        let settled = false;
+        const stream = new ReadableStream({
+            cancel() {
+                initiated = true;
+                return new Promise((resolve) => setTimeout(() => {
+                    settled = true;
+                    resolve();
+                }, 10));
+            },
+        });
+        return { stream, wasInitiated: () => initiated, wasSettled: () => settled };
+    }
+
     export function makeNeverStream() {
         let cancelled = false;
         const stream = new ReadableStream({
@@ -112,6 +129,7 @@ async fn fast_completion_completes_under_a_generous_deadline() {
     }
 "#)]
 extern "C" {
+    fn makeDelayedCancelStream() -> JsValue;
     fn makeNeverStream() -> JsValue;
     fn makeNeverSettlingCancelStream() -> JsValue;
     fn installUnhandledRejectionSpy();
@@ -311,4 +329,40 @@ async fn bounded_completion_carries_deadline_and_auth() {
         CallOptions::new().effective_timeout_ms(Some(30_000)),
         Some(30_000)
     );
+}
+
+#[wasm_bindgen_test]
+async fn expired_write_observes_async_reset_within_grace() -> Result<(), JsValue> {
+    let fixture = makeDelayedCancelStream();
+    let stream = js_sys::Reflect::get(&fixture, &JsValue::from_str("stream"))?
+        .unchecked_into::<web_sys::ReadableStream>();
+    let initiated = js_sys::Reflect::get(&fixture, &JsValue::from_str("wasInitiated"))?
+        .unchecked_into::<js_sys::Function>();
+    let settled = js_sys::Reflect::get(&fixture, &JsValue::from_str("wasSettled"))?
+        .unchecked_into::<js_sys::Function>();
+    let error = cancel_after_write_failure(
+        &stream,
+        anyhow::anyhow!("write expired"),
+        web_time::Instant::now(),
+    )
+    .await;
+    assert_eq!(error.to_string(), "write expired");
+    assert_eq!(initiated.call0(&JsValue::UNDEFINED)?.as_bool(), Some(true));
+    assert_eq!(settled.call0(&JsValue::UNDEFINED)?.as_bool(), Some(true));
+    Ok(())
+}
+
+#[wasm_bindgen_test]
+async fn early_write_failure_does_not_wait_for_request_deadline() -> Result<(), JsValue> {
+    let fixture = makeNeverSettlingCancelStream();
+    let stream = js_sys::Reflect::get(&fixture, &JsValue::from_str("stream"))?
+        .unchecked_into::<web_sys::ReadableStream>();
+    let started = web_time::Instant::now();
+    let error =
+        cancel_after_write_failure(&stream, anyhow::anyhow!("write failed"), deadline_in(5_000))
+            .await;
+    assert!(error.to_string().contains("did not settle"));
+    // Scheduler tolerance for this browser test, not a wall-clock API guarantee.
+    assert!(started.elapsed() < Duration::from_millis(CLEANUP_GRACE_MS as u64 + 150));
+    Ok(())
 }

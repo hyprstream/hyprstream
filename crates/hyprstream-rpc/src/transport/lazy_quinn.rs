@@ -43,9 +43,8 @@ use crate::transport_traits::Transport;
 /// `SessionRpcTransport`.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Ceiling on the lazy connect itself (TLS handshake + dial). The per-request
-/// deadline wraps only the *request*; without this a dead/misrouted address (or
-/// a stalled handshake) would hang the first `send()` indefinitely.
+/// Independent ceiling on a lazy dial. The caller budget also covers lock wait
+/// and dialing; a caller expiry does not record a peer failure.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A quinn RPC transport that connects on first use and caches the session.
@@ -131,30 +130,40 @@ impl Transport for LazyQuinnTransport {
     type Pub = QuinnPublishStub;
 
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
-        let transport = self
-            .connected()
-            .await
-            .map_err(crate::transport_traits::PreDispatchTransportError::new)?;
-
-        // Make *our* deadline authoritative so we can tell a per-request timeout
-        // (the connection is probably fine — keep it) apart from a transport-fatal
-        // error (re-dial). The inner transport gets a generous ceiling that fires
-        // only if ours somehow doesn't.
-        let deadline = timeout_ms
+        let budget = timeout_ms
             .map(|ms| Duration::from_millis(ms.max(0) as u64))
             .unwrap_or(DEFAULT_TIMEOUT);
-        let inner_ceiling_ms = deadline.as_millis().saturating_mul(2).min(i32::MAX as u128) as i32;
+        let deadline = tokio::time::Instant::now() + budget;
+        if budget.is_zero() {
+            return Err(anyhow!("quinn RPC timeout after {budget:?}"));
+        }
+        // Caller expiry is not a peer failure and must not enable endpoint retry.
+        let connected = tokio::time::timeout_at(deadline, self.connected())
+            .await
+            .map_err(|_| anyhow!("quinn RPC timeout after {budget:?}"))?;
+        let transport =
+            connected.map_err(crate::transport_traits::PreDispatchTransportError::new)?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!("quinn RPC timeout after {budget:?}"));
+        }
+        // Round up sub-millisecond remainder; the absolute outer timer owns expiry.
+        let remaining_ms =
+            remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+        let inner_ceiling_ms = remaining_ms.saturating_mul(2).min(i32::MAX as u128) as i32;
 
-        match tokio::time::timeout(deadline, transport.send(payload, Some(inner_ceiling_ms))).await
+        match tokio::time::timeout_at(deadline, transport.send(payload, Some(inner_ceiling_ms)))
+            .await
         {
             // Our deadline fired: a slow/stalled request, not necessarily a dead
             // connection. Keep the cached session — re-dialing on every timeout
             // would thrash a merely-busy peer. (#156 owns liveness-based re-dial.)
-            Err(_elapsed) => Err(anyhow!("quinn RPC timeout after {deadline:?}")),
+            Err(_elapsed) => Err(anyhow!("quinn RPC timeout after {budget:?}")),
             Ok(Ok(resp)) => Ok(resp),
             // Transport-fatal (open_bi/write/read failed): the session is likely
             // dead — drop it so the next call re-dials, like ZmqConnection.
             Ok(Err(e)) => {
+                // Preserve fatal-error cleanup even if it outlives the caller budget.
                 self.invalidate().await;
                 Err(e)
             }
@@ -314,5 +323,69 @@ mod tests {
         );
         assert!(t.subscribe(b"topic").await.is_err());
         assert!(t.publish(b"topic").await.is_err());
+    }
+    #[tokio::test]
+    async fn caller_deadline_bounds_connection_lock_wait() {
+        let transport = LazyQuinnTransport::new(
+            "127.0.0.1:9".parse().unwrap(),
+            "localhost",
+            QuicServerAuth::pinned(vec![[0; 32]]).unwrap(),
+        );
+        let guard = transport.state.lock().await;
+        let error =
+            tokio::time::timeout(Duration::from_secs(2), transport.send(Vec::new(), Some(10)))
+                .await
+                .expect("caller deadline must expire while connection lock remains held")
+                .unwrap_err();
+        assert!(!crate::transport_traits::is_pre_dispatch_transport_error(
+            &error
+        ));
+        assert!(guard.cached.is_none());
+        drop(guard);
+        assert!(transport.state.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn zero_caller_budget_does_not_dial() {
+        let transport = LazyQuinnTransport::new(
+            "127.0.0.1:9".parse().unwrap(),
+            "localhost",
+            QuicServerAuth::pinned(vec![[0; 32]]).unwrap(),
+        );
+        let error = transport.send(Vec::new(), Some(0)).await.unwrap_err();
+        assert!(!crate::transport_traits::is_pre_dispatch_transport_error(
+            &error
+        ));
+        assert!(transport.state.lock().await.cached.is_none());
+    }
+
+    #[tokio::test]
+    async fn caller_deadline_bounds_silent_quinn_dial() {
+        // Keep the port open but never answer the QUIC handshake.
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = LazyQuinnTransport::new(
+            peer.local_addr().unwrap(),
+            "localhost",
+            QuicServerAuth::pinned(vec![[0; 32]]).unwrap(),
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            transport.send(Vec::new(), Some(100)),
+        )
+        .await
+        .expect("caller deadline must bound a silent peer dial")
+        .unwrap_err();
+        assert!(!crate::transport_traits::is_pre_dispatch_transport_error(
+            &error
+        ));
+        let state = transport
+            .state
+            .try_lock()
+            .expect("dial cancellation releases lock");
+        assert!(state.cached.is_none());
+        assert!(state.backoff.cooldown_remaining().is_none());
+        drop(state);
+        drop(transport);
+        drop(peer);
     }
 }

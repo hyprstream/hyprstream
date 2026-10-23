@@ -630,6 +630,7 @@ impl WorktreeHandle {
         let head = repo.head().ok();
         let branch = head
             .as_ref()
+            .filter(|h| h.is_branch())
             .and_then(|h| h.shorthand())
             .map(std::borrow::ToOwned::to_owned);
         let head_oid = head.as_ref().and_then(git2::Reference::target);
@@ -1113,5 +1114,32 @@ impl fmt::Debug for WorktreeHandle {
             .field("path", &self.path)
             .field("driver_name", &self.driver_name)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::WorktreeHandle;
+
+    #[tokio::test]
+    async fn status_distinguishes_symbolic_branch_from_detached_head() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = git2::Repository::init(temp.path())?;
+        let tree_oid = repo.index()?.write_tree()?;
+        let tree = repo.find_tree(tree_oid)?;
+        let signature = git2::Signature::now("Test", "test@example.com")?;
+        let oid = repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])?;
+        let commit = repo.find_commit(oid)?;
+        repo.branch("feature/target", &commit, false)?;
+        repo.set_head("refs/heads/feature/target")?;
+        let mut handle = WorktreeHandle::new(temp.path().to_path_buf(), "vfs".into());
+        let symbolic = handle.status().await?;
+        assert_eq!(symbolic.branch.as_deref(), Some("feature/target"));
+        assert_eq!(symbolic.head, Some(oid));
+        repo.set_head_detached(oid)?;
+        let detached = handle.status().await?;
+        assert_eq!(detached.branch, None);
+        assert_eq!(detached.head, Some(oid));
+        Ok(())
     }
 }
