@@ -23,6 +23,7 @@ mod resolved_spool;
 pub use channel_fp8::Fp8ExecutionError;
 pub mod architectures; // Architecture-specific model implementations (includes Janus placeholder utils)
 pub mod batched_lora;
+pub mod clef_decision; // Native Clef joint-schema decision runtime (R4 serving lane)
 pub mod ttn_profile; // TTN analysis pipeline: adaptive layer profiling + embedded profiles // Batched multi-tenant LoRA forward pass
                      // REMOVED: pub mod conversation_router; // Dead code - VDB TemporalStreamingLayer removed
 pub mod device_pool; // Multi-GPU device abstraction (DevicePool) — Send+Sync, holds only Device values

@@ -140,7 +140,10 @@ pub async fn handle_training_init(
         .list_worktrees()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
-    if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+    if !worktrees
+        .iter()
+        .any(|wt| wt.unavailable_reason.is_empty() && wt.branch_name == branch_name)
+    {
         anyhow::bail!(
             "Worktree '{}' does not exist for model '{}'. Create with:\n  \
              hyprstream training init {} --branch {}",
@@ -373,7 +376,10 @@ pub async fn handle_training_infer(
             .unwrap_or_else(|_| "main".to_owned()),
     };
     let worktrees = repo_client.list_worktrees().await?;
-    if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
+    if !worktrees
+        .iter()
+        .any(|wt| wt.unavailable_reason.is_empty() && wt.branch_name == branch_name)
+    {
         bail!("worktree for {}:{} not found", model_ref.model, branch_name);
     }
 
@@ -637,10 +643,11 @@ pub async fn handle_training_batch(
             .unwrap_or_else(|_| "main".to_owned()),
     };
     let worktrees = repo_client.list_worktrees().await?;
-    if !worktrees
-        .iter()
-        .any(|wt| wt.branch_name == branch_name_resolved)
-    {
+    if !worktrees.iter().any(|wt| {
+        wt.unavailable_reason.is_empty()
+            && wt.unavailable_reason.is_empty()
+            && wt.branch_name == branch_name_resolved
+    }) {
         bail!(
             "Worktree '{}' not found for model {}.\n\
              Run: hyprstream training init {} --branch {}",

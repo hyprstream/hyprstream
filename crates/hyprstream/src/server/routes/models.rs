@@ -28,7 +28,10 @@ async fn resolve_model_path(
     };
     // Verify worktree exists
     let wts = repo.list_worktrees().await?;
-    if !wts.iter().any(|wt| wt.branch_name == branch) {
+    if !wts
+        .iter()
+        .any(|wt| wt.unavailable_reason.is_empty() && wt.branch_name == branch)
+    {
         anyhow::bail!("worktree for {}:{} not found", model_ref.name(), branch);
     }
     // Derive path locally
@@ -144,7 +147,7 @@ async fn list_models(
             match state.registry.repo(&repo.id).list_worktrees().await {
                 Ok(worktrees) => {
                     for wt in worktrees {
-                        if wt.branch_name.is_empty() {
+                        if !wt.unavailable_reason.is_empty() || wt.branch_name.is_empty() {
                             continue;
                         }
                         let display = format!("{}:{}", name, wt.branch_name);

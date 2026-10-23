@@ -70,6 +70,7 @@ pub(crate) use hyprstream_inference::worktree_ext::WorktreeClientExt;
 // contained_root replaced by hyprstream-containedfs crate
 #[cfg(feature = "rocksdb")]
 pub mod at9p_renewal;
+pub mod decision;
 pub mod discovery;
 pub mod editing;
 pub mod factories;
@@ -230,3 +231,6 @@ pub mod event_network;
 
 /// Native producer/Streams carrier admission and lifecycle.
 pub mod stream_network;
+
+#[cfg(test)]
+pub(crate) mod clef_acceptance_control;

@@ -71,6 +71,10 @@ web-time = "1.1"    # Drop-in replacement for std::time (auto-detects wasm32)
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
+# Browser-timer deadlines for the WebTransport request path (wasmtimer under
+# the hood, tokio::time semantics, timer disposed on drop). Same version the
+# rpc-std browser stack already pins.
+web-async = "0.1.5"
 web-sys = { version = "0.3.64", features = [
   "Window", "Response", "Headers", "Request", "RequestInit", "RequestCache",
   "RequestCredentials", "RequestRedirect",

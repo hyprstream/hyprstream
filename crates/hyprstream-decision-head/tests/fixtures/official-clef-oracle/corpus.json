@@ -1,0 +1,65 @@
+{
+  "corpus_version": "clef-public-synthetic-v1",
+  "records": [
+    {
+      "id": "text-joint-three",
+      "max_length": 16384,
+      "request": {
+        "model": "Cloudflare/clef-flash",
+        "state": "A blue box contains exactly two red balls. No animals are present.",
+        "questions": {
+          "z proposition": {"type": "noul", "instructions": "There are exactly two red balls."},
+          "a:color": {"type": "choice", "instructions": "What color is the box?", "criteria": {"z-red": "The box is red.", "a-blue": "The box is blue.", "m-green": null}},
+          "score/quality": {"type": "score", "instructions": "How well is the ball count specified?", "criteria": ["No information", "Some information", "An exact count"]}
+        }
+      }
+    },
+    {
+      "id": "json-numeric-unicode",
+      "max_length": 16384,
+      "request": {
+        "model": "Cloudflare/clef-flash",
+        "state": {"z": null, "a": {"integer": 1, "float": 1.0, "negative_zero": -0.0, "small": 0.00001, "large": 1000000000000000.0}, "unicode": "κ 数 α", "flags": [true, false]},
+        "questions": {
+          "κ?": {"type": "noul", "criteria": {"true": {"meaning": "The flags contain true."}, "false": null}},
+          "2 / choice": {"type": "choice", "instructions": {"query": "Select the integer field.", "order": [2, 1]}, "criteria": {"2": {"field": "float"}, "10": {"field": "integer"}, "α": null}},
+          "11-level-score": {"type": "score", "instructions": "Count observed true flags on this scale.", "criteria": [null, "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]}
+        }
+      }
+    },
+    {
+      "id": "question-order-a-z",
+      "max_length": 16384,
+      "request": {
+        "model": "Cloudflare/clef-flash",
+        "state": "The label is gamma. The switch is off.",
+        "questions": {
+          "a": {"type": "choice", "instructions": "Select the label.", "criteria": {"gamma": "gamma", "beta": "beta", "alpha": "alpha"}},
+          "z": {"type": "noul", "instructions": "The switch is on."}
+        }
+      }
+    },
+    {
+      "id": "question-order-z-a",
+      "max_length": 16384,
+      "request": {
+        "model": "Cloudflare/clef-flash",
+        "state": "The label is gamma. The switch is off.",
+        "questions": {
+          "z": {"type": "noul", "instructions": "The switch is on."},
+          "a": {"type": "choice", "instructions": "Select the label.", "criteria": {"alpha": "alpha", "gamma": "gamma", "beta": "beta"}}
+        }
+      }
+    },
+    {
+      "id": "explicit-state-truncation",
+      "max_length": 512,
+      "max_state_tokens": 8,
+      "request": {
+        "model": "Cloudflare/clef-flash",
+        "state": "First second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth thirteenth fourteenth fifteenth sixteenth seventeenth eighteenth nineteenth twentieth.",
+        "questions": {"truncated?": {"type": "noul", "instructions": "Does the visible state mention a twentieth item?"}}
+      }
+    }
+  ]
+}

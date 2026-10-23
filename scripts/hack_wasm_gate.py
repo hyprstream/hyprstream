@@ -33,6 +33,7 @@ writing if any manifest would change.
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -41,6 +42,22 @@ GATED = "[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]"
 UNGATED_TABLE = "[dependencies]"
 HACK_LINE_RE = re.compile(r'^workspace-hack\s*=\s*\{[^\n]*\}$', re.M)
 SECTION_RE = re.compile(r'^\[[^\]]+\]\s*$', re.M)
+
+
+def tracked_manifest_has_final_newline(path: Path, fallback: bool) -> bool:
+    """Preserve the committed manifest's EOF convention across hakari rewrites."""
+    try:
+        relative = path.resolve().relative_to(ROOT.resolve())
+        result = subprocess.run(
+            ["git", "show", f"HEAD:{relative.as_posix()}"],
+            cwd=ROOT,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return fallback
+    return result.stdout.endswith(b"\n")
 
 
 def strip_hack_lines(text: str) -> tuple[str, str | None]:
@@ -96,6 +113,14 @@ def gate_manifest(path: Path, write: bool = True) -> bool:
     else:
         sep = "\n\n" if text.endswith("\n") else "\n\n\n"
         gated = text + sep + GATED + "\n" + hack_line + "\n"
+
+    # Hakari may drop the EOF newline from a changed manifest. Normalize to
+    # the committed source convention so regeneration remains reproducible.
+    if tracked_manifest_has_final_newline(path, original.endswith("\n")):
+        if not gated.endswith("\n"):
+            gated += "\n"
+    elif gated.endswith("\n"):
+        gated = gated[:-1]
 
     if gated != original:
         if write:

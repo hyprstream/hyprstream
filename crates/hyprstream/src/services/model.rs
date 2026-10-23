@@ -61,6 +61,12 @@ use zeroize::Zeroizing;
 /// Default endpoint for the model service
 pub const MODEL_ENDPOINT: &str = "inproc://hyprstream/model";
 
+mod clef_profile;
+#[cfg(feature = "postgres")]
+mod federate_profile;
+#[cfg(feature = "postgres")]
+pub(crate) use federate_profile::FederateModelProfile;
+
 // ============================================================================
 // Latched load terminal (EV7/#649) — host-side retained load outcome
 // ============================================================================
@@ -176,6 +182,11 @@ pub struct StagingModelPin {
     pub model_ref: String,
     pub commit: git2::Oid,
     projection_policy: git2db::pinned_disk::ProjectionPolicy,
+    // Never parsed from RPC. Clef is set only after explicit startup selection
+    // validates the reviewed local artifact inventory; direct constructors do
+    // not upgrade an arbitrary pin into a browser capability.
+    #[cfg(feature = "postgres")]
+    federate_profile: Option<FederateModelProfile>,
     #[cfg(test)]
     projection_parent: Option<std::path::PathBuf>,
 }
@@ -205,10 +216,16 @@ impl StagingModelPin {
                 && parsed.to_string() == model_ref,
             "bounded staging modelRef must be a canonical local branch ref"
         );
+        #[cfg(feature = "postgres")]
+        let federate_profile = (model_ref == REVIEWED_STAGING_MODEL_REF
+            && commit == git2::Oid::from_str(REVIEWED_STAGING_MODEL_OID)?)
+        .then_some(FederateModelProfile::Qwen);
         Ok(Self {
             model_ref,
             commit,
             projection_policy: Default::default(),
+            #[cfg(feature = "postgres")]
+            federate_profile,
             #[cfg(test)]
             projection_parent: None,
         })
@@ -221,12 +238,12 @@ impl StagingModelPin {
         local_lfs: std::collections::BTreeMap<String, std::path::PathBuf>,
     ) -> Result<Self> {
         let mut pin = Self::new(
-            "clef-flash-fp8:main",
-            git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?,
+            clef_profile::MODEL_REF,
+            git2::Oid::from_str(clef_profile::COMMIT)?,
         )?;
         // R0 normalized complete 21-file pinned tree (head + backbone + metadata).
         pin.projection_policy = git2db::pinned_disk::ProjectionPolicy::from_trusted_contract(
-            12_174_008_714,
+            clef_profile::EXPANDED_BYTES,
             local_lfs,
         )?;
         Ok(pin)
@@ -235,9 +252,8 @@ impl StagingModelPin {
     fn capture_policy(&self) -> Result<git2db::pinned_disk::ProjectionPolicy> {
         if self.projection_policy != Default::default() {
             anyhow::ensure!(
-                self.model_ref == "clef-flash-fp8:main"
-                    && self.commit
-                        == git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?,
+                self.model_ref == clef_profile::MODEL_REF
+                    && self.commit == git2::Oid::from_str(clef_profile::COMMIT)?,
                 "Clef projection policy pin identity changed"
             );
         }
@@ -262,7 +278,112 @@ impl StagingModelPin {
         };
         let model_ref = read_optional(REF)?;
         let oid = read_optional(OID)?;
-        Self::from_settings(&profile, model_ref.as_deref(), oid.as_deref())
+        let directory = read_optional("HYPRSTREAM_CLEF_LFS_DIRECTORY")?;
+        Self::from_startup_settings(
+            &profile,
+            model_ref.as_deref(),
+            oid.as_deref(),
+            directory.as_deref(),
+        )
+    }
+
+    /// Select only reviewed server-owned expanded admission; a request cannot
+    /// supply a local hydration map, profile or projection byte ceiling.
+    fn from_startup_settings(
+        profile: &str,
+        model_ref: Option<&str>,
+        oid: Option<&str>,
+        directory: Option<&str>,
+    ) -> Result<Option<Self>> {
+        Self::select_startup_pin(profile, model_ref, oid, directory, clef_profile::local_lfs)
+    }
+
+    // Private selection core. Tests provide a tiny directory validator closure
+    // here; no runtime setting/public API overrides production object pins.
+    fn select_startup_pin(
+        profile: &str,
+        model_ref: Option<&str>,
+        oid: Option<&str>,
+        directory: Option<&str>,
+        resolve: impl FnOnce(
+            &std::path::Path,
+        ) -> Result<std::collections::BTreeMap<String, std::path::PathBuf>>,
+    ) -> Result<Option<Self>> {
+        if profile != clef_profile::PROFILE {
+            anyhow::ensure!(
+                directory.is_none(),
+                "HYPRSTREAM_CLEF_LFS_DIRECTORY requires the explicit Clef CPU admission profile"
+            );
+            return Self::from_settings(profile, model_ref, oid);
+        }
+        Self::validate_clef_overrides(model_ref, oid)?;
+        let directory = directory
+            .context("HYPRSTREAM_CLEF_LFS_DIRECTORY is required for the Clef CPU profile")?;
+        let local_lfs = resolve(std::path::Path::new(directory))?;
+        let pin = Self::reviewed_clef_flash(local_lfs)?;
+        #[cfg(feature = "postgres")]
+        let pin = Self {
+            federate_profile: Some(FederateModelProfile::Clef),
+            ..pin
+        };
+        info!(profile = clef_profile::PROFILE, model_ref = clef_profile::MODEL_REF,
+            commit = clef_profile::COMMIT, tree = clef_profile::TREE,
+            manifest_sha256 = clef_profile::MANIFEST_SHA256,
+            expanded_bytes = clef_profile::EXPANDED_BYTES,
+            "selected reviewed native Clef contract; payload verification is deferred to owned capture");
+        Ok(Some(pin))
+    }
+
+    fn validate_clef_overrides(model_ref: Option<&str>, oid: Option<&str>) -> Result<()> {
+        match (model_ref, oid) {
+            (None, None) => {}
+            (Some(name), Some(commit)) => anyhow::ensure!(
+                name == clef_profile::MODEL_REF && commit == clef_profile::COMMIT,
+                "Clef overrides must match the complete reviewed alias and commit"
+            ),
+            _ => {
+                anyhow::bail!("Clef model reference and OID must be absent together or both fixed")
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "postgres")]
+    pub(crate) fn federate_profile(&self) -> Result<FederateModelProfile> {
+        let profile = self
+            .federate_profile
+            .ok_or_else(|| anyhow!("pin has no reviewed Federate model capability"))?;
+        anyhow::ensure!(
+            self.model_ref == profile.model_ref()
+                && self.commit == git2::Oid::from_str(profile.commit())?,
+            "Federate model pin identity changed"
+        );
+        let policy = self.capture_policy()?;
+        anyhow::ensure!(
+            (profile == FederateModelProfile::Qwen) == (policy == Default::default()),
+            "Federate model projection policy does not match the selected profile"
+        );
+        Ok(profile)
+    }
+
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) fn federate_clef_startup_fixture() -> Result<Self> {
+        Self::select_startup_pin(
+            clef_profile::PROFILE,
+            None,
+            None,
+            Some("/fixture/clef-cache"),
+            |_| Ok(Default::default()),
+        )?
+        .context("Clef startup fixture pin missing")
+    }
+
+    pub(crate) fn validate_deployment(&self, profile: &InferenceDeploymentProfile) -> Result<()> {
+        if self.projection_policy != Default::default() {
+            self.capture_policy()?;
+            clef_profile::validate_deployment(profile)?;
+        }
+        Ok(())
     }
 
     fn from_settings(
@@ -304,7 +425,52 @@ impl StagingModelPin {
     }
 
     fn admits(&self, model_ref: &str) -> bool {
-        self.model_ref == model_ref
+        if self.model_ref == model_ref {
+            return true;
+        }
+        // The ingress decision gate requires the immutable OID selector form;
+        // it names the same commit this pin admits through its mutable ref.
+        let Ok(parsed) = ModelRef::parse(model_ref) else {
+            return false;
+        };
+        let Ok(configured) = ModelRef::parse(&self.model_ref) else {
+            return false;
+        };
+        if parsed.name() != configured.name() {
+            return false;
+        }
+        let crate::storage::GitRef::Commit(oid) = parsed.git_ref else {
+            return false;
+        };
+        oid == self.commit
+    }
+
+    /// The local branch whose worktree must hold `self.commit` for `model_ref`
+    /// to be admitted: the configured branch ref itself, or an immutable
+    /// commit selector naming exactly the pinned commit. Mutable refs other
+    /// than the configured one, tags, revspecs, and bare names stay rejected.
+    fn staging_worktree_branch(&self, model_ref: &ModelRef) -> Result<String> {
+        let configured = ModelRef::parse(&self.model_ref)?;
+        let crate::storage::GitRef::Branch(branch) = configured.git_ref else {
+            anyhow::bail!("staging pin modelRef must be a canonical local branch ref");
+        };
+        match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(requested) => {
+                anyhow::ensure!(
+                    requested == &branch,
+                    "staging modelRef must select its configured local branch"
+                );
+                Ok(branch)
+            }
+            crate::storage::GitRef::Commit(oid) => {
+                anyhow::ensure!(
+                    oid == &self.commit,
+                    "staging commit selector does not match the configured pin"
+                );
+                Ok(branch)
+            }
+            _ => anyhow::bail!("staging modelRef must select its configured local branch"),
+        }
     }
 }
 
@@ -327,6 +493,14 @@ pub struct ModelServiceInner {
     loaded_models: RwLock<LruCache<InferenceInstanceId, LoadedModel>>,
     /// Models currently being loaded (accepted but not yet in LRU cache)
     pending_loads: parking_lot::Mutex<HashMap<InferenceInstanceId, u64>>,
+    /// Service-owned cold-load jobs. A request only owns its watch receiver;
+    /// disconnect/deadline cancellation cannot drop the worker load future.
+    load_jobs: parking_lot::Mutex<HashMap<(InferenceInstanceId, u64), ModelLoadJob>>,
+    /// Set by `RequestService::on_drained` before it joins all accepted loads.
+    load_jobs_closed: std::sync::atomic::AtomicBool,
+    /// Wakes service drain when an intercepted or tracked load releases its
+    /// attempt-scoped pending marker.
+    load_state_changed: tokio::sync::Notify,
     /// Shared read-only staging projection for tenant-specific workers using
     /// the same reviewed commit pin.
     staging_pinned_artifacts: crate::storage::pinned_model::StagingPinnedArtifactCache,
@@ -403,6 +577,14 @@ pub struct ModelServiceInner {
     /// environment value merely to support restart acceptance coverage.
     #[cfg(test)]
     test_work_order_capture: Mutex<Option<Zeroizing<String>>>,
+    #[cfg(test)]
+    test_decision_control:
+        parking_lot::Mutex<Option<Arc<super::clef_acceptance_control::TestDecisionControl>>>,
+    /// Test-only gate immediately before native worker startup. It is used by
+    /// the ingress deadline regression to make the shared cold-load job
+    /// observable without changing production behavior.
+    #[cfg(test)]
+    test_cold_load_gate: parking_lot::Mutex<Option<Arc<tokio::sync::watch::Sender<bool>>>>,
     /// Test-only ordering witness: successful unload clears admission before
     /// making its `model.unloaded` event visible.
     #[cfg(test)]
@@ -422,6 +604,81 @@ pub struct ModelService {
     inner: Arc<ModelServiceInner>,
 }
 
+struct ModelLoadJob {
+    result: tokio::sync::watch::Receiver<Option<std::result::Result<String, String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Completes one service-owned load attempt even if its task panics or is
+/// cancelled during bridge teardown. The bridge drain normally joins tasks;
+/// this synchronous fallback keeps waiters and retained terminals coherent on
+/// abnormal task termination as well.
+struct ModelLoadAttemptGuard {
+    inner: Arc<ModelServiceInner>,
+    instance: InferenceInstanceId,
+    attempt: u64,
+    result: tokio::sync::watch::Sender<Option<std::result::Result<String, String>>>,
+    active: bool,
+}
+
+impl ModelLoadAttemptGuard {
+    fn new(
+        inner: Arc<ModelServiceInner>,
+        instance: InferenceInstanceId,
+        attempt: u64,
+        result: tokio::sync::watch::Sender<Option<std::result::Result<String, String>>>,
+    ) -> Self {
+        Self {
+            inner,
+            instance,
+            attempt,
+            result,
+            active: true,
+        }
+    }
+
+    fn complete(mut self, outcome: &Result<String>) {
+        Self::finish_attempt(&self.inner, &self.instance, self.attempt, outcome);
+        self.result.send_replace(Some(match outcome {
+            Ok(endpoint) => Ok(endpoint.clone()),
+            Err(error) => Err(error.to_string()),
+        }));
+        self.active = false;
+    }
+
+    fn finish_attempt(
+        inner: &Arc<ModelServiceInner>,
+        instance: &InferenceInstanceId,
+        attempt: u64,
+        outcome: &Result<String>,
+    ) {
+        {
+            let mut pending = inner.pending_loads.lock();
+            if pending.get(instance) == Some(&attempt) {
+                pending.remove(instance);
+            }
+        }
+        ModelService {
+            inner: Arc::clone(inner),
+        }
+        .latch_load_terminal(instance, attempt, outcome);
+        inner.load_state_changed.notify_waiters();
+        inner.load_state_changed.notify_one();
+    }
+}
+
+impl Drop for ModelLoadAttemptGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let error = anyhow!("service-owned model load task ended before publishing a result");
+            Self::finish_attempt(&self.inner, &self.instance, self.attempt, &Err(error));
+            self.result.send_replace(Some(Err(
+                "service-owned model load task ended before publishing a result".to_owned(),
+            )));
+        }
+    }
+}
+
 struct SpawnPublicationGuard(Option<hyprstream_service::SpawnedService>);
 
 impl SpawnPublicationGuard {
@@ -433,22 +690,23 @@ impl SpawnPublicationGuard {
             .take()
             .ok_or_else(|| anyhow!("spawn publication guard was already disarmed"))
     }
+
+    async fn stop(mut self) -> Result<()> {
+        if let Some(mut handle) = self.0.take() {
+            handle
+                .stop()
+                .await
+                .map_err(|error| anyhow!("failed to join unpublished inference worker: {error}"))?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SpawnPublicationGuard {
     fn drop(&mut self) {
         if let Some(mut handle) = self.0.take() {
-            match tokio::runtime::Handle::try_current() {
-                Ok(runtime) => {
-                    runtime.spawn(async move {
-                    if let Err(error) = handle.stop().await {
-                        tracing::error!(%error, "failed to reclaim unpublished inference worker");
-                    }
-                });
-                }
-                Err(error) => {
-                    tracing::error!(%error, "cannot reclaim unpublished inference worker outside Tokio runtime");
-                }
+            if let Err(error) = handle.stop_detached() {
+                tracing::error!(%error, "failed to transfer unpublished inference worker to native teardown owner");
             }
         }
     }
@@ -493,13 +751,24 @@ impl InterceptedLoadReservation {
                 pending.remove(&self.instance);
             }
             self.active = false;
+            self.inner.load_state_changed.notify_waiters();
+            self.inner.load_state_changed.notify_one();
         }
     }
 }
 
 impl Drop for InterceptedLoadReservation {
     fn drop(&mut self) {
-        self.release();
+        if self.active {
+            let error = anyhow!("accepted model load continuation ended before completion");
+            ModelLoadAttemptGuard::finish_attempt(
+                &self.inner,
+                &self.instance,
+                self.attempt,
+                &Err(error),
+            );
+            self.active = false;
+        }
     }
 }
 
@@ -685,6 +954,51 @@ where
     )
 }
 
+/// Select a worktree only when the registry reports one unambiguous branch at
+/// the requested commit. Equal OIDs on multiple branches are valid Git state,
+/// but are intentionally rejected here: a pinned model ref has no branch
+/// identity, and silently choosing one would make the storage path ambiguous.
+fn select_unique_worktree_for_head(
+    worktrees: &[hyprstream_rpc_std::registry_client::WorktreeInfo],
+    head_oid: &str,
+) -> Result<String> {
+    let matches: Vec<_> = worktrees
+        .iter()
+        .filter(|worktree| worktree.unavailable_reason.is_empty() && worktree.head_oid == head_oid)
+        .collect();
+    anyhow::ensure!(
+        matches.len() == 1,
+        "commit {} must select exactly one registered worktree (found {}: {})",
+        head_oid,
+        matches.len(),
+        matches
+            .iter()
+            .map(|worktree| worktree.branch_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(matches[0].branch_name.clone())
+}
+
+/// Branch that backs a cold load of a commit selector. With a staging pin
+/// configured, admission has already matched the selector to the pin, so the
+/// load reuses the pin's configured staging branch — the worktree that
+/// checkout validation verified — instead of repeating generic commit
+/// resolution, which would reject valid repositories where another branch
+/// points at the same pinned commit. Without a pin the selector has no
+/// branch identity, so the unique-worktree rule still applies.
+fn commit_selector_load_branch(
+    pin: Option<&StagingModelPin>,
+    model_ref: &ModelRef,
+    commit: &git2::Oid,
+    worktrees: &[hyprstream_rpc_std::registry_client::WorktreeInfo],
+) -> Result<String> {
+    match pin {
+        Some(pin) => pin.staging_worktree_branch(model_ref),
+        None => select_unique_worktree_for_head(worktrees, &commit.to_string()),
+    }
+}
+
 impl ModelService {
     /// Create a new model service with infrastructure
     pub async fn new(
@@ -711,6 +1025,9 @@ impl ModelService {
             inner: Arc::new(ModelServiceInner {
                 loaded_models: RwLock::new(LruCache::new(cache_size)),
                 pending_loads: parking_lot::Mutex::new(HashMap::new()),
+                load_jobs: parking_lot::Mutex::new(HashMap::new()),
+                load_jobs_closed: std::sync::atomic::AtomicBool::new(false),
+                load_state_changed: tokio::sync::Notify::new(),
                 staging_pinned_artifacts:
                     crate::storage::pinned_model::StagingPinnedArtifactCache::default(),
                 unloading_models: Mutex::new(HashSet::new()),
@@ -740,6 +1057,10 @@ impl ModelService {
                 #[cfg(test)]
                 test_work_order_capture: Mutex::new(None),
                 #[cfg(test)]
+                test_decision_control: parking_lot::Mutex::new(None),
+                #[cfg(test)]
+                test_cold_load_gate: parking_lot::Mutex::new(None),
+                #[cfg(test)]
                 before_unloaded_event: Mutex::new(None),
             }),
         })
@@ -760,6 +1081,11 @@ impl ModelService {
     #[cfg(test)]
     async fn take_test_work_order(&self) -> Option<Zeroizing<String>> {
         self.test_work_order_capture.lock().await.take()
+    }
+
+    #[cfg(test)]
+    fn set_test_cold_load_gate(&self, gate: Option<Arc<tokio::sync::watch::Sender<bool>>>) {
+        *self.test_cold_load_gate.lock() = gate;
     }
 
     /// Set the expected JWT audience for token validation.
@@ -876,6 +1202,13 @@ impl ModelService {
         self.admit_instance(instance)?;
         let _load_unload_gate = self.load_unload_gate.lock().await;
         self.ensure_not_unloading(instance).await?;
+        anyhow::ensure!(
+            !self
+                .inner
+                .load_jobs_closed
+                .load(std::sync::atomic::Ordering::Acquire),
+            "model service is draining and no longer accepts model loads"
+        );
 
         {
             let mut cache = self.loaded_models.write().await;
@@ -927,38 +1260,57 @@ impl ModelService {
             })?;
         let repo_client = self.registry.repo(&tracked.id);
         let worktrees = repo_client.list_worktrees().await?;
-        let branch = match &model_ref.git_ref {
-            crate::storage::GitRef::Branch(branch) => branch,
-            _ => anyhow::bail!("staging modelRef must select its configured local branch"),
-        };
+        let branch = pin.staging_worktree_branch(&model_ref)?;
         anyhow::ensure!(
-            worktrees
-                .iter()
-                .any(|worktree| worktree.branch_name == branch.as_str()),
+            worktrees.iter().any(|worktree| {
+                worktree.unavailable_reason.is_empty()
+                    && !worktree.is_detached
+                    && worktree.branch_name == branch.as_str()
+            }),
             "staging worktree for {}:{} not found",
             model_ref.name(),
             branch
         );
-        let path = crate::storage::StoragePaths::new()?.worktree_path(model_ref.name(), branch)?;
+        let path = crate::storage::StoragePaths::new()?.worktree_path(model_ref.name(), &branch)?;
         crate::storage::pinned_model::verify_selected_checkout(&path, pin.commit)
             .with_context(|| format!("admit staging worktree for {}", pin.model_ref))
     }
 
-    /// Execute one previously admitted intercepted load. Its pending reservation
-    /// was created under `load_unload_gate`; unload rejects against that marker
-    /// until this continuation has finished and released it.
-    async fn run_intercepted_load(
-        &self,
-        instance: &InferenceInstanceId,
-        max_context: Option<u32>,
-        kv_quant: Option<KVQuantType>,
-        mut reservation: InterceptedLoadReservation,
-    ) -> Result<String> {
-        let epoch = reservation.attempt;
-        let result = self.load_model_inner(instance, max_context, kv_quant).await;
-        reservation.release();
-        self.latch_load_terminal(instance, epoch, &result);
-        result
+    async fn publish_load_terminal_event(&self, model_ref: &str, result: &Result<String>) {
+        let model_name = model_ref.split(':').next().unwrap_or(model_ref);
+        let scope = format!("serve:model:{model_name}");
+        let payload = match result {
+            Ok(endpoint) => crate::events::EventEnvelope::new(
+                crate::events::EventSource::Model,
+                scope,
+                crate::events::EventPayload::ModelLoaded {
+                    model_ref: model_ref.to_owned(),
+                    endpoint: endpoint.clone(),
+                },
+            ),
+            Err(error) => crate::events::EventEnvelope::new(
+                crate::events::EventSource::Model,
+                scope,
+                crate::events::EventPayload::ModelFailed {
+                    model_ref: model_ref.to_owned(),
+                    error: error.to_string(),
+                },
+            ),
+        };
+        if let Ok(payload) = serde_json::to_vec(&payload) {
+            let _event_publish_gate = self.lifecycle_event_publish_gate.lock().await;
+            if let Err(error) = self
+                .event_publisher
+                .publish(
+                    "lifecycle",
+                    if result.is_ok() { "loaded" } else { "failed" },
+                    &payload,
+                )
+                .await
+            {
+                debug!(%error, "failed to publish model load terminal event");
+            }
+        }
     }
 
     /// Build an instance key only from the authority-verified tenant binding.
@@ -1321,6 +1673,13 @@ impl ModelService {
         // unloading", then begin after the old worker has been removed.
         let load_unload_gate = self.load_unload_gate.lock().await;
         self.ensure_not_unloading(instance).await?;
+        anyhow::ensure!(
+            !self
+                .inner
+                .load_jobs_closed
+                .load(std::sync::atomic::Ordering::Acquire),
+            "model service is draining and no longer accepts model loads"
+        );
         // Check if already loaded
         {
             let mut cache = self.loaded_models.write().await;
@@ -1331,39 +1690,147 @@ impl ModelService {
             }
         }
 
-        // Atomically check-and-insert into pending_loads (prevents duplicate GPU loads
-        // when multiple requests arrive during the ~40s load window).
-        // HashMap::insert is guarded by contains_key so a direct attempt owns
-        // the epoch stored beside its pending marker.
-        let epoch;
-        {
+        // A decision owns only the result receiver. The load itself is a
+        // service-owned Tokio task, so cancellation of one request cannot
+        // cancel the pending marker, worker startup, or terminal publication.
+        let receiver = {
             let mut pending = self.pending_loads.lock();
-            if pending.contains_key(instance) {
-                anyhow::bail!(
-                    "Model {} is already being loaded — please retry shortly",
-                    model_ref_str
-                );
+            if let Some(attempt) = pending.get(instance).copied() {
+                let jobs = self.inner.load_jobs.lock();
+                let Some(job) = jobs.get(&(instance.clone(), attempt)) else {
+                    anyhow::bail!(
+                        "Model {} is already being loaded by an accepted load continuation",
+                        model_ref_str
+                    );
+                };
+                job.result.clone()
+            } else {
+                let epoch = self.allocate_load_epoch();
+                pending.insert(instance.clone(), epoch);
+                let supervisor = self.clone();
+                let loader = self.clone();
+                let job_instance = instance.clone();
+                supervisor.spawn_load_job(instance.clone(), epoch, async move {
+                    loader
+                        .load_model_inner(&job_instance, max_context, kv_quant)
+                        .await
+                })
             }
-            epoch = self.allocate_load_epoch();
-            pending.insert(instance.clone(), epoch);
-        }
+        };
         drop(load_unload_gate);
 
-        // EV7/#649: the gated pending insertion allocated this genuine load's
-        // fresh epoch, so its terminal latches under a new key on completion.
-        let result = self.load_model_inner(instance, max_context, kv_quant).await;
+        Self::wait_load_result(receiver).await
+    }
 
-        // Always remove from pending, whether load succeeded or failed
-        self.pending_loads.lock().remove(instance);
-
-        // EV7/#649: latch the retained terminal (Loaded / LoadFailed) for this
-        // load attempt — the host-side retain a late `load --wait` reads.
-        self.latch_load_terminal(instance, epoch, &result);
-
-        if result.is_ok() {
-            info!("Model {} loaded successfully", model_ref_str);
+    async fn wait_load_result(
+        mut receiver: tokio::sync::watch::Receiver<Option<std::result::Result<String, String>>>,
+    ) -> Result<String> {
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result.map_err(|error| anyhow!(error));
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| anyhow!("service-owned load task exited without a terminal result"))?;
         }
-        result
+    }
+
+    fn spawn_load_job<F>(
+        &self,
+        instance: InferenceInstanceId,
+        attempt: u64,
+        future: F,
+    ) -> tokio::sync::watch::Receiver<Option<std::result::Result<String, String>>>
+    where
+        F: std::future::Future<Output = Result<String>> + Send + 'static,
+    {
+        let (result_tx, result_rx) = tokio::sync::watch::channel(None);
+        let guard = ModelLoadAttemptGuard::new(
+            Arc::clone(&self.inner),
+            instance.clone(),
+            attempt,
+            result_tx,
+        );
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            // The task must not finish before its handle is visible in the
+            // deduplication map. This also makes completion-time reaping safe
+            // on a multi-thread runtime.
+            let _ = start_rx.await;
+            let result = future.await;
+            guard.complete(&result);
+        });
+        let mut jobs = self.inner.load_jobs.lock();
+        // Completed handles are safe to drop only after Tokio reports the
+        // task has fully exited. Reap them at the next admission so completed
+        // loads do not accumulate, while bridge shutdown still owns a handle
+        // for every task that may be running its completion path.
+        jobs.retain(|_, job| !job.task.is_finished());
+        jobs.insert(
+            (instance, attempt),
+            ModelLoadJob {
+                result: result_rx.clone(),
+                task,
+            },
+        );
+        let _ = start_tx.send(());
+        result_rx
+    }
+
+    async fn drain_load_jobs(&self) -> Result<()> {
+        // Serialize closure with the exact gate used by load admission. Once
+        // this flag is visible, neither a decision load nor an intercepted
+        // Model.load continuation can create a new attempt.
+        let gate = self.load_unload_gate.lock().await;
+        self.inner
+            .load_jobs_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(gate);
+
+        let jobs = std::mem::take(&mut *self.inner.load_jobs.lock());
+        let mut join_errors = Vec::new();
+        for ((instance, attempt), job) in jobs {
+            if let Err(error) = job.task.await {
+                join_errors.push(format!(
+                    "load job {} attempt {} did not join: {error}",
+                    instance.model_ref(),
+                    attempt
+                ));
+            }
+        }
+
+        // Accepted intercepted loads use tracked service-owned jobs too. Their
+        // reservation remains until terminal event publication completes; the
+        // bridge continuation only waits on the result and owns no load state.
+        loop {
+            let changed = self.inner.load_state_changed.notified();
+            if self.inner.pending_loads.lock().is_empty() {
+                break;
+            }
+            changed.await;
+        }
+
+        let mut loaded = Vec::new();
+        {
+            let mut cache = self.loaded_models.write().await;
+            while let Some((_, model)) = cache.pop_lru() {
+                loaded.push(model);
+            }
+        }
+        for mut model in loaded {
+            if let Err(error) = model.service_handle.stop().await {
+                join_errors.push(format!(
+                    "loaded worker {} did not stop cleanly: {error}",
+                    model.instance.model_ref()
+                ));
+            }
+        }
+        if join_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(join_errors.join("; ")))
+        }
     }
 
     /// Inner model loading logic, called by load_model() which manages pending_loads.
@@ -1374,6 +1841,19 @@ impl ModelService {
         kv_quant: Option<KVQuantType>,
     ) -> Result<String> {
         let model_ref_str = instance.model_ref();
+        #[cfg(test)]
+        {
+            let gate = { self.test_cold_load_gate.lock().clone() };
+            if let Some(gate) = gate {
+                let mut released = gate.subscribe();
+                while !*released.borrow() {
+                    released
+                        .changed()
+                        .await
+                        .map_err(|_| anyhow!("test cold-load gate closed"))?;
+                }
+            }
+        }
         self.validate_model_load_ref(model_ref_str)?;
         // Parse/resolve model reference
         let model_ref = self.resolve_model_ref(model_ref_str).await?;
@@ -1390,32 +1870,59 @@ impl ModelService {
         crate::services::restart_diag::phase("registry.get_by_name.done");
         let repo_client = self.registry.repo(&tracked.id);
 
-        let branch_name = match &model_ref.git_ref {
-            crate::storage::GitRef::Branch(name) => name.clone(),
-            crate::storage::GitRef::Commit(_) => repo_client
-                .get_head()
-                .await
-                .context("resolve selected worktree branch for pinned commit")?,
-            crate::storage::GitRef::Tag(_) | crate::storage::GitRef::Revspec(_) => {
-                anyhow::bail!("tag and revspec model loads are unsupported; use a full commit OID")
-            }
-            crate::storage::GitRef::DefaultBranch => repo_client
-                .get_head()
-                .await
-                .unwrap_or_else(|_| "main".to_owned()),
-        };
         #[cfg(test)]
         crate::services::restart_diag::phase("registry.list_worktrees.enter");
         let worktrees = repo_client.list_worktrees().await?;
         #[cfg(test)]
         crate::services::restart_diag::phase("registry.list_worktrees.done");
-        if !worktrees.iter().any(|wt| wt.branch_name == branch_name) {
-            return Err(anyhow!(
-                "worktree for {}:{} not found",
-                model_ref.name(),
-                branch_name
-            ));
-        }
+        let branch_name = match &model_ref.git_ref {
+            crate::storage::GitRef::Branch(name) => {
+                anyhow::ensure!(
+                    worktrees
+                        .iter()
+                        .any(|worktree| worktree.unavailable_reason.is_empty()
+                            && !worktree.is_detached
+                            && worktree.branch_name == *name),
+                    "branch worktree for {}:{} not found",
+                    model_ref.name(),
+                    name
+                );
+                name.clone()
+            }
+            crate::storage::GitRef::Commit(commit) => commit_selector_load_branch(
+                self.config.staging_model_pin.as_ref(),
+                &model_ref,
+                commit,
+                &worktrees,
+            )?,
+            crate::storage::GitRef::Tag(_) | crate::storage::GitRef::Revspec(_) => {
+                anyhow::bail!("tag and revspec model loads are unsupported; use a full commit OID")
+            }
+            crate::storage::GitRef::DefaultBranch => {
+                let branch = if tracked.tracking_ref.is_empty() {
+                    "main".to_owned()
+                } else {
+                    tracked.tracking_ref.clone()
+                };
+                anyhow::ensure!(
+                    worktrees.iter().any(|worktree| {
+                        worktree.unavailable_reason.is_empty()
+                            && !worktree.is_detached
+                            && worktree.branch_name == branch
+                    }),
+                    "default worktree for {}:{} not found",
+                    model_ref.name(),
+                    branch
+                );
+                branch
+            }
+        };
+        anyhow::ensure!(
+            worktrees.iter().any(|wt| wt.branch_name == branch_name),
+            "worktree for {}:{} not found",
+            model_ref.name(),
+            branch_name
+        );
         // Derive worktree path locally
         let storage_paths = crate::storage::StoragePaths::new()?;
         let model_path = storage_paths.worktree_path(model_ref.name(), &branch_name)?;
@@ -1429,7 +1936,7 @@ impl ModelService {
 
         let pinned_artifact = if let Some(pin) = &self.config.staging_model_pin {
             anyhow::ensure!(
-                model_ref_str == pin.model_ref,
+                pin.admits(model_ref_str),
                 "staging modelRef changed after admission"
             );
             let policy = pin.capture_policy()?;
@@ -1520,6 +2027,10 @@ impl ModelService {
                 Arc::clone(&self.producer_reach_config),
                 Arc::clone(&self.moq_origin),
             );
+        #[cfg(test)]
+        if let Some(control) = self.test_decision_control.lock().as_ref() {
+            service_config.test_decision_control = Some(Arc::downgrade(control));
+        }
         if let Some(ref aud) = self.expected_audience {
             service_config = service_config.with_expected_audience(aud.clone());
         }
@@ -1548,7 +2059,8 @@ impl ModelService {
             .spawn(service_config)
             .await
             .map_err(|e| anyhow!("Failed to spawn inference service: {}", e))?;
-        let spawn_guard = SpawnPublicationGuard::new(service_handle);
+        let mut spawn_guard = Some(SpawnPublicationGuard::new(service_handle));
+        let result = async {
         #[cfg(test)]
         crate::services::restart_diag::phase("inference.spawn.done");
         let network_transport = network_reach
@@ -1646,7 +2158,10 @@ impl ModelService {
             }
 
             // Add to cache
-            let service_handle = spawn_guard.publish()?;
+            let service_handle = spawn_guard
+                .take()
+                .ok_or_else(|| anyhow!("spawn publication guard was already disarmed"))?
+                .publish()?;
             cache.put(
                 instance.clone(),
                 LoadedModel {
@@ -1696,7 +2211,18 @@ impl ModelService {
                 "loaded model from private disk exact-tree artifact");
         }
 
-        Ok(endpoint)
+            Ok(endpoint)
+        }
+        .await;
+        if result.is_err() {
+            if let Some(guard) = spawn_guard.take() {
+                // A failed attempt is not terminal until its unpublished native
+                // worker has stopped and joined. Keep pending_loads reserved
+                // until this await completes in the service-owned load job.
+                guard.stop().await?;
+            }
+        }
+        result
     }
 
     async fn ensure_not_unloading(&self, instance: &InferenceInstanceId) -> Result<()> {
@@ -2085,6 +2611,51 @@ impl ModelService {
         }
     }
 
+    /// Re-wrap decision-serving failures as [`hyprstream_rpc::TypedRpcError`]
+    /// so the generated scoped dispatcher re-emits the typed wire code
+    /// instead of collapsing to INTERNAL (S9). Generic errors pass through.
+    fn typed_decision_error(e: impl Into<anyhow::Error>) -> anyhow::Error {
+        let e = e.into();
+        let message = e.to_string();
+        match crate::services::decision::error_code_for(&message) {
+            Some(code) => anyhow::Error::new(hyprstream_rpc::TypedRpcError {
+                code: code.to_owned(),
+                message,
+            }),
+            None => e,
+        }
+    }
+
+    async fn await_forwarded_decision<F>(
+        deadline: Instant,
+        forwarded: F,
+    ) -> Result<hyprstream_rpc_std::inference_client::DecisionResponse>
+    where
+        F: std::future::Future<
+            Output = Result<hyprstream_rpc_std::inference_client::DecisionResponse>,
+        >,
+    {
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), forwarded)
+            .await
+            .map_err(|_| {
+                Self::typed_decision_error(anyhow!(
+                    "clef-decision-cancelled: decision deadline elapsed at Model ingress"
+                ))
+            })?
+            .map_err(|error| {
+                if matches!(
+                    error.downcast_ref::<hyprstream_rpc::error::RpcError>(),
+                    Some(hyprstream_rpc::error::RpcError::InMemoryRequestTimeout { .. })
+                ) {
+                    Self::typed_decision_error(anyhow!(
+                        "clef-decision-cancelled: in-process worker request deadline elapsed"
+                    ))
+                } else {
+                    Self::typed_decision_error(error)
+                }
+            })
+    }
+
     /// Mint-side scope for one forwarded struct/Void Inference operation:
     /// the exact dispatch coordinate for `variant` plus its scope operation.
     fn inference_scope(
@@ -2103,8 +2674,33 @@ impl ModelService {
         ctx: &EnvelopeContext,
         work: hyprstream_rpc::auth::internal_work::InternalWorkScope,
     ) -> Result<InferenceClient> {
+        self.get_inference_client_with_deadline(model_ref_str, ctx, work, None)
+            .await
+    }
+
+    async fn get_inference_client_with_deadline(
+        &self,
+        model_ref_str: &str,
+        ctx: &EnvelopeContext,
+        work: hyprstream_rpc::auth::internal_work::InternalWorkScope,
+        deadline: Option<Instant>,
+    ) -> Result<InferenceClient> {
         let instance = Self::inference_instance(ctx, model_ref_str)?;
-        let _endpoint = self.load_model(&instance, None, None).await?;
+        // The ingress deadline bounds only this caller's waiter; the shared
+        // service-owned load continues for other waiters.
+        let load = self.load_model(&instance, None, None);
+        let _endpoint = match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), load)
+                    .await
+                    .map_err(|_| {
+                        Self::typed_decision_error(anyhow!(
+                "clef-decision-cancelled: decision deadline elapsed while waiting for model load"
+            ))
+                    })??
+            }
+            None => load.await?,
+        };
         let mut cache = self.loaded_models.write().await;
         let model = cache
             .get_mut(&instance)
@@ -2144,6 +2740,19 @@ impl ModelService {
         let routed = self
             .select_inference_routed(model, &placement_key, relay_bearer.as_deref())
             .await?;
+        if let Some(deadline) = deadline {
+            crate::services::decision::remaining_timeout_ms(deadline, Instant::now())
+                .map_err(Self::typed_decision_error)?;
+        }
+        if deadline.is_some()
+            && ctx
+                .request_cancellation()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            return Err(Self::typed_decision_error(anyhow!(
+                "clef-decision-cancelled: caller disconnected before work authorization"
+            )));
+        }
         let work_token =
             self.mint_internal_work_token(&instance, ctx, &work, &live_work_audience)?;
         #[cfg(test)]
@@ -2790,6 +3399,130 @@ impl InferHandler for ModelService {
         client.embed(data).await
     }
 
+    /// Typed Clef decision gateway (R4). The SHARED cheap preflight runs HERE,
+    /// BEFORE `get_inference_client` — which loads the backbone — so invalid
+    /// raw JSON/media/duplicate-ID/cardinality/aggregate-budget/oversized
+    /// bodies can never allocate a model. The worker revalidates after its
+    /// own authorization PEP. No unauthenticated admission is created: this
+    /// handler runs after the generated Model dispatch PEP (`decide` scope).
+    async fn handle_decide(
+        &self,
+        ctx: &EnvelopeContext,
+        _request_id: u64,
+        model_ref: &str,
+        data: &hyprstream_rpc_std::inference_client::DecisionRequest,
+    ) -> Result<hyprstream_rpc_std::inference_client::DecisionResponse> {
+        let request_started = Instant::now();
+        // Cheap shared preflight FIRST (byte bound, ordered parse, media/
+        // duplicate/numeric/cardinality/aggregate/deadline admission), then
+        // the raw-model match and the pin gate — ALL before
+        // get_inference_client, which loads the backbone. The worker
+        // revalidates everything after its own PEP.
+        let parsed = crate::services::decision::preflight_parsed(data)
+            .map_err(Self::typed_decision_error)?;
+        let deadline = crate::services::decision::resolve_deadline(data, request_started)
+            .ok_or_else(|| anyhow!("decision request is missing its bounded deadline"))?;
+        crate::services::decision::ensure_model_matches(&parsed.model, Some(model_ref))
+            .map_err(Self::typed_decision_error)?;
+        let resolve = self.resolve_model_ref(model_ref);
+        let resolved = if let Some(disconnected) = ctx.request_cancellation() {
+            tokio::select! {
+                biased;
+                _ = disconnected.cancelled() => return Err(Self::typed_decision_error(anyhow!(
+                    "clef-decision-cancelled: caller disconnected while resolving model reference"
+                ))),
+                result = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    resolve,
+                ) => result.map_err(|_| Self::typed_decision_error(anyhow!(
+                    "clef-decision-cancelled: decision deadline elapsed while resolving model reference"
+                )))??,
+            }
+        } else {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), resolve)
+                .await
+                .map_err(|_| Self::typed_decision_error(anyhow!(
+                    "clef-decision-cancelled: decision deadline elapsed while resolving model reference"
+                )))??
+        };
+        let is_commit = matches!(resolved.git_ref, crate::storage::GitRef::Commit(_));
+        let staging_admits = self
+            .config
+            .staging_model_pin
+            .as_ref()
+            .is_some_and(|pin| pin.admits(model_ref));
+        crate::services::decision::ensure_pinned_for_decision(is_commit, staging_admits, model_ref)
+            .map_err(Self::typed_decision_error)?;
+
+        // Reject an already exhausted (including timeoutMs=0) request before
+        // a lazy model load can start.
+        crate::services::decision::remaining_timeout_ms(deadline, Instant::now())
+            .map_err(Self::typed_decision_error)?;
+        // Caller cancellation only stops this request's wait. A cold load is
+        // owned and joined by ModelService, so dropping this future cannot
+        // strand its reservation or native worker startup.
+        let client_wait = async {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.get_inference_client_with_deadline(
+                    model_ref,
+                    ctx,
+                    Self::inference_scope("decide", "decide"),
+                    Some(deadline),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                Self::typed_decision_error(anyhow!(
+                    "clef-decision-cancelled: decision deadline elapsed while waiting for model load"
+                ))
+            })?
+        };
+        let client = if let Some(disconnected) = ctx.request_cancellation() {
+            tokio::select! {
+                biased;
+                _ = disconnected.cancelled() => {
+                    return Err(Self::typed_decision_error(anyhow!(
+                        "clef-decision-cancelled: caller disconnected while waiting for model load"
+                    )));
+                }
+                result = client_wait => result?,
+            }
+        } else {
+            client_wait.await?
+        };
+        // Model load and routing happen between ingress and this worker call.
+        // Forward only the remaining relative budget, then bound the whole RPC
+        // wait by the same ingress deadline so dispatch cannot reset it.
+        let timeout_ms = crate::services::decision::remaining_timeout_ms(deadline, Instant::now())
+            .map_err(Self::typed_decision_error)?;
+        let forwarded = hyprstream_rpc_std::inference_client::DecisionRequest {
+            clef_json: data.clef_json.clone(),
+            max_state_tokens: data.max_state_tokens,
+            timeout_ms: Some(timeout_ms),
+        };
+        // Honor the forwarded budget at the transport layer too: the engine
+        // RPC must not be cut by the client's default ceiling while the
+        // ingress deadline still has budget left. Only the deadline is set —
+        // the client's work-order bearer must survive (dispatch denies a
+        // request whose worker order was stripped).
+        let client = client.with_timeout_ms(i32::try_from(timeout_ms).unwrap_or(i32::MAX));
+        let decision = Self::await_forwarded_decision(deadline, client.decide(&forwarded));
+        if let Some(disconnected) = ctx.request_cancellation() {
+            tokio::select! {
+                biased;
+                _ = disconnected.cancelled() => {
+                    Err(Self::typed_decision_error(anyhow!(
+                        "clef-decision-cancelled: caller disconnected"
+                    )))
+                }
+                result = decision => result,
+            }
+        } else {
+            decision.await
+        }
+    }
+
     async fn handle_status(
         &self,
         ctx: &EnvelopeContext,
@@ -3272,11 +4005,12 @@ pub(crate) const FEDERATE_MODEL_REQUEST_ROOT_TYPE_ID: u64 =
     <hyprstream_rpc_std::model_capnp::model_request::Reader<'static> as capnp::traits::HasTypeId>::TYPE_ID;
 
 #[cfg(feature = "postgres")]
-fn federate_model_operation(
+pub(crate) fn federate_model_operation(
     body: &hyprstream_rpc::service::DecodedRequestBody,
     pin: &StagingModelPin,
 ) -> Result<(String, String)> {
     use hyprstream_rpc_std::model_capnp::{infer_request, model_request};
+    let profile = pin.federate_profile()?;
     let request = body.root::<model_request::Reader>()?;
     let (model_ref, resource, operation) = match request.which()? {
         model_request::Which::Load(inner) => (
@@ -3291,17 +4025,18 @@ fn federate_model_operation(
         ),
         model_request::Which::Infer(inner) => {
             let infer = inner?;
-            anyhow::ensure!(
-                matches!(infer.which()?, infer_request::Which::GenerateStream(_)),
-                "unsupported Federate inference method"
-            );
+            let operation = match (profile, infer.which()?) {
+                (FederateModelProfile::Qwen, infer_request::Which::GenerateStream(_)) => "infer",
+                (FederateModelProfile::Clef, infer_request::Which::Decide(_)) => "decide",
+                _ => anyhow::bail!("unsupported Federate inference method"),
+            };
             let model_ref = infer.get_model_ref()?.to_str()?.to_owned();
-            (model_ref.clone(), format!("model:{model_ref}"), "infer")
+            (model_ref.clone(), format!("model:{model_ref}"), operation)
         }
         _ => anyhow::bail!("unsupported Federate Model method"),
     };
     anyhow::ensure!(
-        pin == &StagingModelPin::reviewed()? && pin.admits(&model_ref),
+        pin.admits(&model_ref) && model_ref == profile.model_ref(),
         "Federate Model request is not the reviewed pinned staging model"
     );
     Ok((resource, operation.to_owned()))
@@ -3309,6 +4044,10 @@ fn federate_model_operation(
 
 #[async_trait(?Send)]
 impl crate::services::RequestService for ModelService {
+    async fn on_drained(&self) -> Result<()> {
+        self.drain_load_jobs().await
+    }
+
     fn accept_deferred_federate_credential(&self) -> bool {
         #[cfg(feature = "postgres")]
         {
@@ -3461,61 +4200,32 @@ impl crate::services::RequestService for ModelService {
             };
 
             // The accepted response is sent only after the shared gate has
-            // reserved `pending_loads`. Transfer its attempt-scoped RAII guard
-            // into the continuation *before* response signing/serialization:
-            // if that fallible response path returns early, dropping this
-            // continuation synchronously releases only this attempt's marker.
+            // reserved `pending_loads`. Move the reservation into a tracked,
+            // service-owned load job before response signing/serialization.
             info!("Load request accepted for {} (async)", model_ref);
             let response_model_ref = model_ref.clone();
-            let service = self.clone(); // Arc clone — cheap, 'static
             let (load_max_context, load_kv_quant) = load_data.to_load_params();
+            let job_service = self.clone();
+            let job_model_ref = model_ref.clone();
+            let job_instance = instance.clone();
+            let job_attempt = reservation.attempt;
+            let load_result = self.spawn_load_job(instance.clone(), job_attempt, async move {
+                let mut reservation = reservation;
+                let result = job_service
+                    .load_model_inner(&job_instance, load_max_context, load_kv_quant)
+                    .await;
+                // Retain the actual outcome before publication can block or
+                // the task can be cancelled. The attempt guard's later latch
+                // is write-once and therefore cannot contradict this result.
+                job_service.latch_load_terminal(&job_instance, job_attempt, &result);
+                job_service
+                    .publish_load_terminal_event(&job_model_ref, &result)
+                    .await;
+                reservation.release();
+                result
+            });
             let continuation: crate::services::Continuation = Box::pin(async move {
-                let model_name = model_ref.split(':').next().unwrap_or(&model_ref);
-                let scope = format!("serve:model:{}", model_name);
-                match service
-                    .run_intercepted_load(&instance, load_max_context, load_kv_quant, reservation)
-                    .await
-                {
-                    Ok(endpoint) => {
-                        info!("Model {} loaded successfully at {}", model_ref, endpoint);
-                        let event = crate::events::EventEnvelope::new(
-                            crate::events::EventSource::Model,
-                            scope.clone(),
-                            crate::events::EventPayload::ModelLoaded {
-                                model_ref: model_ref.clone(),
-                                endpoint,
-                            },
-                        );
-                        if let Ok(payload) = serde_json::to_vec(&event) {
-                            let _event_publish_gate =
-                                service.lifecycle_event_publish_gate.lock().await;
-                            let _ = service
-                                .event_publisher
-                                .publish("lifecycle", "loaded", &payload)
-                                .await;
-                            debug!("Published model.loaded event");
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Model {} failed to load: {}", model_ref, e);
-                        let event = crate::events::EventEnvelope::new(
-                            crate::events::EventSource::Model,
-                            scope.clone(),
-                            crate::events::EventPayload::ModelFailed {
-                                model_ref: model_ref.clone(),
-                                error: e.to_string(),
-                            },
-                        );
-                        if let Ok(payload) = serde_json::to_vec(&event) {
-                            let _event_publish_gate =
-                                service.lifecycle_event_publish_gate.lock().await;
-                            let _ = service
-                                .event_publisher
-                                .publish("lifecycle", "failed", &payload)
-                                .await;
-                        }
-                    }
-                }
+                let _ = ModelService::wait_load_result(load_result).await;
             });
 
             let response = serialize_response(
@@ -3563,9 +4273,12 @@ impl crate::services::RequestService for ModelService {
     }
 
     fn build_error_payload(&self, request_id: u64, error: &str) -> Vec<u8> {
+        // Typed decision-serving failures carry their pinned code; every
+        // other error keeps the generic INTERNAL code.
+        let code = crate::services::decision::error_code_for(error).unwrap_or("INTERNAL");
         let variant = ModelResponseVariant::Error(ErrorInfo {
             message: error.to_owned(),
-            code: "INTERNAL".to_owned(),
+            code: code.to_owned(),
             details: String::new(),
         });
         serialize_response(request_id, &variant).unwrap_or_default()
@@ -3586,6 +4299,52 @@ impl crate::services::RequestService for ModelService {
 
 #[cfg(test)]
 mod tests {
+    fn worktree(branch: &str, oid: &str) -> hyprstream_rpc_std::registry_client::WorktreeInfo {
+        hyprstream_rpc_std::registry_client::WorktreeInfo {
+            path_removed: (),
+            branch_name: branch.to_owned(),
+            head_oid: oid.to_owned(),
+            is_locked: false,
+            is_dirty: false,
+            capabilities: Vec::new(),
+            is_detached: false,
+            unavailable_reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn commit_ref_selects_registered_worktree_by_fresh_head_oid() -> anyhow::Result<()> {
+        let worktrees = vec![worktree("main", "abc"), worktree("feature/clef", "def")];
+        assert_eq!(
+            super::select_unique_worktree_for_head(&worktrees, "def")?,
+            "feature/clef"
+        );
+        assert!(super::select_unique_worktree_for_head(&worktrees, "missing").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn commit_ref_skips_unavailable_worktree_entries() -> anyhow::Result<()> {
+        let mut unavailable = worktree("broken", "abc");
+        unavailable.unavailable_reason = "status unavailable".to_owned();
+        let worktrees = vec![unavailable, worktree("healthy", "abc")];
+        assert_eq!(
+            super::select_unique_worktree_for_head(&worktrees, "abc")?,
+            "healthy"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn commit_ref_rejects_ambiguous_worktree_heads() {
+        let worktrees = vec![worktree("main", "abc"), worktree("copy", "abc")];
+        let result = super::select_unique_worktree_for_head(&worktrees, "abc");
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .is_some_and(|error| error.to_string().contains("exactly one")));
+    }
+
     #[test]
     fn clef_projection_contract_keeps_a0_default_and_rejects_rebinding() -> anyhow::Result<()> {
         let a0 = super::StagingModelPin::reviewed()?;
@@ -3606,8 +4365,110 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn staging_pin_admits_only_exact_commit_selector_of_same_model() -> Result<()> {
+        let commit = git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        let pin = StagingModelPin::new("fixture-model:main", commit)?;
+        // The configured mutable branch ref stays admitted (direct worker path).
+        assert!(pin.admits("fixture-model:main"));
+        // The immutable full-OID selector of the pinned commit is admitted.
+        assert!(pin.admits("fixture-model:7b43c2d799e7b5e9fef96b6137840088d75af0d6"));
+        // Mutable refs other than the configured one stay rejected.
+        assert!(!pin.admits("fixture-model:dev"));
+        assert!(!pin.admits("fixture-model:HEAD"));
+        // A foreign model name is rejected even with the pinned OID.
+        assert!(!pin.admits("other-model:7b43c2d799e7b5e9fef96b6137840088d75af0d6"));
+        // A different commit OID is rejected for the same model.
+        assert!(!pin.admits("fixture-model:18c562db6830c2ef6636b8eaf42fb479272052f7"));
+        // Short SHAs remain revspecs, not immutable selectors.
+        assert!(!pin.admits("fixture-model:7b43c2d"));
+        // A bare name (default branch) is not an immutable selector.
+        assert!(!pin.admits("fixture-model"));
+        Ok(())
+    }
+
+    #[test]
+    fn staging_pin_resolves_commit_selector_to_pinned_worktree_branch() -> Result<()> {
+        let commit = git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        let pin = StagingModelPin::new("fixture-model:main", commit)?;
+        // The immutable OID selector of the pinned commit resolves to the
+        // configured branch's worktree, where capture verifies pin.commit.
+        let parsed = ModelRef::parse("fixture-model:7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        assert_eq!(pin.staging_worktree_branch(&parsed)?, "main");
+        // The configured branch ref itself resolves to the same worktree.
+        let parsed = ModelRef::parse("fixture-model:main")?;
+        assert_eq!(pin.staging_worktree_branch(&parsed)?, "main");
+        // A commit selector naming a different commit is rejected.
+        let parsed = ModelRef::parse("fixture-model:18c562db6830c2ef6636b8eaf42fb479272052f7")?;
+        assert!(pin.staging_worktree_branch(&parsed).is_err());
+        // Mutable refs other than the configured one and bare names stay rejected.
+        let parsed = ModelRef::parse("fixture-model:dev")?;
+        assert!(pin.staging_worktree_branch(&parsed).is_err());
+        let parsed = ModelRef::parse("fixture-model")?;
+        assert!(pin.staging_worktree_branch(&parsed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn staging_commit_selector_load_reuses_pinned_branch_despite_ambiguous_heads() -> Result<()> {
+        let commit = git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        let pinned = commit.to_string();
+        let pin = StagingModelPin::new("fixture-model:main", commit)?;
+        let parsed = ModelRef::parse(&format!("fixture-model:{pinned}"))?;
+        // Another available branch also points at the pinned commit: the load
+        // must reuse the staging branch preflight verified, not fail on
+        // multiple matching heads.
+        let worktrees = vec![worktree("main", &pinned), worktree("mirror", &pinned)];
+        assert_eq!(
+            super::commit_selector_load_branch(Some(&pin), &parsed, &commit, &worktrees)?,
+            "main"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unpinned_commit_selector_load_keeps_unique_worktree_rule() -> Result<()> {
+        let commit = git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        let pinned = commit.to_string();
+        let parsed = ModelRef::parse(&format!("fixture-model:{pinned}"))?;
+        // Without a staging pin, ambiguous heads stay rejected...
+        let ambiguous = vec![worktree("main", &pinned), worktree("mirror", &pinned)];
+        let result = super::commit_selector_load_branch(None, &parsed, &commit, &ambiguous);
+        assert!(result
+            .err()
+            .is_some_and(|error| error.to_string().contains("exactly one")));
+        // ...and a unique head still resolves to its branch.
+        let unique = vec![worktree("main", &pinned)];
+        assert_eq!(
+            super::commit_selector_load_branch(None, &parsed, &commit, &unique)?,
+            "main"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_commit_selector_load_rejects_commit_outside_the_pin() -> Result<()> {
+        let pinned = git2::Oid::from_str("7b43c2d799e7b5e9fef96b6137840088d75af0d6")?;
+        let pin = StagingModelPin::new("fixture-model:main", pinned)?;
+        let foreign = git2::Oid::from_str("18c562db6830c2ef6636b8eaf42fb479272052f7")?;
+        let parsed = ModelRef::parse(&format!("fixture-model:{foreign}"))?;
+        // Defense in depth: a selector naming a different commit never routes
+        // to the staging branch, even when a worktree happens to hold it.
+        let worktrees = vec![
+            worktree("main", &pinned.to_string()),
+            worktree("foreign", &foreign.to_string()),
+        ];
+        let result = super::commit_selector_load_branch(Some(&pin), &parsed, &foreign, &worktrees);
+        assert!(result.is_err());
+        Ok(())
+    }
+
     use super::*;
     use hyprstream_rpc::registry::{global as registry, SocketKind};
+
+    mod clef_cpu_acceptance {
+        include!("model_clef_cpu_acceptance.rs");
+    }
 
     #[cfg(feature = "postgres")]
     #[test]
@@ -3708,6 +4569,92 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_clef_requires_startup_qualification_and_exact_decide_only() -> Result<()> {
+        let pin = StagingModelPin::federate_clef_startup_fixture()?;
+        assert_eq!(pin.federate_profile()?, FederateModelProfile::Clef);
+        let make = |model_ref: &str, method: u8| {
+            hyprstream_rpc::serialize_message(|message| {
+                let mut request =
+                    message.init_root::<hyprstream_rpc_std::model_capnp::model_request::Builder>();
+                request.set_id(81);
+                match method {
+                    0 => {
+                        let mut infer = request.init_infer();
+                        infer.set_model_ref(model_ref);
+                        infer.init_decide().set_clef_json("{}");
+                    }
+                    1 => {
+                        let mut infer = request.init_infer();
+                        infer.set_model_ref(model_ref);
+                        infer.init_generate_stream();
+                    }
+                    2 => {
+                        request.init_load().set_model_ref(model_ref);
+                    }
+                    _ => {
+                        request.init_status().set_model_ref(model_ref);
+                    }
+                }
+            })
+        };
+        for (method, resource, operation) in [
+            (0, format!("model:{}", pin.model_ref), "decide"),
+            (2, "model:Load".into(), "write"),
+            (3, "model:Status".into(), "query"),
+        ] {
+            let bytes = make(&pin.model_ref, method)?;
+            let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+            assert_eq!(
+                federate_model_operation(&body, &pin)?,
+                (resource, operation.into())
+            );
+        }
+        for alias in [
+            "",
+            "clef-flash-fp8:other",
+            "clef-flash-fp8:refs/heads/main",
+            REVIEWED_STAGING_MODEL_REF,
+        ] {
+            for method in [0, 2, 3] {
+                let bytes = make(alias, method)?;
+                let body =
+                    crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+                assert!(federate_model_operation(&body, &pin).is_err());
+            }
+        }
+        let bytes = make(&pin.model_ref, 1)?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        assert!(
+            federate_model_operation(&body, &pin).is_err(),
+            "Clef never admits generation"
+        );
+        let bytes = make(&pin.model_ref, 0)?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        for other in [
+            StagingModelPin::reviewed()?,
+            StagingModelPin::new(pin.model_ref.clone(), pin.commit)?,
+            StagingModelPin::reviewed_clef_flash(Default::default())?,
+        ] {
+            assert!(
+                federate_model_operation(&body, &other).is_err(),
+                "identity alone is not explicit Clef startup"
+            );
+        }
+        let mut changed = pin.clone();
+        changed.commit = StagingModelPin::reviewed()?.commit;
+        assert!(federate_model_operation(&body, &changed).is_err());
+        let mut changed = pin.clone();
+        changed.model_ref = "clef-flash-fp8:other".into();
+        assert!(federate_model_operation(&body, &changed).is_err());
+        // A generated Decide method cannot enter the preserved Qwen branch.
+        let bytes = make(REVIEWED_STAGING_MODEL_REF, 0)?;
+        let body = crate::services::generated::model_client::decode_model_request_body(&bytes)?;
+        assert!(federate_model_operation(&body, &StagingModelPin::reviewed()?).is_err());
+        Ok(())
+    }
+
     #[test]
     fn test_config_defaults() {
         let config = ModelServiceConfig::default();
@@ -3734,6 +4681,547 @@ mod tests {
         }
         assert!(StagingModelPin::new("qwen2.5-0.5b-instruct:refs/heads/main", oid).is_err());
         Ok(())
+    }
+
+    // ── R4 decide ingress: cheap gates run BEFORE any backbone load ────────
+
+    fn wire_decide_request(
+        clef_json: &str,
+    ) -> hyprstream_rpc_std::inference_client::DecisionRequest {
+        hyprstream_rpc_std::inference_client::DecisionRequest {
+            clef_json: clef_json.to_owned(),
+            max_state_tokens: None,
+            timeout_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn decide_ingress_preflight_rejects_before_load() {
+        let service = selector_model_service().await;
+        let ctx = boundary_caller_ctx(3600);
+
+        // Invalid body (media field): the shared preflight error surfaces,
+        // never a model-load error — no load may be attempted.
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                "nonexistent-model:main",
+                &wire_decide_request(
+                    r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}},"images":[]}"#,
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("clef-decision-input"), "{err}");
+        assert!(!err.to_lowercase().contains("not found"), "{err}");
+
+        // Model mismatch vs the route ref: rejected before load.
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                "nonexistent-model:main",
+                &wire_decide_request(
+                    r#"{"model":"some-other-model","state":null,"questions":{"q":{"type":"noul"}}}"#,
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decision-model-mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn decide_ingress_rejects_mutable_refs_before_load() {
+        let service = selector_model_service().await;
+        let ctx = boundary_caller_ctx(3600);
+        // Valid body, branch ref: pin gate rejects BEFORE load_model.
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                "nonexistent-model:main",
+                &wire_decide_request(
+                    r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}}}"#,
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decision-not-pinned"), "{err}");
+        assert!(!err.to_lowercase().contains("not found"), "{err}");
+
+        // A commit ref passes the pin gate and reaches the load, which then
+        // fails on the missing worktree — proving gate ORDER, not absence.
+        let commit_ref = format!("nonexistent-model:{}", "0".repeat(40));
+        let err = service
+            .handle_decide(
+                &ctx,
+                0,
+                &commit_ref,
+                &wire_decide_request(&format!(
+                    r#"{{"model":"{commit_ref}","state":null,"questions":{{"q":{{"type":"noul"}}}}}}"#
+                )),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("decision-not-pinned"), "{err}");
+
+        // An already-expired request must not begin a lazy load even when its
+        // pinned model reference would otherwise pass the admission gates.
+        let mut zero_timeout = wire_decide_request(&format!(
+            r#"{{"model":"{commit_ref}","state":null,"questions":{{"q":{{"type":"noul"}}}}}}"#
+        ));
+        zero_timeout.timeout_ms = Some(0);
+        let err = service
+            .handle_decide(&ctx, 0, &commit_ref, &zero_timeout)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("clef-decision-cancelled"), "{err}");
+        assert!(!err.to_lowercase().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn decision_error_mapping_diagnostic_branches() -> Result<()> {
+        use hyprstream_rpc::transport::in_memory::InMemoryTransport;
+        use hyprstream_rpc::transport::rpc_session::from_fn;
+        use hyprstream_rpc::transport_traits::Transport;
+        use hyprstream_rpc::TypedRpcError;
+
+        // Synthetic errors only. Never print arbitrary transport/worker messages.
+        let classify = |e: &anyhow::Error| {
+            e.downcast_ref::<TypedRpcError>()
+                .map(|typed| typed.code.as_str())
+                .unwrap_or("UNTYPED")
+                .to_owned()
+        };
+        let cancel = ModelService::typed_decision_error(anyhow::anyhow!(
+            "clef-decision-cancelled: synthetic deadline"
+        ));
+        assert_eq!(
+            classify(&cancel),
+            "DECISION_CANCELLED",
+            "case=direct_cancel"
+        );
+
+        let internal = ModelService::typed_decision_error(anyhow::Error::new(TypedRpcError {
+            code: "INTERNAL".to_owned(),
+            message: "synthetic worker failure".to_owned(),
+        }));
+        assert_eq!(classify(&internal), "INTERNAL", "case=worker_internal");
+
+        let wrapped = anyhow::Error::new(TypedRpcError {
+            code: "DECISION_CANCELLED".to_owned(),
+            message: "clef-decision-cancelled: synthetic deadline".to_owned(),
+        })
+        .context("synthetic outer context");
+        let wrapped = ModelService::typed_decision_error(wrapped);
+        assert_eq!(
+            classify(&wrapped),
+            "DECISION_CANCELLED",
+            "case=wrapped_typed_cancel"
+        );
+
+        let wrapped_prefix = anyhow::anyhow!("clef-decision-cancelled: synthetic deadline")
+            .context("synthetic outer context");
+        let wrapped_prefix = ModelService::typed_decision_error(wrapped_prefix);
+        assert_eq!(
+            classify(&wrapped_prefix),
+            "UNTYPED",
+            "case=wrapped_prefix_current_behavior"
+        );
+
+        let slow = Arc::new(from_fn(|_request| async {
+            std::future::pending::<Result<bytes::Bytes>>().await
+        }));
+        let transport = InMemoryTransport::new(slow);
+        let timeout = transport
+            .send(Vec::new(), Some(1))
+            .await
+            .err()
+            .context("synthetic pending processor unexpectedly returned")?;
+        // Exercise the actual transport timer and actual Model mapper, not a copy.
+        let timeout = ModelService::typed_decision_error(timeout);
+        assert_eq!(
+            classify(&timeout),
+            "UNTYPED",
+            "case=transport_timeout_current_behavior"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwarded_decision_deadline_diagnostic_branches() -> Result<()> {
+        use hyprstream_rpc::transport::in_memory::InMemoryTransport;
+        use hyprstream_rpc::transport::rpc_session::from_fn;
+        use hyprstream_rpc::transport_traits::Transport;
+        use hyprstream_rpc::TypedRpcError;
+        use hyprstream_rpc_std::inference_client::DecisionResponse;
+
+        let code = |error: &anyhow::Error| {
+            error
+                .downcast_ref::<TypedRpcError>()
+                .map(|typed| typed.code.clone())
+                .unwrap_or_else(|| "UNTYPED".to_owned())
+        };
+        let pending = Arc::new(from_fn(|_request| async {
+            std::future::pending::<Result<bytes::Bytes>>().await
+        }));
+        let transport = InMemoryTransport::new(pending);
+        let forwarded = async {
+            transport.send(Vec::new(), Some(1)).await?;
+            anyhow::bail!("synthetic pending processor unexpectedly completed")
+        };
+        let inner = ModelService::await_forwarded_decision(
+            Instant::now() + std::time::Duration::from_secs(30),
+            forwarded,
+        )
+        .await
+        .err()
+        .context("inner timeout must fail")?;
+        assert_eq!(
+            code(&inner),
+            "DECISION_CANCELLED",
+            "case=earlier_inner_transport_deadline"
+        );
+
+        let outer = ModelService::await_forwarded_decision(
+            Instant::now(),
+            std::future::pending::<Result<DecisionResponse>>(),
+        )
+        .await
+        .err()
+        .context("outer timeout must fail")?;
+        assert_eq!(code(&outer), "DECISION_CANCELLED", "case=outer_deadline");
+
+        let worker_elapsed =
+            tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+                .await
+                .err()
+                .context("synthetic worker timer must expire")?;
+        let worker_elapsed = ModelService::await_forwarded_decision(
+            Instant::now() + std::time::Duration::from_secs(30),
+            std::future::ready(Err::<DecisionResponse, _>(anyhow::Error::new(
+                worker_elapsed,
+            ))),
+        )
+        .await
+        .err()
+        .context("worker elapsed must propagate")?;
+        assert!(
+            worker_elapsed
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some(),
+            "case=worker_elapsed_preserved"
+        );
+        assert_eq!(
+            code(&worker_elapsed),
+            "UNTYPED",
+            "case=worker_elapsed_not_transport"
+        );
+
+        for expected in ["INTERNAL", "DECISION_CANCELLED"] {
+            let error = anyhow::Error::new(TypedRpcError {
+                code: expected.to_owned(),
+                message: "synthetic worker result".to_owned(),
+            });
+            let result = ModelService::await_forwarded_decision(
+                Instant::now() + std::time::Duration::from_secs(30),
+                std::future::ready(Err::<DecisionResponse, _>(error)),
+            )
+            .await
+            .err()
+            .context("worker error must propagate")?;
+            assert_eq!(code(&result), expected, "case=worker_typed_error");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // authenticated wire fixture assertions
+    async fn real_model_scoped_dispatch_carries_typed_decision_code() -> Result<()> {
+        use hyprstream_rpc::auth::{
+            CompositeKeyPair, CompositeKeySet, CompositePairRole, CompositePairState,
+        };
+        use hyprstream_service::ServiceManager as _;
+
+        // A real holder-authenticated Model request, followed by real delegated
+        // Policy admission. This test requires its own process (nextest default),
+        // because envelope verification/replay/session stores are first-write.
+        let policy_key = SigningKey::from_bytes(&[0x77; 32]);
+        let model_key = SigningKey::from_bytes(&[0x41; 32]);
+        let alice_key = SigningKey::from_bytes(&[0x43; 32]);
+        install_restart_fixture_auth(&[policy_key.clone(), model_key.clone(), alice_key.clone()])?;
+        if hyprstream_rpc::auth::global_session_registry().is_none() {
+            hyprstream_rpc::auth::set_global_session_registry(Arc::new(
+                hyprstream_rpc::auth::InMemorySessionRegistry::new(),
+            ))?;
+        }
+        let _ = hyprstream_rpc::moq_event::init_global_moq_event_origin(
+            hyprstream_rpc::moq_event::MoqEventOrigin::new(),
+        );
+        hyprstream_rpc::registry::init(hyprstream_rpc::registry::EndpointMode::Inproc, None);
+        let tag = hex::encode(hyprstream_rpc::envelope::generate_nonce());
+        let ca =
+            hyprstream_rpc::node_identity::derive_purpose_key(&policy_key, "hyprstream-jwt-v1");
+        let ca_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&ca);
+        let oauth = SigningKey::from_bytes(&[0x76; 32]);
+        let oauth_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&oauth);
+        let oauth_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&oauth_pq);
+        let keys = Arc::new(CompositeKeySet::default());
+        keys.publish(
+            1,
+            format!("decide-typed-{tag}"),
+            vec![CompositeKeyPair::verifying(
+                hyprstream_rpc::auth::composite_kid(&oauth_vk, &oauth.verifying_key()),
+                oauth_vk,
+                oauth.verifying_key(),
+                CompositePairRole::OAuth,
+                CompositePairState::Active,
+                0,
+                i64::MAX,
+            )],
+        )?;
+        let jwt_source = Arc::new(
+            hyprstream_rpc::auth::ClusterKeySource::new(
+                ca.verifying_key(),
+                RESTART_FIXTURE_ISSUER.to_owned(),
+            )
+            .with_ca_composite_key(hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk(&ca_pq))
+            .with_composite_key_set(keys),
+        );
+        let credentials = tempfile::TempDir::new()?;
+        let model_token = restart_fixture_service_jwt(&credentials, "model", &ca, &model_key)?;
+        hyprstream_service::global_trust_store().insert(
+            model_key.verifying_key(),
+            hyprstream_service::Attestation {
+                scopes: ["model".to_owned()].into_iter().collect(),
+                subject: Some("service:model".to_owned()),
+                jwt: Some(model_token.clone()),
+                expires_at: chrono::Utc::now().timestamp() + 300,
+                attested_by: Some(ca.verifying_key().to_bytes()),
+            },
+        );
+
+        struct AlicePrimary(SigningKey);
+        impl crate::services::policy::PrimaryEnrollmentResolver for AlicePrimary {
+            fn primary_group(
+                &self,
+                principal: &str,
+                tenant: &str,
+            ) -> Option<crate::services::policy::PrimaryGroup> {
+                if principal != "alice" || tenant != "fixture-tenant" {
+                    return None;
+                }
+                let pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&self.0);
+                Some(crate::services::policy::PrimaryGroup {
+                    suite_id: hyprstream_rpc::auth::SUITE_HYBRID_ED25519_MLDSA65.to_owned(),
+                    ordered_component_keys: vec![
+                        self.0.verifying_key().to_bytes().to_vec(),
+                        hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&pq),
+                    ],
+                })
+            }
+        }
+        let policy_manager = Arc::new(crate::auth::PolicyManager::new_in_memory().await?);
+        // Only the typed decision operation is granted to the original holder;
+        // generation and embedding keep the separate generic `infer` action.
+        policy_manager
+            .add_policy_with_domain(
+                "alice",
+                "fixture-tenant",
+                "model:nonexistent-model:main",
+                "decide",
+                "allow",
+            )
+            .await?;
+        let policy_base = tempfile::TempDir::new()?;
+        let (policy_transport, policy_endpoint) =
+            restart_acceptance_inproc_endpoint("policy", &format!("decide-typed-{tag}"));
+        let policy_service = crate::services::PolicyService::new(
+            policy_manager,
+            Arc::new(policy_key.clone()),
+            crate::config::TokenConfig::default(),
+            Arc::new(RwLock::new(git2db::Git2DB::open(policy_base.path()).await?)),
+            policy_transport.clone(),
+        )
+        .with_default_audience(RESTART_FIXTURE_ISSUER.to_owned())
+        .with_jwt_key_source(jwt_source.clone())
+        .with_primary_enrollment_resolver(Arc::new(AlicePrimary(alice_key.clone())));
+        let manager = hyprstream_service::InprocManager::new();
+        let _policy_handle = manager.spawn(Box::new(policy_service)).await?;
+        let policy_client = PolicyClient::for_local_endpoint_bootstrap(
+            &policy_endpoint,
+            model_key.clone(),
+            policy_key.verifying_key(),
+            Some(model_token),
+        )?;
+        let infrastructure = Arc::new(BoundaryRpcClient::new(
+            TransportConfig::inproc(format!("decide-typed-registry-{tag}")),
+            Arc::new(BoundaryDialState::default()),
+        ));
+        let (model_transport, model_endpoint) =
+            restart_acceptance_inproc_endpoint("model", &format!("decide-typed-{tag}"));
+        let service = ModelService::new(
+            ModelServiceConfig::default(),
+            model_key.clone(),
+            policy_client,
+            RegistryClient::new(infrastructure),
+            model_transport,
+            policy_transport,
+        )
+        .await?
+        .with_expected_audience(RESTART_FIXTURE_ISSUER.to_owned())
+        .with_jwt_key_source(jwt_source);
+        // Historical synthetic claims without the original token MUST deny.
+        assert!(ModelHandler::authorize(
+            &service,
+            &boundary_caller_ctx(chrono::Utc::now().timestamp() + 300),
+            "model:nonexistent-model:main",
+            "decide"
+        )
+        .await
+        .is_err());
+        let _model_handle = manager.spawn(Box::new(service.clone())).await?;
+
+        let now = chrono::Utc::now().timestamp();
+        let sid = format!("decide-typed-{tag}");
+        hyprstream_rpc::auth::global_session_registry()
+            .expect("session store installed")
+            .register_session(
+                hyprstream_rpc::auth::SessionKey::oidc(RESTART_FIXTURE_ISSUER, &sid),
+                hyprstream_rpc::auth::SessionState {
+                    subject: "alice".to_owned(),
+                    tenant: "fixture-tenant".to_owned(),
+                    kind: hyprstream_rpc::auth::SessionKind::Interactive,
+                    created_at: now,
+                    expires_at: now + 300,
+                    status: hyprstream_rpc::auth::ActiveOrRevoked::Active,
+                    clearance_epoch: 0,
+                },
+            )
+            .await?;
+        let alice_pq = hyprstream_rpc::node_identity::derive_mesh_mldsa_key(&alice_key);
+        let alice_pq_vk = hyprstream_rpc::crypto::pq::ml_dsa_sk_to_vk_bytes(&alice_pq);
+        let claims = hyprstream_rpc::auth::Claims::new("alice".to_owned(), now, now + 300)
+            .with_issuer(RESTART_FIXTURE_ISSUER.to_owned())
+            .with_audience(Some(RESTART_FIXTURE_ISSUER.to_owned()))
+            .with_tenant("fixture-tenant".to_owned())
+            .with_sid(&sid)
+            .with_client_id("decide-typed-native-test")
+            .with_scope(Some("read write".to_owned()))
+            .with_jti()
+            .with_cnf_jwk(&alice_key.verifying_key().to_bytes())
+            .with_cnf_hs_signer_suite(hyprstream_rpc::auth::service_signer_suite_b64(
+                &alice_key.verifying_key().to_bytes(),
+                Some(&alice_pq_vk),
+            ))
+            .with_clearance(crate::services::inference::inference_object_label());
+        let token =
+            crate::auth::jwt::encode_composite_ml_dsa_65_ed25519(&claims, &oauth_pq, &oauth);
+        let request = wire_decide_request(
+            r#"{"model":"nonexistent-model:main","state":null,"questions":{"q":{"type":"noul"}},"images":[]}"#,
+        );
+        let missing = hyprstream_rpc_std::model_client::ModelClient::for_local_endpoint_bootstrap(
+            &model_endpoint,
+            alice_key.clone(),
+            model_key.verifying_key(),
+            None,
+        )?;
+        assert_restart_dispatch_denied(
+            missing
+                .infer("nonexistent-model:main")
+                .decide(&request)
+                .await,
+            "missing original user credential",
+        )?;
+        let alice = hyprstream_rpc_std::model_client::ModelClient::for_local_endpoint_bootstrap(
+            &model_endpoint,
+            alice_key,
+            model_key.verifying_key(),
+            Some(token),
+        )?;
+        let error = alice
+            .infer("nonexistent-model:main")
+            .decide(&request)
+            .await
+            .expect_err("authenticated invalid input must produce typed preflight failure");
+        let typed = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<hyprstream_rpc::TypedRpcError>())
+            .expect("real generated Model client preserves typed ErrorInfo");
+        assert_eq!(typed.code, "DECISION_INPUT");
+        assert!(typed.message.contains("clef-decision-input"));
+
+        // The same key-bound holder and policy grant can decide, but cannot
+        // use the Model RPC to generate or embed through generic `infer`.
+        use hyprstream_rpc_std::model_client::InferRpc;
+        let generation = hyprstream_rpc_std::inference_client::GenerationRequest {
+            prompt: "blocked generation".to_owned(),
+            ..Default::default()
+        };
+        let infer_client = alice.infer("nonexistent-model:main");
+        let generated = match InferRpc::generate_stream(&infer_client, &generation).await {
+            Ok(_) => panic!("decide-only policy must reject generateStream"),
+            Err(error) => error,
+        };
+        assert!(
+            generated.to_string().contains("Unauthorized"),
+            "expected generateStream policy denial, got: {generated:#}"
+        );
+        let embedded = match InferRpc::embed(
+            &infer_client,
+            &hyprstream_rpc_std::inference_client::EmbedImagesRequest { images: Vec::new() },
+        )
+        .await
+        {
+            Ok(_) => panic!("decide-only policy must reject embed"),
+            Err(error) => error,
+        };
+        assert!(
+            embedded.to_string().contains("Unauthorized"),
+            "expected embed policy denial, got: {embedded:#}"
+        );
+        assert!(service.loaded_models.read().await.is_empty());
+        assert!(service.take_test_work_order().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // new decide fixture assertions
+    async fn decide_gateway_typed_error_codes_reach_model_wire() {
+        let service = selector_model_service().await;
+        // The Model gateway's own error payload carries decision typed codes
+        // (scoped dispatcher failures would otherwise land in INTERNAL).
+        for (message, code) in [
+            ("decision-not-pinned: x", "DECISION_NOT_PINNED"),
+            ("decision-model-mismatch: y", "DECISION_MODEL_MISMATCH"),
+            ("clef-decision-input: z", "DECISION_INPUT"),
+        ] {
+            let payload = service.build_error_payload(9, message);
+            let parsed = hyprstream_rpc_std::model_client::ModelClient::parse_response(&payload)
+                .expect("parse model error payload");
+            match parsed {
+                ModelResponseVariant::Error(info) => {
+                    assert_eq!(info.code, code, "message {message}");
+                    assert_eq!(info.message, message);
+                }
+                other => panic!("expected Error variant, got {other:?}"),
+            }
+        }
+        let payload = service.build_error_payload(9, "unrelated");
+        let parsed =
+            hyprstream_rpc_std::model_client::ModelClient::parse_response(&payload).expect("parse");
+        match parsed {
+            ModelResponseVariant::Error(info) => assert_eq!(info.code, "INTERNAL"),
+            other => panic!("expected Error variant, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3987,6 +5475,77 @@ mod tests {
             },
             latched_by: "model-service".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn disconnected_load_waiter_does_not_cancel_service_owned_job() -> Result<()> {
+        let service = selector_model_service().await;
+        let instance = selector_instance();
+        let attempt = service.allocate_load_epoch();
+        service
+            .pending_loads
+            .lock()
+            .insert(instance.clone(), attempt);
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<String>();
+        let load_result = service.spawn_load_job(instance.clone(), attempt, async move {
+            release_rx
+                .await
+                .map_err(|_| anyhow!("test load gate closed before release"))
+        });
+        let shutdown_caller = tokio_util::sync::CancellationToken::new();
+        let caller_token = shutdown_caller.clone();
+        let caller_waiter = load_result.clone();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = caller_token.cancelled() => Err(anyhow!("caller disconnected")),
+                result = ModelService::wait_load_result(caller_waiter) => result,
+            };
+            let _ = cancelled_tx.send(result.is_err());
+        });
+        tokio::task::yield_now().await;
+        // Cancel only this waiter. The owned load remains pending and another
+        // waiter can still observe its shared completion.
+        shutdown_caller.cancel();
+        assert!(cancelled_rx.await?);
+        assert!(service.pending_loads.lock().contains_key(&instance));
+
+        let drain_service = service.clone();
+        let drain = <ModelService as crate::services::RequestService>::on_drained(&drain_service);
+        tokio::pin!(drain);
+        tokio::select! {
+            biased;
+            result = &mut drain => panic!(
+                "service drain completed while its owned cold-load task was gated: {result:?}"
+            ),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        release_tx
+            .send("inproc://clef-test".to_owned())
+            .map_err(|_| anyhow!("service-owned load stopped before test release"))?;
+        assert_eq!(
+            ModelService::wait_load_result(load_result).await?,
+            "inproc://clef-test"
+        );
+        drain.await?;
+        assert!(!service.pending_loads.lock().contains_key(&instance));
+        assert_eq!(
+            latched_value(
+                &service.load_terminals,
+                &ModelLoadKey {
+                    tenant: instance.tenant().to_owned(),
+                    model_ref: instance.model_ref().to_owned(),
+                    epoch: attempt,
+                },
+            ),
+            ModelLoadTerminal::Loaded {
+                endpoint: "inproc://clef-test".to_owned(),
+            }
+        );
+        Ok(())
     }
 
     // Read back a latched terminal without `.unwrap()` (clippy denies it here).
@@ -5473,12 +7032,22 @@ mod tests {
         // The selector fixture fails normal model resolution immediately; this
         // drives the continuation's ordinary failure completion without
         // starting a worker and proves it releases its own reservation.
+        let attempt = reservation.attempt;
+        let loader = service.clone();
+        let job_instance = instance.clone();
+        let result = service.spawn_load_job(instance.clone(), attempt, async move {
+            let mut reservation = reservation;
+            let result = loader.load_model_inner(&job_instance, None, None).await;
+            loader.latch_load_terminal(&job_instance, attempt, &result);
+            loader
+                .publish_load_terminal_event(job_instance.model_ref(), &result)
+                .await;
+            reservation.release();
+            result
+        });
         assert!(
-            service
-                .run_intercepted_load(&instance, None, None, reservation)
-                .await
-                .is_err(),
-            "fixture resolution must reach the continuation failure path"
+            ModelService::wait_load_result(result).await.is_err(),
+            "fixture resolution must reach the owned load failure path"
         );
         assert!(
             !service.pending_loads.lock().contains_key(&instance),
@@ -6212,6 +7781,24 @@ mod tests {
             let auth = RestartAuthServices::new(&repo, &model_name).await?;
             let mut config = ModelServiceConfig::default();
             config.inference_deployment.compute = InferenceCompute::Cpu;
+            if std::env::var_os("HYPRSTREAM_MODEL_ADMISSION_PROFILE").is_some() {
+                let mut pin = StagingModelPin::from_env()?.context(
+                    "restart acceptance fixture requires the reviewed Clef admission profile",
+                )?;
+                #[cfg(test)]
+                {
+                    pin.projection_parent = Some(
+                        std::env::var_os("XDG_CACHE_HOME")
+                            .map(std::path::PathBuf::from)
+                            .context("restart acceptance fixture requires XDG_CACHE_HOME")?,
+                    );
+                }
+                config.staging_model_pin = Some(pin);
+                anyhow::ensure!(
+                    config.staging_model_pin.is_some(),
+                    "restart acceptance fixture must resolve a staging model pin"
+                );
+            }
             let model = ModelService::new(
                 config,
                 auth.model_key.clone(),
@@ -6423,6 +8010,107 @@ mod tests {
                 event.record(&mut RestartAudienceDenialVisitor { seen: &self.seen });
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires the sealed local CPU-model repository and isolated XDG guest fixture"]
+    async fn decide_ingress_deadline_does_not_cancel_service_owned_cold_load() -> Result<()> {
+        crate::services::restart_diag::enable();
+        let fixture = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            RestartAcceptanceFixture::from_guest_env(),
+        )
+        .await
+        .map_err(|_| anyhow!("cold-load fixture timed out"))??;
+        let (gate_tx, _gate_rx) = tokio::sync::watch::channel(false);
+        let gate = Arc::new(gate_tx);
+        fixture
+            .model
+            .set_test_cold_load_gate(Some(Arc::clone(&gate)));
+        let caller_key = SigningKey::from_bytes(&[0xC1; 32]);
+        let ctx = restart_acceptance_caller_ctx(
+            "cold-load-caller",
+            &caller_key,
+            "restart-acceptance-tenant",
+        );
+        let pinned_ref = "clef-flash-fp8:7b43c2d799e7b5e9fef96b6137840088d75af0d6";
+        let pinned_instance = InferenceInstanceId::new("restart-acceptance-tenant", pinned_ref, 0)?;
+        let mut request = wire_decide_request(&format!(
+            r#"{{"model":"{}","state":null,"questions":{{"q":{{"type":"noul"}}}}}}"#,
+            pinned_ref
+        ));
+        request.timeout_ms = Some(100);
+        let first_future = fixture.model.handle_decide(&ctx, 0, pinned_ref, &request);
+        tokio::pin!(first_future);
+        let pending_wait = async {
+            loop {
+                if fixture
+                    .model
+                    .pending_loads
+                    .lock()
+                    .contains_key(&pinned_instance)
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut first_future => {
+                    anyhow::bail!("ingress caller returned before admitting cold load: {result:?}");
+                }
+                _ = pending_wait => Ok(()),
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("ingress caller never admitted a pending cold load"))??;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), &mut first_future)
+            .await
+            .map_err(|_| anyhow!("first ingress caller did not expire"))?;
+        let first_error = match first {
+            Ok(_) => anyhow::bail!("cold-load caller completed while the owned load was gated"),
+            Err(error) => error,
+        };
+        let first_text = first_error.to_string();
+        assert!(
+            first_text.contains("clef-decision-cancelled"),
+            "deadline ingress error must be typed cancellation: {first_text}"
+        );
+        assert!(
+            fixture
+                .model
+                .pending_loads
+                .lock()
+                .contains_key(&pinned_instance),
+            "caller deadline must not cancel the service-owned load reservation"
+        );
+        gate.send(true)
+            .map_err(|_| anyhow!("cold-load gate receiver disappeared"))?;
+        fixture.model.set_test_cold_load_gate(None);
+        let mut second_request = request.clone();
+        // A cold 12 GiB pinned capture plus the first engine load runs ~45s on
+        // current hardware; the asserted properties are budget-independent.
+        second_request.timeout_ms = Some(120_000);
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            fixture
+                .model
+                .handle_decide(&ctx, 0, pinned_ref, &second_request),
+        )
+        .await
+        .map_err(|_| anyhow!("second ingress caller did not complete"))??;
+        let _ = second.batch;
+        assert!(
+            fixture
+                .model
+                .loaded_models
+                .read()
+                .await
+                .contains(&pinned_instance),
+            "released shared cold load must publish the loaded model"
+        );
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

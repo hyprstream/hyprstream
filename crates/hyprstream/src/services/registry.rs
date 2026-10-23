@@ -1258,20 +1258,34 @@ impl RegistryService {
         let archetype_registry = crate::archetypes::global_registry();
         let mut result = Vec::with_capacity(worktrees.len());
         for wt in &mut worktrees {
-            // Extract branch name from worktree path (last component)
-            let branch_name = wt
+            // Use WorktreeHandle::status() as the source of truth for branch,
+            // HEAD, and dirty state. Path basenames lose hierarchical branch names.
+            let storage_key = wt
                 .path()
                 .file_name()
-                .and_then(|s| s.to_str())
-                .map(std::borrow::ToOwned::to_owned)
-                .unwrap_or_default();
-
-            // Use WorktreeHandle::status() - single source of truth for dirty status
-            let status = wt.status().await.ok();
-            let is_dirty = status.as_ref().map(|s| !s.is_clean).unwrap_or(false);
-            let head_oid = status
-                .and_then(|s| s.head.map(|h| h.to_string()))
-                .unwrap_or_default();
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            anyhow::ensure!(
+                !storage_key.is_empty(),
+                "registered worktree has no storage identity"
+            );
+            let (branch_name, is_detached, is_dirty, head_oid, unavailable_reason) = match wt
+                .status()
+                .await
+            {
+                Ok(status) => (
+                    status.branch.clone().unwrap_or_else(|| storage_key.clone()),
+                    status.branch.is_none(),
+                    !status.is_clean,
+                    status.head.map(|h| h.to_string()).unwrap_or_default(),
+                    String::new(),
+                ),
+                Err(error) => {
+                    tracing::warn!(path = %wt.path().display(), %error, "worktree status unavailable");
+                    (storage_key, true, false, String::new(), error.to_string())
+                }
+            };
 
             // Detect capabilities from worktree path (server-side, same machine as files)
             let capabilities: Vec<String> = archetype_registry
@@ -1290,6 +1304,8 @@ impl RegistryService {
                 is_locked: false,
                 is_dirty,
                 capabilities,
+                is_detached,
+                unavailable_reason,
             });
         }
         Ok(result)
@@ -1699,6 +1715,38 @@ impl RegistryService {
     // Filesystem Operations
     // ========================================================================
 
+    async fn find_contained_worktree_path(
+        worktrees: &mut [git2db::storage::WorktreeHandle],
+        worktree: &str,
+    ) -> Result<Option<PathBuf>, FsError> {
+        let mut target_error = None;
+        for wt in worktrees {
+            let storage_key = wt
+                .path()
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_owned();
+            let status = match wt.status().await {
+                Ok(status) => status,
+                Err(error) => {
+                    if storage_key == worktree && target_error.is_none() {
+                        target_error = Some(FsError::Io(std::io::Error::other(error.to_string())));
+                    }
+                    continue;
+                }
+            };
+            let identity = status.branch.as_deref().unwrap_or(&storage_key);
+            if identity == worktree {
+                return Ok(Some(wt.path().to_path_buf()));
+            }
+        }
+        match target_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
+    }
+
     /// Get or create a ContainedFs for a (repo_id, worktree) pair.
     async fn get_contained_root(
         &self,
@@ -1717,20 +1765,14 @@ impl RegistryService {
         let handle = registry
             .repo(&id)
             .map_err(|e| FsError::NotFound(e.to_string()))?;
-        let worktrees = handle
+        let mut worktrees = handle
             .get_worktrees()
             .await
             .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
 
-        // Find the worktree matching the requested name
-        let mut worktree_path = None;
-        for wt in &worktrees {
-            let wt_name = wt.path().file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if wt_name == worktree {
-                worktree_path = Some(wt.path().to_path_buf());
-                break;
-            }
-        }
+        // Symbolic identities require status; only detached/unavailable entries
+        // use their storage key, matching list_worktrees.
+        let worktree_path = Self::find_contained_worktree_path(&mut worktrees, worktree).await?;
 
         // If worktree name is "." or empty, use the repo's base worktree path
         let worktree_path = if let Some(p) = worktree_path {
@@ -4009,17 +4051,18 @@ fn federate_registry_operation(
     pin: &crate::services::model::StagingModelPin,
 ) -> Result<(String, String)> {
     use hyprstream_rpc_std::registry_capnp::registry_request;
-    anyhow::ensure!(
-        pin == &crate::services::model::StagingModelPin::reviewed()?,
-        "Federate Registry requires the reviewed staging model pin"
-    );
+    let profile = pin.federate_profile()?;
     let request = body.root::<registry_request::Reader>()?;
     match request.which()? {
-        registry_request::Which::List(()) => Ok(("registry:List".to_owned(), "query".to_owned())),
+        registry_request::Which::List(())
+            if profile == crate::services::model::FederateModelProfile::Qwen =>
+        {
+            Ok(("registry:List".to_owned(), "query".to_owned()))
+        }
         registry_request::Which::GetByName(name) => {
             let name = name?.to_str()?;
             anyhow::ensure!(
-                name == crate::services::model::StagingModelPin::reviewed_repo_name(),
+                name == profile.repo_name(),
                 "Federate Registry lookup is not the reviewed model repository"
             );
             Ok((format!("registry:{name}"), "query".to_owned()))
@@ -4396,6 +4439,50 @@ mod xet_pointer_tests {
 )]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn federate_clef_registry_admits_only_exact_repo_without_list() -> Result<()> {
+        let pin = crate::services::model::StagingModelPin::federate_clef_startup_fixture()?;
+        let make = |name: Option<&str>| {
+            hyprstream_rpc::serialize_message(|message| {
+                let mut request = message
+                    .init_root::<hyprstream_rpc_std::registry_capnp::registry_request::Builder>(
+                );
+                request.set_id(91);
+                if let Some(name) = name {
+                    request.set_get_by_name(name);
+                } else {
+                    request.set_list(());
+                }
+            })
+        };
+        let bytes = make(Some("clef-flash-fp8"))?;
+        let body =
+            crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        assert_eq!(
+            federate_registry_operation(&body, &pin)?,
+            ("registry:clef-flash-fp8".into(), "query".into())
+        );
+        for name in [
+            None,
+            Some(""),
+            Some("clef-flash-fp8:main"),
+            Some("qwen2.5-0.5b-instruct"),
+            Some("other"),
+        ] {
+            let bytes = make(name)?;
+            let body =
+                crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+            assert!(federate_registry_operation(&body, &pin).is_err());
+        }
+        let body =
+            crate::services::generated::registry_client::decode_registry_request_body(&bytes)?;
+        let unqualified =
+            crate::services::model::StagingModelPin::new(pin.model_ref.clone(), pin.commit)?;
+        assert!(federate_registry_operation(&body, &unqualified).is_err());
+        Ok(())
+    }
 
     #[cfg(feature = "postgres")]
     #[test]
@@ -5173,6 +5260,74 @@ mod tests {
     }
 
     // ── #427 finding 1: Tstat must return the real name, not "" ─────────────
+    #[tokio::test]
+    async fn contained_worktree_lookup_skips_only_unrelated_status_errors() {
+        use git2db::storage::WorktreeHandle;
+        let temp = TempDir::new().expect("temp dir");
+        let (_service, _id) =
+            registry_with_committed_repo(temp.path(), "healthy-storage", &[("config.json", "{}")])
+                .await;
+        let healthy = temp.path().join("healthy-storage");
+        let repo = git2::Repository::open(&healthy).expect("open");
+        let commit = repo.head().expect("head").peel_to_commit().expect("commit");
+        repo.branch("feature/target", &commit, false)
+            .expect("branch");
+        repo.set_head("refs/heads/feature/target")
+            .expect("symbolic head");
+        let broken = temp.path().join("broken");
+        std::fs::create_dir(&broken).expect("broken directory");
+        let mut handles = vec![
+            WorktreeHandle::new(broken, "vfs".into()),
+            WorktreeHandle::new(healthy.clone(), "vfs".into()),
+        ];
+        assert_eq!(
+            RegistryService::find_contained_worktree_path(&mut handles, "feature/target")
+                .await
+                .expect("healthy lookup"),
+            Some(healthy.clone())
+        );
+        assert!(matches!(
+            RegistryService::find_contained_worktree_path(&mut handles, "broken").await,
+            Err(FsError::Io(_))
+        ));
+        assert!(
+            RegistryService::find_contained_worktree_path(&mut handles, "healthy-storage")
+                .await
+                .expect("no basename alias")
+                .is_none()
+        );
+        assert!(
+            RegistryService::find_contained_worktree_path(&mut handles, "missing")
+                .await
+                .expect("missing")
+                .is_none()
+        );
+        let precedence_broken = temp.path().join("same-key");
+        std::fs::create_dir(&precedence_broken).expect("unavailable same key");
+        repo.branch("same-key", &commit, false)
+            .expect("precedence branch");
+        repo.set_head("refs/heads/same-key")
+            .expect("precedence head");
+        let mut precedence = vec![
+            WorktreeHandle::new(precedence_broken, "vfs".into()),
+            WorktreeHandle::new(healthy.clone(), "vfs".into()),
+        ];
+        assert_eq!(
+            RegistryService::find_contained_worktree_path(&mut precedence, "same-key")
+                .await
+                .expect("healthy canonical identity wins"),
+            Some(healthy.clone())
+        );
+        repo.set_head_detached(commit.id()).expect("detach");
+        let mut detached = vec![WorktreeHandle::new(healthy.clone(), "vfs".into())];
+        assert_eq!(
+            RegistryService::find_contained_worktree_path(&mut detached, "healthy-storage")
+                .await
+                .expect("detached lookup"),
+            Some(healthy)
+        );
+    }
+
     #[tokio::test]
     async fn test_tstat_returns_real_registry_repo_name() {
         // `metadata_to_np_stat("", ..)` meant the registry's Tstat handler

@@ -15,12 +15,131 @@ use std::task::{Context, Poll};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use futures::Future;
 use futures::Stream;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::transport_traits::{PublishSink, Transport};
 use crate::zmtp_framing;
+
+/// Transport ceiling applied when the caller supplies no request deadline —
+/// the same 30s family default `RpcClientImpl::calculate_timeout` returns
+/// for calls without caller options (rpc_client.rs). A caller deadline
+/// replaces it verbatim: a non-negative deadline is honored as-is (never
+/// clamped to the default), and a negative value expires immediately rather
+/// than being clamped up.
+const DEFAULT_REQUEST_TIMEOUT_MS: i32 = 30_000;
+
+/// Cleanup BUDGET, measured FROM the request deadline, shared by the whole
+/// expired-request cleanup: the stream-reset observation and the
+/// abandoned-read observation are both bounded by the SAME absolute instant
+/// — deadline + `CLEANUP_GRACE_MS` — so the caller's error is allocated at
+/// most `CLEANUP_GRACE_MS` of cleanup work past the deadline, never a
+/// per-step sum. This bounds allocated cleanup work, not wall-clock
+/// delivery: browser event-loop suspension (background-tab timer
+/// throttling, a busy main thread) can stretch real time beyond it.
+///
+/// `doc(hidden)` pub so the browser behavioral tests derive their bound
+/// from this constant instead of hardcoding it.
+#[doc(hidden)]
+pub const CLEANUP_GRACE_MS: i64 = 50;
+
+/// Await `fut` bounded by `deadline` (a monotonic `web_time::Instant`).
+///
+/// `Err` means the deadline expired before the future resolved; `fut` is
+/// dropped at that point. Every await inside [`WtConnection::request`] goes
+/// through this so a stalled stream can never hang a browser RPC past its
+/// deadline.
+///
+/// The timer is `web_async::time` — the browser timer via `wasmtimer` on
+/// WASM, `tokio::time` on native — and it is DISPOSED when the future
+/// completes first or the bound future is dropped: no retained
+/// `setTimeout` callbacks outlive the await.
+///
+/// `pub` + `doc(hidden)` so the browser behavioral tests in
+/// `tests/wasm_deadline_behavior.rs` drive the exact production function;
+/// not part of the supported SDK contract.
+#[doc(hidden)]
+pub async fn bounded<F: Future>(fut: F, deadline: web_time::Instant) -> Result<F::Output> {
+    let remaining = deadline.saturating_duration_since(web_time::Instant::now());
+    web_async::time::timeout(remaining, fut)
+        .await
+        .map_err(|_| anyhow!("WebTransport RPC request deadline exceeded"))
+}
+
+/// Production cleanup for an expired read.
+///
+/// Requirement: the reset must happen while the reader is still associated
+/// with the stream. This function therefore does exactly one thing to the
+/// stream — `reader.cancel()` — before anything else touches or drops the
+/// reader, and performs no lock release of its own.
+///
+/// Both observations — the stream reset and the abandoned read settlement —
+/// are bounded by the SAME absolute instant, the request deadline plus
+/// [`CLEANUP_GRACE_MS`]: the caller's error is allocated at most that one
+/// shared cleanup budget past the deadline (allocated work, not a
+/// wall-clock delivery guarantee), while still reporting whether the stream
+/// actually reset. The browser behavioral tests in
+/// `tests/wasm_deadline_behavior.rs` drive this exact function and assert
+/// those outcomes in a real browser.
+///
+/// `doc(hidden)` pub for those tests; not part of the supported SDK
+/// contract.
+#[doc(hidden)]
+pub async fn cancel_reader_on_expiry(
+    reader: &web_sys::ReadableStreamDefaultReader,
+    abandoned_read: Option<js_sys::Promise>,
+    base: anyhow::Error,
+    deadline: web_time::Instant,
+) -> anyhow::Error {
+    let cleanup_deadline = deadline + web_time::Duration::from_millis(CLEANUP_GRACE_MS as u64);
+    let result = reset_with_grace(reader.cancel(), base, cleanup_deadline).await;
+    if let Some(read) = abandoned_read {
+        let _ = bounded(JsFuture::from(read), cleanup_deadline).await;
+    }
+    result
+}
+
+/// Cancel the unlocked readable side after a write failure, observing the
+/// reset for at most one cleanup grace, never beyond request deadline + grace.
+#[doc(hidden)]
+pub async fn cancel_after_write_failure(
+    readable: &web_sys::ReadableStream,
+    base: anyhow::Error,
+    deadline: web_time::Instant,
+) -> anyhow::Error {
+    let cleanup_deadline = web_time::Instant::now().min(deadline)
+        + web_time::Duration::from_millis(CLEANUP_GRACE_MS as u64);
+    reset_with_grace(readable.cancel(), base, cleanup_deadline).await
+}
+
+/// Observe a stream-reset promise under a short cleanup deadline and fold
+/// any failure into the surfaced error — a reset that did not settle is
+/// never silently swallowed. The cleanup budget can extend the OBSERVED
+/// completion of a deadline-expired call past its deadline; the deadline
+/// itself governs the request, the budget only bounds the reset
+/// observation.
+async fn reset_with_grace(
+    reset: js_sys::Promise,
+    base: anyhow::Error,
+    deadline: web_time::Instant,
+) -> anyhow::Error {
+    match bounded(JsFuture::from(reset), deadline).await {
+        Ok(Ok(_)) => base,
+        Ok(Err(rejection)) => {
+            anyhow::anyhow!(
+                "{base}; stream reset rejected: {}",
+                rejection
+                    .as_string()
+                    .unwrap_or_else(|| "unknown JS rejection".to_owned())
+            )
+        }
+        Err(_) => anyhow::anyhow!(
+            "{base}; stream reset did not settle within the {CLEANUP_GRACE_MS}ms cleanup budget"
+        ),
+    }
+}
 
 /// Browser-side WebTransport connection to a hyprstream server.
 ///
@@ -93,19 +212,41 @@ impl WtConnection {
     }
 
     /// Send a REQ/REP request. Returns response payload bytes.
-    pub async fn request(&self, payload: &[u8]) -> Result<Vec<u8>> {
-        let bidi = JsFuture::from(self.wt.create_bidirectional_stream())
-            .await
-            .map_err(|e| anyhow!("createBidirectionalStream: {:?}", e))?;
+    ///
+    /// `timeout_ms` bounds the whole request — stream setup, write, and the
+    /// response read loop. `None` applies [`DEFAULT_REQUEST_TIMEOUT_MS`]; a
+    /// caller deadline replaces the default verbatim (never clamped to it;
+    /// a negative value expires immediately). On expiry the bidirectional
+    /// stream is reset so the server observes the abort (`reader.cancel()`
+    /// — a direct `ReadableStream::cancel` while the reader holds the lock
+    /// rejects; asserted by the browser behavioral tests) and an error is
+    /// returned: no await here can hang a browser RPC past its deadline.
+    /// The one tail: the expiry cleanup is allocated a single shared
+    /// [`CLEANUP_GRACE_MS`] budget past the deadline for observing the reset
+    /// and the abandoned read (allocated cleanup work, not a wall-clock
+    /// delivery guarantee).
+    pub async fn request(&self, payload: &[u8], timeout_ms: Option<i32>) -> Result<Vec<u8>> {
+        let started = web_time::Instant::now();
+        let deadline = started
+            + web_time::Duration::from_millis(
+                timeout_ms.unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS).max(0) as u64,
+            );
+        let deadline_error = || {
+            anyhow!(
+                "WebTransport RPC request deadline exceeded after {}ms",
+                (web_time::Instant::now() - started).as_millis()
+            )
+        };
 
-        let writable: web_sys::WritableStream =
-            js_sys::Reflect::get(&bidi, &JsValue::from_str("writable"))
-                .map_err(|_| anyhow!("no writable"))?
-                .unchecked_into();
-        let readable: web_sys::ReadableStream =
-            js_sys::Reflect::get(&bidi, &JsValue::from_str("readable"))
-                .map_err(|_| anyhow!("no readable"))?
-                .unchecked_into();
+        // Accepted gap: expiry during stream setup drops the just-created
+        // bidirectional stream without an explicit reset — there is no
+        // reader/writer yet to cancel it through, and the WebTransport
+        // session reclaims abandoned streams when the connection closes.
+        let (writable, readable) = match bounded(self.create_request_streams(), deadline).await {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(deadline_error()),
+        };
 
         // Build ZMTP command + multipart
         let cmd = zmtp_framing::encode_command("STREAM_TYPE", b"REQ");
@@ -115,27 +256,61 @@ impl WtConnection {
         combined.extend_from_slice(&msg);
 
         // Write
-        let writer = writable
-            .get_writer()
-            .map_err(|e| anyhow!("getWriter: {:?}", e))?;
-        let js_data = js_sys::Uint8Array::from(&combined[..]);
-        JsFuture::from(writer.write_with_chunk(&js_data))
-            .await
-            .map_err(|e| anyhow!("write: {:?}", e))?;
-        JsFuture::from(writer.ready())
-            .await
-            .map_err(|e| anyhow!("writer.ready: {:?}", e))?;
-        let _ = JsFuture::from(writer.close()).await;
-        writer.release_lock();
+        let write = async {
+            let writer = writable
+                .get_writer()
+                .map_err(|e| anyhow!("getWriter: {:?}", e))?;
+            let js_data = js_sys::Uint8Array::from(&combined[..]);
+            JsFuture::from(writer.write_with_chunk(&js_data))
+                .await
+                .map_err(|e| anyhow!("write: {:?}", e))?;
+            JsFuture::from(writer.ready())
+                .await
+                .map_err(|e| anyhow!("writer.ready: {:?}", e))?;
+            // Best-effort close: the request bytes are already written, and a
+            // close failure does not invalidate the exchange — the read loop's
+            // deadline still bounds the call.
+            let _ = JsFuture::from(writer.close()).await;
+            writer.release_lock();
+            Ok::<(), anyhow::Error>(())
+        };
+        match bounded(write, deadline).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                // Reset the stream before surfacing the write failure. The
+                // readable side is not locked in this phase (only the writer
+                // holds the writable lock), so stream cancel reaches the
+                // underlying source and aborts both directions.
+                return Err(cancel_after_write_failure(&readable, error, deadline).await);
+            }
+            Err(_) => {
+                return Err(
+                    cancel_after_write_failure(&readable, deadline_error(), deadline).await,
+                );
+            }
+        }
 
         // Read response
         let reader: web_sys::ReadableStreamDefaultReader = readable.get_reader().unchecked_into();
         let mut chunks: Vec<u8> = Vec::new();
 
         loop {
-            let result = JsFuture::from(reader.read())
-                .await
-                .map_err(|e| anyhow!("read: {:?}", e))?;
+            // Keep the read promise: if the deadline wins, the cleanup
+            // observes its settlement so it cannot become an unhandled
+            // rejection.
+            let read_promise = reader.read();
+            let result = match bounded(JsFuture::from(read_promise.clone()), deadline).await {
+                Ok(result) => result.map_err(|e| anyhow!("read: {:?}", e))?,
+                Err(_) => {
+                    return Err(cancel_reader_on_expiry(
+                        &reader,
+                        Some(read_promise),
+                        deadline_error(),
+                        deadline,
+                    )
+                    .await);
+                }
+            };
             let done = js_sys::Reflect::get(&result, &JsValue::from_str("done"))
                 .unwrap_or(JsValue::TRUE)
                 .as_bool()
@@ -158,6 +333,24 @@ impl WtConnection {
             return Err(anyhow!("empty ZMTP response"));
         }
         Ok(frames[0].clone())
+    }
+
+    /// Create the bidirectional stream pair for one REQ/REP exchange.
+    async fn create_request_streams(
+        &self,
+    ) -> Result<(web_sys::WritableStream, web_sys::ReadableStream)> {
+        let bidi = JsFuture::from(self.wt.create_bidirectional_stream())
+            .await
+            .map_err(|e| anyhow!("createBidirectionalStream: {:?}", e))?;
+        let writable: web_sys::WritableStream =
+            js_sys::Reflect::get(&bidi, &JsValue::from_str("writable"))
+                .map_err(|_| anyhow!("no writable"))?
+                .unchecked_into();
+        let readable: web_sys::ReadableStream =
+            js_sys::Reflect::get(&bidi, &JsValue::from_str("readable"))
+                .map_err(|_| anyhow!("no readable"))?
+                .unchecked_into();
+        Ok((writable, readable))
     }
 
     /// Open a SUB stream (internal, returns WtSubscriber).
@@ -266,8 +459,8 @@ impl Transport for WtConnection {
     type Sub = WtSubscriber;
     type Pub = WtPublisher;
 
-    async fn send(&self, payload: Vec<u8>, _timeout_ms: Option<i32>) -> Result<Vec<u8>> {
-        self.request(&payload).await
+    async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
+        self.request(&payload, timeout_ms).await
     }
 
     fn forbids_cleartext_envelope(&self) -> bool {

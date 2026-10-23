@@ -30,7 +30,7 @@
 //!   surface so emitted columns compose unquoted in SQL (the ADBC path). Wire-level ids
 //!   stay opaque; the constraint applies at schema construction, not at authoring.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder, StringBuilder};
@@ -39,7 +39,7 @@ use arrow_schema::{DataType, Field, Schema};
 use thiserror::Error;
 
 use crate::answer::{AnswerValue, QuestionAnswer, VersionTriple};
-use crate::confidence::{self, PRODUCER_SUM_TOLERANCE};
+use crate::confidence::{self, CONSUMER_SUM_TOLERANCE, PRODUCER_SUM_TOLERANCE};
 use crate::spec::{QuestionKind, QuestionSet, QuestionSpec};
 
 /// Field-metadata key carrying the question kind (`noul` / `choice` / `score`).
@@ -395,10 +395,40 @@ impl DecisionSchema {
         version: &VersionTriple,
         rows: &[AnswerRow],
     ) -> Result<RecordBatch, BatchError> {
+        self.build_batch_with_tolerance(version, rows, PRODUCER_SUM_TOLERANCE)
+    }
+
+    /// Emit an Arrow batch from rows that have already crossed a consumer boundary.
+    ///
+    /// Wire decoders accept distributions within the consumer tolerance (D5), which is
+    /// intentionally looser than the producer tolerance used by [`Self::build_batch`].
+    /// This path preserves decoded values exactly while validating them against the
+    /// consumer tolerance. Use [`Self::build_batch`] for locally produced rows.
+    pub fn build_batch_from_consumer(
+        &self,
+        version: &VersionTriple,
+        rows: &[AnswerRow],
+    ) -> Result<RecordBatch, BatchError> {
+        self.build_batch_with_tolerance(version, rows, CONSUMER_SUM_TOLERANCE)
+    }
+
+    fn build_batch_with_tolerance(
+        &self,
+        version: &VersionTriple,
+        rows: &[AnswerRow],
+        distribution_tolerance: f32,
+    ) -> Result<RecordBatch, BatchError> {
         let row_count = rows.len();
+        // Validate dense rows against a precomputed ID set. Scanning all questions for
+        // every answer key made this O(R * Q²) for R rows and Q questions.
+        let question_ids: HashSet<&str> = self
+            .questions
+            .iter()
+            .map(|question| question.id.as_str())
+            .collect();
         for (row_index, row) in rows.iter().enumerate() {
             for key in row.answers.keys() {
-                if !self.questions.iter().any(|question| &question.id == key) {
+                if !question_ids.contains(key.as_str()) {
                     return Err(BatchError::UnknownQuestion {
                         row: row_index,
                         question_id: key.clone(),
@@ -441,7 +471,12 @@ impl DecisionSchema {
                         conformal_builder.append_null();
                     }
                     (Some(value), conformal_set) => {
-                        let distribution = validated_distribution(question, value, row_index)?;
+                        let distribution = validated_distribution(
+                            question,
+                            value,
+                            row_index,
+                            distribution_tolerance,
+                        )?;
                         for &p in &distribution {
                             probabilities.values().append_value(p);
                         }
@@ -500,6 +535,7 @@ fn validated_distribution(
     question: &QuestionSpec,
     value: &AnswerValue,
     row: usize,
+    tolerance: f32,
 ) -> Result<Vec<f32>, BatchError> {
     let answer_kind = match value {
         AnswerValue::Noul { .. } => QuestionKind::Noul,
@@ -524,7 +560,7 @@ fn validated_distribution(
             got: distribution.len(),
         });
     }
-    confidence::check_distribution(&distribution, PRODUCER_SUM_TOLERANCE)
+    confidence::check_distribution(&distribution, tolerance)
         .map_err(|error| BatchError::InvalidDistribution(row, question.id.clone(), error))?;
     Ok(distribution)
 }

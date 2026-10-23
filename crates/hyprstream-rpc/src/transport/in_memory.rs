@@ -33,7 +33,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -57,6 +57,14 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct InMemoryTransport {
     processor: Arc<dyn IrohRequestProcessor>,
+}
+
+struct CancelRequestOnDrop(tokio_util::sync::CancellationToken);
+
+impl Drop for CancelRequestOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl InMemoryTransport {
@@ -86,16 +94,19 @@ impl Transport for InMemoryTransport {
         // INV-2 (#1042): the request never leaves this address space — the
         // one carrier class that is inproc by construction.
         let fut = async move {
+            let request_cancel = tokio_util::sync::CancellationToken::new();
+            let _cancel_on_drop = CancelRequestOnDrop(request_cancel.clone());
             processor
                 .process(
                     Bytes::from(payload),
                     crate::transport::carrier::CarrierContext::inproc(),
+                    request_cancel,
                 )
                 .await
         };
         let resp = tokio::time::timeout(timeout, fut)
             .await
-            .map_err(|_| anyhow!("in-process RPC timeout after {timeout:?}"))??;
+            .map_err(|_| crate::error::RpcError::InMemoryRequestTimeout { timeout })??;
         Ok(resp.to_vec())
     }
 
@@ -113,6 +124,7 @@ impl Transport for InMemoryTransport {
 mod tests {
     use super::*;
     use crate::transport::rpc_session::from_fn;
+    use anyhow::anyhow;
 
     fn echo_processor() -> Arc<dyn IrohRequestProcessor> {
         Arc::new(from_fn(|req: Bytes| async move { Ok(req) }))
@@ -140,10 +152,49 @@ mod tests {
         }));
         let t = InMemoryTransport::new(slow);
         let err = t.send(b"x".to_vec(), Some(20)).await;
+        let error = err.expect_err("a handler exceeding the deadline must time out");
+        assert!(matches!(
+            error.downcast_ref::<crate::error::RpcError>(),
+            Some(crate::error::RpcError::InMemoryRequestTimeout { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_deadline_value_is_what_the_transport_honors() {
+        let start = std::time::Instant::now();
+        let slow = Arc::new(from_fn(|req: Bytes| async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok(req)
+        }));
+        let t = InMemoryTransport::new(slow);
+        // A 1ms deadline must cut the 150ms handler at ~1ms, not at the 30s
+        // default: proves the caller's value (not the default) is used.
+        let err = t.send(b"x".to_vec(), Some(1)).await;
+        assert!(err.is_err());
         assert!(
-            err.is_err(),
-            "a handler exceeding the deadline must time out"
+            start.elapsed() < Duration::from_secs(5),
+            "the caller-supplied deadline must apply immediately: {:?}",
+            start.elapsed()
         );
+        // A deadline above the default admits the same handler.
+        let resp = t.send(b"x".to_vec(), Some(35_000)).await.unwrap();
+        assert_eq!(resp, b"x");
+    }
+
+    #[tokio::test]
+    async fn worker_elapsed_is_not_transport_timeout() {
+        let failing = Arc::new(from_fn(|_req: Bytes| async move {
+            let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+                .await
+                .unwrap_err();
+            Err(anyhow::Error::new(elapsed))
+        }));
+        let transport = InMemoryTransport::new(failing);
+        let error = transport.send(Vec::new(), Some(30_000)).await.unwrap_err();
+        assert!(error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some());
+        assert!(error.downcast_ref::<crate::error::RpcError>().is_none());
     }
 
     #[tokio::test]

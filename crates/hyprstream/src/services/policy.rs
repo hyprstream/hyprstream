@@ -281,6 +281,7 @@ impl PolicyService {
         collision_inventory: hyprstream_session_store::primary::CollisionInventory,
         host: crate::services::oauth::federate_source::FederateHost,
         tui_client: Option<&str>,
+        model_profile: crate::services::model::FederateModelProfile,
     ) -> Self {
         let admission = Arc::new(federate_admission::AdmissionService::configured(
             Arc::clone(&self.policy_manager),
@@ -289,6 +290,7 @@ impl PolicyService {
             None,
             host,
             tui_client,
+            model_profile,
         ));
         self.federate_request_use = Some(federate_admission::RequestUseReader::new(
             Arc::clone(&admission),

@@ -72,6 +72,10 @@ pub enum RpcError {
     #[error("envelope error: {0}")]
     Envelope(#[from] EnvelopeError),
 
+    /// The in-process transport deadline elapsed, not an error returned by its worker.
+    #[error("in-process RPC timeout after {timeout:?}")]
+    InMemoryRequestTimeout { timeout: std::time::Duration },
+
     /// Process spawn failed.
     #[error("spawn failed: {0}")]
     SpawnFailed(String),
@@ -95,3 +99,17 @@ pub enum RpcError {
 
 /// Result type alias for RPC operations.
 pub type Result<T> = std::result::Result<T, RpcError>;
+
+/// Typed RPC error tunnel: carries a wire `ErrorInfo` code through an
+/// `anyhow` chain without changing the displayed message. Generated clients
+/// wrap `ErrorInfo` responses into this type; generated (scoped) server
+/// wrappers re-emit the code instead of collapsing to INTERNAL. Display is
+/// message-only so existing error-string matching is unchanged.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct TypedRpcError {
+    /// Wire error code (e.g. `DECISION_INPUT`, `UNAUTHORIZED`, `INTERNAL`).
+    pub code: String,
+    /// Human-readable message.
+    pub message: String,
+}

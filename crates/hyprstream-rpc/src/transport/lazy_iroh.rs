@@ -56,9 +56,8 @@ pub enum IrohPeerUnavailable {
 /// Default per-request deadline when the caller passes `None`.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Ceiling on the lazy connect (iroh dial + handshake). The per-request deadline
-/// wraps only the request; without this an unreachable peer would hang the first
-/// `send()` indefinitely.
+/// Independent ceiling on a lazy dial. The caller budget also covers lock wait
+/// and dialing; a caller expiry does not record a peer failure.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Process-wide client iroh endpoint, installed once at startup.
@@ -292,24 +291,35 @@ impl Transport for LazyIrohTransport {
     type Pub = IrohPublishStub;
 
     async fn send(&self, payload: Vec<u8>, timeout_ms: Option<i32>) -> Result<Vec<u8>> {
-        let transport = self
-            .connected()
-            .await
-            .map_err(crate::transport_traits::PreDispatchTransportError::new)?;
-
-        // Our deadline is authoritative so a per-request timeout (busy peer —
-        // keep the session) is distinguishable from a transport-fatal error
-        // (re-dial), matching LazyQuinnTransport.
-        let deadline = timeout_ms
+        let budget = timeout_ms
             .map(|ms| Duration::from_millis(ms.max(0) as u64))
             .unwrap_or(DEFAULT_TIMEOUT);
-        let inner_ceiling_ms = deadline.as_millis().saturating_mul(2).min(i32::MAX as u128) as i32;
+        let deadline = tokio::time::Instant::now() + budget;
+        if budget.is_zero() {
+            return Err(anyhow!("iroh RPC timeout after {budget:?}"));
+        }
+        // Caller expiry is not a peer failure and must not enable endpoint retry.
+        let connected = tokio::time::timeout_at(deadline, self.connected())
+            .await
+            .map_err(|_| anyhow!("iroh RPC timeout after {budget:?}"))?;
+        let transport =
+            connected.map_err(crate::transport_traits::PreDispatchTransportError::new)?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!("iroh RPC timeout after {budget:?}"));
+        }
+        // Round up sub-millisecond remainder; the absolute outer timer owns expiry.
+        let remaining_ms =
+            remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+        let inner_ceiling_ms = remaining_ms.saturating_mul(2).min(i32::MAX as u128) as i32;
 
-        match tokio::time::timeout(deadline, transport.send(payload, Some(inner_ceiling_ms))).await
+        match tokio::time::timeout_at(deadline, transport.send(payload, Some(inner_ceiling_ms)))
+            .await
         {
-            Err(_elapsed) => Err(anyhow!("iroh RPC timeout after {deadline:?}")),
+            Err(_elapsed) => Err(anyhow!("iroh RPC timeout after {budget:?}")),
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(e)) => {
+                // Preserve fatal-error cleanup even if it outlives the caller budget.
                 self.invalidate().await;
                 Err(e)
             }
@@ -503,5 +513,34 @@ mod tests {
         let t = LazyIrohTransport::new([0u8; 32], vec![], None);
         assert!(t.subscribe(b"topic").await.is_err());
         assert!(t.publish(b"topic").await.is_err());
+    }
+    #[tokio::test]
+    async fn caller_deadline_bounds_connection_lock_wait() {
+        let transport = LazyIrohTransport::new([0; 32], vec![], None);
+        let guard = transport.state.lock().await;
+        let error =
+            tokio::time::timeout(Duration::from_secs(2), transport.send(Vec::new(), Some(10)))
+                .await
+                .expect("caller deadline must expire while connection lock remains held")
+                .unwrap_err();
+        assert!(!crate::transport_traits::is_pre_dispatch_transport_error(
+            &error
+        ));
+        assert!(guard.cached.is_none());
+        assert!(!error
+            .chain()
+            .any(|cause| cause.downcast_ref::<IrohPeerUnavailable>().is_some()));
+        drop(guard);
+        assert!(transport.state.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn zero_caller_budget_does_not_dial() {
+        let transport = LazyIrohTransport::new([0; 32], vec![], None);
+        let error = transport.send(Vec::new(), Some(0)).await.unwrap_err();
+        assert!(!crate::transport_traits::is_pre_dispatch_transport_error(
+            &error
+        ));
+        assert!(transport.state.lock().await.cached.is_none());
     }
 }

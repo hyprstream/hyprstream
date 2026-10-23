@@ -1033,6 +1033,21 @@ pub fn generate_client(
                 self
             }
 
+            /// Override this client's per-call options for every call.
+            #[must_use]
+            pub fn with_call_options(mut self, options: hyprstream_rpc::CallOptions) -> Self {
+                self.call_options = options;
+                self
+            }
+
+            /// Set this client's per-call request deadline (milliseconds)
+            /// without touching any auth options already on the client.
+            #[must_use]
+            pub fn with_timeout_ms(mut self, timeout_ms: i32) -> Self {
+                self.call_options.timeout_ms = Some(timeout_ms);
+                self
+            }
+
             /// Set this client's DIRECT bearer for every call.
             ///
             /// Unlike [`Self::with_delegated_bearer`], the token travels as the
@@ -1065,8 +1080,12 @@ pub fn generate_client(
                     Some(token) => builder.jwt(token.clone()),
                     None => builder,
                 };
-                match &self.call_options.delegated_bearer {
+                let builder = match &self.call_options.delegated_bearer {
                     Some(token) => builder.delegated_bearer(token.clone()),
+                    None => builder,
+                };
+                match self.call_options.timeout_ms {
+                    Some(timeout_ms) => builder.timeout_ms(timeout_ms),
                     None => builder,
                 }
             }
@@ -1487,7 +1506,15 @@ fn find_typed_return_info(
 
     let error_arm = if has_error {
         quote! {
-            #response_type::Error(ref e) => Err(anyhow::anyhow!("{}", e.message)),
+            // Typed error tunnel: the wire ErrorInfo code rides in the typed
+            // error (Display stays message-only so existing string matching
+            // is unchanged); service-side scoped wrappers re-emit the code.
+            #response_type::Error(ref e) => Err(anyhow::Error::new(
+                hyprstream_rpc::error::TypedRpcError {
+                    code: e.code.clone(),
+                    message: e.message.clone(),
+                },
+            )),
         }
     } else {
         TokenStream::new()

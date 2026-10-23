@@ -461,6 +461,7 @@ mod tests {
         assert_eq!(Action::from(ScopeAction::Subscribe), Action(1));
         assert_eq!(Action::from(ScopeAction::Manage), Action(10));
         assert_eq!(Action::from(ScopeAction::MeshDelta), Action(13));
+        assert_eq!(Action::from(ScopeAction::Decide), Action(14));
         assert_eq!(Action(u32::MAX).scope_action(), None);
     }
 

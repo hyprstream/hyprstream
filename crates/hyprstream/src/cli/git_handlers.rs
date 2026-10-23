@@ -305,7 +305,10 @@ pub async fn handle_commit(
 
     // Check if worktree exists
     let wts = repo_client.list_worktrees().await?;
-    if !wts.iter().any(|wt| wt.branch_name == branch_name) {
+    if !wts
+        .iter()
+        .any(|wt| wt.unavailable_reason.is_empty() && wt.branch_name == branch_name)
+    {
         anyhow::bail!(
             "Worktree '{}' does not exist for model '{}'.\n\nCreate it first with:\n  hyprstream branch {} {}",
             branch_name, model_ref.model, model_ref.model, branch_name
@@ -2169,7 +2172,10 @@ async fn handle_merge_conflict_resolution(
 
     // Verify worktree exists
     let wts = repo_client.list_worktrees().await?;
-    if !wts.iter().any(|wt| wt.branch_name == target_branch) {
+    if !wts
+        .iter()
+        .any(|wt| wt.unavailable_reason.is_empty() && wt.branch_name == target_branch)
+    {
         bail!("Worktree not found for branch {}", target_branch);
     }
 
@@ -2254,7 +2260,10 @@ pub async fn handle_remove(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
-        let wt = match worktrees.iter().find(|wt| wt.branch_name == branch) {
+        let wt = match worktrees
+            .iter()
+            .find(|wt| wt.unavailable_reason.is_empty() && wt.branch_name == branch)
+        {
             Some(wt) => wt,
             None => {
                 println!(

@@ -63,6 +63,10 @@ hyprstream-util = { path = "../hyprstream-util" }  # Generic shared primitives (
 moq-net.workspace = true  # moq-lite streaming for cross-process subscriber (M2b)
 ml-dsa = { workspace = true }  # ML-DSA-65 — always compiled (runtime CryptoPolicy selects PQ). See M3 #152.
 hyprstream-rpc-std = { path = "../hyprstream-rpc-std" }  # Standard service schemas + clients
+# R4 decision serving: jev-1 IR answer types for the E2 decision.capnp
+# batch, plus the head/encoder contract types used by the service adapter.
+hyprstream-decision = { path = "../hyprstream-decision" }
+hyprstream-decision-head = { path = "../hyprstream-decision-head" }
 hyprstream-inference = { path = "../hyprstream-inference" }  # Torch runtime + training (Wave B decomposition)
 hyprstream-discovery = { path = "../hyprstream-discovery" }  # Service discovery
 hyprstream-pds = { path = "../hyprstream-pds" }  # atproto PDS record store: DAG-CBOR + MST + signed commit + CAR proof (#392/#431)
@@ -309,6 +313,7 @@ serde_json.workspace = true  # JSON output for metadata
 hyprstream-rpc-build.workspace = true  # Shared annotation extraction
 
 [dev-dependencies]
+hyprstream-inference = { path = "../hyprstream-inference", features = ["test-fixtures"] }
 hyprstream-rpc = { path = "../hyprstream-rpc", features = ["test-classical-policy"] }
 hyprstream-discovery = { path = "../hyprstream-discovery", features = ["test-fixtures"] }
 hyprstream-pds = { path = "../hyprstream-pds", features = ["postgres-test-connect"] }  # scratch-DB live tests (NoTls, test-only)

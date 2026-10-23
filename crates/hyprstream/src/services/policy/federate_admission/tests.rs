@@ -1369,6 +1369,7 @@ async fn configured_host_policy_admits_only_its_exact_issuer_and_resource() {
             None,
             crate::services::oauth::federate_source::FederateHost::new(local).unwrap(),
             None,
+            crate::services::model::FederateModelProfile::Qwen,
         );
         let authority = service.authority.as_ref().unwrap();
         assert_eq!(authority.profile.host, local);
@@ -2394,4 +2395,144 @@ async fn h2_admission_pg_race_replay_revocation_and_outage() {
         .batch_execute(&format!("DROP DATABASE {db} WITH (FORCE)"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn clef_closed_ceiling_and_current_did_tenant_grant_control_each_boundary() {
+    let (mut service, ctx) = fixture().await;
+    let profile = crate::services::model::FederateModelProfile::Clef;
+    let (mut configured_fixture, _) = fixture().await;
+    let prior = configured_fixture.authority.take().unwrap();
+    let configured = AdmissionService::configured(
+        prior.policy,
+        prior.enrollment,
+        prior.collision_inventory,
+        None,
+        crate::services::oauth::federate_source::FederateHost::new("https://clef.example").unwrap(),
+        None,
+        profile,
+    );
+    let configured_authority = configured.authority.as_ref().unwrap();
+    assert_eq!(configured_authority.profile.client_scopes, profile.scopes());
+    assert_eq!(
+        configured_authority.profile.resource_scopes,
+        profile.scopes()
+    );
+    let resource = format!("model:{}", profile.model_ref());
+    let scope = format!("decide:{resource}");
+    {
+        let authority = service.authority.as_mut().unwrap();
+        authority.profile.client_scopes = profile.scopes();
+        authority.profile.resource_scopes = profile.scopes();
+        // Existing Qwen grant stays installed: the selected ceiling, rather
+        // than a missing rule, must reject cross-profile issuance and use.
+        authority
+            .policy
+            .add_policy_with_domain(ATPROTO_DID, "tenant", &resource, "decide", "allow")
+            .await
+            .unwrap();
+        authority
+            .policy
+            .add_policy_with_domain(ATPROTO_DID, "tenant", "registry:List", "query", "allow")
+            .await
+            .unwrap();
+    }
+    let source_record = source();
+    let decision = service
+        .prepare(
+            &ctx,
+            // The www staging pin selects the Clef-ceiling table entry.
+            "client",
+            &source_record,
+            std::slice::from_ref(&scope),
+        )
+        .await
+        .unwrap();
+    assert_eq!(decision.subject, ATPROTO_DID);
+    assert_eq!(decision.tenant, "tenant");
+    assert_eq!(decision.scopes.as_slice(), std::slice::from_ref(&scope));
+    for scope in [
+        STAGING_SCOPE,
+        REGISTRY_LIST_SCOPE,
+        "decide:model:clef-flash-fp8:other",
+    ] {
+        assert!(service
+            .prepare(&ctx, "client", &source_record, &[scope.into()])
+            .await
+            .is_err());
+    }
+    let session = session(&decision);
+    let authority = service.authority.as_ref().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    authority
+        .authorize_use(
+            &session,
+            &source_record.issuer,
+            &source_record.atproto_did,
+            &resource,
+            "decide",
+            now,
+        )
+        .await
+        .unwrap();
+    for (target, operation) in [
+        ("model:qwen2.5-0.5b-instruct:main", "infer"),
+        ("registry:List", "query"),
+        (resource.as_str(), "write"),
+    ] {
+        assert!(authority
+            .authorize_use(
+                &session,
+                &source_record.issuer,
+                &source_record.atproto_did,
+                target,
+                operation,
+                now
+            )
+            .await
+            .is_err());
+    }
+    let mut wrong = session.clone();
+    wrong.tenant = "other-tenant".into();
+    assert!(authority
+        .authorize_use(
+            &wrong,
+            &source_record.issuer,
+            &source_record.atproto_did,
+            &resource,
+            "decide",
+            now
+        )
+        .await
+        .is_err());
+    assert!(authority
+        .authorize_use(
+            &session,
+            &source_record.issuer,
+            "did:plc:wrongholder",
+            &resource,
+            "decide",
+            now
+        )
+        .await
+        .is_err());
+    assert!(authority
+        .policy
+        .remove_policy_with_domain(ATPROTO_DID, "tenant", &resource, "decide", "allow")
+        .await
+        .unwrap());
+    assert!(
+        authority
+            .authorize_use(
+                &session,
+                &source_record.issuer,
+                &source_record.atproto_did,
+                &resource,
+                "decide",
+                now
+            )
+            .await
+            .is_err(),
+        "next boundary sees revoked DID grant"
+    );
 }

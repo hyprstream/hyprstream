@@ -30,7 +30,10 @@ pub async fn handle_worktree_add(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
-    if worktrees.iter().any(|wt| wt.branch_name == branch) {
+    if worktrees
+        .iter()
+        .any(|wt| wt.unavailable_reason.is_empty() && wt.branch_name == branch)
+    {
         anyhow::bail!(
             "Worktree already exists for branch '{}' in model {}",
             branch,
@@ -100,8 +103,11 @@ pub async fn handle_worktree_list(
         .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
     // Helper to check if a branch has a worktree
-    let has_worktree =
-        |branch: &str| -> bool { worktrees.iter().any(|wt| wt.branch_name == branch) };
+    let has_worktree = |branch: &str| -> bool {
+        worktrees
+            .iter()
+            .any(|wt| wt.unavailable_reason.is_empty() && wt.branch_name == branch)
+    };
 
     if show_all {
         // Show all branches including those without worktrees
@@ -176,7 +182,7 @@ pub async fn handle_worktree_info(
 
     let wt = worktrees
         .iter()
-        .find(|wt| wt.branch_name == branch)
+        .find(|wt| wt.unavailable_reason.is_empty() && wt.branch_name == branch)
         .ok_or_else(|| anyhow::anyhow!("Worktree {} does not exist for model {}", branch, model))?;
 
     println!("Worktree: {model}/{branch}\n");
@@ -210,7 +216,10 @@ pub async fn handle_worktree_remove(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to list worktrees: {}", e))?;
 
-    if !worktrees.iter().any(|wt| wt.branch_name == branch) {
+    if !worktrees
+        .iter()
+        .any(|wt| wt.unavailable_reason.is_empty() && wt.branch_name == branch)
+    {
         anyhow::bail!("Worktree {} does not exist for model {}", branch, model);
     }
 

@@ -776,14 +776,23 @@ fn generate_dispatch_fn(
                 #[allow(unreachable_patterns)]
                 _ => anyhow::bail!("Unknown request variant (not in schema)"),
             };
-            // Convert errors (auth failures, handler errors) to Error response variant
+            // Convert errors (auth failures, handler errors) to Error response
+            // variant. Typed error tunnel: an error carrying a TypedRpcError
+            // (e.g. typed decision-serving failures) keeps its wire code;
+            // every other error keeps the pre-existing generic classification.
             let result = match result {
                 Ok(v) => v,
-                Err(e) => #response_type::Error(ErrorInfo {
-                    message: e.to_string(),
-                    code: "UNAUTHORIZED".to_string(),
-                    details: String::new(),
-                }),
+                Err(e) => {
+                    let code = e
+                        .downcast_ref::<hyprstream_rpc::error::TypedRpcError>()
+                        .map(|t| t.code.clone())
+                        .unwrap_or_else(|| "UNAUTHORIZED".to_string());
+                    #response_type::Error(ErrorInfo {
+                        message: e.to_string(),
+                        code,
+                        details: String::new(),
+                    })
+                }
             };
             Ok((serialize_response(request_id, &result)?, None))
         }
@@ -1986,11 +1995,20 @@ fn generate_scope_dispatch_phase(
                 };
 
                 let err_wrap = quote! {
-                    Err(e) => #response_type::Error(ErrorInfo {
-                        message: e.to_string(),
-                        code: "INTERNAL".to_string(),
-                        details: String::new(),
-                    })
+                    // Typed error tunnel: an error carrying a TypedRpcError
+                    // (e.g. a forwarded worker ErrorInfo) keeps its typed
+                    // code; everything else stays INTERNAL as before.
+                    Err(e) => {
+                        let typed = e
+                            .downcast_ref::<hyprstream_rpc::error::TypedRpcError>()
+                            .map(|t| t.code.clone())
+                            .unwrap_or_else(|| "INTERNAL".to_string());
+                        #response_type::Error(ErrorInfo {
+                            message: e.to_string(),
+                            code: typed,
+                            details: String::new(),
+                        })
+                    }
                 };
 
                 match ct {
@@ -2416,11 +2434,20 @@ fn generate_nested_scope_dispatch_phase(
                 };
 
                 let err_wrap = quote! {
-                    Err(e) => #response_type::Error(ErrorInfo {
-                        message: e.to_string(),
-                        code: "INTERNAL".to_string(),
-                        details: String::new(),
-                    })
+                    // Typed error tunnel: an error carrying a TypedRpcError
+                    // (e.g. a forwarded worker ErrorInfo) keeps its typed
+                    // code; everything else stays INTERNAL as before.
+                    Err(e) => {
+                        let typed = e
+                            .downcast_ref::<hyprstream_rpc::error::TypedRpcError>()
+                            .map(|t| t.code.clone())
+                            .unwrap_or_else(|| "INTERNAL".to_string());
+                        #response_type::Error(ErrorInfo {
+                            message: e.to_string(),
+                            code: typed,
+                            details: String::new(),
+                        })
+                    }
                 };
 
                 match ct {

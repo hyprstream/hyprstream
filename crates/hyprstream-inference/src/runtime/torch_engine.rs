@@ -250,6 +250,12 @@ impl TorchEngine {
         self.device
     }
 
+    /// CPU-device admission helper: the Clef v1 serving profile is CPU-only,
+    /// and `tch::Device` has no `is_cpu()` predicate.
+    pub fn is_cpu_device(&self) -> bool {
+        self.device == Device::Cpu
+    }
+
     /// The resolved multi-device pool, if this engine was built with >1 device.
     ///
     /// Returns `None` for single-device engines (the common case, including the
@@ -2401,6 +2407,11 @@ impl TorchEngine {
             .as_ref()
             .ok_or_else(|| anyhow!("Model not loaded"))?;
         let model = model.lock();
+        // Recheck IMMEDIATELY after the (potentially long) model-lock wait:
+        // a request whose deadline expired while blocked on the lock must
+        // fail here, before the no_grad guard, input tensor allocation, or
+        // any decoder work. Fresh state means nothing needs unwinding.
+        check()?;
         let _guard = tch::no_grad_guard();
         let input = Tensor::from_slice(token_ids)
             .reshape([1, token_ids.len() as i64])

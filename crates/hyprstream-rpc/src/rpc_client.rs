@@ -132,6 +132,10 @@ pub struct CallOptions {
     pub jwt: Option<String>,
     /// Bearer token relayed on behalf of a user (delegation).
     pub delegated_bearer: Option<String>,
+    /// Caller-supplied request deadline for this call, in milliseconds. When
+    /// present it replaces the client's default transport ceiling: a deadline
+    /// is a property of the request, not something the transport may shorten.
+    pub timeout_ms: Option<i32>,
 }
 
 impl CallOptions {
@@ -150,6 +154,19 @@ impl CallOptions {
     pub fn delegated_bearer(mut self, token: impl Into<String>) -> Self {
         self.delegated_bearer = Some(token.into());
         self
+    }
+
+    /// Set the caller's request deadline for this call (milliseconds).
+    pub fn timeout_ms(mut self, timeout_ms: i32) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// The effective transport timeout: the request deadline when present,
+    /// else the client's default ceiling. A present deadline is honored as-is,
+    /// never clamped to the default.
+    pub fn effective_timeout_ms(&self, default: Option<i32>) -> Option<i32> {
+        self.timeout_ms.or(default)
     }
 }
 
@@ -176,6 +193,7 @@ pub struct RequestBuilder<'a> {
     service_domain: Option<&'static str>,
     jwt: Option<String>,
     delegated_bearer: Option<String>,
+    timeout_ms: Option<i32>,
 }
 
 impl<'a> std::fmt::Debug for RequestBuilder<'a> {
@@ -186,6 +204,7 @@ impl<'a> std::fmt::Debug for RequestBuilder<'a> {
                 "delegated_bearer",
                 &self.delegated_bearer.as_ref().map(|_| "***"),
             )
+            .field("timeout_ms", &self.timeout_ms)
             .finish()
     }
 }
@@ -198,6 +217,7 @@ impl<'a> RequestBuilder<'a> {
             service_domain: None,
             jwt: None,
             delegated_bearer: None,
+            timeout_ms: None,
         }
     }
 
@@ -208,6 +228,7 @@ impl<'a> RequestBuilder<'a> {
             service_domain: Some(service_domain),
             jwt: None,
             delegated_bearer: None,
+            timeout_ms: None,
         }
     }
 
@@ -223,11 +244,18 @@ impl<'a> RequestBuilder<'a> {
         self
     }
 
+    /// Set the caller's request deadline for this call (milliseconds).
+    pub fn timeout_ms(mut self, timeout_ms: i32) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
+    }
+
     /// Send a raw request with these options and return the raw response bytes.
     pub async fn call(self, payload: Vec<u8>) -> Result<Vec<u8>> {
         let options = CallOptions {
             jwt: self.jwt,
             delegated_bearer: self.delegated_bearer,
+            timeout_ms: self.timeout_ms,
         };
         match self.service_domain {
             Some(service_domain) => {
@@ -596,6 +624,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         );
         // Delegation is an explicit principal-selection mode. Do not let a
         // pooled client's default JWT silently take precedence over it.
+        let timeout = options.effective_timeout_ms(self.calculate_timeout());
         let jwt = if options.delegated_bearer.is_some() {
             None
         } else {
@@ -613,7 +642,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 method_discriminator,
             )
             .await?;
-        let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
         let (_req_id, inner) = self.unwrap_response(&response_bytes, request_id, pending)?;
         Ok(inner)
@@ -674,6 +702,7 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
         );
         // Delegation is an explicit principal-selection mode. Do not let a
         // pooled client's default JWT silently take precedence over it.
+        let timeout = options.effective_timeout_ms(self.calculate_timeout());
         let jwt = if options.delegated_bearer.is_some() {
             None
         } else {
@@ -691,7 +720,6 @@ impl<S: Signer, T: Transport + 'static> RpcClientImpl<S, T> {
                 method_discriminator,
             )
             .await?;
-        let timeout = self.calculate_timeout();
         let response_bytes = self.transport.send(signed_bytes, timeout).await?;
         let (_req_id, inner) = self.unwrap_response(&response_bytes, request_id, pending)?;
         Ok(inner)
@@ -1240,8 +1268,11 @@ pub trait RpcClient: Send + Sync {
         options: CallOptions,
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            options.jwt.is_none() && options.delegated_bearer.is_none(),
-            "this RPC client does not support method-bound call options"
+            options.jwt.is_none()
+                && options.delegated_bearer.is_none()
+                && options.timeout_ms.is_none(),
+            "this RPC client does not support method-bound call options \
+             (jwt, delegated_bearer, timeout_ms)"
         );
         self.call_for_service_with_method(service_domain, method_discriminator, payload)
             .await
@@ -1266,8 +1297,11 @@ pub trait RpcClient: Send + Sync {
         options: CallOptions,
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            options.jwt.is_none() && options.delegated_bearer.is_none(),
-            "this RPC client does not support streaming call options"
+            options.jwt.is_none()
+                && options.delegated_bearer.is_none()
+                && options.timeout_ms.is_none(),
+            "this RPC client does not support streaming call options \
+             (jwt, delegated_bearer, timeout_ms)"
         );
         self.call_streaming_for_service(service_domain, payload, ephemeral_pubkey)
             .await
@@ -1290,8 +1324,11 @@ pub trait RpcClient: Send + Sync {
         options: CallOptions,
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            options.jwt.is_none() && options.delegated_bearer.is_none(),
-            "this RPC client does not support method-bound streaming call options"
+            options.jwt.is_none()
+                && options.delegated_bearer.is_none()
+                && options.timeout_ms.is_none(),
+            "this RPC client does not support method-bound streaming call options \
+             (jwt, delegated_bearer, timeout_ms)"
         );
         self.call_streaming_for_service_with_method(
             service_domain,
@@ -2510,5 +2547,246 @@ mod request_kem_tests {
             recipients[1], recipients[2],
             "caller retry must generate a fresh response recipient"
         );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod call_options_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn request_deadline_overrides_default_and_absence_keeps_it() {
+        let options = CallOptions::new().timeout_ms(35_000);
+        assert_eq!(
+            options.effective_timeout_ms(Some(30_000)),
+            Some(35_000),
+            "a caller deadline above the default must never be clamped to it"
+        );
+        let quiet = CallOptions::new();
+        assert_eq!(
+            quiet.effective_timeout_ms(Some(30_000)),
+            Some(30_000),
+            "without a request deadline the default ceiling applies"
+        );
+    }
+
+    /// Records the `CallOptions` each request arrives with; everything else
+    /// fails closed so a test only observes option propagation.
+    struct OptionsCapturingClient {
+        seen: parking_lot::Mutex<Vec<CallOptions>>,
+    }
+
+    impl Default for OptionsCapturingClient {
+        fn default() -> Self {
+            Self {
+                seen: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RpcClient for OptionsCapturingClient {
+        async fn call(&self, _payload: Vec<u8>) -> Result<Vec<u8>> {
+            anyhow::bail!("unexpected unbound call")
+        }
+        async fn call_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("unexpected service call")
+        }
+        async fn call_for_service_with_method(
+            &self,
+            service_domain: &str,
+            method_discriminator: u16,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>> {
+            assert_eq!(service_domain, "model");
+            assert_eq!(method_discriminator, 7);
+            assert_eq!(payload, b"payload");
+            Ok(b"method-bound response".to_vec())
+        }
+        async fn call_with_options(
+            &self,
+            _payload: Vec<u8>,
+            _options: CallOptions,
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("unexpected optionless-target call")
+        }
+        async fn call_with_options_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+            options: CallOptions,
+        ) -> Result<Vec<u8>> {
+            self.seen.lock().push(options);
+            Ok(Vec::new())
+        }
+        async fn call_streaming(
+            &self,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("unexpected streaming call")
+        }
+        async fn call_streaming_for_service(
+            &self,
+            _service_domain: &str,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("unexpected service streaming call")
+        }
+        async fn call_streaming_for_service_with_method(
+            &self,
+            _service_domain: &str,
+            _method_discriminator: u16,
+            _payload: Vec<u8>,
+            _ephemeral_pubkey: [u8; 32],
+        ) -> Result<Vec<u8>> {
+            anyhow::bail!("unexpected method-bound streaming call")
+        }
+        async fn open_stream(&self, _payload: Vec<u8>) -> Result<Box<dyn StreamHandle>> {
+            anyhow::bail!("unexpected open_stream")
+        }
+        async fn open_stream_from_info(
+            &self,
+            _stream_info: crate::stream_info::StreamInfo,
+            _client_secret: [u8; 32],
+            _client_pubkey: [u8; 32],
+        ) -> Result<Box<dyn StreamHandle>> {
+            anyhow::bail!("unexpected open_stream_from_info")
+        }
+        fn next_id(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Regression (Codex finding, PR #1767): a `RequestBuilder` deadline set
+    /// via `.timeout_ms(...)` must reach the transport — `call()` used to
+    /// hard-code `timeout_ms: None` so the deadline was silently discarded.
+    #[tokio::test]
+    async fn request_builder_carries_the_caller_deadline_into_call_options() -> anyhow::Result<()> {
+        let stub = std::sync::Arc::new(OptionsCapturingClient::default());
+        let client: std::sync::Arc<dyn RpcClient> = stub.clone();
+        RequestBuilder::for_service(&client, "model")
+            .timeout_ms(1_500)
+            .call(b"payload".to_vec())
+            .await?;
+        let seen = stub.seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].timeout_ms,
+            Some(1_500),
+            "RequestBuilder::timeout_ms must survive into the CallOptions"
+        );
+        assert_eq!(seen[0].jwt, None);
+        assert_eq!(seen[0].delegated_bearer, None);
+        Ok(())
+    }
+
+    /// Regression (Codex finding, PR #1767): the trait-default option methods
+    /// only validated the two auth fields and then called the optionless
+    /// method, silently discarding a caller deadline. They must now fail
+    /// closed on an unhandled deadline while keeping the auth rejection.
+    #[tokio::test]
+    async fn default_method_bound_options_fail_closed_on_unhandled_deadline() -> anyhow::Result<()>
+    {
+        let client = OptionsCapturingClient::default();
+        let error = client
+            .call_with_options_for_service_with_method(
+                "model",
+                7,
+                b"payload".to_vec(),
+                CallOptions::new().timeout_ms(1_500),
+            )
+            .await
+            .err()
+            .ok_or_else(|| {
+                anyhow::anyhow!("an unhandled caller deadline must not be dropped silently")
+            })?;
+        assert!(
+            error.to_string().contains("timeout_ms"),
+            "error must name the dropped deadline: {error}"
+        );
+
+        let error = client
+            .call_streaming_with_options_for_service(
+                "model",
+                b"payload".to_vec(),
+                [0u8; 32],
+                CallOptions::new().timeout_ms(1_500),
+            )
+            .await
+            .err()
+            .ok_or_else(|| {
+                anyhow::anyhow!("streaming default must fail closed on a deadline too")
+            })?;
+        assert!(
+            error.to_string().contains("timeout_ms"),
+            "error must name the dropped deadline: {error}"
+        );
+
+        let error = client
+            .call_streaming_with_options_for_service_with_method(
+                "model",
+                7,
+                b"payload".to_vec(),
+                [0u8; 32],
+                CallOptions::new().timeout_ms(1_500),
+            )
+            .await
+            .err()
+            .ok_or_else(|| {
+                anyhow::anyhow!("method-bound streaming default must fail closed too")
+            })?;
+        assert!(
+            error.to_string().contains("timeout_ms"),
+            "error must name the dropped deadline: {error}"
+        );
+        Ok(())
+    }
+
+    /// The auth-field rejection is unchanged: options-bearing auth on a client
+    /// that cannot handle it still fails closed (deadline additions must not
+    /// weaken the existing checks).
+    #[tokio::test]
+    async fn default_method_bound_options_still_reject_unsupported_auth() {
+        let client = OptionsCapturingClient::default();
+        for options in [
+            CallOptions::new().jwt("token".to_owned()),
+            CallOptions::new().delegated_bearer("token".to_owned()),
+        ] {
+            assert!(
+                client
+                    .call_with_options_for_service_with_method(
+                        "model",
+                        7,
+                        b"payload".to_vec(),
+                        options.clone(),
+                    )
+                    .await
+                    .is_err(),
+                "auth options must still be rejected: {options:?}"
+            );
+        }
+    }
+
+    /// An options-free call through the defaults keeps working (backwards
+    /// compatibility for clients without option support).
+    #[tokio::test]
+    async fn default_method_bound_options_still_admit_empty_options() -> anyhow::Result<()> {
+        let client = OptionsCapturingClient::default();
+        let response = client
+            .call_with_options_for_service_with_method(
+                "model",
+                7,
+                b"payload".to_vec(),
+                CallOptions::new(),
+            )
+            .await?;
+        assert_eq!(response, b"method-bound response");
+        Ok(())
     }
 }

@@ -22,6 +22,24 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 /**
+ * Decoded remote application error. Its code comes only from the wire field,
+ * never from message text. This type alone is NOT proof of peer authentication,
+ * policy denial, or worker termination; the transport owns those guarantees.
+ * Transport and parser failures are not converted into RpcError.
+ */
+export class RpcError extends Error {
+  readonly code: string | undefined;
+
+  constructor(info: unknown) {
+    const message = info !== null && typeof info === 'object' && 'message' in info ? info.message : undefined;
+    super(typeof message === 'string' ? message : 'RPC error');
+    const code = info !== null && typeof info === 'object' && 'code' in info ? info.code : undefined;
+    this.code = typeof code === 'string' ? code : undefined;
+  }
+}
+
+
+/**
  * Single-segment Cap'n Proto message builder / arena.
  *
  * JS-heap backed — grows on demand via Uint8Array reallocation.
